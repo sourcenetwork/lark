@@ -3,6 +3,7 @@ pub(crate) mod block_cache;
 pub(crate) mod bloom;
 pub(crate) mod compaction;
 pub(crate) mod internal_key;
+pub(crate) mod iterator;
 pub(crate) mod manifest;
 pub(crate) mod memtable;
 pub(crate) mod sstable;
@@ -19,7 +20,7 @@ use block_cache::BlockCache;
 use compaction::{CompactionOptions, CompactionScheduler};
 use manifest::{VersionEdit, VersionSet};
 use memtable::MemTable;
-use sstable::{sst_filename, LookupResult, SsTableMeta, SsTableReader, SsTableWriter};
+use sstable::{sst_filename, LiveSst, LookupResult, SsTableMeta, SsTableReader, SsTableWriter};
 use wal::{wal_filename, Wal, WalEntry};
 
 /// Controls when data is flushed to disk after a commit.
@@ -84,7 +85,7 @@ impl LarkEngine {
         std::fs::create_dir_all(&sst_dir)?;
         std::fs::create_dir_all(&wal_dir)?;
 
-        let mut version_set = VersionSet::open(db_dir)?;
+        let mut version_set = VersionSet::open(db_dir, &sst_dir)?;
         let version = version_set.current();
         let mut latest_seq = version.last_seq;
 
@@ -168,6 +169,28 @@ impl LarkEngine {
         self.latest_seq.load(Ordering::Acquire)
     }
 
+    /// Construct a streaming iterator rooted at `snapshot_seq`. Captures
+    /// the current memtable state and the current version; no filesystem
+    /// access happens here — file handles are already open in the
+    /// pinned `Arc<LiveSst>`s carried by the version.
+    pub(crate) fn new_iter(&self, snapshot_seq: u64) -> iterator::LarkIterator {
+        let active = Arc::clone(&self.active_memtable.read());
+        let frozen: Vec<Arc<MemTable>> = self
+            .frozen_memtables
+            .read()
+            .iter()
+            .map(Arc::clone)
+            .collect();
+        let version = self.versions.lock().current();
+        iterator::LarkIterator::new(
+            active,
+            frozen,
+            version,
+            Arc::clone(&self.cache),
+            snapshot_seq,
+        )
+    }
+
     /// Point lookup at a given snapshot. Returns `Ok(Some(value))` or `Ok(None)`.
     pub(crate) fn get(&self, key: &[u8], snapshot_seq: u64) -> std::io::Result<Option<Vec<u8>>> {
         if let Some(result) = self.active_memtable.read().get(key, snapshot_seq) {
@@ -185,11 +208,12 @@ impl LarkEngine {
 
         let version = self.versions.lock().current();
 
-        // L0: check all files (may overlap), newest first.
-        for meta in version.levels[0].iter().rev() {
-            let path = self.sst_dir.join(sst_filename(meta.file_id));
-            let reader = SsTableReader::open(&path, meta.file_id)?;
-            match reader.get(key, snapshot_seq, &self.cache)? {
+        // L0: check all files (may overlap), newest first. Readers are
+        // already open in the pinned `Version`, so no filesystem access
+        // happens here — concurrent compaction unlinking paths cannot
+        // break us.
+        for file in version.levels[0].iter().rev() {
+            match file.reader.get(key, snapshot_seq, &self.cache)? {
                 LookupResult::Found(value) => return Ok(Some(value)),
                 LookupResult::FoundTombstone => return Ok(None),
                 LookupResult::NotInTable => {}
@@ -203,12 +227,10 @@ impl LarkEngine {
                 continue;
             }
 
-            let idx = files.partition_point(|f| f.largest_key.as_slice() < key);
-            if idx < files.len() && files[idx].smallest_key.as_slice() <= key {
-                let meta = &files[idx];
-                let path = self.sst_dir.join(sst_filename(meta.file_id));
-                let reader = SsTableReader::open(&path, meta.file_id)?;
-                match reader.get(key, snapshot_seq, &self.cache)? {
+            let idx = files.partition_point(|f| f.meta.largest_key.as_slice() < key);
+            if idx < files.len() && files[idx].meta.smallest_key.as_slice() <= key {
+                let file = &files[idx];
+                match file.reader.get(key, snapshot_seq, &self.cache)? {
                     LookupResult::Found(value) => return Ok(Some(value)),
                     LookupResult::FoundTombstone => return Ok(None),
                     LookupResult::NotInTable => {}
@@ -217,64 +239,6 @@ impl LarkEngine {
         }
 
         Ok(None)
-    }
-
-    /// Scan a key range at a given snapshot.
-    ///
-    /// Sources are processed in priority order — active memtable, then
-    /// frozen memtables (newest-first), then L0 SSTables (newest-first),
-    /// then L1, L2, … — and the first entry seen for each user key wins.
-    /// Tombstones in the winning source hide the key entirely.
-    pub(crate) fn scan(
-        &self,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-        snapshot_seq: u64,
-    ) -> std::io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let mut seen: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-        let mut insert = |k: Vec<u8>, v: Option<Vec<u8>>| {
-            seen.entry(k).or_insert(v);
-        };
-
-        for (key, value) in self.active_memtable.read().iter(snapshot_seq) {
-            if in_range(&key, start, end) {
-                insert(key, value);
-            }
-        }
-
-        {
-            let frozen = self.frozen_memtables.read();
-            for mt in frozen.iter().rev() {
-                for (key, value) in mt.iter(snapshot_seq) {
-                    if in_range(&key, start, end) {
-                        insert(key, value);
-                    }
-                }
-            }
-        }
-
-        let version = self.versions.lock().current();
-        for meta in version.levels[0].iter().rev() {
-            let path = self.sst_dir.join(sst_filename(meta.file_id));
-            let reader = SsTableReader::open(&path, meta.file_id)?;
-            for (key, value) in reader.range_iter(start, end, snapshot_seq, &self.cache)? {
-                insert(key, value);
-            }
-        }
-        for level in 1..version.levels.len() {
-            for meta in &version.levels[level] {
-                let path = self.sst_dir.join(sst_filename(meta.file_id));
-                let reader = SsTableReader::open(&path, meta.file_id)?;
-                for (key, value) in reader.range_iter(start, end, snapshot_seq, &self.cache)? {
-                    insert(key, value);
-                }
-            }
-        }
-
-        Ok(seen
-            .into_iter()
-            .filter_map(|(k, v)| v.map(|vv| (k, vv)))
-            .collect())
     }
 
     /// Apply a batch of writes atomically.
@@ -411,18 +375,21 @@ impl LarkEngine {
         let file_size = std::fs::metadata(&sst_path)?.len();
         let num_entries = summary.num_entries;
 
+        let reader = Arc::new(SsTableReader::open(&sst_path, file_id)?);
+        let file = LiveSst::new(
+            SsTableMeta {
+                file_id,
+                smallest_key: summary.smallest_user_key,
+                largest_key: summary.largest_user_key,
+                file_size,
+                num_entries,
+            },
+            reader,
+        );
+
         let seq = self.latest_seq.load(Ordering::Acquire);
         let edits = vec![
-            VersionEdit::AddFile {
-                level: 0,
-                meta: SsTableMeta {
-                    file_id,
-                    smallest_key: summary.smallest_user_key,
-                    largest_key: summary.largest_user_key,
-                    file_size,
-                    num_entries,
-                },
-            },
+            VersionEdit::AddFile { level: 0, file },
             VersionEdit::SetLastSeq(seq),
         ];
         self.versions.lock().apply(&edits)?;
@@ -450,8 +417,8 @@ impl LarkEngine {
 
         let version = self.versions.lock().current();
         for level in &version.levels {
-            for meta in level {
-                let path = self.sst_dir.join(sst_filename(meta.file_id));
+            for file in level {
+                let path = self.sst_dir.join(sst_filename(file.meta.file_id));
                 let _ = std::fs::remove_file(&path);
             }
         }
@@ -463,10 +430,10 @@ impl LarkEngine {
             let mut edits = Vec::new();
             let ver = versions.current();
             for (level_idx, level) in ver.levels.iter().enumerate() {
-                for meta in level {
+                for file in level {
                     edits.push(VersionEdit::RemoveFile {
                         level: level_idx,
-                        file_id: meta.file_id,
+                        file_id: file.meta.file_id,
                     });
                 }
             }
@@ -525,20 +492,6 @@ impl LarkEngine {
 
         Ok(())
     }
-}
-
-fn in_range(key: &[u8], start: Option<&[u8]>, end: Option<&[u8]>) -> bool {
-    if let Some(s) = start {
-        if key < s {
-            return false;
-        }
-    }
-    if let Some(e) = end {
-        if key >= e {
-            return false;
-        }
-    }
-    true
 }
 
 fn list_wal_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {

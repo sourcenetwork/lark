@@ -67,37 +67,6 @@ impl MemTable {
         None
     }
 
-    /// Iterate entries visible at `snapshot_seq`, deduplicated by user key.
-    /// Returns `(user_key, Option<value>)` — `None` is a tombstone.
-    pub(crate) fn iter(&self, snapshot_seq: u64) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
-        let mut result = Vec::new();
-        let mut last_user_key: Option<Vec<u8>> = None;
-
-        for entry in self.data.iter() {
-            let (user_key, seq, value_type) = decode_internal_key(entry.key());
-
-            if seq > snapshot_seq {
-                continue;
-            }
-
-            if let Some(ref last) = last_user_key {
-                if last.as_slice() == user_key {
-                    continue;
-                }
-            }
-
-            last_user_key = Some(user_key.to_vec());
-
-            if value_type == VALUE_TYPE_DELETION {
-                result.push((user_key.to_vec(), None));
-            } else {
-                result.push((user_key.to_vec(), Some(entry.value().clone())));
-            }
-        }
-
-        result
-    }
-
     /// Iterate **all** raw entries in internal-key order, preserving every
     /// version and tombstone. Used by flush and compaction; the returned
     /// pairs are `(internal_key, value_bytes)` with value_bytes empty for
@@ -107,6 +76,33 @@ impl MemTable {
             .iter()
             .map(|e| (e.key().clone(), e.value().clone()))
             .collect()
+    }
+
+    /// Return the first `(internal_key, value)` pair whose key is in the
+    /// half-open range `[lower, ..)`. Used by the streaming iterator to walk
+    /// the memtable statelessly — each call does a fresh `O(log N)` seek in
+    /// the skip list.
+    pub(crate) fn first_entry_from(
+        &self,
+        lower: std::ops::Bound<&[u8]>,
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.data
+            .range::<[u8], _>((lower, std::ops::Bound::Unbounded))
+            .next()
+            .map(|e| (e.key().clone(), e.value().clone()))
+    }
+
+    /// Return the last `(internal_key, value)` pair whose key is in the
+    /// half-open range `(.., upper]`. The companion of [`first_entry_from`]
+    /// used for reverse seeks.
+    pub(crate) fn last_entry_before(
+        &self,
+        upper: std::ops::Bound<&[u8]>,
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.data
+            .range::<[u8], _>((std::ops::Bound::Unbounded, upper))
+            .next_back()
+            .map(|e| (e.key().clone(), e.value().clone()))
     }
 
     pub(crate) fn approximate_size(&self) -> usize {
@@ -148,19 +144,6 @@ mod tests {
 
         assert_eq!(mt.get(b"key1", 2), Some(Some(b"v2".to_vec())));
         assert_eq!(mt.get(b"key1", 1), Some(Some(b"v1".to_vec())));
-    }
-
-    #[test]
-    fn test_iter_dedup() {
-        let mt = MemTable::new();
-        mt.put(b"a", b"v1", 1);
-        mt.put(b"a", b"v2", 2);
-        mt.put(b"b", b"v3", 3);
-
-        let items = mt.iter(3);
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0], (b"a".to_vec(), Some(b"v2".to_vec())));
-        assert_eq!(items[1], (b"b".to_vec(), Some(b"v3".to_vec())));
     }
 
     #[test]

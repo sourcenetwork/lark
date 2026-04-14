@@ -14,8 +14,10 @@
 
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use super::block::{Block, BlockBuilder, BlockHandle, RESTART_INTERVAL};
 use super::block_cache::BlockCache;
@@ -87,16 +89,32 @@ pub(crate) struct SsTableMeta {
     pub(crate) num_entries: u64,
 }
 
+/// A live SSTable: metadata plus an already-opened reader. Held by
+/// [`super::manifest::Version`] so that as long as any version
+/// referencing this file is alive, the underlying file descriptor stays
+/// open — reads remain valid even after a concurrent compaction unlinks
+/// the file from disk (the kernel keeps the inode alive via FD
+/// refcounting).
+///
+/// `Arc<LiveSst>` is shared between versions and between a version and
+/// any iterator built from it, so cloning is cheap.
+pub(crate) struct LiveSst {
+    pub(crate) meta: SsTableMeta,
+    pub(crate) reader: Arc<SsTableReader>,
+}
+
+impl LiveSst {
+    pub(crate) fn new(meta: SsTableMeta, reader: Arc<SsTableReader>) -> Arc<Self> {
+        Arc::new(Self { meta, reader })
+    }
+}
+
 /// Index entry: the **last internal key** of the data block plus its handle.
 #[derive(Debug, Clone)]
 struct IndexEntry {
     key: Vec<u8>,
     handle: BlockHandle,
 }
-
-/// A user-key / optional-value pair as returned by [`SsTableReader::range_iter`].
-/// `None` indicates a tombstone.
-pub(crate) type ScanEntry = (Vec<u8>, Option<Vec<u8>>);
 
 /// Result of looking up a user key in a single SSTable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,9 +342,12 @@ impl SsTableWriter {
 
 // ─── Reader ─────────────────────────────────────────────────────────────────
 
-/// Reads an SSTable file. Index and bloom filter are loaded into memory at open.
+/// Reads an SSTable file. Index and bloom filter are loaded into memory at
+/// open; the file handle is held for the reader's lifetime so concurrent
+/// compaction unlinking the path cannot corrupt an in-progress read (the OS
+/// keeps the bytes alive via file-descriptor refcounting).
 pub(crate) struct SsTableReader {
-    path: PathBuf,
+    file: Mutex<File>,
     pub(crate) file_id: u64,
     index: Vec<IndexEntry>,
     bloom: BloomFilter,
@@ -361,7 +382,7 @@ impl SsTableReader {
         let index = decode_index_block(&index_data)?;
 
         Ok(Self {
-            path: path.to_path_buf(),
+            file: Mutex::new(file),
             file_id,
             index,
             bloom,
@@ -410,76 +431,6 @@ impl SsTableReader {
         }
     }
 
-    /// Iterate entries visible at `snapshot_seq` in the user-key range
-    /// `[start, end)`. Results are deduplicated by user key, keeping the
-    /// most recent visible version. Tombstones are reported as `None` so
-    /// callers can suppress older versions living in lower levels.
-    pub(crate) fn range_iter(
-        &self,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-        snapshot_seq: u64,
-        cache: &BlockCache,
-    ) -> io::Result<Vec<ScanEntry>> {
-        let start_block = if let Some(start_user_key) = start {
-            // The smallest internal key for `start_user_key` is the one with
-            // seq = u64::MAX (because we encode !seq). Binary-searching for
-            // the first index entry whose last internal key is >= that puts
-            // us on the first block that may contain the range.
-            let probe = lookup_key(start_user_key, u64::MAX);
-            match self
-                .index
-                .binary_search_by(|e| e.key.as_slice().cmp(&probe))
-            {
-                Ok(i) => i,
-                Err(i) => {
-                    if i >= self.index.len() {
-                        return Ok(Vec::new());
-                    }
-                    i
-                }
-            }
-        } else {
-            0
-        };
-
-        let mut result: Vec<ScanEntry> = Vec::new();
-        let mut last_user_key: Option<Vec<u8>> = None;
-
-        for entry in &self.index[start_block..] {
-            let block = self.read_block(entry.handle, cache)?;
-            for (ik, value) in block.iter() {
-                let (uk, seq, vt) = decode_internal_key(&ik);
-
-                if let Some(e) = end {
-                    if uk >= e {
-                        return Ok(result);
-                    }
-                }
-                if let Some(s) = start {
-                    if uk < s {
-                        continue;
-                    }
-                }
-                if seq > snapshot_seq {
-                    continue;
-                }
-                if last_user_key.as_deref() == Some(uk) {
-                    continue;
-                }
-                last_user_key = Some(uk.to_vec());
-
-                if vt == VALUE_TYPE_DELETION {
-                    result.push((uk.to_vec(), None));
-                } else {
-                    result.push((uk.to_vec(), Some(value)));
-                }
-            }
-        }
-
-        Ok(result)
-    }
-
     /// Read every entry in internal-key order with no dedup or filtering.
     /// Used by compaction to merge tables without losing versions.
     pub(crate) fn iter_internal(&self, cache: &BlockCache) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -493,16 +444,53 @@ impl SsTableReader {
         Ok(result)
     }
 
+    /// Number of data blocks in this table.
+    pub(crate) fn num_blocks(&self) -> usize {
+        self.index.len()
+    }
+
+    /// Find the first block whose last internal key is `>= target`. Used by
+    /// the streaming iterator to seek to a position within this SSTable.
+    pub(crate) fn seek_block(&self, target: &[u8]) -> Option<usize> {
+        match self
+            .index
+            .binary_search_by(|e| e.key.as_slice().cmp(target))
+        {
+            Ok(i) => Some(i),
+            Err(i) => {
+                if i >= self.index.len() {
+                    None
+                } else {
+                    Some(i)
+                }
+            }
+        }
+    }
+
+    /// Materialize every entry in `block_idx` as a vector of `(internal_key,
+    /// value)` pairs through the block cache. Used by the streaming iterator
+    /// to drive forward through one block at a time.
+    pub(crate) fn load_block_entries(
+        &self,
+        block_idx: usize,
+        cache: &BlockCache,
+    ) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let handle = self.index[block_idx].handle;
+        let block = self.read_block(handle, cache)?;
+        Ok(block.iter().collect())
+    }
+
     fn read_block(&self, handle: BlockHandle, cache: &BlockCache) -> io::Result<Arc<Block>> {
         if let Some(block) = cache.get(self.file_id, handle.offset) {
             return Ok(block);
         }
 
-        let mut file = File::open(&self.path)?;
-        file.seek(SeekFrom::Start(handle.offset))?;
-
         let mut block_data = vec![0u8; handle.size as usize];
-        file.read_exact(&mut block_data)?;
+        {
+            let mut file = self.file.lock();
+            file.seek(SeekFrom::Start(handle.offset))?;
+            file.read_exact(&mut block_data)?;
+        }
 
         // Frame: [compression_type: u8][payload][checksum: u32]
         let compression_type = block_data[0];
@@ -630,35 +618,6 @@ mod tests {
             reader.get(b"k", 0, &cache).unwrap(),
             LookupResult::NotInTable
         );
-    }
-
-    #[test]
-    fn test_sstable_range_iter_dedup_and_tombstones() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("range.sst");
-        let cache = BlockCache::new(1024 * 1024);
-
-        {
-            let mut writer = SsTableWriter::new(&path, 4096, 10, false).unwrap();
-            writer.add(&ik(b"a", 1), b"a1").unwrap();
-            writer.add(&tombstone(b"b", 4), b"").unwrap();
-            writer.add(&ik(b"b", 2), b"b2").unwrap();
-            writer.add(&ik(b"c", 3), b"c3").unwrap();
-            writer.finish().unwrap().unwrap();
-        }
-
-        let reader = SsTableReader::open(&path, 42).unwrap();
-        // At seq=5 we see: a=a1, b=tombstone, c=c3
-        let items = reader.range_iter(None, None, 5, &cache).unwrap();
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[0], (b"a".to_vec(), Some(b"a1".to_vec())));
-        assert_eq!(items[1], (b"b".to_vec(), None));
-        assert_eq!(items[2], (b"c".to_vec(), Some(b"c3".to_vec())));
-
-        // At seq=3 we see: a=a1, b=b2, c=c3 (tombstone is in the future)
-        let items = reader.range_iter(None, None, 3, &cache).unwrap();
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[1], (b"b".to_vec(), Some(b"b2".to_vec())));
     }
 
     #[test]

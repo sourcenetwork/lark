@@ -63,31 +63,12 @@ impl Block {
 
     /// Return the first `(key, value)` entry with `key >= target`, if any.
     ///
-    /// This is the primitive SSTable readers use for MVCC lookups: the
+    /// This is the primitive SSTable readers use for MVCC point lookups: the
     /// caller constructs a search key from `(user_key, snapshot_seq)` and
     /// inspects the returned entry to decide whether it satisfies the query.
     pub(crate) fn seek_ge(&self, target: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
         let data_end = self.data.len() - 4 - self.restarts.len() * 4;
-
-        // Binary search on restart points to narrow the scan region.
-        let mut left = 0;
-        let mut right = self.restarts.len();
-        while left < right {
-            let mid = left + (right - left) / 2;
-            let restart_pos = self.restarts[mid] as usize;
-            let (key, _) = decode_block_entry(&self.data[..data_end], restart_pos, &[]);
-            if key.as_slice() < target {
-                left = mid + 1;
-            } else {
-                right = mid;
-            }
-        }
-
-        let start = if left > 0 {
-            self.restarts[left - 1] as usize
-        } else {
-            0
-        };
+        let start = self.restart_start_for(target);
 
         let mut pos = start;
         let mut current_key = Vec::new();
@@ -103,6 +84,29 @@ impl Block {
         }
 
         None
+    }
+
+    /// Binary-search restart points for the first entry whose key could be
+    /// `>= target`; returns the byte offset to start the linear walk from.
+    fn restart_start_for(&self, target: &[u8]) -> usize {
+        let data_end = self.data.len() - 4 - self.restarts.len() * 4;
+        let mut left = 0;
+        let mut right = self.restarts.len();
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let restart_pos = self.restarts[mid] as usize;
+            let (key, _) = decode_block_entry(&self.data[..data_end], restart_pos, &[]);
+            if key.as_slice() < target {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        if left > 0 {
+            self.restarts[left - 1] as usize
+        } else {
+            0
+        }
     }
 }
 
@@ -260,15 +264,21 @@ mod tests {
         }
     }
 
+    fn build_block(pairs: &[(&[u8], &[u8])]) -> Block {
+        let mut builder = BlockBuilder::new(4);
+        for (k, v) in pairs {
+            builder.add(k, v);
+        }
+        Block::decode(builder.finish()).unwrap()
+    }
+
     #[test]
     fn test_block_seek_ge() {
-        let mut builder = BlockBuilder::new(4);
-        builder.add(b"apple", b"red");
-        builder.add(b"application", b"software");
-        builder.add(b"banana", b"yellow");
-
-        let data = builder.finish();
-        let block = Block::decode(data).unwrap();
+        let block = build_block(&[
+            (b"apple", b"red"),
+            (b"application", b"software"),
+            (b"banana", b"yellow"),
+        ]);
 
         assert_eq!(
             block.seek_ge(b"apple"),

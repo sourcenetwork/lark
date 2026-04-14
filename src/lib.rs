@@ -44,9 +44,11 @@
 
 mod engine;
 mod error;
+mod iter;
 mod options;
 
 pub use error::Error;
+pub use iter::Iter;
 pub use options::{DurabilityMode, Options};
 
 use std::collections::BTreeMap;
@@ -149,7 +151,21 @@ impl Db {
         end: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let seq = self.engine.snapshot_seq();
-        self.engine.scan(start, end, seq).map_err(Error::Io)
+        collect_range(&self.engine, start, end, seq)
+    }
+
+    /// Create a streaming iterator over the current database state.
+    ///
+    /// The iterator captures a consistent view at the moment it is created
+    /// — later writes are invisible to this iterator, and concurrent
+    /// background compaction cannot invalidate it.
+    ///
+    /// A fresh iterator is not positioned; call one of
+    /// [`Iter::seek_to_first`], [`Iter::seek`], or
+    /// [`Iter::seek_for_prev`] before reading.
+    pub fn iter(&self) -> Iter<'_> {
+        let seq = self.engine.snapshot_seq();
+        Iter::from_internal(self.engine.new_iter(seq))
     }
 
     /// Delete all data in the database.
@@ -189,8 +205,46 @@ impl Snapshot {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.engine.scan(start, end, self.seq).map_err(Error::Io)
+        collect_range(&self.engine, start, end, self.seq)
     }
+
+    /// Create a streaming iterator anchored at this snapshot.
+    pub fn iter(&self) -> Iter<'_> {
+        Iter::from_internal(self.engine.new_iter(self.seq))
+    }
+}
+
+/// Collect a bounded range of `(user_key, value)` pairs via the streaming
+/// iterator. This is the engine of `Db::scan` / `Snapshot::scan`; the
+/// dedicated method exists so both callers share one merge implementation.
+fn collect_range(
+    engine: &LarkEngine,
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+    snapshot_seq: u64,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let mut iter = engine.new_iter(snapshot_seq);
+    match start {
+        Some(s) => iter.seek(s),
+        None => iter.seek_to_first(),
+    }
+    iter.status().map_err(Error::Io)?;
+
+    let mut out = Vec::new();
+    while iter.valid() {
+        let (Some(k), Some(v)) = (iter.key(), iter.value()) else {
+            break;
+        };
+        if let Some(e) = end {
+            if k >= e {
+                break;
+            }
+        }
+        out.push((k.to_vec(), v.to_vec()));
+        iter.next();
+    }
+    iter.status().map_err(Error::Io)?;
+    Ok(out)
 }
 
 /// A batch of write operations to apply atomically.
@@ -377,6 +431,287 @@ mod tests {
         assert_eq!(db.get(b"a").unwrap(), None);
         assert_eq!(db.get(b"b").unwrap(), Some(b"2".to_vec()));
         assert_eq!(db.get(b"c").unwrap(), Some(b"3".to_vec()));
+    }
+
+    // ─── Streaming iterator tests ────────────────────────────────────────
+
+    fn collect_iter(db: &Db) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut it = db.iter();
+        it.seek_to_first();
+        let mut out = Vec::new();
+        while it.valid() {
+            out.push((it.key().unwrap().to_vec(), it.value().unwrap().to_vec()));
+            it.next();
+        }
+        it.status().unwrap();
+        out
+    }
+
+    #[test]
+    fn test_iter_empty_db() {
+        let (db, _dir) = open_tmp();
+        let mut it = db.iter();
+        it.seek_to_first();
+        assert!(!it.valid());
+        it.seek(b"anything");
+        assert!(!it.valid());
+        assert!(it.status().is_ok());
+    }
+
+    #[test]
+    fn test_iter_basic_forward() {
+        let (db, _dir) = open_tmp();
+        for i in 0..10 {
+            let k = format!("k{:02}", i);
+            let v = format!("v{}", i);
+            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+        }
+        let items = collect_iter(&db);
+        assert_eq!(items.len(), 10);
+        for (i, (k, v)) in items.iter().enumerate() {
+            assert_eq!(k, format!("k{:02}", i).as_bytes());
+            assert_eq!(v, format!("v{}", i).as_bytes());
+        }
+    }
+
+    #[test]
+    fn test_iter_seek_exact_and_between() {
+        let (db, _dir) = open_tmp();
+        db.put(b"a", b"1").unwrap();
+        db.put(b"c", b"3").unwrap();
+        db.put(b"e", b"5").unwrap();
+
+        let mut it = db.iter();
+
+        it.seek(b"a");
+        assert!(it.valid());
+        assert_eq!(it.key(), Some(b"a".as_ref()));
+
+        it.seek(b"b");
+        assert_eq!(it.key(), Some(b"c".as_ref()));
+
+        it.seek(b"c");
+        assert_eq!(it.key(), Some(b"c".as_ref()));
+
+        it.seek(b"f");
+        assert!(!it.valid());
+    }
+
+    #[test]
+    fn test_iter_seek_for_prev() {
+        let (db, _dir) = open_tmp();
+        db.put(b"a", b"1").unwrap();
+        db.put(b"c", b"3").unwrap();
+        db.put(b"e", b"5").unwrap();
+
+        let mut it = db.iter();
+
+        it.seek_for_prev(b"e");
+        assert_eq!(it.key(), Some(b"e".as_ref()));
+
+        it.seek_for_prev(b"d");
+        assert_eq!(it.key(), Some(b"c".as_ref()));
+
+        it.seek_for_prev(b"a");
+        assert_eq!(it.key(), Some(b"a".as_ref()));
+
+        it.seek_for_prev(b"0");
+        assert!(!it.valid());
+    }
+
+    #[test]
+    fn test_iter_continues_after_seek() {
+        let (db, _dir) = open_tmp();
+        for c in b'a'..=b'j' {
+            db.put(&[c], &[c]).unwrap();
+        }
+
+        let mut it = db.iter();
+        it.seek(b"d");
+        let mut keys = Vec::new();
+        while it.valid() {
+            keys.push(it.key().unwrap().to_vec());
+            it.next();
+        }
+        assert_eq!(
+            keys,
+            vec![
+                b"d".to_vec(),
+                b"e".to_vec(),
+                b"f".to_vec(),
+                b"g".to_vec(),
+                b"h".to_vec(),
+                b"i".to_vec(),
+                b"j".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_iter_across_memtable_and_l0() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        for i in 0..10 {
+            let k = format!("old{:02}", i);
+            db.put(k.as_bytes(), b"old").unwrap();
+        }
+        force_flush(&db, "to-l0");
+
+        for i in 0..5 {
+            let k = format!("new{:02}", i);
+            db.put(k.as_bytes(), b"new").unwrap();
+        }
+
+        let items = collect_iter(&db);
+        let olds = items.iter().filter(|(k, _)| k.starts_with(b"old")).count();
+        let news = items.iter().filter(|(k, _)| k.starts_with(b"new")).count();
+        assert_eq!(olds, 10);
+        assert_eq!(news, 5);
+
+        let sorted: Vec<_> = items.iter().map(|(k, _)| k.clone()).collect();
+        let mut expected = sorted.clone();
+        expected.sort();
+        assert_eq!(sorted, expected);
+    }
+
+    #[test]
+    fn test_iter_tombstone_hides_older_level_entry() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        db.put(b"kept", b"v1").unwrap();
+        db.put(b"gone", b"v1").unwrap();
+        force_flush(&db, "a");
+
+        db.delete(b"gone").unwrap();
+
+        let items = collect_iter(&db);
+        let keys: Vec<_> = items.iter().map(|(k, _)| k.clone()).collect();
+        assert!(keys.contains(&b"kept".to_vec()));
+        assert!(!keys.contains(&b"gone".to_vec()));
+    }
+
+    #[test]
+    fn test_iter_latest_version_wins_across_levels() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        db.put(b"k", b"v1").unwrap();
+        force_flush(&db, "a");
+        db.put(b"k", b"v2").unwrap();
+
+        let mut it = db.iter();
+        it.seek(b"k");
+        assert_eq!(it.key(), Some(b"k".as_ref()));
+        assert_eq!(it.value(), Some(b"v2".as_ref()));
+    }
+
+    #[test]
+    fn test_iter_honors_snapshot_isolation() {
+        let (db, _dir) = open_tmp();
+        db.put(b"k", b"v1").unwrap();
+        let snap = db.snapshot();
+        db.put(b"k", b"v2").unwrap();
+
+        let mut it = snap.iter();
+        it.seek(b"k");
+        assert_eq!(it.value(), Some(b"v1".as_ref()));
+    }
+
+    #[test]
+    fn test_iter_snapshot_ignores_tombstone_newer_than_snap() {
+        let (db, _dir) = open_tmp();
+        db.put(b"k", b"v1").unwrap();
+        let snap = db.snapshot();
+        db.delete(b"k").unwrap();
+
+        let mut it = snap.iter();
+        it.seek(b"k");
+        assert_eq!(it.value(), Some(b"v1".as_ref()));
+    }
+
+    #[test]
+    fn test_iter_consistency_with_scan() {
+        let (db, _dir) = open_tmp();
+        for i in 0..100 {
+            let k = format!("k{:03}", i);
+            let v = format!("v{}", i);
+            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+        }
+
+        let scan = db.scan(Some(b"k020"), Some(b"k050")).unwrap();
+
+        let mut it = db.iter();
+        it.seek(b"k020");
+        let mut from_iter = Vec::new();
+        while it.valid() {
+            let k = it.key().unwrap();
+            if k >= b"k050".as_ref() {
+                break;
+            }
+            from_iter.push((k.to_vec(), it.value().unwrap().to_vec()));
+            it.next();
+        }
+
+        assert_eq!(scan, from_iter);
+    }
+
+    #[test]
+    fn test_iter_large_scan_10k_keys_after_flush() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        const N: usize = 10_000;
+        for i in 0..N {
+            let k = format!("key_{:06}", i);
+            db.put(k.as_bytes(), b"v").unwrap();
+        }
+
+        let mut it = db.iter();
+        it.seek(b"key_");
+        let mut count = 0;
+        while it.valid() {
+            let k = it.key().unwrap();
+            if !k.starts_with(b"key_") {
+                it.next();
+                continue;
+            }
+            count += 1;
+            it.next();
+        }
+        assert_eq!(count, N);
+    }
+
+    #[test]
+    fn test_iter_survives_drop_all() {
+        // drop_all unlinks every SSTable file. An iterator captured before
+        // drop_all holds its own Arc<SsTableReader>s (each with an open
+        // File), so OS fd refcounting keeps the bytes alive and the
+        // iterator continues to produce its original view.
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        for i in 0..20 {
+            let k = format!("pin{:03}", i);
+            db.put(k.as_bytes(), b"v").unwrap();
+        }
+        force_flush(&db, "pinned");
+
+        let mut it = db.iter();
+        it.seek_to_first();
+
+        db.drop_all().unwrap();
+
+        let mut seen_pinned = 0;
+        while it.valid() {
+            if it.key().unwrap().starts_with(b"pin") {
+                seen_pinned += 1;
+            }
+            it.next();
+        }
+        assert_eq!(seen_pinned, 20);
+        assert!(it.status().is_ok());
     }
 
     #[test]
