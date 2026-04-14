@@ -51,6 +51,56 @@ pub trait CompactionFilter: Send + Sync + 'static {
     fn name(&self) -> &'static str;
 }
 
+/// Per-call knobs for point and batch writes. Overrides the database-
+/// global [`Options::durability`] on a single operation so callers can
+/// opt a critical write into synchronous fsync, or opt a bulk-load
+/// phase out of the WAL, without flipping the whole database.
+///
+/// All fields default to `false`. The ergonomic builders below cover
+/// the two knobs currently implemented.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WriteOptions {
+    /// Fsync the WAL before returning. Equivalent to
+    /// [`DurabilityMode::Immediate`] for this single call, regardless
+    /// of the database-global default.
+    pub sync: bool,
+    /// Skip the WAL append entirely. The caller accepts that a crash
+    /// before the next memtable flush loses the write. Used by
+    /// bulk-load phases that will be ingested via SST file anyway.
+    pub disable_wal: bool,
+    /// Reserved for future use by a cooperative write-lock priority
+    /// queue. Currently accepted but ignored.
+    pub low_pri: bool,
+    /// Reserved for future use by the write-stall / rate-limiter
+    /// plumbing. Currently accepted but ignored — the engine never
+    /// actually stalls today, so this knob is a no-op.
+    pub no_slowdown: bool,
+}
+
+impl WriteOptions {
+    /// Construct a `WriteOptions` with the default values (all
+    /// fields `false`).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Shortcut for a `WriteOptions` with `sync: true`.
+    pub fn sync() -> Self {
+        Self {
+            sync: true,
+            ..Self::default()
+        }
+    }
+
+    /// Shortcut for a `WriteOptions` with `disable_wal: true`.
+    pub fn disable_wal() -> Self {
+        Self {
+            disable_wal: true,
+            ..Self::default()
+        }
+    }
+}
+
 /// Controls when data is flushed to disk after a write.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum DurabilityMode {
