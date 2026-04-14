@@ -46,6 +46,7 @@ pub(crate) struct EngineOptions {
     pub(crate) level_base_bytes: u64,
     pub(crate) level_size_multiplier: u64,
     pub(crate) target_file_size: u64,
+    pub(crate) compaction_filter: Option<Arc<dyn crate::options::CompactionFilter>>,
 }
 
 impl EngineOptions {
@@ -73,6 +74,7 @@ impl Default for EngineOptions {
             level_base_bytes: compaction::DEFAULT_LEVEL_BASE_BYTES,
             level_size_multiplier: compaction::LEVEL_SIZE_MULTIPLIER,
             target_file_size: compaction::DEFAULT_TARGET_FILE_SIZE,
+            compaction_filter: None,
         }
     }
 }
@@ -173,6 +175,7 @@ impl LarkEngine {
             bloom_bits_per_key: options.bloom_bits_per_key,
             compression: options.compression,
             compression_per_level: options.compression_per_level.clone(),
+            compaction_filter: options.compaction_filter.clone(),
         };
 
         let compaction_lock = Arc::new(Mutex::new(()));
@@ -745,6 +748,7 @@ impl LarkEngine {
             bloom_bits_per_key: self.options.bloom_bits_per_key,
             compression: self.options.compression,
             compression_per_level: self.options.compression_per_level.clone(),
+            compaction_filter: self.options.compaction_filter.clone(),
         };
         compaction::run_compact_range(
             &self.versions,

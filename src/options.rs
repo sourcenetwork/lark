@@ -1,3 +1,56 @@
+use std::sync::Arc;
+
+/// Decision returned by a [`CompactionFilter`] for each entry it sees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactionDecision {
+    /// Leave the entry untouched.
+    Keep,
+    /// Drop the entry. Compaction replaces it with a tombstone at the
+    /// same sequence number so lower levels cannot resurrect the
+    /// original value.
+    Remove,
+    /// Replace the entry's value with a new byte string. The key and
+    /// sequence number are preserved.
+    Change(Vec<u8>),
+}
+
+/// A user-supplied hook that runs during compaction and can drop or
+/// rewrite entries in place. Typical uses: TTL expiration, application-
+/// level GC, schema migrations.
+///
+/// # Determinism
+///
+/// Implementations must be deterministic functions of `(level, key,
+/// value)` — the same input should always yield the same decision.
+/// They must not read from the database (would deadlock) and should
+/// avoid blocking.
+///
+/// # Snapshot isolation
+///
+/// Compaction filters currently run only when no live [`crate::Snapshot`]
+/// is pinned. This guarantees that every `Snapshot` taken before
+/// compaction still observes the pre-filter value until the snapshot
+/// is dropped. When a snapshot is alive, compaction still runs but
+/// skips the filter entirely. Finer-grained per-snapshot filtering is
+/// a planned follow-up.
+pub trait CompactionFilter: Send + Sync + 'static {
+    /// Inspect a point entry. Called once per surviving
+    /// `(user_key, value)` pair during compaction.
+    fn filter(&self, level: usize, key: &[u8], value: &[u8]) -> CompactionDecision;
+
+    /// Inspect a range tombstone. Default implementation keeps every
+    /// range tombstone. `CompactionDecision::Change` is treated as
+    /// `Keep` for range tombstones (there's no "value" to rewrite).
+    fn filter_range_delete(&self, level: usize, start: &[u8], end: &[u8]) -> CompactionDecision {
+        let _ = (level, start, end);
+        CompactionDecision::Keep
+    }
+
+    /// A stable, human-readable identifier for this filter. Used by
+    /// tracing and diagnostics.
+    fn name(&self) -> &'static str;
+}
+
 /// Controls when data is flushed to disk after a write.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum DurabilityMode {
@@ -31,7 +84,7 @@ pub enum CompressionType {
 }
 
 /// Configuration options for a lark database.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Options {
     /// Write buffer (memtable) size before flush. Default: 64 MB.
     pub write_buffer_size: usize,
@@ -59,6 +112,10 @@ pub struct Options {
     pub target_file_size: u64,
     /// Durability mode. Default: Eventual.
     pub durability: DurabilityMode,
+    /// Optional user hook invoked during compaction for every point
+    /// entry and range tombstone. See [`CompactionFilter`] for
+    /// semantics and snapshot-isolation rules.
+    pub compaction_filter: Option<Arc<dyn CompactionFilter>>,
 }
 
 impl Default for Options {
@@ -75,7 +132,30 @@ impl Default for Options {
             level_size_multiplier: 10,
             target_file_size: 64 * 1024 * 1024,
             durability: DurabilityMode::Eventual,
+            compaction_filter: None,
         }
+    }
+}
+
+impl std::fmt::Debug for Options {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Options")
+            .field("write_buffer_size", &self.write_buffer_size)
+            .field("block_size", &self.block_size)
+            .field("block_cache_size", &self.block_cache_size)
+            .field("bloom_bits_per_key", &self.bloom_bits_per_key)
+            .field("compression", &self.compression)
+            .field("compression_per_level", &self.compression_per_level)
+            .field("l0_compaction_trigger", &self.l0_compaction_trigger)
+            .field("level_base_bytes", &self.level_base_bytes)
+            .field("level_size_multiplier", &self.level_size_multiplier)
+            .field("target_file_size", &self.target_file_size)
+            .field("durability", &self.durability)
+            .field(
+                "compaction_filter",
+                &self.compaction_filter.as_ref().map(|f| f.name()),
+            )
+            .finish()
     }
 }
 
@@ -92,6 +172,7 @@ impl Options {
             level_base_bytes: self.level_base_bytes,
             level_size_multiplier: self.level_size_multiplier,
             target_file_size: self.target_file_size,
+            compaction_filter: self.compaction_filter.clone(),
         }
     }
 }

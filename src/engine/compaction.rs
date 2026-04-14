@@ -113,6 +113,7 @@ pub(crate) struct CompactionOptions {
     pub(crate) bloom_bits_per_key: usize,
     pub(crate) compression: crate::options::CompressionType,
     pub(crate) compression_per_level: Option<Vec<crate::options::CompressionType>>,
+    pub(crate) compaction_filter: Option<Arc<dyn crate::options::CompactionFilter>>,
 }
 
 impl CompactionOptions {
@@ -137,6 +138,7 @@ impl Default for CompactionOptions {
             bloom_bits_per_key: 10,
             compression: crate::options::CompressionType::Lz4,
             compression_per_level: None,
+            compaction_filter: None,
         }
     }
 }
@@ -405,6 +407,21 @@ fn perform_compaction(
     all_entries.sort_by(|a, b| a.0.cmp(&b.0));
     all_entries.dedup_by(|a, b| a.0 == b.0);
 
+    // User compaction filter for range tombstones. Run this **before**
+    // the point-entry RT shadow pass so a filter that drops a range
+    // tombstone doesn't leave orphaned point entries already wiped
+    // out by that same RT. Only runs when no snapshot is pinned.
+    if pin_seq == u64::MAX {
+        if let Some(filter) = opts.compaction_filter.as_ref() {
+            merged_range_tombstones.retain(|rt| {
+                !matches!(
+                    filter.filter_range_delete(target_level, &rt.start, &rt.end),
+                    crate::options::CompactionDecision::Remove
+                )
+            });
+        }
+    }
+
     // Drop point entries that a range tombstone from the merged input
     // set shadows — i.e. any `(user_key, seq)` where some RT covering
     // `user_key` has `rt_seq > seq`. This shrinks the live set before
@@ -421,6 +438,18 @@ fn perform_compaction(
     // Snapshot-pinning GC: drop versions that no live snapshot and no
     // current reader can see. See `gc_old_versions` for the rule.
     let all_entries = gc_old_versions(all_entries, pin_seq);
+
+    // Point-entry compaction filter. Snapshot-gated like the RT
+    // filter above.
+    let all_entries = if pin_seq == u64::MAX {
+        if let Some(filter) = opts.compaction_filter.as_ref() {
+            apply_compaction_filter(all_entries, filter.as_ref(), target_level)
+        } else {
+            all_entries
+        }
+    } else {
+        all_entries
+    };
 
     // Dedup merged range tombstones by (start, end, seq) — a single
     // logical RT may appear in multiple input files after previous
@@ -627,6 +656,48 @@ fn gc_old_versions(entries: Vec<(Vec<u8>, Vec<u8>)>, pin_seq: u64) -> Vec<(Vec<u
         }
     }
 
+    out
+}
+
+/// Run the user [`crate::options::CompactionFilter`] over every
+/// `Value` entry in `entries` and apply its decision:
+///
+/// - [`CompactionDecision::Keep`] — pass the entry through unchanged.
+/// - [`CompactionDecision::Change`] — pass through with the filter's
+///   new value (key and seq preserved).
+/// - [`CompactionDecision::Remove`] — replace the entry with a
+///   deletion tombstone at the same seq. The tombstone prevents an
+///   older version of the same user key (living deeper in the LSM)
+///   from resurfacing after the filtered value disappears.
+///
+/// Deletion internal keys are passed through without consulting the
+/// filter — the filter's contract is about the user's own values,
+/// not about tombstones lark writes itself.
+fn apply_compaction_filter(
+    entries: Vec<(Vec<u8>, Vec<u8>)>,
+    filter: &dyn crate::options::CompactionFilter,
+    level: usize,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    use super::internal_key::{encode_internal_key, VALUE_TYPE_DELETION, VALUE_TYPE_VALUE};
+
+    let mut out = Vec::with_capacity(entries.len());
+    for (ik, value) in entries {
+        let (uk, seq, vt) = decode_internal_key(&ik);
+        if vt != VALUE_TYPE_VALUE {
+            out.push((ik, value));
+            continue;
+        }
+        match filter.filter(level, uk, &value) {
+            crate::options::CompactionDecision::Keep => out.push((ik, value)),
+            crate::options::CompactionDecision::Change(new_value) => out.push((ik, new_value)),
+            crate::options::CompactionDecision::Remove => {
+                // Replace with a same-seq deletion so lower levels
+                // can't resurrect the filtered value.
+                let tombstone_key = encode_internal_key(uk, seq, VALUE_TYPE_DELETION);
+                out.push((tombstone_key, Vec::new()));
+            }
+        }
+    }
     out
 }
 
