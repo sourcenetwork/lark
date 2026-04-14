@@ -5,15 +5,21 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use super::sstable::SsTableMeta;
+use super::sstable::{sst_filename, LiveSst, SsTableMeta, SsTableReader};
 
 /// Maximum number of levels in the LSM tree.
 pub(crate) const MAX_LEVELS: usize = 7;
 
 /// A snapshot of which SSTables exist at each level.
-#[derive(Clone, Debug)]
+///
+/// Each level holds `Arc<LiveSst>` — the metadata plus an open reader —
+/// so that every file referenced by a live version has a pinned file
+/// descriptor. Concurrent compaction can safely `unlink` a file as soon
+/// as it's removed from the *current* version because the Arcs in older
+/// versions keep the FD alive until those versions are dropped.
+#[derive(Clone)]
 pub(crate) struct Version {
-    pub(crate) levels: Vec<Vec<SsTableMeta>>,
+    pub(crate) levels: Vec<Vec<Arc<LiveSst>>>,
     pub(crate) next_file_id: u64,
     pub(crate) last_seq: u64,
 }
@@ -34,29 +40,58 @@ impl Version {
 
     /// Total size of SSTables at a given level.
     pub(crate) fn level_size(&self, level: usize) -> u64 {
-        self.levels[level].iter().map(|m| m.file_size).sum()
+        self.levels[level].iter().map(|f| f.meta.file_size).sum()
     }
 }
 
-/// A mutation to the version.
-#[derive(Debug, Clone)]
+/// A runtime mutation to the version. Carries `Arc<LiveSst>` for
+/// `AddFile` so the caller is responsible for opening the reader before
+/// the apply, and the manifest machinery never has to touch the
+/// filesystem for a runtime edit.
+#[derive(Clone)]
 pub(crate) enum VersionEdit {
+    AddFile { level: usize, file: Arc<LiveSst> },
+    RemoveFile { level: usize, file_id: u64 },
+    SetLastSeq(u64),
+    SetNextFileId(u64),
+}
+
+/// Serialized form of a version edit. The manifest on disk is a sequence
+/// of these records; runtime edits are converted to records just before
+/// being written out.
+enum ManifestRecord {
     AddFile { level: usize, meta: SsTableMeta },
     RemoveFile { level: usize, file_id: u64 },
     SetLastSeq(u64),
     SetNextFileId(u64),
 }
 
-/// Tag bytes for serialized version edits.
 const TAG_ADD_FILE: u8 = 1;
 const TAG_REMOVE_FILE: u8 = 2;
 const TAG_LAST_SEQ: u8 = 3;
 const TAG_NEXT_FILE_ID: u8 = 4;
 
 impl VersionEdit {
+    fn to_record(&self) -> ManifestRecord {
+        match self {
+            VersionEdit::AddFile { level, file } => ManifestRecord::AddFile {
+                level: *level,
+                meta: file.meta.clone(),
+            },
+            VersionEdit::RemoveFile { level, file_id } => ManifestRecord::RemoveFile {
+                level: *level,
+                file_id: *file_id,
+            },
+            VersionEdit::SetLastSeq(seq) => ManifestRecord::SetLastSeq(*seq),
+            VersionEdit::SetNextFileId(id) => ManifestRecord::SetNextFileId(*id),
+        }
+    }
+}
+
+impl ManifestRecord {
     fn encode(&self, buf: &mut Vec<u8>) {
         match self {
-            VersionEdit::AddFile { level, meta } => {
+            ManifestRecord::AddFile { level, meta } => {
                 buf.push(TAG_ADD_FILE);
                 buf.extend_from_slice(&(*level as u32).to_le_bytes());
                 buf.extend_from_slice(&meta.file_id.to_le_bytes());
@@ -67,16 +102,16 @@ impl VersionEdit {
                 buf.extend_from_slice(&meta.file_size.to_le_bytes());
                 buf.extend_from_slice(&meta.num_entries.to_le_bytes());
             }
-            VersionEdit::RemoveFile { level, file_id } => {
+            ManifestRecord::RemoveFile { level, file_id } => {
                 buf.push(TAG_REMOVE_FILE);
                 buf.extend_from_slice(&(*level as u32).to_le_bytes());
                 buf.extend_from_slice(&file_id.to_le_bytes());
             }
-            VersionEdit::SetLastSeq(seq) => {
+            ManifestRecord::SetLastSeq(seq) => {
                 buf.push(TAG_LAST_SEQ);
                 buf.extend_from_slice(&seq.to_le_bytes());
             }
-            VersionEdit::SetNextFileId(id) => {
+            ManifestRecord::SetNextFileId(id) => {
                 buf.push(TAG_NEXT_FILE_ID);
                 buf.extend_from_slice(&id.to_le_bytes());
             }
@@ -100,7 +135,7 @@ impl VersionEdit {
                 let file_size = read_u64(data, pos)?;
                 let num_entries = read_u64(data, pos)?;
 
-                Ok(Some(VersionEdit::AddFile {
+                Ok(Some(ManifestRecord::AddFile {
                     level,
                     meta: SsTableMeta {
                         file_id,
@@ -114,19 +149,19 @@ impl VersionEdit {
             TAG_REMOVE_FILE => {
                 let level = read_u32(data, pos)? as usize;
                 let file_id = read_u64(data, pos)?;
-                Ok(Some(VersionEdit::RemoveFile { level, file_id }))
+                Ok(Some(ManifestRecord::RemoveFile { level, file_id }))
             }
             TAG_LAST_SEQ => {
                 let seq = read_u64(data, pos)?;
-                Ok(Some(VersionEdit::SetLastSeq(seq)))
+                Ok(Some(ManifestRecord::SetLastSeq(seq)))
             }
             TAG_NEXT_FILE_ID => {
                 let id = read_u64(data, pos)?;
-                Ok(Some(VersionEdit::SetNextFileId(id)))
+                Ok(Some(ManifestRecord::SetNextFileId(id)))
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unknown version edit tag: {}", tag),
+                format!("unknown manifest record tag: {}", tag),
             )),
         }
     }
@@ -168,19 +203,20 @@ pub(crate) struct VersionSet {
 }
 
 impl VersionSet {
-    /// Create or recover a VersionSet from the given directory.
-    pub(crate) fn open(db_dir: &Path) -> io::Result<Self> {
+    /// Create or recover a VersionSet from the given directory. During
+    /// recovery every SSTable referenced by the manifest is opened
+    /// eagerly so the returned version is fully populated with live
+    /// readers.
+    pub(crate) fn open(db_dir: &Path, sst_dir: &Path) -> io::Result<Self> {
         let manifest_path = db_dir.join("MANIFEST");
 
         let (version, writer) = if manifest_path.exists() {
-            // Recover by replaying the manifest
             let data = fs::read(&manifest_path)?;
-            let version = Self::replay_manifest(&data)?;
+            let version = Self::replay_manifest(&data, sst_dir)?;
 
             let file = OpenOptions::new().append(true).open(&manifest_path)?;
             (version, BufWriter::new(file))
         } else {
-            // Create new manifest
             let version = Version::new();
             let file = File::create(&manifest_path)?;
             (version, BufWriter::new(file))
@@ -199,17 +235,17 @@ impl VersionSet {
     }
 
     /// Apply a batch of edits atomically: update the in-memory version
-    /// and persist to the manifest log.
+    /// and persist the serialized records to the manifest log.
     pub(crate) fn apply(&mut self, edits: &[VersionEdit]) -> io::Result<()> {
         let mut version = (*self.current()).clone();
 
         for edit in edits {
             match edit {
-                VersionEdit::AddFile { level, meta } => {
-                    version.levels[*level].push(meta.clone());
+                VersionEdit::AddFile { level, file } => {
+                    version.levels[*level].push(Arc::clone(file));
                 }
                 VersionEdit::RemoveFile { level, file_id } => {
-                    version.levels[*level].retain(|m| m.file_id != *file_id);
+                    version.levels[*level].retain(|f| f.meta.file_id != *file_id);
                 }
                 VersionEdit::SetLastSeq(seq) => {
                     version.last_seq = *seq;
@@ -220,39 +256,38 @@ impl VersionSet {
             }
         }
 
-        // Persist to manifest
-        let encoded = Self::encode_edits(edits);
+        let records: Vec<ManifestRecord> = edits.iter().map(VersionEdit::to_record).collect();
+        let encoded = Self::encode_records(&records);
         if let Some(writer) = &mut self.manifest_writer {
             writer.write_all(&encoded)?;
             writer.flush()?;
         }
 
-        // Atomically swap version
         *self.current.write() = Arc::new(version);
 
         Ok(())
     }
 
-    /// Rewrite the manifest from scratch (compaction of manifest itself).
+    /// Rewrite the manifest from scratch, emitting the current version as
+    /// a single compact sequence of records. Readers in the live
+    /// `Version` are preserved — we never close their file descriptors.
     pub(crate) fn compact_manifest(&mut self) -> io::Result<()> {
         let version = self.current();
-        let mut edits = Vec::new();
 
-        edits.push(VersionEdit::SetNextFileId(version.next_file_id));
-        edits.push(VersionEdit::SetLastSeq(version.last_seq));
-
+        let mut records = Vec::new();
+        records.push(ManifestRecord::SetNextFileId(version.next_file_id));
+        records.push(ManifestRecord::SetLastSeq(version.last_seq));
         for (level, files) in version.levels.iter().enumerate() {
-            for meta in files {
-                edits.push(VersionEdit::AddFile {
+            for file in files {
+                records.push(ManifestRecord::AddFile {
                     level,
-                    meta: meta.clone(),
+                    meta: file.meta.clone(),
                 });
             }
         }
 
-        let encoded = Self::encode_edits(&edits);
+        let encoded = Self::encode_records(&records);
 
-        // Write to temp file, then rename
         let tmp_path = self.manifest_path.with_extension("tmp");
         {
             let mut file = File::create(&tmp_path)?;
@@ -261,31 +296,29 @@ impl VersionSet {
         }
         fs::rename(&tmp_path, &self.manifest_path)?;
 
-        // Reopen for append
         let file = OpenOptions::new().append(true).open(&self.manifest_path)?;
         self.manifest_writer = Some(BufWriter::new(file));
 
         Ok(())
     }
 
-    fn encode_edits(edits: &[VersionEdit]) -> Vec<u8> {
+    fn encode_records(records: &[ManifestRecord]) -> Vec<u8> {
         let mut buf = Vec::new();
-        for edit in edits {
-            let mut edit_buf = Vec::new();
-            edit.encode(&mut edit_buf);
+        for record in records {
+            let mut record_buf = Vec::new();
+            record.encode(&mut record_buf);
 
-            // Length-prefixed record with checksum
-            let len = edit_buf.len() as u32;
-            let checksum = xxhash_rust::xxh3::xxh3_64(&edit_buf) as u32;
+            let len = record_buf.len() as u32;
+            let checksum = xxhash_rust::xxh3::xxh3_64(&record_buf) as u32;
 
             buf.extend_from_slice(&len.to_le_bytes());
-            buf.extend_from_slice(&edit_buf);
+            buf.extend_from_slice(&record_buf);
             buf.extend_from_slice(&checksum.to_le_bytes());
         }
         buf
     }
 
-    fn replay_manifest(data: &[u8]) -> io::Result<Version> {
+    fn replay_manifest(data: &[u8], sst_dir: &Path) -> io::Result<Version> {
         let mut version = Version::new();
         let mut offset = 0;
 
@@ -298,32 +331,34 @@ impl VersionSet {
                 break;
             }
 
-            let edit_data = &data[offset..offset + len];
+            let record_data = &data[offset..offset + len];
             offset += len;
 
             let stored_checksum = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
             offset += 4;
 
-            let computed_checksum = xxhash_rust::xxh3::xxh3_64(edit_data) as u32;
+            let computed_checksum = xxhash_rust::xxh3::xxh3_64(record_data) as u32;
             if stored_checksum != computed_checksum {
                 tracing::warn!("Manifest checksum mismatch, stopping replay");
                 break;
             }
 
             let mut pos = 0;
-            while let Some(edit) = VersionEdit::decode(edit_data, &mut pos)? {
-                match &edit {
-                    VersionEdit::AddFile { level, meta } => {
-                        version.levels[*level].push(meta.clone());
+            while let Some(record) = ManifestRecord::decode(record_data, &mut pos)? {
+                match record {
+                    ManifestRecord::AddFile { level, meta } => {
+                        let path = sst_dir.join(sst_filename(meta.file_id));
+                        let reader = Arc::new(SsTableReader::open(&path, meta.file_id)?);
+                        version.levels[level].push(LiveSst::new(meta, reader));
                     }
-                    VersionEdit::RemoveFile { level, file_id } => {
-                        version.levels[*level].retain(|m| m.file_id != *file_id);
+                    ManifestRecord::RemoveFile { level, file_id } => {
+                        version.levels[level].retain(|f| f.meta.file_id != file_id);
                     }
-                    VersionEdit::SetLastSeq(seq) => {
-                        version.last_seq = *seq;
+                    ManifestRecord::SetLastSeq(seq) => {
+                        version.last_seq = seq;
                     }
-                    VersionEdit::SetNextFileId(id) => {
-                        version.next_file_id = *id;
+                    ManifestRecord::SetNextFileId(id) => {
+                        version.next_file_id = id;
                     }
                 }
             }
@@ -338,61 +373,114 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Build a real on-disk SSTable and open a reader for it. Used by
+    /// tests that need a non-trivial `LiveSst` instance.
+    fn make_live_sst(dir: &Path, file_id: u64, smallest: &[u8], largest: &[u8]) -> Arc<LiveSst> {
+        use super::super::internal_key::{encode_internal_key, VALUE_TYPE_VALUE};
+        use super::super::sstable::SsTableWriter;
+
+        let path = dir.join(sst_filename(file_id));
+        let mut writer = SsTableWriter::new(&path, 4096, 10, false).unwrap();
+        writer
+            .add(
+                &encode_internal_key(smallest, 1, VALUE_TYPE_VALUE),
+                b"value",
+            )
+            .unwrap();
+        if smallest != largest {
+            writer
+                .add(&encode_internal_key(largest, 1, VALUE_TYPE_VALUE), b"value")
+                .unwrap();
+        }
+        let summary = writer.finish().unwrap().unwrap();
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        let reader = Arc::new(SsTableReader::open(&path, file_id).unwrap());
+        LiveSst::new(
+            SsTableMeta {
+                file_id,
+                smallest_key: summary.smallest_user_key,
+                largest_key: summary.largest_user_key,
+                file_size,
+                num_entries: summary.num_entries,
+            },
+            reader,
+        )
+    }
+
     #[test]
-    fn test_version_edit_roundtrip() {
+    fn test_apply_and_replay_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+
+        let file1 = make_live_sst(&sst_dir, 1, b"aaa", b"zzz");
+
         let edits = vec![
             VersionEdit::AddFile {
                 level: 0,
-                meta: SsTableMeta {
-                    file_id: 1,
-                    smallest_key: b"aaa".to_vec(),
-                    largest_key: b"zzz".to_vec(),
-                    file_size: 1024,
-                    num_entries: 100,
-                },
-            },
-            VersionEdit::RemoveFile {
-                level: 1,
-                file_id: 5,
+                file: Arc::clone(&file1),
             },
             VersionEdit::SetLastSeq(42),
             VersionEdit::SetNextFileId(10),
         ];
 
-        let encoded = VersionSet::encode_edits(&edits);
-        let version = VersionSet::replay_manifest(&encoded).unwrap();
+        {
+            let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+            vs.apply(&edits).unwrap();
+            let v = vs.current();
+            assert_eq!(v.levels[0].len(), 1);
+            assert_eq!(v.levels[0][0].meta.file_id, 1);
+            assert_eq!(v.last_seq, 42);
+            assert_eq!(v.next_file_id, 10);
+        }
 
-        assert_eq!(version.levels[0].len(), 1);
-        assert_eq!(version.levels[0][0].file_id, 1);
-        assert_eq!(version.last_seq, 42);
-        assert_eq!(version.next_file_id, 10);
+        // Recover by replaying the manifest; readers are reopened.
+        let vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+        let v = vs.current();
+        assert_eq!(v.levels[0].len(), 1);
+        assert_eq!(v.levels[0][0].meta.file_id, 1);
+        assert_eq!(v.last_seq, 42);
+        assert_eq!(v.next_file_id, 10);
     }
 
     #[test]
-    fn test_version_set_persistence() {
+    fn test_remove_file_hides_it_from_new_version() {
         let dir = TempDir::new().unwrap();
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
 
-        // Create and apply edits
-        {
-            let mut vs = VersionSet::open(dir.path()).unwrap();
-            vs.apply(&[VersionEdit::AddFile {
+        let file1 = make_live_sst(&sst_dir, 1, b"a", b"c");
+        let file2 = make_live_sst(&sst_dir, 2, b"d", b"f");
+
+        let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+        vs.apply(&[
+            VersionEdit::AddFile {
                 level: 0,
-                meta: SsTableMeta {
-                    file_id: 1,
-                    smallest_key: b"a".to_vec(),
-                    largest_key: b"z".to_vec(),
-                    file_size: 512,
-                    num_entries: 50,
-                },
-            }])
-            .unwrap();
-            vs.apply(&[VersionEdit::SetLastSeq(100)]).unwrap();
-        }
+                file: Arc::clone(&file1),
+            },
+            VersionEdit::AddFile {
+                level: 0,
+                file: Arc::clone(&file2),
+            },
+        ])
+        .unwrap();
 
-        // Recover
-        let vs = VersionSet::open(dir.path()).unwrap();
-        let version = vs.current();
-        assert_eq!(version.levels[0].len(), 1);
-        assert_eq!(version.last_seq, 100);
+        // Holding a snapshot of the version *before* removal keeps both
+        // files alive — this is the invariant that lets get/iter reads
+        // survive concurrent compaction.
+        let pinned = vs.current();
+        assert_eq!(pinned.levels[0].len(), 2);
+
+        vs.apply(&[VersionEdit::RemoveFile {
+            level: 0,
+            file_id: 1,
+        }])
+        .unwrap();
+
+        let v = vs.current();
+        assert_eq!(v.levels[0].len(), 1);
+        assert_eq!(v.levels[0][0].meta.file_id, 2);
+        // Pinned snapshot still sees both files.
+        assert_eq!(pinned.levels[0].len(), 2);
     }
 }

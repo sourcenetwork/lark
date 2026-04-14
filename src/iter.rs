@@ -37,7 +37,7 @@ use crate::Result;
 /// db.put(b"banana", b"yellow").unwrap();
 /// db.put(b"cherry", b"red").unwrap();
 ///
-/// let mut it = db.iter().unwrap();
+/// let mut it = db.iter();
 /// it.seek(b"b");
 /// while it.valid() {
 ///     println!("{:?} = {:?}", it.key(), it.value());

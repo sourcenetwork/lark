@@ -163,10 +163,9 @@ impl Db {
     /// A fresh iterator is not positioned; call one of
     /// [`Iter::seek_to_first`], [`Iter::seek`], or
     /// [`Iter::seek_for_prev`] before reading.
-    pub fn iter(&self) -> Result<Iter<'_>> {
+    pub fn iter(&self) -> Iter<'_> {
         let seq = self.engine.snapshot_seq();
-        let inner = self.engine.new_iter(seq).map_err(Error::Io)?;
-        Ok(Iter::from_internal(inner))
+        Iter::from_internal(self.engine.new_iter(seq))
     }
 
     /// Delete all data in the database.
@@ -210,9 +209,8 @@ impl Snapshot {
     }
 
     /// Create a streaming iterator anchored at this snapshot.
-    pub fn iter(&self) -> Result<Iter<'_>> {
-        let inner = self.engine.new_iter(self.seq).map_err(Error::Io)?;
-        Ok(Iter::from_internal(inner))
+    pub fn iter(&self) -> Iter<'_> {
+        Iter::from_internal(self.engine.new_iter(self.seq))
     }
 }
 
@@ -225,7 +223,7 @@ fn collect_range(
     end: Option<&[u8]>,
     snapshot_seq: u64,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let mut iter = engine.new_iter(snapshot_seq).map_err(Error::Io)?;
+    let mut iter = engine.new_iter(snapshot_seq);
     match start {
         Some(s) => iter.seek(s),
         None => iter.seek_to_first(),
@@ -438,7 +436,7 @@ mod tests {
     // ─── Streaming iterator tests ────────────────────────────────────────
 
     fn collect_iter(db: &Db) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let mut it = db.iter().unwrap();
+        let mut it = db.iter();
         it.seek_to_first();
         let mut out = Vec::new();
         while it.valid() {
@@ -452,7 +450,7 @@ mod tests {
     #[test]
     fn test_iter_empty_db() {
         let (db, _dir) = open_tmp();
-        let mut it = db.iter().unwrap();
+        let mut it = db.iter();
         it.seek_to_first();
         assert!(!it.valid());
         it.seek(b"anything");
@@ -483,7 +481,7 @@ mod tests {
         db.put(b"c", b"3").unwrap();
         db.put(b"e", b"5").unwrap();
 
-        let mut it = db.iter().unwrap();
+        let mut it = db.iter();
 
         it.seek(b"a");
         assert!(it.valid());
@@ -506,7 +504,7 @@ mod tests {
         db.put(b"c", b"3").unwrap();
         db.put(b"e", b"5").unwrap();
 
-        let mut it = db.iter().unwrap();
+        let mut it = db.iter();
 
         it.seek_for_prev(b"e");
         assert_eq!(it.key(), Some(b"e".as_ref()));
@@ -528,7 +526,7 @@ mod tests {
             db.put(&[c], &[c]).unwrap();
         }
 
-        let mut it = db.iter().unwrap();
+        let mut it = db.iter();
         it.seek(b"d");
         let mut keys = Vec::new();
         while it.valid() {
@@ -603,7 +601,7 @@ mod tests {
         force_flush(&db, "a");
         db.put(b"k", b"v2").unwrap();
 
-        let mut it = db.iter().unwrap();
+        let mut it = db.iter();
         it.seek(b"k");
         assert_eq!(it.key(), Some(b"k".as_ref()));
         assert_eq!(it.value(), Some(b"v2".as_ref()));
@@ -616,7 +614,7 @@ mod tests {
         let snap = db.snapshot();
         db.put(b"k", b"v2").unwrap();
 
-        let mut it = snap.iter().unwrap();
+        let mut it = snap.iter();
         it.seek(b"k");
         assert_eq!(it.value(), Some(b"v1".as_ref()));
     }
@@ -628,7 +626,7 @@ mod tests {
         let snap = db.snapshot();
         db.delete(b"k").unwrap();
 
-        let mut it = snap.iter().unwrap();
+        let mut it = snap.iter();
         it.seek(b"k");
         assert_eq!(it.value(), Some(b"v1".as_ref()));
     }
@@ -644,7 +642,7 @@ mod tests {
 
         let scan = db.scan(Some(b"k020"), Some(b"k050")).unwrap();
 
-        let mut it = db.iter().unwrap();
+        let mut it = db.iter();
         it.seek(b"k020");
         let mut from_iter = Vec::new();
         while it.valid() {
@@ -670,7 +668,7 @@ mod tests {
             db.put(k.as_bytes(), b"v").unwrap();
         }
 
-        let mut it = db.iter().unwrap();
+        let mut it = db.iter();
         it.seek(b"key_");
         let mut count = 0;
         while it.valid() {
@@ -700,7 +698,7 @@ mod tests {
         }
         force_flush(&db, "pinned");
 
-        let mut it = db.iter().unwrap();
+        let mut it = db.iter();
         it.seek_to_first();
 
         db.drop_all().unwrap();

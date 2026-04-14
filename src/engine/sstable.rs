@@ -89,6 +89,26 @@ pub(crate) struct SsTableMeta {
     pub(crate) num_entries: u64,
 }
 
+/// A live SSTable: metadata plus an already-opened reader. Held by
+/// [`super::manifest::Version`] so that as long as any version
+/// referencing this file is alive, the underlying file descriptor stays
+/// open — reads remain valid even after a concurrent compaction unlinks
+/// the file from disk (the kernel keeps the inode alive via FD
+/// refcounting).
+///
+/// `Arc<LiveSst>` is shared between versions and between a version and
+/// any iterator built from it, so cloning is cheap.
+pub(crate) struct LiveSst {
+    pub(crate) meta: SsTableMeta,
+    pub(crate) reader: Arc<SsTableReader>,
+}
+
+impl LiveSst {
+    pub(crate) fn new(meta: SsTableMeta, reader: Arc<SsTableReader>) -> Arc<Self> {
+        Arc::new(Self { meta, reader })
+    }
+}
+
 /// Index entry: the **last internal key** of the data block plus its handle.
 #[derive(Debug, Clone)]
 struct IndexEntry {

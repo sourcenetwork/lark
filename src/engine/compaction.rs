@@ -6,7 +6,9 @@ use std::thread;
 use super::block_cache::BlockCache;
 use super::internal_key::user_key_of;
 use super::manifest::{VersionEdit, VersionSet, MAX_LEVELS};
-use super::sstable::{remove_sst, sst_filename, SsTableMeta, SsTableReader, SsTableWriter};
+use super::sstable::{
+    remove_sst, sst_filename, LiveSst, SsTableMeta, SsTableReader, SsTableWriter,
+};
 
 /// Default compaction trigger: flush L0 → L1 when L0 has this many SSTables.
 pub(crate) const L0_COMPACTION_TRIGGER: usize = 4;
@@ -209,35 +211,30 @@ fn compact_level(
 
     let version = versions.lock().current();
 
-    let input_files: Vec<SsTableMeta> = version.levels[level].clone();
+    let input_files: Vec<Arc<LiveSst>> = version.levels[level].clone();
     if input_files.is_empty() {
         return Ok(false);
     }
 
     // For L0, all files may overlap. For other levels, pick the first file.
-    let (input_metas, overlap_metas) = if level == 0 {
-        // All L0 files
+    let (input_files, overlap_files) = if level == 0 {
         let l0_files = input_files;
-        // Find overlapping L1 files
         let (min_key, max_key) = key_range(&l0_files);
         let overlapping = find_overlapping(&version.levels[target_level], &min_key, &max_key);
         (l0_files, overlapping)
     } else {
-        // Pick first file from this level
-        let picked = vec![input_files[0].clone()];
+        let picked = vec![Arc::clone(&input_files[0])];
         let (min_key, max_key) = key_range(&picked);
         let overlapping = find_overlapping(&version.levels[target_level], &min_key, &max_key);
         (picked, overlapping)
     };
 
     // Read all input entries as raw internal-key / value pairs so every
-    // version and tombstone is preserved through the merge.
+    // version and tombstone is preserved through the merge. Readers are
+    // already open in the pinned version — no fresh `File::open`.
     let mut all_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-
-    for meta in input_metas.iter().chain(overlap_metas.iter()) {
-        let path = sst_dir.join(sst_filename(meta.file_id));
-        let reader = SsTableReader::open(&path, meta.file_id)?;
-        all_entries.extend(reader.iter_internal(cache)?);
+    for file in input_files.iter().chain(overlap_files.iter()) {
+        all_entries.extend(file.reader.iter_internal(cache)?);
     }
 
     // Sort by internal key (which orders newer seqs first within each user
@@ -247,16 +244,16 @@ fn compact_level(
 
     let mut edits = Vec::new();
 
-    for meta in &input_metas {
+    for file in &input_files {
         edits.push(VersionEdit::RemoveFile {
             level,
-            file_id: meta.file_id,
+            file_id: file.meta.file_id,
         });
     }
-    for meta in &overlap_metas {
+    for file in &overlap_files {
         edits.push(VersionEdit::RemoveFile {
             level: target_level,
-            file_id: meta.file_id,
+            file_id: file.meta.file_id,
         });
     }
 
@@ -265,7 +262,7 @@ fn compact_level(
     if all_entries.is_empty() {
         edits.push(VersionEdit::SetNextFileId(next_file_id));
         versions.lock().apply(&edits)?;
-        delete_old_files(sst_dir, &input_metas, &overlap_metas, cache);
+        delete_old_files(sst_dir, &input_files, &overlap_files, cache);
         return Ok(true);
     }
 
@@ -314,16 +311,21 @@ fn compact_level(
         };
 
         let file_size = std::fs::metadata(&path)?.len();
-
-        edits.push(VersionEdit::AddFile {
-            level: target_level,
-            meta: SsTableMeta {
+        let reader = Arc::new(SsTableReader::open(&path, file_id)?);
+        let new_file = LiveSst::new(
+            SsTableMeta {
                 file_id,
                 smallest_key: summary.smallest_user_key,
                 largest_key: summary.largest_user_key,
                 file_size,
                 num_entries: summary.num_entries,
             },
+            reader,
+        );
+
+        edits.push(VersionEdit::AddFile {
+            level: target_level,
+            file: new_file,
         });
     }
 
@@ -332,58 +334,59 @@ fn compact_level(
     // Atomically apply version edits
     versions.lock().apply(&edits)?;
 
-    // Delete old SSTable files (safe because version no longer references them)
-    delete_old_files(sst_dir, &input_metas, &overlap_metas, cache);
+    // Unlink the old SSTable paths. Their file descriptors stay alive
+    // through any `Arc<LiveSst>` still held by older versions or by
+    // iterators, so the data remains readable until those Arcs drop.
+    delete_old_files(sst_dir, &input_files, &overlap_files, cache);
 
     tracing::info!(
         level,
         target_level,
-        input_files = input_metas.len() + overlap_metas.len(),
+        input_files = input_files.len() + overlap_files.len(),
         "Compaction completed"
     );
 
     Ok(true)
 }
 
-fn key_range(files: &[SsTableMeta]) -> (Vec<u8>, Vec<u8>) {
-    let mut min_key = files[0].smallest_key.clone();
-    let mut max_key = files[0].largest_key.clone();
+fn key_range(files: &[Arc<LiveSst>]) -> (Vec<u8>, Vec<u8>) {
+    let mut min_key = files[0].meta.smallest_key.clone();
+    let mut max_key = files[0].meta.largest_key.clone();
 
-    for meta in &files[1..] {
-        if meta.smallest_key < min_key {
-            min_key = meta.smallest_key.clone();
+    for file in &files[1..] {
+        if file.meta.smallest_key < min_key {
+            min_key = file.meta.smallest_key.clone();
         }
-        if meta.largest_key > max_key {
-            max_key = meta.largest_key.clone();
+        if file.meta.largest_key > max_key {
+            max_key = file.meta.largest_key.clone();
         }
     }
 
     (min_key, max_key)
 }
 
-fn find_overlapping(files: &[SsTableMeta], min_key: &[u8], max_key: &[u8]) -> Vec<SsTableMeta> {
+fn find_overlapping(files: &[Arc<LiveSst>], min_key: &[u8], max_key: &[u8]) -> Vec<Arc<LiveSst>> {
     files
         .iter()
         .filter(|f| {
-            // Overlaps if: file.smallest <= max_key AND file.largest >= min_key
-            f.smallest_key.as_slice() <= max_key && f.largest_key.as_slice() >= min_key
+            f.meta.smallest_key.as_slice() <= max_key && f.meta.largest_key.as_slice() >= min_key
         })
-        .cloned()
+        .map(Arc::clone)
         .collect()
 }
 
 fn delete_old_files(
     sst_dir: &Path,
-    input_metas: &[SsTableMeta],
-    overlap_metas: &[SsTableMeta],
+    input_files: &[Arc<LiveSst>],
+    overlap_files: &[Arc<LiveSst>],
     cache: &BlockCache,
 ) {
-    for meta in input_metas.iter().chain(overlap_metas.iter()) {
-        let path = sst_dir.join(sst_filename(meta.file_id));
-        cache.evict_file(meta.file_id);
+    for file in input_files.iter().chain(overlap_files.iter()) {
+        let path = sst_dir.join(sst_filename(file.meta.file_id));
+        cache.evict_file(file.meta.file_id);
         if let Err(e) = remove_sst(&path) {
             tracing::warn!(
-                file_id = meta.file_id,
+                file_id = file.meta.file_id,
                 error = %e,
                 "Failed to delete old SSTable"
             );

@@ -37,14 +37,13 @@
 
 use std::io;
 use std::ops::Bound;
-use std::path::Path;
 use std::sync::Arc;
 
 use super::block_cache::BlockCache;
 use super::internal_key::{decode_internal_key, lookup_key, VALUE_TYPE_DELETION};
 use super::manifest::Version;
 use super::memtable::MemTable;
-use super::sstable::{sst_filename, SsTableReader};
+use super::sstable::SsTableReader;
 
 /// A cursor into one ordered source that yields `(internal_key, value)`
 /// pairs. Used by the merging iterator.
@@ -405,49 +404,47 @@ pub(crate) struct LarkIterator {
 
 impl LarkIterator {
     /// Build an iterator over `(active_memtable, frozen_memtables, version)`
-    /// at the given snapshot sequence. Opens every SSTable eagerly so
-    /// compaction running in parallel cannot invalidate the iterator.
+    /// at the given snapshot sequence. SSTable readers come directly from
+    /// the pinned `Version`, which holds `Arc<LiveSst>`s whose file
+    /// descriptors are guaranteed to stay open for the lifetime of any
+    /// version that still references them — so the iterator is immune to
+    /// concurrent compaction unlinking files.
     pub(crate) fn new(
         active: Arc<MemTable>,
         frozen: Vec<Arc<MemTable>>,
         version: Arc<Version>,
-        sst_dir: &Path,
         cache: Arc<BlockCache>,
         snapshot_seq: u64,
-    ) -> io::Result<Self> {
+    ) -> Self {
         let mut levels: Vec<LevelIter> = Vec::new();
         levels.push(LevelIter::Memtable(MemtableLevelIter::new(active)));
         for mt in frozen.iter().rev() {
             levels.push(LevelIter::Memtable(MemtableLevelIter::new(Arc::clone(mt))));
         }
         // L0: newest first.
-        for meta in version.levels[0].iter().rev() {
-            let path = sst_dir.join(sst_filename(meta.file_id));
-            let reader = Arc::new(SsTableReader::open(&path, meta.file_id)?);
+        for file in version.levels[0].iter().rev() {
             levels.push(LevelIter::SsTable(SsTableLevelIter::new(
-                reader,
+                Arc::clone(&file.reader),
                 Arc::clone(&cache),
             )));
         }
         // L1+: within a level file order doesn't matter (non-overlapping).
         for level in 1..version.levels.len() {
-            for meta in &version.levels[level] {
-                let path = sst_dir.join(sst_filename(meta.file_id));
-                let reader = Arc::new(SsTableReader::open(&path, meta.file_id)?);
+            for file in &version.levels[level] {
                 levels.push(LevelIter::SsTable(SsTableLevelIter::new(
-                    reader,
+                    Arc::clone(&file.reader),
                     Arc::clone(&cache),
                 )));
             }
         }
 
-        Ok(Self {
+        Self {
             inner: MergingIter::new(levels),
             snapshot_seq,
             curr_user: None,
             _version: version,
             error: None,
-        })
+        }
     }
 
     pub(crate) fn seek_to_first(&mut self) {
