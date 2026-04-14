@@ -257,10 +257,7 @@ fn compact_level(
         });
     }
 
-    let mut next_file_id = version.next_file_id;
-
     if all_entries.is_empty() {
-        edits.push(VersionEdit::SetNextFileId(next_file_id));
         versions.lock().apply(&edits)?;
         delete_old_files(sst_dir, &input_files, &overlap_files, cache);
         return Ok(true);
@@ -271,8 +268,20 @@ fn compact_level(
     // for the non-overlap invariant at L1+).
     let mut chunk_start = 0;
     while chunk_start < all_entries.len() {
-        let file_id = next_file_id;
-        next_file_id += 1;
+        // Allocate the output file_id atomically from the *current*
+        // version inside `versions.lock()` — same pattern `flush_frozen_memtable`
+        // uses. Using the `next_file_id` captured earlier in this
+        // function would race with a concurrent flush that advances the
+        // counter on the current version; both paths would then pick
+        // the same id and the second `File::create(path)` would
+        // truncate the first path's newly written file.
+        let file_id = {
+            let mut guard = versions.lock();
+            let current = guard.current();
+            let id = current.next_file_id;
+            guard.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
+            id
+        };
 
         let path = sst_dir.join(sst_filename(file_id));
         let mut writer = SsTableWriter::new(
@@ -329,9 +338,9 @@ fn compact_level(
         });
     }
 
-    edits.push(VersionEdit::SetNextFileId(next_file_id));
-
-    // Atomically apply version edits
+    // Atomically apply the remove / add edits. `SetNextFileId` is not
+    // needed here — each output file already advanced it when it was
+    // allocated above.
     versions.lock().apply(&edits)?;
 
     // Unlink the old SSTable paths. Their file descriptors stay alive
