@@ -46,10 +46,12 @@ mod engine;
 mod error;
 mod iter;
 mod options;
+mod ttl;
 
 pub use error::Error;
 pub use iter::Iter;
 pub use options::{CompactionDecision, CompactionFilter, CompressionType, DurabilityMode, Options};
+pub use ttl::{strip_timestamp, DbWithTtl, TtlCompactionFilter};
 
 use std::collections::BTreeMap;
 use std::path::Path;
