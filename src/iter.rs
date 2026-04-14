@@ -60,25 +60,45 @@ impl<'a> Iter<'a> {
         }
     }
 
-    /// Position the iterator at the first user key `>= target`.
+    /// Position the iterator at the first user key `>= target`. Sets the
+    /// scan direction to forward, so subsequent [`next`](Self::next)
+    /// calls advance alphabetically.
     pub fn seek(&mut self, target: &[u8]) {
         self.inner.seek(target);
     }
 
-    /// Position the iterator at the largest user key `<= target`. The
-    /// iterator can then be advanced forward with [`next`](Self::next).
+    /// Position the iterator at the largest user key `<= target`. Sets
+    /// the scan direction to reverse, so subsequent [`prev`](Self::prev)
+    /// calls walk backward. Calling [`next`](Self::next) after
+    /// `seek_for_prev` flips direction and moves alphabetically forward.
     pub fn seek_for_prev(&mut self, target: &[u8]) {
         self.inner.seek_for_prev(target);
     }
 
     /// Position the iterator at the smallest user key in the database.
+    /// Sets the scan direction to forward.
     pub fn seek_to_first(&mut self) {
         self.inner.seek_to_first();
     }
 
-    /// Advance to the next user key. A no-op if the iterator is not valid.
+    /// Position the iterator at the largest user key in the database.
+    /// Sets the scan direction to reverse.
+    pub fn seek_to_last(&mut self) {
+        self.inner.seek_to_last();
+    }
+
+    /// Advance to the next user key alphabetically. If the iterator was
+    /// walking backward, direction flips before the advance. A no-op if
+    /// the iterator is not valid.
     pub fn next(&mut self) {
         self.inner.next();
+    }
+
+    /// Step back to the previous user key alphabetically. If the
+    /// iterator was walking forward, direction flips before the step.
+    /// A no-op if the iterator is not valid.
+    pub fn prev(&mut self) {
+        self.inner.prev();
     }
 
     /// Whether the iterator currently points at a valid `(key, value)`

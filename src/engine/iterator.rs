@@ -1,6 +1,6 @@
 //! Streaming iterator: merges memtable + frozen memtables + all SSTable
-//! levels into a single forward cursor honoring MVCC snapshot visibility
-//! and tombstone suppression.
+//! levels into a single cursor honoring MVCC snapshot visibility and
+//! tombstone suppression, supporting both forward and reverse iteration.
 //!
 //! # Sources
 //!
@@ -14,19 +14,39 @@
 //!
 //! Each level iterator yields `(internal_key, value)` pairs in sorted
 //! internal-key order. Because the internal key encodes `!seq`, newer
-//! versions of the same user key precede older ones in the natural ordering.
+//! versions of the same user key precede older ones in forward order.
 //!
 //! # Merging
 //!
-//! [`MergingIter`] holds one [`LevelIter`] per source and advances by
-//! picking the smallest internal key across all valid sources on every
-//! step. The top-level [`LarkIterator`] then:
+//! [`MergingIter`] holds one [`LevelIter`] per source. In forward mode it
+//! picks the smallest internal key across all valid sources; in reverse
+//! mode it picks the largest. The top-level [`LarkIterator`] then:
 //!
 //! - Drops entries with `seq > snapshot_seq` (not visible at the captured
 //!   snapshot).
 //! - Deduplicates by user key, keeping only the newest visible version.
-//! - Treats a tombstone as "this user key is deleted" — the whole key is
-//!   skipped, and any older versions in lower levels are suppressed.
+//! - Treats a tombstone as "this user key is deleted" — the whole group
+//!   is skipped, and any older versions in lower levels are suppressed.
+//!
+//! # Forward vs reverse materialization
+//!
+//! In **forward** mode, entries within a user-key group are visited newest-
+//! seq first, so the first visible entry we see is the answer — the rest
+//! of the group can be consumed quickly.
+//!
+//! In **reverse** mode, entries within a user-key group are visited
+//! oldest-seq first (because internal keys are `!seq`-sorted). We must
+//! scan the *entire* group before we know the latest visible version, so
+//! [`LarkIterator::materialize_prev_visible`] accumulates the most recent
+//! visible entry seen and emits it once the group ends.
+//!
+//! # Direction changes
+//!
+//! Calling `next()` while in reverse mode (or vice versa) flips the
+//! direction. To avoid yielding the already-emitted user key again, the
+//! iterator re-seeks every level to the position just past the current
+//! user key in the new direction — see [`LarkIterator::flip_to_forward`]
+//! and [`LarkIterator::flip_to_reverse`].
 //!
 //! # Safety against concurrent compaction
 //!
@@ -40,10 +60,29 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use super::block_cache::BlockCache;
-use super::internal_key::{decode_internal_key, lookup_key, VALUE_TYPE_DELETION};
+use super::internal_key::{
+    decode_internal_key, lookup_key, INTERNAL_KEY_SUFFIX_LEN, VALUE_TYPE_DELETION,
+};
 use super::manifest::Version;
 use super::memtable::MemTable;
 use super::sstable::SsTableReader;
+
+/// Scan direction for [`LarkIterator`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Forward,
+    Reverse,
+}
+
+/// Build an internal-key probe strictly greater than any real entry for
+/// `user_key`. Used to seek past the last version of a user key when
+/// switching from reverse to forward iteration.
+fn above_all_versions(user_key: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(user_key.len() + INTERNAL_KEY_SUFFIX_LEN);
+    buf.extend_from_slice(user_key);
+    buf.extend_from_slice(&[0xff; INTERNAL_KEY_SUFFIX_LEN]);
+    buf
+}
 
 /// A cursor into one ordered source that yields `(internal_key, value)`
 /// pairs. Used by the merging iterator.
@@ -60,6 +99,16 @@ impl LevelIter {
                 Ok(())
             }
             Self::SsTable(it) => it.seek_to_first(),
+        }
+    }
+
+    fn seek_to_last(&mut self) -> io::Result<()> {
+        match self {
+            Self::Memtable(it) => {
+                it.seek_to_last();
+                Ok(())
+            }
+            Self::SsTable(it) => it.seek_to_last(),
         }
     }
 
@@ -93,6 +142,16 @@ impl LevelIter {
         }
     }
 
+    fn advance_backward(&mut self) -> io::Result<()> {
+        match self {
+            Self::Memtable(it) => {
+                it.advance_backward();
+                Ok(())
+            }
+            Self::SsTable(it) => it.advance_backward(),
+        }
+    }
+
     fn key(&self) -> Option<&[u8]> {
         match self {
             Self::Memtable(it) => it.curr.as_ref().map(|(k, _)| k.as_slice()),
@@ -122,6 +181,10 @@ impl MemtableLevelIter {
         self.curr = self.mt.first_entry_from(Bound::Unbounded);
     }
 
+    fn seek_to_last(&mut self) {
+        self.curr = self.mt.last_entry_before(Bound::Unbounded);
+    }
+
     fn seek(&mut self, target: &[u8]) {
         self.curr = self.mt.first_entry_from(Bound::Included(target));
     }
@@ -133,6 +196,12 @@ impl MemtableLevelIter {
     fn advance(&mut self) {
         if let Some((k, _)) = self.curr.take() {
             self.curr = self.mt.first_entry_from(Bound::Excluded(k.as_slice()));
+        }
+    }
+
+    fn advance_backward(&mut self) {
+        if let Some((k, _)) = self.curr.take() {
+            self.curr = self.mt.last_entry_before(Bound::Excluded(k.as_slice()));
         }
     }
 }
@@ -211,32 +280,30 @@ impl SsTableLevelIter {
     }
 
     fn seek_for_prev(&mut self, target: &[u8]) -> io::Result<()> {
-        // Find the block that could contain the largest key <= target.
-        // `seek_block` returns the first block whose last-key is >= target,
-        // which is where such a key would live. If no block qualifies (all
-        // last-keys are > target), the target could still live in the very
-        // first block if its first key is <= target.
-        let candidate_block = self.reader.seek_block(target).or_else(|| {
-            if self.reader.num_blocks() > 0 {
-                Some(0)
-            } else {
-                None
-            }
-        });
-        let block_idx = match candidate_block {
-            Some(i) => i,
-            None => {
-                self.curr = None;
-                return Ok(());
-            }
-        };
+        // Pick the block that could contain the largest entry `<= target`.
+        //
+        // `seek_block` returns the first block whose last key is `>= target`
+        // — that is the "containing" block, i.e. the earliest block that
+        // might hold `target` or the smallest key greater than `target`.
+        //
+        // If `seek_block` returns `None` every block's last key is `<
+        // target`, which means `target` is greater than every entry in
+        // the table. The correct answer is then the last entry of the
+        // **last** block (not block 0).
+        let num_blocks = self.reader.num_blocks();
+        if num_blocks == 0 {
+            self.curr = None;
+            return Ok(());
+        }
+        let block_idx = self.reader.seek_block(target).unwrap_or(num_blocks - 1);
+
         self.block_idx = block_idx;
         self.block_entries = self
             .reader
             .load_block_entries(self.block_idx, &self.cache)?;
-        // Within the block, find the largest entry <= target by a linear
-        // walk. This is O(block_size / entry_size), which is fine — one
-        // block is ~hundreds of entries.
+
+        // Within the block, find the largest entry `<= target` via linear
+        // walk. One block holds ~hundreds of entries, so this is cheap.
         let mut best: Option<usize> = None;
         for (i, (k, _)) in self.block_entries.iter().enumerate() {
             if k.as_slice() <= target {
@@ -251,8 +318,12 @@ impl SsTableLevelIter {
                 self.curr = self.block_entries.get(i).cloned();
             }
             None => {
-                // No entry in this block is <= target. Try the previous
-                // block if any — its last entry is necessarily < target.
+                // Every entry in this block is `> target`, which can
+                // happen when the containing block's first key already
+                // exceeds `target`. The answer, if one exists, is the
+                // last entry of the previous block — its last key is
+                // known to be `< target` (that's why `seek_block`
+                // skipped it).
                 if self.block_idx == 0 {
                     self.curr = None;
                     return Ok(());
@@ -287,6 +358,52 @@ impl SsTableLevelIter {
         self.curr = self.block_entries.first().cloned();
         Ok(())
     }
+
+    fn seek_to_last(&mut self) -> io::Result<()> {
+        let n = self.reader.num_blocks();
+        if n == 0 {
+            self.curr = None;
+            return Ok(());
+        }
+        self.block_idx = n - 1;
+        self.block_entries = self
+            .reader
+            .load_block_entries(self.block_idx, &self.cache)?;
+        if self.block_entries.is_empty() {
+            self.curr = None;
+            return Ok(());
+        }
+        self.entry_pos = self.block_entries.len() - 1;
+        self.curr = self.block_entries.last().cloned();
+        Ok(())
+    }
+
+    fn advance_backward(&mut self) -> io::Result<()> {
+        if self.curr.is_none() {
+            return Ok(());
+        }
+        if self.entry_pos > 0 {
+            self.entry_pos -= 1;
+            self.curr = self.block_entries.get(self.entry_pos).cloned();
+            return Ok(());
+        }
+        // Move to the previous block.
+        if self.block_idx == 0 {
+            self.curr = None;
+            return Ok(());
+        }
+        self.block_idx -= 1;
+        self.block_entries = self
+            .reader
+            .load_block_entries(self.block_idx, &self.cache)?;
+        if self.block_entries.is_empty() {
+            self.curr = None;
+            return Ok(());
+        }
+        self.entry_pos = self.block_entries.len() - 1;
+        self.curr = self.block_entries.last().cloned();
+        Ok(())
+    }
 }
 
 /// Merges multiple `LevelIter`s into a single stream of internal-key /
@@ -314,6 +431,14 @@ impl MergingIter {
         Ok(())
     }
 
+    fn seek_to_last(&mut self) -> io::Result<()> {
+        for lvl in &mut self.levels {
+            lvl.seek_to_last()?;
+        }
+        self.pick_largest();
+        Ok(())
+    }
+
     fn seek(&mut self, target: &[u8]) -> io::Result<()> {
         for lvl in &mut self.levels {
             lvl.seek(target)?;
@@ -338,6 +463,14 @@ impl MergingIter {
             self.levels[idx].advance()?;
         }
         self.pick_smallest();
+        Ok(())
+    }
+
+    fn advance_backward(&mut self) -> io::Result<()> {
+        if let Some(idx) = self.current_idx {
+            self.levels[idx].advance_backward()?;
+        }
+        self.pick_largest();
         Ok(())
     }
 
@@ -387,10 +520,16 @@ impl MergingIter {
 
 /// Streaming iterator over a consistent view of the database at a given
 /// snapshot sequence. Wraps [`MergingIter`] and adds user-key
-/// deduplication, snapshot visibility filtering, and tombstone suppression.
+/// deduplication, snapshot visibility filtering, tombstone suppression,
+/// and bidirectional iteration.
 pub(crate) struct LarkIterator {
     inner: MergingIter,
     snapshot_seq: u64,
+    /// Current scan direction. `next()` / `prev()` honor this; calling
+    /// the opposite-direction method flips it and re-seeks the merging
+    /// iterator so the first move in the new direction lands on the
+    /// correct neighbor of `curr_user`.
+    direction: Direction,
     /// Most recently produced `(user_key, value)` pair, if any.
     curr_user: Option<(Vec<u8>, Vec<u8>)>,
     /// Pinning handle — keeping this alive guarantees compaction cannot
@@ -441,6 +580,7 @@ impl LarkIterator {
         Self {
             inner: MergingIter::new(levels),
             snapshot_seq,
+            direction: Direction::Forward,
             curr_user: None,
             _version: version,
             error: None,
@@ -450,6 +590,7 @@ impl LarkIterator {
     pub(crate) fn seek_to_first(&mut self) {
         self.error = None;
         self.curr_user = None;
+        self.direction = Direction::Forward;
         if let Err(e) = self.inner.seek_to_first() {
             self.error = Some(e);
             return;
@@ -457,9 +598,21 @@ impl LarkIterator {
         self.materialize_next_visible();
     }
 
+    pub(crate) fn seek_to_last(&mut self) {
+        self.error = None;
+        self.curr_user = None;
+        self.direction = Direction::Reverse;
+        if let Err(e) = self.inner.seek_to_last() {
+            self.error = Some(e);
+            return;
+        }
+        self.materialize_prev_visible();
+    }
+
     pub(crate) fn seek(&mut self, target: &[u8]) {
         self.error = None;
         self.curr_user = None;
+        self.direction = Direction::Forward;
         // Smallest internal key for `target` at any seq: `target || !u64::MAX || 0`.
         // This positions the merging iterator at the newest version of the
         // target user key, or the first user key > target if none exists.
@@ -474,28 +627,41 @@ impl LarkIterator {
     pub(crate) fn seek_for_prev(&mut self, target: &[u8]) {
         self.error = None;
         self.curr_user = None;
-        // Largest internal key with user key `target`: entries within a
-        // user key sort by `!seq` ascending, so the largest is
-        // `target || !0 || 0`. Reverse-seeking to this probe puts the
-        // merging iterator at the most recent version of `target` or the
-        // last version of the preceding user key.
-        let probe = lookup_key(target, 0);
+        self.direction = Direction::Reverse;
+        // Reverse-seek to the largest internal key ≤ `target`. Probe with
+        // `above_all_versions(target)` so `seek_for_prev` lands at the
+        // oldest-seq entry of `target` itself (or of the preceding user
+        // key if `target` isn't present). Walking reverse through a
+        // user-key group visits entries in ascending seq order, which is
+        // exactly what `materialize_prev_visible` expects.
+        let probe = above_all_versions(target);
         if let Err(e) = self.inner.seek_for_prev(&probe) {
             self.error = Some(e);
             return;
         }
-        self.materialize_next_visible();
+        self.materialize_prev_visible();
     }
 
     pub(crate) fn next(&mut self) {
         if self.curr_user.is_none() || self.error.is_some() {
             return;
         }
-        // `materialize_next_visible` always leaves the inner iterator
-        // advanced past the current user key (via `consume_user_key`), so
-        // a plain call here picks up the next visible user key.
+        if self.direction == Direction::Reverse {
+            self.flip_to_forward();
+        }
         self.curr_user = None;
         self.materialize_next_visible();
+    }
+
+    pub(crate) fn prev(&mut self) {
+        if self.curr_user.is_none() || self.error.is_some() {
+            return;
+        }
+        if self.direction == Direction::Forward {
+            self.flip_to_reverse();
+        }
+        self.curr_user = None;
+        self.materialize_prev_visible();
     }
 
     pub(crate) fn valid(&self) -> bool {
@@ -547,21 +713,79 @@ impl LarkIterator {
             // it's the value the public iterator should yield.
             let uk_owned = uk.to_vec();
             if vt == VALUE_TYPE_DELETION {
-                self.consume_user_key(&uk_owned);
+                self.consume_user_key_forward(&uk_owned);
                 continue;
             }
             let v = self.inner.value().map(|s| s.to_vec()).unwrap_or_default();
             self.curr_user = Some((uk_owned.clone(), v));
-            self.consume_user_key(&uk_owned);
+            self.consume_user_key_forward(&uk_owned);
             return;
         }
     }
 
-    /// Advance the merging iterator past every entry whose user key
-    /// matches `user_key`. Called after materializing a live value (to
-    /// leave the cursor positioned at the next user key) or after
-    /// hitting a tombstone (to skip every older version in the group).
-    fn consume_user_key(&mut self, user_key: &[u8]) {
+    /// Walk the merging iterator **backward** until we find a user key
+    /// whose newest visible version (at `snapshot_seq`) is a live value.
+    ///
+    /// In reverse walk, a user-key group is visited in *ascending* seq
+    /// order (because higher seq produces a smaller internal key, which
+    /// comes later in reverse order). We scan the whole group, keeping
+    /// track of the highest visible seq we see — that is the winning
+    /// version. If it's a tombstone the group is skipped; otherwise it
+    /// is emitted.
+    fn materialize_prev_visible(&mut self) {
+        loop {
+            let Some(ik) = self.inner.key() else {
+                self.curr_user = None;
+                return;
+            };
+            let (uk, _, _) = decode_internal_key(ik);
+            let group = uk.to_vec();
+
+            // Newest visible entry seen so far in this group. Because
+            // reverse walk visits seqs in ascending order within a group,
+            // every visible entry we see is strictly newer than the
+            // previous one — so a simple "keep overwriting" strategy
+            // yields the newest visible entry for the group.
+            let mut latest: Option<(u8, Vec<u8>)> = None;
+
+            while let Some(ik2) = self.inner.key() {
+                let (uk2, seq, vt) = decode_internal_key(ik2);
+                if uk2 != group.as_slice() {
+                    break;
+                }
+                if seq <= self.snapshot_seq {
+                    let v = self.inner.value().map(|s| s.to_vec()).unwrap_or_default();
+                    latest = Some((vt, v));
+                }
+                if let Err(e) = self.inner.advance_backward() {
+                    self.error = Some(e);
+                    self.curr_user = None;
+                    return;
+                }
+            }
+
+            match latest {
+                Some((VALUE_TYPE_DELETION, _)) => {
+                    // Newest visible entry is a tombstone — try the next
+                    // (alphabetically earlier) user key.
+                    continue;
+                }
+                Some((_, v)) => {
+                    self.curr_user = Some((group, v));
+                    return;
+                }
+                None => {
+                    // No visible entries in this group (all seqs are in
+                    // the future of our snapshot). Try the next.
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// Advance the merging iterator forward past every entry whose user
+    /// key matches `user_key`.
+    fn consume_user_key_forward(&mut self, user_key: &[u8]) {
         loop {
             let Some(ik) = self.inner.key() else { return };
             let (uk, _, _) = decode_internal_key(ik);
@@ -573,5 +797,52 @@ impl LarkIterator {
                 return;
             }
         }
+    }
+
+    /// Switch from reverse to forward iteration. After a reverse pass
+    /// just emitted `curr_user`, the merging iterator's level cursors
+    /// are positioned in the *previous* user-key group. Re-seek every
+    /// level forward to just past the last version of `curr_user` so the
+    /// next forward step lands on the immediately following user key.
+    fn flip_to_forward(&mut self) {
+        let Some((uk, _)) = &self.curr_user else {
+            return;
+        };
+        let probe = above_all_versions(uk);
+        if let Err(e) = self.inner.seek(&probe) {
+            self.error = Some(e);
+        }
+        self.direction = Direction::Forward;
+    }
+
+    /// Switch from forward to reverse iteration. After a forward pass
+    /// just emitted `curr_user`, re-seek every level backward to just
+    /// before the smallest internal key of `curr_user` so the next
+    /// reverse step lands on the immediately preceding user key.
+    fn flip_to_reverse(&mut self) {
+        let Some((uk, _)) = &self.curr_user else {
+            return;
+        };
+        // `lookup_key(uk, u64::MAX)` is the smallest internal key for
+        // `uk`. `seek_for_prev` lands at the largest entry strictly less
+        // than that — some entry of the preceding user key (or nothing
+        // if `uk` is the first user key).
+        let probe = lookup_key(uk, u64::MAX);
+        // Subtract one logically: `seek_for_prev` is inclusive, but the
+        // entry at exactly `probe` would be for `uk` itself (unlikely —
+        // that's `uk` at seq u64::MAX, which we don't generate). If it
+        // ever matched we'd want to step past it; simpler to use a
+        // probe that's guaranteed strictly less.
+        let mut strict_probe = probe;
+        // Drop the final byte to make the probe shorter than any real
+        // internal key for `uk`. Any entry for `uk` is len(uk)+9 bytes;
+        // the truncated probe is len(uk)+8 bytes — shorter prefixes
+        // compare lex-less. This yields the largest entry strictly less
+        // than any entry for `uk`.
+        strict_probe.pop();
+        if let Err(e) = self.inner.seek_for_prev(&strict_probe) {
+            self.error = Some(e);
+        }
+        self.direction = Direction::Reverse;
     }
 }

@@ -683,6 +683,273 @@ mod tests {
         assert_eq!(count, N);
     }
 
+    // ─── Reverse iteration tests ─────────────────────────────────────────
+
+    fn collect_reverse(db: &Db) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut it = db.iter();
+        it.seek_to_last();
+        let mut out = Vec::new();
+        while it.valid() {
+            out.push((it.key().unwrap().to_vec(), it.value().unwrap().to_vec()));
+            it.prev();
+        }
+        it.status().unwrap();
+        out
+    }
+
+    #[test]
+    fn test_iter_seek_to_last_empty() {
+        let (db, _dir) = open_tmp();
+        let mut it = db.iter();
+        it.seek_to_last();
+        assert!(!it.valid());
+    }
+
+    #[test]
+    fn test_iter_reverse_walk_basic() {
+        let (db, _dir) = open_tmp();
+        for i in 0..10 {
+            let k = format!("k{:02}", i);
+            db.put(k.as_bytes(), b"v").unwrap();
+        }
+        let items = collect_reverse(&db);
+        assert_eq!(items.len(), 10);
+        for (i, (k, _)) in items.iter().enumerate() {
+            assert_eq!(k, format!("k{:02}", 9 - i).as_bytes());
+        }
+    }
+
+    #[test]
+    fn test_iter_prev_latest_version() {
+        let (db, _dir) = open_tmp();
+        db.put(b"a", b"a1").unwrap();
+        db.put(b"b", b"b1").unwrap();
+        db.put(b"b", b"b2").unwrap();
+        db.put(b"c", b"c1").unwrap();
+
+        let mut it = db.iter();
+        it.seek_to_last();
+        assert_eq!(it.key(), Some(b"c".as_ref()));
+        it.prev();
+        assert_eq!(it.key(), Some(b"b".as_ref()));
+        assert_eq!(it.value(), Some(b"b2".as_ref()));
+        it.prev();
+        assert_eq!(it.key(), Some(b"a".as_ref()));
+        it.prev();
+        assert!(!it.valid());
+    }
+
+    #[test]
+    fn test_iter_seek_for_prev_then_prev() {
+        let (db, _dir) = open_tmp();
+        db.put(b"a", b"1").unwrap();
+        db.put(b"c", b"3").unwrap();
+        db.put(b"e", b"5").unwrap();
+        db.put(b"g", b"7").unwrap();
+
+        let mut it = db.iter();
+        it.seek_for_prev(b"f");
+        assert_eq!(it.key(), Some(b"e".as_ref()));
+        it.prev();
+        assert_eq!(it.key(), Some(b"c".as_ref()));
+        it.prev();
+        assert_eq!(it.key(), Some(b"a".as_ref()));
+        it.prev();
+        assert!(!it.valid());
+    }
+
+    #[test]
+    fn test_iter_reverse_across_flush_levels() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        for i in 0..20 {
+            let k = format!("k{:02}", i);
+            db.put(k.as_bytes(), b"v").unwrap();
+        }
+        force_flush(&db, "a");
+        for i in 20..30 {
+            let k = format!("k{:02}", i);
+            db.put(k.as_bytes(), b"v").unwrap();
+        }
+
+        let items = collect_reverse(&db);
+        let k_count = items.iter().filter(|(k, _)| k.starts_with(b"k")).count();
+        assert_eq!(k_count, 30);
+        let mut prev_k: Option<Vec<u8>> = None;
+        for (k, _) in items.iter().filter(|(k, _)| k.starts_with(b"k")) {
+            if let Some(p) = &prev_k {
+                assert!(k < p, "not descending: {:?} after {:?}", k, p);
+            }
+            prev_k = Some(k.clone());
+        }
+    }
+
+    #[test]
+    fn test_iter_reverse_hides_tombstoned_user_key() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        db.put(b"keep", b"v").unwrap();
+        db.put(b"gone", b"v").unwrap();
+        force_flush(&db, "a");
+        db.delete(b"gone").unwrap();
+
+        let items = collect_reverse(&db);
+        let keys: Vec<_> = items.iter().map(|(k, _)| k.clone()).collect();
+        assert!(keys.contains(&b"keep".to_vec()));
+        assert!(!keys.contains(&b"gone".to_vec()));
+    }
+
+    #[test]
+    fn test_iter_reverse_honors_snapshot_isolation() {
+        let (db, _dir) = open_tmp();
+        db.put(b"k", b"v1").unwrap();
+        let snap = db.snapshot();
+        db.put(b"k", b"v2").unwrap();
+
+        let mut it = snap.iter();
+        it.seek_to_last();
+        assert_eq!(it.key(), Some(b"k".as_ref()));
+        assert_eq!(it.value(), Some(b"v1".as_ref()));
+    }
+
+    #[test]
+    fn test_iter_direction_flip_forward_to_reverse() {
+        let (db, _dir) = open_tmp();
+        for c in b'a'..=b'e' {
+            db.put(&[c], &[c]).unwrap();
+        }
+
+        let mut it = db.iter();
+        it.seek_to_first();
+        assert_eq!(it.key(), Some(b"a".as_ref()));
+        it.next();
+        assert_eq!(it.key(), Some(b"b".as_ref()));
+        it.next();
+        assert_eq!(it.key(), Some(b"c".as_ref()));
+
+        it.prev();
+        assert_eq!(it.key(), Some(b"b".as_ref()));
+        it.prev();
+        assert_eq!(it.key(), Some(b"a".as_ref()));
+        it.prev();
+        assert!(!it.valid());
+    }
+
+    #[test]
+    fn test_iter_direction_flip_reverse_to_forward() {
+        let (db, _dir) = open_tmp();
+        for c in b'a'..=b'e' {
+            db.put(&[c], &[c]).unwrap();
+        }
+
+        let mut it = db.iter();
+        it.seek_to_last();
+        assert_eq!(it.key(), Some(b"e".as_ref()));
+        it.prev();
+        assert_eq!(it.key(), Some(b"d".as_ref()));
+        it.prev();
+        assert_eq!(it.key(), Some(b"c".as_ref()));
+
+        it.next();
+        assert_eq!(it.key(), Some(b"d".as_ref()));
+        it.next();
+        assert_eq!(it.key(), Some(b"e".as_ref()));
+        it.next();
+        assert!(!it.valid());
+    }
+
+    #[test]
+    fn test_iter_reverse_scan_10k_keys_after_flush() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        const N: usize = 10_000;
+        for i in 0..N {
+            let k = format!("key_{:06}", i);
+            db.put(k.as_bytes(), b"v").unwrap();
+        }
+
+        let mut it = db.iter();
+        it.seek_for_prev(b"key_~"); // '~' sorts after digits
+        let mut count = 0;
+        let mut prev: Option<Vec<u8>> = None;
+        while it.valid() {
+            let k = it.key().unwrap().to_vec();
+            if !k.starts_with(b"key_") {
+                it.prev();
+                continue;
+            }
+            if let Some(p) = &prev {
+                assert!(k < *p, "not descending: {:?} after {:?}", k, p);
+            }
+            prev = Some(k);
+            count += 1;
+            it.prev();
+        }
+        assert_eq!(count, N);
+        assert!(it.status().is_ok());
+    }
+
+    #[test]
+    fn test_iter_reverse_seek_past_end_of_multi_block_sst() {
+        // Regression: SsTableLevelIter::seek_for_prev used to fall back
+        // to block 0 when the target exceeded every entry in the SST.
+        // The correct fallback is the *last* block, so reverse walks
+        // that start past the end actually visit every user key.
+        //
+        // Forces a multi-block SSTable with a small `block_size`, flushes
+        // to L0 via `close()` so the data is guaranteed to be on disk,
+        // then reopens and runs `seek_for_prev` with a target larger
+        // than every key.
+        let dir = TempDir::new().unwrap();
+        let opts = Options {
+            block_size: 128,
+            write_buffer_size: 64 * 1024,
+            ..Options::default()
+        };
+        {
+            let db = Db::open(dir.path(), opts.clone()).unwrap();
+            for i in 0..60u32 {
+                let k = format!("k{:03}", i);
+                db.put(k.as_bytes(), b"v").unwrap();
+            }
+            db.close().unwrap();
+        }
+
+        let db = Db::open(dir.path(), opts).unwrap();
+        let mut it = db.iter();
+        it.seek_for_prev(b"~"); // '~' sorts after 'k'
+
+        let mut seen = Vec::new();
+        while it.valid() {
+            seen.push(it.key().unwrap().to_vec());
+            it.prev();
+        }
+        assert_eq!(seen.len(), 60);
+        assert_eq!(seen.first().map(|k| k.as_slice()), Some(&b"k059"[..]));
+        assert_eq!(seen.last().map(|k| k.as_slice()), Some(&b"k000"[..]));
+    }
+
+    #[test]
+    fn test_iter_seek_for_prev_on_tombstoned_key() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        db.put(b"a", b"a1").unwrap();
+        db.put(b"b", b"b1").unwrap();
+        db.put(b"c", b"c1").unwrap();
+        force_flush(&db, "x");
+        db.delete(b"b").unwrap();
+
+        let mut it = db.iter();
+        it.seek_for_prev(b"b");
+        // `b` is tombstoned, so reverse-seek to `b` should skip past it
+        // and land on `a`.
+        assert_eq!(it.key(), Some(b"a".as_ref()));
+    }
+
     #[test]
     fn test_iter_survives_drop_all() {
         // drop_all unlinks every SSTable file. An iterator captured before
