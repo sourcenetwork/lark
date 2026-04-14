@@ -1,0 +1,402 @@
+//! Offline SSTable builder and bulk-ingest options.
+//!
+//! [`SstFileWriter`] lets a caller construct a valid lark SSTable on disk
+//! without going through a [`crate::Db`], and
+//! [`crate::Db::ingest_external_files`] bulk-loads those files into a
+//! running database. All entries in a single ingest file are assigned
+//! one freshly-allocated sequence number at ingest time; the
+//! placeholder seq (`0`) embedded by this writer is rewritten as the
+//! engine re-emits the file into `sst_dir`.
+
+use std::io;
+use std::path::{Path, PathBuf};
+
+use crate::engine::internal_key::{encode_internal_key, VALUE_TYPE_DELETION, VALUE_TYPE_VALUE};
+use crate::engine::sstable::SsTableWriter;
+use crate::options::Options;
+
+/// Writes a standalone SSTable file that a running [`crate::Db`] can
+/// bulk-ingest via [`crate::Db::ingest_external_files`].
+///
+/// Keys must be supplied in **strictly ascending** user-key order —
+/// duplicates and out-of-order keys are rejected with an error. Every
+/// entry is written with a placeholder sequence number of `0`; the
+/// real sequence number is assigned by the engine when the file is
+/// ingested.
+pub struct SstFileWriter {
+    inner: Option<SsTableWriter>,
+    path: PathBuf,
+    last_user_key: Option<Vec<u8>>,
+    num_entries: u64,
+}
+
+/// Summary of a finished ingest file, returned by [`SstFileWriter::finish`].
+#[derive(Debug, Clone)]
+pub struct SstFileMeta {
+    /// Path the file was written to.
+    pub path: PathBuf,
+    /// Smallest user key in the file.
+    pub smallest_user_key: Vec<u8>,
+    /// Largest user key in the file.
+    pub largest_user_key: Vec<u8>,
+    /// Number of point entries written (puts + deletes).
+    pub num_entries: u64,
+}
+
+/// Options controlling how [`crate::Db::ingest_external_files`] moves
+/// files into the database.
+#[derive(Debug, Clone, Copy)]
+pub struct IngestOptions {
+    /// Advisory: whether to treat the source file as movable. In the
+    /// current implementation the engine always re-emits the ingest
+    /// file (to rewrite sequence numbers), so the source path is left
+    /// untouched regardless of this flag — the caller is free to
+    /// delete or re-ingest it.
+    pub move_files: bool,
+    /// Reject the ingest if any live snapshot is pinned. Ingest
+    /// assigns a single new seq to every entry in the file; a snapshot
+    /// taken before the ingest would otherwise be inconsistent with
+    /// that seq's apparent ordering.
+    pub snapshot_consistency: bool,
+    /// Force every ingest file to land at the bottommost level. The
+    /// ingest is rejected if any input file's user-key range overlaps
+    /// an existing SSTable at any level.
+    pub ingest_behind: bool,
+}
+
+impl Default for IngestOptions {
+    fn default() -> Self {
+        Self {
+            move_files: false,
+            snapshot_consistency: true,
+            ingest_behind: false,
+        }
+    }
+}
+
+impl SstFileWriter {
+    /// Create a new SSTable file at `path`. The file is overwritten if
+    /// it already exists. The writer borrows `block_size`,
+    /// `bloom_bits_per_key`, and `compression` from `opts`.
+    pub fn create<P: AsRef<Path>>(path: P, opts: &Options) -> crate::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let inner = SsTableWriter::new(
+            &path,
+            opts.block_size,
+            opts.bloom_bits_per_key,
+            opts.compression,
+        )
+        .map_err(crate::Error::Io)?;
+        Ok(Self {
+            inner: Some(inner),
+            path,
+            last_user_key: None,
+            num_entries: 0,
+        })
+    }
+
+    /// Append a `(key, value)` pair. `key` must be strictly greater
+    /// than every previously added key.
+    pub fn put(&mut self, key: &[u8], value: &[u8]) -> crate::Result<()> {
+        self.add(key, value, VALUE_TYPE_VALUE)
+    }
+
+    /// Append a deletion tombstone for `key`. `key` must be strictly
+    /// greater than every previously added key.
+    pub fn delete(&mut self, key: &[u8]) -> crate::Result<()> {
+        self.add(key, &[], VALUE_TYPE_DELETION)
+    }
+
+    fn add(&mut self, key: &[u8], value: &[u8], value_type: u8) -> crate::Result<()> {
+        if let Some(last) = &self.last_user_key {
+            if key <= last.as_slice() {
+                return Err(crate::Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "SstFileWriter keys must arrive in strictly ascending order",
+                )));
+            }
+        }
+        let internal = encode_internal_key(key, 0, value_type);
+        let inner = self
+            .inner
+            .as_mut()
+            .expect("SstFileWriter used after finish");
+        inner.add(&internal, value).map_err(crate::Error::Io)?;
+        self.last_user_key = Some(key.to_vec());
+        self.num_entries += 1;
+        Ok(())
+    }
+
+    /// Finalize the file. Errors if no entries were written — an empty
+    /// ingest file is almost certainly a bug and would be rejected at
+    /// ingest time anyway.
+    pub fn finish(mut self) -> crate::Result<SstFileMeta> {
+        let inner = self.inner.take().expect("SstFileWriter used after finish");
+        let summary = inner.finish().map_err(crate::Error::Io)?.ok_or_else(|| {
+            crate::Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SstFileWriter::finish called with no entries",
+            ))
+        })?;
+        Ok(SstFileMeta {
+            path: self.path,
+            smallest_user_key: summary.smallest_user_key,
+            largest_user_key: summary.largest_user_key,
+            num_entries: summary.num_entries,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Db, Options};
+    use tempfile::TempDir;
+
+    fn open_tmp() -> (Db, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), Options::default()).unwrap();
+        (db, dir)
+    }
+
+    fn build_sst(path: &Path, entries: &[(&[u8], Option<&[u8]>)]) -> SstFileMeta {
+        let mut w = SstFileWriter::create(path, &Options::default()).unwrap();
+        for (k, v) in entries {
+            match v {
+                Some(v) => w.put(k, v).unwrap(),
+                None => w.delete(k).unwrap(),
+            }
+        }
+        w.finish().unwrap()
+    }
+
+    #[test]
+    fn test_put_out_of_order_rejected() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad.sst");
+        let mut w = SstFileWriter::create(&path, &Options::default()).unwrap();
+        w.put(b"b", b"1").unwrap();
+        assert!(w.put(b"a", b"2").is_err());
+        assert!(w.put(b"b", b"3").is_err());
+    }
+
+    #[test]
+    fn test_put_and_delete_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rt.sst");
+        let meta = build_sst(
+            &path,
+            &[
+                (b"a", Some(b"1")),
+                (b"b", Some(b"2")),
+                (b"c", None),
+                (b"d", Some(b"4")),
+            ],
+        );
+        assert_eq!(meta.num_entries, 4);
+        assert_eq!(meta.smallest_user_key, b"a");
+        assert_eq!(meta.largest_user_key, b"d");
+        assert!(meta.path.exists());
+    }
+
+    #[test]
+    fn test_empty_finish_errors() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("empty.sst");
+        let w = SstFileWriter::create(&path, &Options::default()).unwrap();
+        assert!(w.finish().is_err());
+    }
+
+    #[test]
+    fn test_ingest_into_empty_db() {
+        let (db, dir) = open_tmp();
+        let sst_path = dir.path().join("external-1.sst");
+        build_sst(
+            &sst_path,
+            &[
+                (b"apple", Some(b"red")),
+                (b"banana", Some(b"yellow")),
+                (b"cherry", Some(b"dark-red")),
+            ],
+        );
+
+        db.ingest_external_files(&[sst_path], IngestOptions::default())
+            .unwrap();
+
+        assert_eq!(db.get(b"apple").unwrap(), Some(b"red".to_vec()));
+        assert_eq!(db.get(b"banana").unwrap(), Some(b"yellow".to_vec()));
+        assert_eq!(db.get(b"cherry").unwrap(), Some(b"dark-red".to_vec()));
+
+        let scanned = db.scan(None, None).unwrap();
+        assert_eq!(scanned.len(), 3);
+    }
+
+    #[test]
+    fn test_ingest_overlap_lands_at_l0() {
+        let (db, dir) = open_tmp();
+        db.put(b"banana", b"old").unwrap();
+        db.compact_range(None, None).unwrap();
+
+        let sst_path = dir.path().join("external-overlap.sst");
+        build_sst(
+            &sst_path,
+            &[(b"apple", Some(b"a")), (b"banana", Some(b"new"))],
+        );
+
+        db.ingest_external_files(&[sst_path], IngestOptions::default())
+            .unwrap();
+
+        assert_eq!(db.get(b"apple").unwrap(), Some(b"a".to_vec()));
+        assert_eq!(db.get(b"banana").unwrap(), Some(b"new".to_vec()));
+        assert!(db.level_file_count(0) >= 1);
+    }
+
+    #[test]
+    fn test_ingest_disjoint_lands_at_deep_level() {
+        let (db, dir) = open_tmp();
+        db.put(b"aaa", b"x").unwrap();
+        db.put(b"bbb", b"y").unwrap();
+        db.compact_range(None, None).unwrap();
+        let before_l0 = db.level_file_count(0);
+
+        let sst_path = dir.path().join("external-disjoint.sst");
+        build_sst(&sst_path, &[(b"mmm", Some(b"m")), (b"nnn", Some(b"n"))]);
+
+        db.ingest_external_files(&[sst_path], IngestOptions::default())
+            .unwrap();
+
+        assert_eq!(db.get(b"mmm").unwrap(), Some(b"m".to_vec()));
+        assert_eq!(db.get(b"nnn").unwrap(), Some(b"n".to_vec()));
+        // The ingest should NOT have added an L0 file: its range is
+        // disjoint from every existing file.
+        assert_eq!(db.engine.level_file_count(0), before_l0);
+    }
+
+    #[test]
+    fn test_ingest_behind_rejects_overlap() {
+        let (db, dir) = open_tmp();
+        db.put(b"banana", b"old").unwrap();
+
+        let sst_path = dir.path().join("external-behind-bad.sst");
+        build_sst(&sst_path, &[(b"banana", Some(b"new"))]);
+
+        let opts = IngestOptions {
+            ingest_behind: true,
+            ..Default::default()
+        };
+        assert!(db.ingest_external_files(&[sst_path], opts).is_err());
+    }
+
+    #[test]
+    fn test_ingest_behind_forces_bottommost() {
+        let (db, dir) = open_tmp();
+        db.put(b"aaa", b"x").unwrap();
+        db.compact_range(None, None).unwrap();
+
+        let sst_path = dir.path().join("external-behind-ok.sst");
+        build_sst(&sst_path, &[(b"zzz", Some(b"z"))]);
+
+        let opts = IngestOptions {
+            ingest_behind: true,
+            ..Default::default()
+        };
+        db.ingest_external_files(&[sst_path], opts).unwrap();
+
+        assert_eq!(db.get(b"zzz").unwrap(), Some(b"z".to_vec()));
+        // Placed at the bottommost level — not L0.
+        assert_eq!(db.level_file_count(0), 0);
+    }
+
+    #[test]
+    fn test_ingest_post_read_and_iter() {
+        let (db, dir) = open_tmp();
+        let sst_path = dir.path().join("external-iter.sst");
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..20u32)
+            .map(|i| {
+                (
+                    format!("key_{:04}", i).into_bytes(),
+                    format!("val_{}", i).into_bytes(),
+                )
+            })
+            .collect();
+        {
+            let mut w = SstFileWriter::create(&sst_path, &Options::default()).unwrap();
+            for (k, v) in &entries {
+                w.put(k, v).unwrap();
+            }
+            w.finish().unwrap();
+        }
+
+        db.ingest_external_files(&[sst_path], IngestOptions::default())
+            .unwrap();
+
+        for (k, v) in &entries {
+            assert_eq!(db.get(k).unwrap(), Some(v.clone()));
+        }
+        let scanned = db.scan(None, None).unwrap();
+        assert_eq!(scanned.len(), entries.len());
+        for ((k_got, v_got), (k, v)) in scanned.iter().zip(entries.iter()) {
+            assert_eq!(k_got, k);
+            assert_eq!(v_got, v);
+        }
+    }
+
+    #[test]
+    fn test_ingest_snapshot_consistency_rejects_with_live_snapshot() {
+        let (db, dir) = open_tmp();
+        db.put(b"a", b"1").unwrap();
+        let snap = db.snapshot();
+
+        let sst_path = dir.path().join("external-snap.sst");
+        build_sst(&sst_path, &[(b"b", Some(b"2"))]);
+
+        let err = db
+            .ingest_external_files(&[sst_path], IngestOptions::default())
+            .unwrap_err();
+        drop(snap);
+        let msg = format!("{err}");
+        assert!(msg.contains("snapshot"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_ingest_snapshot_consistency_false_preserves_old_snapshot_view() {
+        let (db, dir) = open_tmp();
+        db.put(b"a", b"1").unwrap();
+        let snap = db.snapshot();
+
+        let sst_path = dir.path().join("external-snap2.sst");
+        build_sst(&sst_path, &[(b"b", Some(b"2"))]);
+
+        let opts = IngestOptions {
+            snapshot_consistency: false,
+            ..Default::default()
+        };
+        db.ingest_external_files(&[sst_path], opts).unwrap();
+
+        // Live db sees both.
+        assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(db.get(b"b").unwrap(), Some(b"2".to_vec()));
+        // Pre-ingest snapshot sees only the original key — the
+        // ingested entry carries a higher seq than the snapshot's.
+        assert_eq!(snap.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(snap.get(b"b").unwrap(), None);
+    }
+
+    #[test]
+    fn test_ingest_then_compact_range_merges() {
+        let (db, dir) = open_tmp();
+        db.put(b"aaa", b"old").unwrap();
+        db.compact_range(None, None).unwrap();
+
+        let sst_path = dir.path().join("external-merge.sst");
+        build_sst(&sst_path, &[(b"bbb", Some(b"b")), (b"ccc", Some(b"c"))]);
+        db.ingest_external_files(&[sst_path], IngestOptions::default())
+            .unwrap();
+
+        db.compact_range(None, None).unwrap();
+
+        assert_eq!(db.get(b"aaa").unwrap(), Some(b"old".to_vec()));
+        assert_eq!(db.get(b"bbb").unwrap(), Some(b"b".to_vec()));
+        assert_eq!(db.get(b"ccc").unwrap(), Some(b"c".to_vec()));
+    }
+}

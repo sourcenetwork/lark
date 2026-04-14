@@ -767,6 +767,205 @@ impl LarkEngine {
         )
     }
 
+    /// Bulk-ingest a set of externally-built SSTable files. Each file
+    /// is re-emitted into `sst_dir` so its entries are rewritten with
+    /// a freshly allocated sequence number (one per file), then the
+    /// file is added to the version at an appropriate level:
+    ///
+    /// - L0 if the file's user-key range overlaps any file at any
+    ///   existing level;
+    /// - otherwise the deepest level whose files are all strictly
+    ///   disjoint from the input range.
+    ///
+    /// If `ingest_behind` is set the file is forced to the bottommost
+    /// level — any overlap is an error. If `snapshot_consistency` is
+    /// set the call is rejected while any snapshot is pinned (ingest
+    /// would otherwise inject a new seq that older snapshots cannot
+    /// consistently observe).
+    pub(crate) fn ingest_external_files(
+        &self,
+        files: &[PathBuf],
+        ingest_opts: &crate::sst_file_writer::IngestOptions,
+    ) -> std::io::Result<()> {
+        use crate::engine::internal_key::decode_internal_key;
+
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        if ingest_opts.snapshot_consistency && self.oldest_live_seq() != u64::MAX {
+            return Err(std::io::Error::other(
+                "ingest_external_files: snapshot isolation would be violated \
+                 because a live snapshot is pinned (use snapshot_consistency=false \
+                 to override)",
+            ));
+        }
+
+        // Pre-open every source file and compute its key range, so we
+        // can reject bad inputs before we start mutating anything.
+        let mut sources: Vec<IngestSource> = Vec::with_capacity(files.len());
+        for path in files {
+            let reader = SsTableReader::open(path, 0).map_err(|e| {
+                std::io::Error::new(e.kind(), format!("ingest: open {}: {e}", path.display()))
+            })?;
+            let entries = reader.iter_internal(&self.cache)?;
+            let rts = reader.range_tombstones();
+            let (smallest, largest) =
+                if let (Some(first), Some(last)) = (entries.first(), entries.last()) {
+                    let (uk_lo, _, _) = decode_internal_key(&first.0);
+                    let (uk_hi, _, _) = decode_internal_key(&last.0);
+                    (uk_lo.to_vec(), uk_hi.to_vec())
+                } else if !rts.is_empty() {
+                    let mut lo = rts[0].start.clone();
+                    let mut hi = rts[0].end.clone();
+                    for rt in rts.iter().skip(1) {
+                        if rt.start < lo {
+                            lo = rt.start.clone();
+                        }
+                        if rt.end > hi {
+                            hi = rt.end.clone();
+                        }
+                    }
+                    (lo, hi)
+                } else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("ingest: source file {} is empty", path.display()),
+                    ));
+                };
+            sources.push(IngestSource {
+                path: path.clone(),
+                reader,
+                smallest,
+                largest,
+            });
+        }
+
+        // Serialize with background compaction for the duration of the
+        // ingest — same pattern as `compact_range`.
+        let _compact_guard = self.compaction_lock.lock();
+
+        for source in &sources {
+            self.ingest_one(source, ingest_opts)?;
+        }
+
+        self.compaction.lock().notify();
+        Ok(())
+    }
+
+    fn ingest_one(
+        &self,
+        source: &IngestSource,
+        ingest_opts: &crate::sst_file_writer::IngestOptions,
+    ) -> std::io::Result<()> {
+        use crate::engine::internal_key::{decode_internal_key, encode_internal_key};
+
+        // Flush the active memtable if it overlaps the ingest range.
+        // The cheapest correct thing is to flush unconditionally when
+        // the memtable is non-empty and we might be landing at L0 —
+        // which is the only level where a concurrent memtable could
+        // shadow the ingested keys.
+        let needs_flush = {
+            let mt = self.active_memtable.read();
+            !mt.is_empty() || !mt.clone_range_tombstones().is_empty()
+        };
+        if needs_flush {
+            let _write_guard = self.write_lock.lock();
+            let mt = self.active_memtable.read();
+            if !mt.is_empty() || !mt.clone_range_tombstones().is_empty() {
+                drop(mt);
+                self.rotate_memtable()?;
+            }
+        }
+
+        // Compute the target level from the current version.
+        let version = self.versions.lock().current();
+        let target_level = compute_target_level(
+            &version,
+            &source.smallest,
+            &source.largest,
+            ingest_opts.ingest_behind,
+        )?;
+
+        // Allocate a new file_id and a new global seq. All entries in
+        // the emitted file share the allocated seq.
+        let file_id = {
+            let mut guard = self.versions.lock();
+            let current = guard.current();
+            let id = current.next_file_id;
+            guard.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
+            id
+        };
+        let ingest_seq = self.latest_seq.fetch_add(1, Ordering::AcqRel) + 1;
+
+        let dest_path = self.sst_dir.join(sst_filename(file_id));
+        let mut writer = SsTableWriter::new(
+            &dest_path,
+            self.options.block_size,
+            self.options.bloom_bits_per_key,
+            self.options.compression_for_level(target_level),
+        )?;
+
+        // Re-encode every point entry with the ingest seq.
+        let entries = source.reader.iter_internal(&self.cache)?;
+        for (ik, value) in entries {
+            let (uk, _old_seq, vt) = decode_internal_key(&ik);
+            let new_ik = encode_internal_key(uk, ingest_seq, vt);
+            writer.add(&new_ik, &value)?;
+        }
+        // Carry range tombstones across with the same seq rewrite.
+        for rt in source.reader.range_tombstones() {
+            writer.add_range_tombstone(&rt.start, &rt.end, ingest_seq);
+        }
+
+        let summary = match writer.finish()? {
+            Some(s) => s,
+            None => {
+                let _ = std::fs::remove_file(&dest_path);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "ingest: source file {} produced empty output",
+                        source.path.display()
+                    ),
+                ));
+            }
+        };
+
+        let file_size = std::fs::metadata(&dest_path)?.len();
+        let reader = Arc::new(SsTableReader::open(&dest_path, file_id)?);
+        let live = LiveSst::new(
+            SsTableMeta {
+                file_id,
+                smallest_key: summary.smallest_user_key,
+                largest_key: summary.largest_user_key,
+                file_size,
+                num_entries: summary.num_entries,
+            },
+            reader,
+        );
+
+        let edits = vec![
+            VersionEdit::AddFile {
+                level: target_level,
+                file: live,
+            },
+            VersionEdit::SetLastSeq(ingest_seq),
+        ];
+        self.versions.lock().apply(&edits)?;
+
+        tracing::info!(
+            file_id,
+            target_level,
+            ingest_seq,
+            entries = summary.num_entries,
+            size = file_size,
+            source = %source.path.display(),
+            "Ingested external SSTable"
+        );
+        Ok(())
+    }
+
     /// Drop all data in the engine.
     pub(crate) fn drop_all(&self) -> std::io::Result<()> {
         let _write_guard = self.write_lock.lock();
@@ -909,6 +1108,62 @@ impl LarkEngine {
 
         Ok(())
     }
+}
+
+/// A validated ingest source: an open reader plus its user-key range.
+struct IngestSource {
+    path: PathBuf,
+    reader: SsTableReader,
+    smallest: Vec<u8>,
+    largest: Vec<u8>,
+}
+
+/// Choose the target level for an ingest file covering the user-key
+/// range `[smallest, largest]`. Returns L0 when the range overlaps any
+/// existing file at any level; otherwise walks upward from the
+/// bottommost non-empty level and picks the deepest level whose files
+/// are all strictly disjoint from the input range. Level 0 is the
+/// fallback when every other level also overlaps or when every level
+/// is empty.
+///
+/// When `ingest_behind` is true the target is forced to the
+/// bottommost level (MAX_LEVELS-1) and the call errors if any file at
+/// any level overlaps the input range.
+fn compute_target_level(
+    version: &manifest::Version,
+    smallest: &[u8],
+    largest: &[u8],
+    ingest_behind: bool,
+) -> std::io::Result<usize> {
+    let overlaps_level = |level: usize| -> bool {
+        version.levels[level].iter().any(|f| {
+            f.meta.smallest_key.as_slice() <= largest && f.meta.largest_key.as_slice() >= smallest
+        })
+    };
+
+    if ingest_behind {
+        for level in 0..manifest::MAX_LEVELS {
+            if overlaps_level(level) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "ingest_behind: input range overlaps existing SSTable",
+                ));
+            }
+        }
+        return Ok(manifest::MAX_LEVELS - 1);
+    }
+
+    // Any overlap at any level → land at L0. L0 is the only level
+    // that tolerates overlapping files, so this is the only safe
+    // destination when the ingest range is not disjoint from the
+    // existing tree.
+    for level in 0..manifest::MAX_LEVELS {
+        if overlaps_level(level) {
+            return Ok(0);
+        }
+    }
+    // Every level is disjoint (or empty): land at the deepest level.
+    Ok(manifest::MAX_LEVELS - 1)
 }
 
 fn list_wal_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
