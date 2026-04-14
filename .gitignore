@@ -1,0 +1,30 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Generated
+defra.h
+crates/ffi/defra.h
+
+# Test artifacts
+*.profraw
+*.profdata
+
+# Documentation
+/book/
+
+# Environment
+.env
+.env.local
+
+# Claude (user-specific)
+.claude/
