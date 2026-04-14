@@ -319,7 +319,20 @@ impl VersionSet {
     }
 
     fn replay_manifest(data: &[u8], sst_dir: &Path) -> io::Result<Version> {
-        let mut version = Version::new();
+        // Two-pass replay. The first pass walks every record and tracks
+        // the *logical* state of each level — which file ids are live —
+        // without touching the filesystem. Only after replay completes
+        // do we open readers for the surviving files.
+        //
+        // This matters for compaction-heavy histories: when compaction
+        // adds an L1 file and removes the L0 inputs, both records land
+        // in the manifest, but the inputs' physical files are unlinked
+        // from disk by `delete_old_files`. An eager open at AddFile
+        // time would fail on the unlinked files even though a later
+        // RemoveFile record cancels them out.
+        let mut surviving: Vec<Vec<SsTableMeta>> = vec![Vec::new(); MAX_LEVELS];
+        let mut last_seq: u64 = 0;
+        let mut next_file_id: u64 = 1;
         let mut offset = 0;
 
         while offset + 4 <= data.len() {
@@ -347,20 +360,32 @@ impl VersionSet {
             while let Some(record) = ManifestRecord::decode(record_data, &mut pos)? {
                 match record {
                     ManifestRecord::AddFile { level, meta } => {
-                        let path = sst_dir.join(sst_filename(meta.file_id));
-                        let reader = Arc::new(SsTableReader::open(&path, meta.file_id)?);
-                        version.levels[level].push(LiveSst::new(meta, reader));
+                        surviving[level].push(meta);
                     }
                     ManifestRecord::RemoveFile { level, file_id } => {
-                        version.levels[level].retain(|f| f.meta.file_id != file_id);
+                        surviving[level].retain(|m| m.file_id != file_id);
                     }
                     ManifestRecord::SetLastSeq(seq) => {
-                        version.last_seq = seq;
+                        last_seq = seq;
                     }
                     ManifestRecord::SetNextFileId(id) => {
-                        version.next_file_id = id;
+                        next_file_id = id;
                     }
                 }
+            }
+        }
+
+        // Second pass: open readers for the survivors.
+        let mut version = Version::new();
+        version.last_seq = last_seq;
+        version.next_file_id = next_file_id;
+        for (level, files) in surviving.into_iter().enumerate() {
+            for meta in files {
+                let path = sst_dir.join(sst_filename(meta.file_id));
+                let reader = Arc::new(SsTableReader::open(&path, meta.file_id).map_err(|e| {
+                    std::io::Error::new(e.kind(), format!("open {}: {e}", path.display()))
+                })?);
+                version.levels[level].push(LiveSst::new(meta, reader));
             }
         }
 
@@ -378,9 +403,10 @@ mod tests {
     fn make_live_sst(dir: &Path, file_id: u64, smallest: &[u8], largest: &[u8]) -> Arc<LiveSst> {
         use super::super::internal_key::{encode_internal_key, VALUE_TYPE_VALUE};
         use super::super::sstable::SsTableWriter;
+        use crate::options::CompressionType;
 
         let path = dir.join(sst_filename(file_id));
-        let mut writer = SsTableWriter::new(&path, 4096, 10, false).unwrap();
+        let mut writer = SsTableWriter::new(&path, 4096, 10, CompressionType::None).unwrap();
         writer
             .add(
                 &encode_internal_key(smallest, 1, VALUE_TYPE_VALUE),

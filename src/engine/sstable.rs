@@ -24,6 +24,7 @@ use super::block_cache::BlockCache;
 use super::bloom::{decode_bloom_block, encode_bloom_block, BloomFilter, BloomFilterBuilder};
 use super::internal_key::{decode_internal_key, lookup_key, user_key_of, VALUE_TYPE_DELETION};
 use super::range_tombstone::{max_covering_seq, RangeTombstone};
+use crate::options::CompressionType;
 
 /// SSTable magic number: "LARKSST\x01" (format version 2 — added the
 /// range-tombstone meta block at the bottom of the file).
@@ -34,6 +35,7 @@ const FOOTER_SIZE: usize = 64;
 
 const COMPRESSION_NONE: u8 = 0x00;
 const COMPRESSION_LZ4: u8 = 0x01;
+const COMPRESSION_SNAPPY: u8 = 0x02;
 
 /// SSTable footer (fixed 64 bytes, written at end of file).
 ///
@@ -273,7 +275,7 @@ pub(crate) struct SsTableWriter {
     smallest_user_key: Option<Vec<u8>>,
     largest_user_key: Option<Vec<u8>>,
     last_bloom_user_key: Vec<u8>,
-    compression: bool,
+    compression: CompressionType,
 }
 
 impl SsTableWriter {
@@ -281,7 +283,7 @@ impl SsTableWriter {
         path: &Path,
         block_size: usize,
         bloom_bits_per_key: usize,
-        compression: bool,
+        compression: CompressionType,
     ) -> io::Result<Self> {
         let file = File::create(path)?;
         Ok(Self {
@@ -428,26 +430,29 @@ impl SsTableWriter {
 
         let block_offset = self.current_offset;
 
-        if self.compression {
-            let compressed = lz4_flex::compress_prepend_size(&raw_data);
-            let checksum = xxhash_rust::xxh3::xxh3_64(&compressed) as u32;
+        let (codec_byte, payload) = match self.compression {
+            CompressionType::None => (COMPRESSION_NONE, raw_data.clone()),
+            CompressionType::Lz4 => (COMPRESSION_LZ4, lz4_flex::compress_prepend_size(&raw_data)),
+            CompressionType::Snappy => {
+                let mut encoder = snap::raw::Encoder::new();
+                let compressed = encoder.compress_vec(&raw_data).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("snappy encode: {e}"))
+                })?;
+                // Prepend the original length so the reader can pre-size
+                // its decode buffer — matches `lz4_flex::compress_prepend_size`.
+                let mut framed = Vec::with_capacity(4 + compressed.len());
+                framed.extend_from_slice(&(raw_data.len() as u32).to_le_bytes());
+                framed.extend_from_slice(&compressed);
+                (COMPRESSION_SNAPPY, framed)
+            }
+        };
 
-            self.writer.write_all(&[COMPRESSION_LZ4])?;
-            self.writer.write_all(&compressed)?;
-            self.writer.write_all(&checksum.to_le_bytes())?;
-
-            let total = 1 + compressed.len() + 4;
-            self.current_offset += total as u64;
-        } else {
-            let checksum = xxhash_rust::xxh3::xxh3_64(&raw_data) as u32;
-
-            self.writer.write_all(&[COMPRESSION_NONE])?;
-            self.writer.write_all(&raw_data)?;
-            self.writer.write_all(&checksum.to_le_bytes())?;
-
-            let total = 1 + raw_data.len() + 4;
-            self.current_offset += total as u64;
-        }
+        let checksum = xxhash_rust::xxh3::xxh3_64(&payload) as u32;
+        self.writer.write_all(&[codec_byte])?;
+        self.writer.write_all(&payload)?;
+        self.writer.write_all(&checksum.to_le_bytes())?;
+        let total = 1 + payload.len() + 4;
+        self.current_offset += total as u64;
 
         let block_size = self.current_offset - block_offset;
         self.index_entries.push((
@@ -660,6 +665,25 @@ impl SsTableReader {
             COMPRESSION_NONE => compressed_data.to_vec(),
             COMPRESSION_LZ4 => lz4_flex::decompress_size_prepended(compressed_data)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?,
+            COMPRESSION_SNAPPY => {
+                if compressed_data.len() < 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "snappy block too short",
+                    ));
+                }
+                let raw_len =
+                    u32::from_le_bytes(compressed_data[0..4].try_into().unwrap()) as usize;
+                let mut decoder = snap::raw::Decoder::new();
+                let mut out = vec![0u8; raw_len];
+                let n = decoder
+                    .decompress(&compressed_data[4..], &mut out)
+                    .map_err(|e| {
+                        io::Error::new(io::ErrorKind::InvalidData, format!("snappy decode: {e}"))
+                    })?;
+                out.truncate(n);
+                out
+            }
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -705,7 +729,7 @@ mod tests {
         let cache = BlockCache::new(64 * 1024 * 1024);
 
         {
-            let mut writer = SsTableWriter::new(&path, 4096, 10, true).unwrap();
+            let mut writer = SsTableWriter::new(&path, 4096, 10, CompressionType::Lz4).unwrap();
             // Add 100 distinct user keys at seq=1 in sorted order.
             for i in 0..100 {
                 let user_key = format!("key_{:04}", i);
@@ -746,7 +770,7 @@ mod tests {
         let cache = BlockCache::new(1024 * 1024);
 
         {
-            let mut writer = SsTableWriter::new(&path, 4096, 10, false).unwrap();
+            let mut writer = SsTableWriter::new(&path, 4096, 10, CompressionType::None).unwrap();
             // Must be written in internal-key order: newest seq first.
             writer.add(&tombstone(b"k", 5), b"").unwrap();
             writer.add(&ik(b"k", 3), b"v3").unwrap();
@@ -786,7 +810,7 @@ mod tests {
         let cache = BlockCache::new(1024 * 1024);
 
         {
-            let mut writer = SsTableWriter::new(&path, 4096, 10, false).unwrap();
+            let mut writer = SsTableWriter::new(&path, 4096, 10, CompressionType::None).unwrap();
             writer.add(&ik(b"hello", 1), b"world").unwrap();
             writer.add(&ik(b"test", 1), b"data").unwrap();
             writer.finish().unwrap().unwrap();
@@ -815,7 +839,7 @@ mod tests {
         let path = dir.path().join("rt.sst");
 
         {
-            let mut writer = SsTableWriter::new(&path, 4096, 10, false).unwrap();
+            let mut writer = SsTableWriter::new(&path, 4096, 10, CompressionType::None).unwrap();
             writer.add(&ik(b"a", 1), b"v_a").unwrap();
             writer.add(&ik(b"m", 2), b"v_m").unwrap();
             writer.add(&ik(b"z", 3), b"v_z").unwrap();
@@ -843,7 +867,7 @@ mod tests {
         let path = dir.path().join("rt_only.sst");
 
         {
-            let mut writer = SsTableWriter::new(&path, 4096, 10, false).unwrap();
+            let mut writer = SsTableWriter::new(&path, 4096, 10, CompressionType::None).unwrap();
             writer.add_range_tombstone(b"aa", b"kk", 5);
             writer.add_range_tombstone(b"mm", b"zz", 7);
             let summary = writer.finish().unwrap().unwrap();

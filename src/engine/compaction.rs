@@ -111,7 +111,19 @@ pub(crate) struct CompactionOptions {
     pub(crate) target_file_size: u64,
     pub(crate) block_size: usize,
     pub(crate) bloom_bits_per_key: usize,
-    pub(crate) compression: bool,
+    pub(crate) compression: crate::options::CompressionType,
+    pub(crate) compression_per_level: Option<Vec<crate::options::CompressionType>>,
+}
+
+impl CompactionOptions {
+    /// Resolve the codec used when writing an output SSTable destined
+    /// for `level`. Mirrors `EngineOptions::compression_for_level`.
+    pub(crate) fn compression_for_level(&self, level: usize) -> crate::options::CompressionType {
+        match &self.compression_per_level {
+            Some(per_level) if level < per_level.len() => per_level[level],
+            _ => self.compression,
+        }
+    }
 }
 
 impl Default for CompactionOptions {
@@ -123,7 +135,8 @@ impl Default for CompactionOptions {
             target_file_size: DEFAULT_TARGET_FILE_SIZE,
             block_size: 16 * 1024,
             bloom_bits_per_key: 10,
-            compression: true,
+            compression: crate::options::CompressionType::Lz4,
+            compression_per_level: None,
         }
     }
 }
@@ -478,11 +491,15 @@ fn perform_compaction(
         };
 
         let path = sst_dir.join(sst_filename(file_id));
+        // Output files land at `target_level`, so pick that level's
+        // codec — this is what makes `compression_per_level` actually
+        // shape the on-disk layout as files migrate down through the
+        // tree.
         let mut writer = SsTableWriter::new(
             &path,
             opts.block_size,
             opts.bloom_bits_per_key,
-            opts.compression,
+            opts.compression_for_level(target_level),
         )?;
 
         let mut estimated_size: u64 = 0;
