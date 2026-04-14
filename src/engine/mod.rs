@@ -241,6 +241,134 @@ impl LarkEngine {
         Ok(None)
     }
 
+    /// Batched point lookup at a given snapshot. Returns one `Option<Vec<u8>>`
+    /// per input key in the same order as `keys`. Duplicate keys in the
+    /// input produce duplicate results.
+    ///
+    /// The batch amortizes per-call overhead — a single version snapshot,
+    /// a single memtable lock acquisition per level, one logical walk of
+    /// the source hierarchy — and short-circuits once every key has been
+    /// resolved. All keys see the **same** consistent view, regardless of
+    /// concurrent writers.
+    pub(crate) fn multi_get(
+        &self,
+        keys: &[&[u8]],
+        snapshot_seq: u64,
+    ) -> std::io::Result<Vec<Option<Vec<u8>>>> {
+        let mut results: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
+        // `None` = still pending, `Some(_)` = resolved (the result is
+        // already stored in `results[i]`).
+        let mut resolved: Vec<bool> = vec![false; keys.len()];
+        let mut unresolved = keys.len();
+        if unresolved == 0 {
+            return Ok(results);
+        }
+
+        // 1. Active memtable.
+        {
+            let mt = self.active_memtable.read();
+            for (i, k) in keys.iter().enumerate() {
+                if resolved[i] {
+                    continue;
+                }
+                if let Some(result) = mt.get(k, snapshot_seq) {
+                    results[i] = result;
+                    resolved[i] = true;
+                    unresolved -= 1;
+                }
+            }
+        }
+        if unresolved == 0 {
+            return Ok(results);
+        }
+
+        // 2. Frozen memtables, newest first.
+        {
+            let frozen = self.frozen_memtables.read();
+            for mt in frozen.iter().rev() {
+                for (i, k) in keys.iter().enumerate() {
+                    if resolved[i] {
+                        continue;
+                    }
+                    if let Some(result) = mt.get(k, snapshot_seq) {
+                        results[i] = result;
+                        resolved[i] = true;
+                        unresolved -= 1;
+                    }
+                }
+                if unresolved == 0 {
+                    return Ok(results);
+                }
+            }
+        }
+
+        let version = self.versions.lock().current();
+
+        // 3. L0 SSTables, newest first.
+        for file in version.levels[0].iter().rev() {
+            for (i, k) in keys.iter().enumerate() {
+                if resolved[i] {
+                    continue;
+                }
+                match file.reader.get(k, snapshot_seq, &self.cache)? {
+                    LookupResult::Found(v) => {
+                        results[i] = Some(v);
+                        resolved[i] = true;
+                        unresolved -= 1;
+                    }
+                    LookupResult::FoundTombstone => {
+                        // tombstone hides any older versions.
+                        results[i] = None;
+                        resolved[i] = true;
+                        unresolved -= 1;
+                    }
+                    LookupResult::NotInTable => {}
+                }
+            }
+            if unresolved == 0 {
+                return Ok(results);
+            }
+        }
+
+        // 4. L1..Ln: within each level files are non-overlapping, so a
+        //    single partition_point locates the at-most-one file that
+        //    could contain a given key.
+        for level in 1..version.levels.len() {
+            let files = &version.levels[level];
+            if files.is_empty() {
+                continue;
+            }
+            for (i, k) in keys.iter().enumerate() {
+                if resolved[i] {
+                    continue;
+                }
+                let idx = files.partition_point(|f| f.meta.largest_key.as_slice() < k);
+                if idx >= files.len() || files[idx].meta.smallest_key.as_slice() > *k {
+                    continue;
+                }
+                let file = &files[idx];
+                match file.reader.get(k, snapshot_seq, &self.cache)? {
+                    LookupResult::Found(v) => {
+                        results[i] = Some(v);
+                        resolved[i] = true;
+                        unresolved -= 1;
+                    }
+                    LookupResult::FoundTombstone => {
+                        results[i] = None;
+                        resolved[i] = true;
+                        unresolved -= 1;
+                    }
+                    LookupResult::NotInTable => {}
+                }
+            }
+            if unresolved == 0 {
+                return Ok(results);
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Apply a batch of writes atomically.
     pub(crate) fn apply_batch(
         &self,

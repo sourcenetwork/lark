@@ -91,6 +91,17 @@ impl Db {
         self.engine.get(key, seq).map_err(Error::Io)
     }
 
+    /// Look up a batch of keys in one call. Returns a vector with one
+    /// entry per input key (preserving order and duplicates); each entry
+    /// is `None` if the key does not exist or is tombstoned.
+    ///
+    /// All keys in a single call see the **same** consistent view — a
+    /// concurrent writer cannot make two keys disagree about visibility.
+    pub fn multi_get(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
+        let seq = self.engine.snapshot_seq();
+        self.engine.multi_get(keys, seq).map_err(Error::Io)
+    }
+
     /// Set a key-value pair.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         let mut batch = BTreeMap::new();
@@ -197,6 +208,11 @@ impl Snapshot {
     /// Get the value for a key at this snapshot.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.engine.get(key, self.seq).map_err(Error::Io)
+    }
+
+    /// Batched point lookup anchored at this snapshot.
+    pub fn multi_get(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
+        self.engine.multi_get(keys, self.seq).map_err(Error::Io)
     }
 
     /// Scan a key range at this snapshot.
@@ -681,6 +697,229 @@ mod tests {
             it.next();
         }
         assert_eq!(count, N);
+    }
+
+    // ─── MultiGet tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_multi_get_empty_batch() {
+        let (db, _dir) = open_tmp();
+        db.put(b"x", b"y").unwrap();
+        let results = db.multi_get(&[]).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_multi_get_all_hit() {
+        let (db, _dir) = open_tmp();
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        db.put(b"c", b"3").unwrap();
+
+        let keys: &[&[u8]] = &[b"a", b"b", b"c"];
+        let results = db.multi_get(keys).unwrap();
+        assert_eq!(
+            results,
+            vec![
+                Some(b"1".to_vec()),
+                Some(b"2".to_vec()),
+                Some(b"3".to_vec())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_multi_get_all_miss() {
+        let (db, _dir) = open_tmp();
+        db.put(b"a", b"1").unwrap();
+
+        let keys: &[&[u8]] = &[b"x", b"y", b"z"];
+        let results = db.multi_get(keys).unwrap();
+        assert_eq!(results, vec![None, None, None]);
+    }
+
+    #[test]
+    fn test_multi_get_mixed_hit_miss() {
+        let (db, _dir) = open_tmp();
+        db.put(b"a", b"1").unwrap();
+        db.put(b"c", b"3").unwrap();
+
+        let keys: &[&[u8]] = &[b"a", b"b", b"c", b"d"];
+        let results = db.multi_get(keys).unwrap();
+        assert_eq!(
+            results,
+            vec![Some(b"1".to_vec()), None, Some(b"3".to_vec()), None]
+        );
+    }
+
+    #[test]
+    fn test_multi_get_preserves_input_order() {
+        let (db, _dir) = open_tmp();
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        db.put(b"c", b"3").unwrap();
+
+        // Reverse order input.
+        let keys: &[&[u8]] = &[b"c", b"a", b"b"];
+        let results = db.multi_get(keys).unwrap();
+        assert_eq!(
+            results,
+            vec![
+                Some(b"3".to_vec()),
+                Some(b"1".to_vec()),
+                Some(b"2".to_vec())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_multi_get_duplicates_in_input() {
+        let (db, _dir) = open_tmp();
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+
+        let keys: &[&[u8]] = &[b"a", b"b", b"a", b"missing", b"a"];
+        let results = db.multi_get(keys).unwrap();
+        assert_eq!(
+            results,
+            vec![
+                Some(b"1".to_vec()),
+                Some(b"2".to_vec()),
+                Some(b"1".to_vec()),
+                None,
+                Some(b"1".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_multi_get_honors_tombstones() {
+        let (db, _dir) = open_tmp();
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        db.put(b"c", b"3").unwrap();
+        db.delete(b"b").unwrap();
+
+        let keys: &[&[u8]] = &[b"a", b"b", b"c"];
+        let results = db.multi_get(keys).unwrap();
+        assert_eq!(
+            results,
+            vec![Some(b"1".to_vec()), None, Some(b"3".to_vec())]
+        );
+    }
+
+    #[test]
+    fn test_multi_get_tombstone_hides_older_level_entry() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        db.put(b"keep", b"v").unwrap();
+        db.put(b"gone", b"v").unwrap();
+        force_flush(&db, "x");
+        db.delete(b"gone").unwrap();
+
+        let keys: &[&[u8]] = &[b"keep", b"gone"];
+        let results = db.multi_get(keys).unwrap();
+        assert_eq!(results, vec![Some(b"v".to_vec()), None]);
+    }
+
+    #[test]
+    fn test_multi_get_spans_memtable_and_l0() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        db.put(b"from_l0_1", b"v1").unwrap();
+        db.put(b"from_l0_2", b"v2").unwrap();
+        force_flush(&db, "x");
+
+        db.put(b"from_mem_1", b"v3").unwrap();
+        db.put(b"from_mem_2", b"v4").unwrap();
+
+        let keys: &[&[u8]] = &[b"from_mem_1", b"from_l0_1", b"from_mem_2", b"from_l0_2"];
+        let results = db.multi_get(keys).unwrap();
+        assert_eq!(
+            results,
+            vec![
+                Some(b"v3".to_vec()),
+                Some(b"v1".to_vec()),
+                Some(b"v4".to_vec()),
+                Some(b"v2".to_vec())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_multi_get_snapshot_isolation() {
+        let (db, _dir) = open_tmp();
+        db.put(b"a", b"a1").unwrap();
+        db.put(b"b", b"b1").unwrap();
+
+        let snap = db.snapshot();
+
+        db.put(b"a", b"a2").unwrap();
+        db.put(b"c", b"c1").unwrap();
+        db.delete(b"b").unwrap();
+
+        let keys: &[&[u8]] = &[b"a", b"b", b"c"];
+        let results = snap.multi_get(keys).unwrap();
+        assert_eq!(
+            results,
+            vec![Some(b"a1".to_vec()), Some(b"b1".to_vec()), None],
+        );
+    }
+
+    #[test]
+    fn test_multi_get_consistency_with_get() {
+        // For any batch, multi_get must return the same results as a
+        // loop of individual get calls at the same snapshot.
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        for i in 0..500 {
+            let k = format!("k{:04}", i);
+            db.put(k.as_bytes(), format!("v{}", i).as_bytes()).unwrap();
+        }
+        // Delete some.
+        for i in (0..500).step_by(7) {
+            let k = format!("k{:04}", i);
+            db.delete(k.as_bytes()).unwrap();
+        }
+
+        // Snapshot so individual gets and multi_get see the same thing.
+        let snap = db.snapshot();
+
+        let keys_owned: Vec<String> = (0..500)
+            .step_by(3)
+            .map(|i| format!("k{:04}", i))
+            .chain(std::iter::once("missing_key".to_string()))
+            .collect();
+        let keys: Vec<&[u8]> = keys_owned.iter().map(|s| s.as_bytes()).collect();
+
+        let individual: Vec<_> = keys.iter().map(|k| snap.get(k).unwrap()).collect();
+        let batched = snap.multi_get(&keys).unwrap();
+
+        assert_eq!(individual, batched);
+        assert_eq!(individual.len(), keys.len());
+    }
+
+    #[test]
+    fn test_multi_get_large_batch_after_flush() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        const N: usize = 2_000;
+        for i in 0..N {
+            let k = format!("key_{:05}", i);
+            db.put(k.as_bytes(), b"v").unwrap();
+        }
+
+        let keys_owned: Vec<String> = (0..N).map(|i| format!("key_{:05}", i)).collect();
+        let keys: Vec<&[u8]> = keys_owned.iter().map(|s| s.as_bytes()).collect();
+        let results = db.multi_get(&keys).unwrap();
+        assert_eq!(results.len(), N);
+        for r in &results {
+            assert_eq!(r.as_deref(), Some(b"v".as_ref()));
+        }
     }
 
     // ─── Reverse iteration tests ─────────────────────────────────────────
