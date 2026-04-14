@@ -49,7 +49,7 @@ mod options;
 
 pub use error::Error;
 pub use iter::Iter;
-pub use options::{DurabilityMode, Options};
+pub use options::{CompressionType, DurabilityMode, Options};
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -1917,5 +1917,134 @@ mod tests {
             assert_eq!(db.get(&[c]).unwrap(), None, "key {} deleted", c as char);
         }
         assert_eq!(db.get(b"h").unwrap(), Some(b"h".to_vec()));
+    }
+
+    // ── compression codecs ──────────────────────────────────────────────────
+
+    fn compression_opts(codec: CompressionType) -> Options {
+        Options {
+            write_buffer_size: 4 * 1024,
+            compression: codec,
+            ..Options::default()
+        }
+    }
+
+    fn write_and_read_back(opts: Options) {
+        let dir = TempDir::new().unwrap();
+        let payload: Vec<u8> = (0..256).map(|i| (i % 31) as u8).collect();
+        {
+            let db = Db::open(dir.path(), opts.clone()).unwrap();
+            for i in 0..200 {
+                let key = format!("key_{:04}", i);
+                db.put(key.as_bytes(), &payload).unwrap();
+            }
+            // Force a flush so reads must go through the SSTable codec path.
+            force_flush(&db, "comp");
+            for i in 0..200 {
+                let key = format!("key_{:04}", i);
+                assert_eq!(
+                    db.get(key.as_bytes()).unwrap().as_deref(),
+                    Some(payload.as_slice()),
+                    "round-trip failed for {key}"
+                );
+            }
+            db.close().unwrap();
+        }
+        // Reopen to verify the on-disk codec is decoded correctly by a
+        // fresh reader.
+        let db = Db::open(dir.path(), opts).unwrap();
+        for i in 0..200 {
+            let key = format!("key_{:04}", i);
+            assert_eq!(
+                db.get(key.as_bytes()).unwrap().as_deref(),
+                Some(payload.as_slice())
+            );
+        }
+    }
+
+    #[test]
+    fn test_compression_none_roundtrip() {
+        write_and_read_back(compression_opts(CompressionType::None));
+    }
+
+    #[test]
+    fn test_compression_lz4_roundtrip() {
+        write_and_read_back(compression_opts(CompressionType::Lz4));
+    }
+
+    #[test]
+    fn test_compression_snappy_roundtrip() {
+        write_and_read_back(compression_opts(CompressionType::Snappy));
+    }
+
+    #[test]
+    fn test_compression_per_level_mixed_codecs() {
+        // L0 = Snappy, L1+ = Lz4. After a flush + manual compaction the
+        // database must hold blocks compressed with both codecs and
+        // still read back correctly.
+        let dir = TempDir::new().unwrap();
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            compression: CompressionType::Lz4,
+            compression_per_level: Some(vec![
+                CompressionType::Snappy, // L0
+                CompressionType::Lz4,    // L1
+                CompressionType::None,   // L2 (unused here, just to exercise the slot)
+            ]),
+            ..Options::default()
+        };
+        let payload: Vec<u8> = (0..256).map(|i| (i % 17) as u8).collect();
+        {
+            let db = Db::open(dir.path(), opts.clone()).unwrap();
+            for i in 0..300 {
+                let key = format!("k_{:04}", i);
+                db.put(key.as_bytes(), &payload).unwrap();
+            }
+            force_flush(&db, "mix");
+            // Push everything down to L1 with the manual compaction path.
+            db.compact_range(None, None).unwrap();
+            for i in 0..300 {
+                let key = format!("k_{:04}", i);
+                assert_eq!(
+                    db.get(key.as_bytes()).unwrap().as_deref(),
+                    Some(payload.as_slice())
+                );
+            }
+            db.close().unwrap();
+        }
+        // Reopen and re-read so the test exercises a fresh reader
+        // hitting both codecs through the level layout we just built.
+        let db = Db::open(dir.path(), opts).unwrap();
+        for i in 0..300 {
+            let key = format!("k_{:04}", i);
+            assert_eq!(
+                db.get(key.as_bytes()).unwrap().as_deref(),
+                Some(payload.as_slice())
+            );
+        }
+    }
+
+    #[test]
+    fn test_compression_per_level_falls_back_to_default() {
+        // Override only L0; L1+ should fall back to `compression`.
+        let dir = TempDir::new().unwrap();
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            compression: CompressionType::Snappy,
+            compression_per_level: Some(vec![CompressionType::None]),
+            ..Options::default()
+        };
+        let db = Db::open(dir.path(), opts).unwrap();
+        for i in 0..50 {
+            db.put(format!("k_{i:03}").as_bytes(), b"v").unwrap();
+        }
+        force_flush(&db, "fb");
+        db.compact_range(None, None).unwrap();
+        for i in 0..50 {
+            assert_eq!(
+                db.get(format!("k_{i:03}").as_bytes()).unwrap(),
+                Some(b"v".to_vec())
+            );
+        }
     }
 }

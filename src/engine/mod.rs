@@ -40,11 +40,24 @@ pub(crate) struct EngineOptions {
     pub(crate) block_size: usize,
     pub(crate) block_cache_size: usize,
     pub(crate) bloom_bits_per_key: usize,
-    pub(crate) compression: bool,
+    pub(crate) compression: crate::options::CompressionType,
+    pub(crate) compression_per_level: Option<Vec<crate::options::CompressionType>>,
     pub(crate) l0_compaction_trigger: usize,
     pub(crate) level_base_bytes: u64,
     pub(crate) level_size_multiplier: u64,
     pub(crate) target_file_size: u64,
+}
+
+impl EngineOptions {
+    /// Resolve the codec to use when writing an SSTable destined for
+    /// `level`. A per-level override (if any) wins; otherwise fall
+    /// back to the default codec.
+    pub(crate) fn compression_for_level(&self, level: usize) -> crate::options::CompressionType {
+        match &self.compression_per_level {
+            Some(per_level) if level < per_level.len() => per_level[level],
+            _ => self.compression,
+        }
+    }
 }
 
 impl Default for EngineOptions {
@@ -54,7 +67,8 @@ impl Default for EngineOptions {
             block_size: 16 * 1024,
             block_cache_size: 512 * 1024 * 1024,
             bloom_bits_per_key: 10,
-            compression: true,
+            compression: crate::options::CompressionType::Lz4,
+            compression_per_level: None,
             l0_compaction_trigger: compaction::L0_COMPACTION_TRIGGER,
             level_base_bytes: compaction::DEFAULT_LEVEL_BASE_BYTES,
             level_size_multiplier: compaction::LEVEL_SIZE_MULTIPLIER,
@@ -158,6 +172,7 @@ impl LarkEngine {
             block_size: options.block_size,
             bloom_bits_per_key: options.bloom_bits_per_key,
             compression: options.compression,
+            compression_per_level: options.compression_per_level.clone(),
         };
 
         let compaction_lock = Arc::new(Mutex::new(()));
@@ -620,11 +635,12 @@ impl LarkEngine {
 
         let sst_path = self.sst_dir.join(sst_filename(file_id));
 
+        // Memtable flushes always land at L0 — pick L0's codec.
         let mut writer = SsTableWriter::new(
             &sst_path,
             self.options.block_size,
             self.options.bloom_bits_per_key,
-            self.options.compression,
+            self.options.compression_for_level(0),
         )?;
 
         // Walk the memtable in internal-key order and copy every version
@@ -728,6 +744,7 @@ impl LarkEngine {
             block_size: self.options.block_size,
             bloom_bits_per_key: self.options.bloom_bits_per_key,
             compression: self.options.compression,
+            compression_per_level: self.options.compression_per_level.clone(),
         };
         compaction::run_compact_range(
             &self.versions,
