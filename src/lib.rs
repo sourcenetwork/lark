@@ -51,7 +51,8 @@ mod ttl;
 pub use error::Error;
 pub use iter::Iter;
 pub use options::{
-    CompactionDecision, CompactionFilter, CompressionType, DurabilityMode, Options, WriteOptions,
+    CompactionDecision, CompactionFilter, CompressionType, DurabilityMode, FixedLengthPrefix,
+    Options, PrefixExtractor, WriteOptions,
 };
 pub use ttl::{strip_timestamp, DbWithTtl, TtlCompactionFilter};
 
@@ -2284,6 +2285,149 @@ mod tests {
                 c as char
             );
         }
+    }
+
+    fn prefix_opts() -> Options {
+        Options {
+            write_buffer_size: 4 * 1024,
+            prefix_extractor: Some(std::sync::Arc::new(FixedLengthPrefix(10))),
+            ..Options::default()
+        }
+    }
+
+    #[test]
+    fn test_seek_prefix_basic() {
+        let (db, _dir) = open_tmp();
+        db.put(b"tenant_001:k1", b"1").unwrap();
+        db.put(b"tenant_001:k2", b"2").unwrap();
+        db.put(b"tenant_002:k1", b"3").unwrap();
+        db.put(b"tenant_010:k1", b"4").unwrap();
+
+        let mut it = db.iter();
+        it.seek_prefix(b"tenant_001");
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        while it.valid() {
+            got.push((it.key().unwrap().to_vec(), it.value().unwrap().to_vec()));
+            it.next();
+        }
+        assert_eq!(
+            got,
+            vec![
+                (b"tenant_001:k1".to_vec(), b"1".to_vec()),
+                (b"tenant_001:k2".to_vec(), b"2".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_seek_prefix_absent_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), prefix_opts()).unwrap();
+        for i in 0..200 {
+            let key = format!("tenant_001:k{:04}", i);
+            db.put(key.as_bytes(), b"v").unwrap();
+        }
+        force_flush(&db, "p");
+
+        let mut it = db.iter();
+        it.seek_prefix(b"tenant_999");
+        assert!(!it.valid(), "expected no keys under an absent prefix");
+    }
+
+    #[test]
+    fn test_seek_prefix_across_flush_boundary() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), prefix_opts()).unwrap();
+
+        // First generation → flushed to L0.
+        db.put(b"tenant_001:a", b"1a").unwrap();
+        db.put(b"tenant_002:a", b"2a").unwrap();
+        force_flush(&db, "p1");
+
+        // Second generation → stays in memtable at iteration time.
+        db.put(b"tenant_001:b", b"1b").unwrap();
+        db.put(b"tenant_002:b", b"2b").unwrap();
+
+        let mut it = db.iter();
+        it.seek_prefix(b"tenant_001");
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        while it.valid() {
+            keys.push(it.key().unwrap().to_vec());
+            it.next();
+        }
+        assert_eq!(
+            keys,
+            vec![b"tenant_001:a".to_vec(), b"tenant_001:b".to_vec()]
+        );
+    }
+
+    #[test]
+    fn test_seek_prefix_after_compact_range() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), prefix_opts()).unwrap();
+
+        for i in 0..50 {
+            db.put(format!("tenant_001:{:04}", i).as_bytes(), b"v")
+                .unwrap();
+            db.put(format!("tenant_002:{:04}", i).as_bytes(), b"v")
+                .unwrap();
+        }
+        force_flush(&db, "c1");
+        db.compact_range(None, None).unwrap();
+
+        let mut it = db.iter();
+        it.seek_prefix(b"tenant_002");
+        let mut count = 0;
+        while it.valid() {
+            let k = it.key().unwrap();
+            assert!(
+                k.starts_with(b"tenant_002"),
+                "got unexpected key {:?}",
+                std::str::from_utf8(k).unwrap_or("<non-utf8>")
+            );
+            count += 1;
+            it.next();
+        }
+        assert_eq!(count, 50);
+    }
+
+    #[test]
+    fn test_seek_prefix_mixed_with_without_extractor() {
+        // Open with no extractor, flush some data (file A has no prefix
+        // bloom), then reopen with an extractor and write new data
+        // (file B has a prefix bloom). Reads through the extractor-
+        // configured DB must still return correct results across both
+        // files.
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Db::open(
+                dir.path(),
+                Options {
+                    write_buffer_size: 4 * 1024,
+                    ..Options::default()
+                },
+            )
+            .unwrap();
+            db.put(b"tenant_001:old", b"old").unwrap();
+            force_flush(&db, "a");
+        }
+
+        let db = Db::open(dir.path(), prefix_opts()).unwrap();
+        db.put(b"tenant_001:new", b"new").unwrap();
+        db.put(b"tenant_002:new", b"new").unwrap();
+        force_flush(&db, "b");
+
+        let mut it = db.iter();
+        it.seek_prefix(b"tenant_001");
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        while it.valid() {
+            keys.push(it.key().unwrap().to_vec());
+            it.next();
+        }
+        assert_eq!(
+            keys,
+            vec![b"tenant_001:new".to_vec(), b"tenant_001:old".to_vec()]
+        );
     }
 
     #[test]

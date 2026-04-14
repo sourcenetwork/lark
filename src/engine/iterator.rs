@@ -67,6 +67,7 @@ use super::manifest::Version;
 use super::memtable::MemTable;
 use super::range_tombstone::{max_covering_seq, RangeTombstone};
 use super::sstable::SsTableReader;
+use crate::options::PrefixExtractor;
 
 /// Scan direction for [`LarkIterator`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +121,26 @@ impl LevelIter {
                 Ok(())
             }
             Self::SsTable(it) => it.seek(target),
+        }
+    }
+
+    /// Like [`seek`], but additionally consults the underlying
+    /// SSTable's prefix bloom filter (when present) and leaves the
+    /// level iterator empty if the file cannot contain any key with
+    /// the given prefix. Memtable levels always perform a normal seek.
+    fn seek_with_prefix_skip(&mut self, target: &[u8], prefix: &[u8]) -> io::Result<()> {
+        match self {
+            Self::Memtable(it) => {
+                it.seek(target);
+                Ok(())
+            }
+            Self::SsTable(it) => {
+                if !it.reader.may_have_prefix(prefix) {
+                    it.curr = None;
+                    return Ok(());
+                }
+                it.seek(target)
+            }
         }
     }
 
@@ -448,6 +469,14 @@ impl MergingIter {
         Ok(())
     }
 
+    fn seek_with_prefix_skip(&mut self, target: &[u8], prefix: &[u8]) -> io::Result<()> {
+        for lvl in &mut self.levels {
+            lvl.seek_with_prefix_skip(target, prefix)?;
+        }
+        self.pick_smallest();
+        Ok(())
+    }
+
     fn seek_for_prev(&mut self, target: &[u8]) -> io::Result<()> {
         // For seek_for_prev, each level positions at the largest key ≤
         // target, and the merging step picks the *largest* across all
@@ -548,6 +577,35 @@ pub(crate) struct LarkIterator {
     /// Sticky error from the most recent I/O attempt, if any. Cleared on
     /// the next successful seek.
     error: Option<io::Error>,
+    /// Exclusive upper bound set by [`LarkIterator::seek_prefix`]. When
+    /// `Some`, forward iteration stops as soon as the next visible key
+    /// is `>= upper_bound`, confining the scan to the originally seeked
+    /// prefix. Cleared by any other seek.
+    upper_bound: Option<Vec<u8>>,
+    /// Prefix extractor captured at construction. Used by
+    /// [`LarkIterator::seek_prefix`] to decide whether the caller's
+    /// query prefix is a valid extracted prefix (in which case the
+    /// per-SSTable prefix bloom can be consulted) or an arbitrary
+    /// byte string (in which case we fall back to a plain upper-bound
+    /// scan without bloom skipping).
+    prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
+}
+
+/// Compute the exclusive upper bound of all keys that start with
+/// `prefix`: the shortest byte string strictly greater than every
+/// `prefix || ...` key. Returns `None` if `prefix` is empty or
+/// consists entirely of `0xff` bytes, in which case every key `>=
+/// prefix` is in-bounds.
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut out = prefix.to_vec();
+    while let Some(last) = out.last_mut() {
+        if *last != 0xff {
+            *last += 1;
+            return Some(out);
+        }
+        out.pop();
+    }
+    None
 }
 
 impl LarkIterator {
@@ -563,6 +621,7 @@ impl LarkIterator {
         version: Arc<Version>,
         cache: Arc<BlockCache>,
         snapshot_seq: u64,
+        prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
     ) -> Self {
         let mut levels: Vec<LevelIter> = Vec::new();
         let mut range_tombstones: Vec<RangeTombstone> = Vec::new();
@@ -600,6 +659,8 @@ impl LarkIterator {
             range_tombstones,
             _version: version,
             error: None,
+            upper_bound: None,
+            prefix_extractor,
         }
     }
 
@@ -615,6 +676,7 @@ impl LarkIterator {
     pub(crate) fn seek_to_first(&mut self) {
         self.error = None;
         self.curr_user = None;
+        self.upper_bound = None;
         self.direction = Direction::Forward;
         if let Err(e) = self.inner.seek_to_first() {
             self.error = Some(e);
@@ -626,6 +688,7 @@ impl LarkIterator {
     pub(crate) fn seek_to_last(&mut self) {
         self.error = None;
         self.curr_user = None;
+        self.upper_bound = None;
         self.direction = Direction::Reverse;
         if let Err(e) = self.inner.seek_to_last() {
             self.error = Some(e);
@@ -637,6 +700,7 @@ impl LarkIterator {
     pub(crate) fn seek(&mut self, target: &[u8]) {
         self.error = None;
         self.curr_user = None;
+        self.upper_bound = None;
         self.direction = Direction::Forward;
         // Smallest internal key for `target` at any seq: `target || !u64::MAX || 0`.
         // This positions the merging iterator at the newest version of the
@@ -652,6 +716,7 @@ impl LarkIterator {
     pub(crate) fn seek_for_prev(&mut self, target: &[u8]) {
         self.error = None;
         self.curr_user = None;
+        self.upper_bound = None;
         self.direction = Direction::Reverse;
         // Reverse-seek to the largest internal key ≤ `target`. Probe with
         // `above_all_versions(target)` so `seek_for_prev` lands at the
@@ -665,6 +730,41 @@ impl LarkIterator {
             return;
         }
         self.materialize_prev_visible();
+    }
+
+    /// Position the iterator at the first user key `>= prefix` and
+    /// confine forward iteration to keys that start with `prefix`. When
+    /// the underlying SSTables have a matching prefix bloom filter,
+    /// files that demonstrably cannot contain `prefix` are skipped
+    /// entirely; files built without a prefix bloom are consulted
+    /// normally (safe superset).
+    pub(crate) fn seek_prefix(&mut self, prefix: &[u8]) {
+        self.error = None;
+        self.curr_user = None;
+        self.direction = Direction::Forward;
+        self.upper_bound = prefix_upper_bound(prefix);
+
+        // Only consult per-SSTable prefix blooms when the caller's
+        // query prefix is itself a valid extracted prefix — otherwise
+        // the bloom was hashed with different inputs and a negative
+        // answer is meaningless. Fall back to a plain seek + upper
+        // bound walk.
+        let can_skip = match &self.prefix_extractor {
+            Some(ex) => matches!(ex.extract(prefix), Some(p) if p == prefix),
+            None => false,
+        };
+
+        let search_key = lookup_key(prefix, u64::MAX);
+        let res = if can_skip {
+            self.inner.seek_with_prefix_skip(&search_key, prefix)
+        } else {
+            self.inner.seek(&search_key)
+        };
+        if let Err(e) = res {
+            self.error = Some(e);
+            return;
+        }
+        self.materialize_next_visible();
     }
 
     pub(crate) fn next(&mut self) {
@@ -720,6 +820,16 @@ impl LarkIterator {
                 return;
             };
             let (uk, seq, vt) = decode_internal_key(ik);
+
+            // Prefix-bounded scan: once we reach a user key at or past
+            // the upper bound we're done. Bound is exclusive — a key
+            // equal to `upper_bound` is already outside the prefix.
+            if let Some(ub) = self.upper_bound.as_deref() {
+                if uk >= ub {
+                    self.curr_user = None;
+                    return;
+                }
+            }
 
             if seq > self.snapshot_seq {
                 // Invisible at this snapshot. Skip this single entry and
