@@ -31,7 +31,14 @@ pub(crate) struct CompactionScheduler {
 
 impl CompactionScheduler {
     /// Start the background compaction thread.
+    ///
+    /// `compaction_lock` is the engine-wide mutex that serializes
+    /// background compactions with any foreground caller of
+    /// [`run_compact_range`] — acquiring it around every compaction pass
+    /// ensures both paths don't try to pick overlapping input sets or
+    /// double-delete the same file.
     pub(crate) fn start(
+        compaction_lock: Arc<parking_lot::Mutex<()>>,
         versions: Arc<parking_lot::Mutex<VersionSet>>,
         sst_dir: Arc<Path>,
         cache: Arc<BlockCache>,
@@ -49,6 +56,7 @@ impl CompactionScheduler {
                 compaction_loop(
                     shutdown_clone,
                     trigger_clone,
+                    compaction_lock,
                     versions,
                     sst_dir,
                     cache,
@@ -116,6 +124,7 @@ impl Default for CompactionOptions {
 fn compaction_loop(
     shutdown: Arc<AtomicBool>,
     trigger: Arc<(Mutex<bool>, Condvar)>,
+    compaction_lock: Arc<parking_lot::Mutex<()>>,
     versions: Arc<parking_lot::Mutex<VersionSet>>,
     sst_dir: Arc<Path>,
     cache: Arc<BlockCache>,
@@ -137,13 +146,19 @@ fn compaction_loop(
             break;
         }
 
-        // Check if compaction is needed
+        // Drive compactions until there's nothing to do. Each pass
+        // acquires `compaction_lock` so a foreground `compact_range`
+        // caller can interleave cleanly — foreground grabs the lock
+        // for the duration of its walk and we block until it's done.
         loop {
-            let did_work = match pick_and_run_compaction(&versions, &sst_dir, &cache, &opts) {
-                Ok(did_work) => did_work,
-                Err(e) => {
-                    tracing::error!(error = %e, "Compaction failed");
-                    false
+            let did_work = {
+                let _guard = compaction_lock.lock();
+                match pick_and_run_compaction(&versions, &sst_dir, &cache, &opts) {
+                    Ok(did_work) => did_work,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Compaction failed");
+                        false
+                    }
                 }
             };
 
@@ -196,7 +211,9 @@ fn compact_l0(
     compact_level(versions, sst_dir, cache, opts, 0)
 }
 
-/// Compact a level into the next level.
+/// Compact a level into the next level using the standard size-based
+/// heuristic (all L0 files, or the first file of L1+). Used by the
+/// background scheduler.
 fn compact_level(
     versions: &Arc<parking_lot::Mutex<VersionSet>>,
     sst_dir: &Path,
@@ -229,6 +246,101 @@ fn compact_level(
         (picked, overlapping)
     };
 
+    perform_compaction(
+        versions,
+        sst_dir,
+        cache,
+        opts,
+        level,
+        input_files,
+        overlap_files,
+    )?;
+    Ok(true)
+}
+
+/// Run a manual `compact_range` pass synchronously: for every level from
+/// 0 down to MAX_LEVELS-2, pick the files overlapping `[start, end)` and
+/// push them down to the next level. Returns once no level has any more
+/// files in the range that can be pushed down.
+///
+/// Callers must hold the engine-wide compaction lock so the background
+/// scheduler can't pick an overlapping input set concurrently.
+pub(crate) fn run_compact_range(
+    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    sst_dir: &Path,
+    cache: &BlockCache,
+    opts: &CompactionOptions,
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+) -> std::io::Result<()> {
+    for level in 0..MAX_LEVELS - 1 {
+        loop {
+            let version = versions.lock().current();
+            let files = &version.levels[level];
+            if files.is_empty() {
+                break;
+            }
+
+            // At L0 files overlap each other, so picking any file that
+            // intersects the range drags in every other L0 file it
+            // overlaps — simplest correct move: take every L0 file
+            // that intersects the range in one shot.
+            //
+            // At L1+ files are non-overlapping, so we can pick them
+            // one at a time.
+            let inputs: Vec<Arc<LiveSst>> = if level == 0 {
+                files
+                    .iter()
+                    .filter(|f| file_overlaps_range(f, start, end))
+                    .map(Arc::clone)
+                    .collect()
+            } else {
+                files
+                    .iter()
+                    .find(|f| file_overlaps_range(f, start, end))
+                    .map(Arc::clone)
+                    .into_iter()
+                    .collect()
+            };
+
+            if inputs.is_empty() {
+                break;
+            }
+
+            let (min_key, max_key) = key_range(&inputs);
+            let target_level = level + 1;
+            let overlap_files = find_overlapping(&version.levels[target_level], &min_key, &max_key);
+
+            perform_compaction(versions, sst_dir, cache, opts, level, inputs, overlap_files)?;
+
+            // At L0 we handled every range-overlapping file in one
+            // shot, so we're done with this level.
+            if level == 0 {
+                break;
+            }
+            // At L1+, loop again to pick the next file in the range,
+            // if any.
+        }
+    }
+    Ok(())
+}
+
+/// Inner body of a compaction: read the merged entries from
+/// `input_files` + `overlap_files`, write new output SSTables at
+/// `target_level`, and atomically apply the version edit (Remove old
+/// files, Add new ones). File descriptors of old files stay alive via
+/// any `Arc<LiveSst>` still referenced by older versions / iterators.
+fn perform_compaction(
+    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    sst_dir: &Path,
+    cache: &BlockCache,
+    opts: &CompactionOptions,
+    level: usize,
+    input_files: Vec<Arc<LiveSst>>,
+    overlap_files: Vec<Arc<LiveSst>>,
+) -> std::io::Result<()> {
+    let target_level = level + 1;
+
     // Read all input entries as raw internal-key / value pairs so every
     // version and tombstone is preserved through the merge. Readers are
     // already open in the pinned version — no fresh `File::open`.
@@ -260,7 +372,7 @@ fn compact_level(
     if all_entries.is_empty() {
         versions.lock().apply(&edits)?;
         delete_old_files(sst_dir, &input_files, &overlap_files, cache);
-        return Ok(true);
+        return Ok(());
     }
 
     // Split output across multiple SSTables at user-key boundaries so that
@@ -269,12 +381,13 @@ fn compact_level(
     let mut chunk_start = 0;
     while chunk_start < all_entries.len() {
         // Allocate the output file_id atomically from the *current*
-        // version inside `versions.lock()` — same pattern `flush_frozen_memtable`
-        // uses. Using the `next_file_id` captured earlier in this
-        // function would race with a concurrent flush that advances the
-        // counter on the current version; both paths would then pick
-        // the same id and the second `File::create(path)` would
-        // truncate the first path's newly written file.
+        // version inside `versions.lock()` — same pattern
+        // `flush_frozen_memtable` uses. Using a captured
+        // `version.next_file_id` would race with a concurrent flush
+        // that advances the counter on the current version; both
+        // paths would then pick the same id and the second
+        // `File::create(path)` would truncate the first path's newly
+        // written file.
         let file_id = {
             let mut guard = versions.lock();
             let current = guard.current();
@@ -355,7 +468,23 @@ fn compact_level(
         "Compaction completed"
     );
 
-    Ok(true)
+    Ok(())
+}
+
+/// Whether a file's user-key range intersects `[start, end)`. `None`
+/// bounds are treated as unbounded.
+fn file_overlaps_range(file: &Arc<LiveSst>, start: Option<&[u8]>, end: Option<&[u8]>) -> bool {
+    if let Some(s) = start {
+        if file.meta.largest_key.as_slice() < s {
+            return false;
+        }
+    }
+    if let Some(e) = end {
+        if file.meta.smallest_key.as_slice() >= e {
+            return false;
+        }
+    }
+    true
 }
 
 fn key_range(files: &[Arc<LiveSst>]) -> (Vec<u8>, Vec<u8>) {

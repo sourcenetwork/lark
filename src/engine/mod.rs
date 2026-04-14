@@ -72,6 +72,13 @@ pub(crate) struct LarkEngine {
     sst_dir: PathBuf,
     wal_dir: PathBuf,
     compaction: Mutex<CompactionScheduler>,
+    /// Engine-wide mutex that serializes every compaction pass —
+    /// background and foreground — so two compactions can't pick
+    /// overlapping input sets and double-delete files out from under
+    /// each other. Held around each `pick_and_run_compaction` call in
+    /// the background scheduler, and around the whole
+    /// [`LarkEngine::compact_range`] walk in the foreground path.
+    compaction_lock: Arc<Mutex<()>>,
     options: EngineOptions,
     write_lock: Mutex<()>,
 }
@@ -140,7 +147,9 @@ impl LarkEngine {
             compression: options.compression,
         };
 
+        let compaction_lock = Arc::new(Mutex::new(()));
         let compaction = CompactionScheduler::start(
+            Arc::clone(&compaction_lock),
             Arc::clone(&versions),
             Arc::from(sst_dir.as_path()),
             Arc::clone(&cache),
@@ -158,6 +167,7 @@ impl LarkEngine {
             sst_dir,
             wal_dir,
             compaction: Mutex::new(compaction),
+            compaction_lock,
             options,
             write_lock: Mutex::new(()),
         });
@@ -536,6 +546,54 @@ impl LarkEngine {
         Ok(())
     }
 
+    /// Synchronously compact SSTables overlapping the user-key range
+    /// `[start, end)` down to the bottommost non-empty level.
+    ///
+    /// - Flushes the active memtable first so any matching in-memory
+    ///   data reaches L0 before compaction picks inputs.
+    /// - Acquires the engine-wide compaction lock so the background
+    ///   scheduler can't pick an overlapping input set concurrently.
+    /// - Walks levels 0..MAX_LEVELS-1, picking range-overlapping files
+    ///   and merging them into the next level.
+    pub(crate) fn compact_range(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> std::io::Result<()> {
+        // 1. Flush the active memtable so any in-memory data that
+        //    overlaps the range is materialized in L0. We only touch
+        //    the write lock if there's actually data to flush.
+        if !self.active_memtable.read().is_empty() {
+            let _write_guard = self.write_lock.lock();
+            if !self.active_memtable.read().is_empty() {
+                self.rotate_memtable()?;
+            }
+        }
+
+        // 2. Serialize with background compaction for the duration of
+        //    the range walk.
+        let _compact_guard = self.compaction_lock.lock();
+
+        // 3. Run the level-by-level push-down.
+        let compaction_opts = compaction::CompactionOptions {
+            l0_compaction_trigger: self.options.l0_compaction_trigger,
+            level_base_bytes: self.options.level_base_bytes,
+            level_size_multiplier: self.options.level_size_multiplier,
+            target_file_size: self.options.target_file_size,
+            block_size: self.options.block_size,
+            bloom_bits_per_key: self.options.bloom_bits_per_key,
+            compression: self.options.compression,
+        };
+        compaction::run_compact_range(
+            &self.versions,
+            &self.sst_dir,
+            &self.cache,
+            &compaction_opts,
+            start,
+            end,
+        )
+    }
+
     /// Drop all data in the engine.
     pub(crate) fn drop_all(&self) -> std::io::Result<()> {
         let _write_guard = self.write_lock.lock();
@@ -590,6 +648,28 @@ impl LarkEngine {
         self.latest_seq.store(0, Ordering::Release);
 
         Ok(())
+    }
+
+    /// Test-only: whether the active memtable currently holds any
+    /// entries. Used by `compact_range` tests to verify that the
+    /// memtable was flushed to L0 as part of the range walk.
+    #[cfg(test)]
+    pub(crate) fn active_memtable_is_empty(&self) -> bool {
+        self.active_memtable.read().is_empty()
+    }
+
+    /// Test-only: number of SSTable files at `level` in the current
+    /// version.
+    #[cfg(test)]
+    pub(crate) fn level_file_count(&self, level: usize) -> usize {
+        self.versions.lock().current().levels[level].len()
+    }
+
+    /// Test-only: total number of SSTable files across every level.
+    #[cfg(test)]
+    pub(crate) fn total_file_count(&self) -> usize {
+        let v = self.versions.lock().current();
+        v.levels.iter().map(|level| level.len()).sum()
     }
 
     /// Flush all data to disk and shut down background threads.
