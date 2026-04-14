@@ -48,7 +48,7 @@ let results = db.scan(Some(b"a"), Some(b"z"))?;
 ## Architecture
 
 ```
-                    ┌─────────────┐
+                   ┌──────────────┐
          writes ──>│  MemTable    │──> reads
                    │ (skip list)  │
                    └──────┬───────┘
