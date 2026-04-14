@@ -107,7 +107,7 @@ impl Db {
         let mut batch = BTreeMap::new();
         batch.insert(key.to_vec(), Some(value.to_vec()));
         self.engine
-            .apply_batch(batch, self.durability)
+            .apply_batch(batch, Vec::new(), self.durability)
             .map_err(Error::Io)
     }
 
@@ -116,17 +116,39 @@ impl Db {
         let mut batch = BTreeMap::new();
         batch.insert(key.to_vec(), None);
         self.engine
-            .apply_batch(batch, self.durability)
+            .apply_batch(batch, Vec::new(), self.durability)
+            .map_err(Error::Io)
+    }
+
+    /// Delete every key in the half-open range `[start, end)`.
+    ///
+    /// Range deletes are cheap regardless of how many keys the range
+    /// covers — internally they are stored as a single range-tombstone
+    /// record rather than as one point tombstone per key. The delete
+    /// is durable under the same rules as [`Db::put`] / [`Db::delete`]
+    /// and is atomic with respect to concurrent readers.
+    ///
+    /// If `start >= end` the call is a no-op.
+    pub fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()> {
+        if start >= end {
+            return Ok(());
+        }
+        self.engine
+            .apply_batch(
+                BTreeMap::new(),
+                vec![(start.to_vec(), end.to_vec())],
+                self.durability,
+            )
             .map_err(Error::Io)
     }
 
     /// Apply a batch of writes atomically.
     pub fn write(&self, batch: WriteBatch) -> Result<()> {
-        if batch.ops.is_empty() {
+        if batch.is_empty() {
             return Ok(());
         }
         self.engine
-            .apply_batch(batch.ops, self.durability)
+            .apply_batch(batch.ops, batch.range_deletes, self.durability)
             .map_err(Error::Io)
     }
 
@@ -136,14 +158,16 @@ impl Db {
         batch: WriteBatch,
         durability: DurabilityMode,
     ) -> Result<()> {
-        if batch.ops.is_empty() {
+        if batch.is_empty() {
             return Ok(());
         }
         let dm = match durability {
             DurabilityMode::Immediate => engine::DurabilityMode::Immediate,
             DurabilityMode::Eventual => engine::DurabilityMode::Eventual,
         };
-        self.engine.apply_batch(batch.ops, dm).map_err(Error::Io)
+        self.engine
+            .apply_batch(batch.ops, batch.range_deletes, dm)
+            .map_err(Error::Io)
     }
 
     /// Create a point-in-time snapshot for consistent reads.
@@ -299,14 +323,13 @@ fn collect_range(
 #[derive(Debug, Default)]
 pub struct WriteBatch {
     ops: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 impl WriteBatch {
     /// Create an empty write batch.
     pub fn new() -> Self {
-        Self {
-            ops: BTreeMap::new(),
-        }
+        Self::default()
     }
 
     /// Add a put operation to the batch.
@@ -319,14 +342,33 @@ impl WriteBatch {
         self.ops.insert(key.to_vec(), None);
     }
 
-    /// Number of operations in the batch.
+    /// Delete every key in the half-open range `[start, end)`.
+    ///
+    /// When the batch is applied, the range delete is recorded with
+    /// the same transactional seq as the other batch operations, so
+    /// concurrent readers see an all-or-nothing effect. Calls with
+    /// `start >= end` are ignored.
+    pub fn delete_range(&mut self, start: &[u8], end: &[u8]) {
+        if start >= end {
+            return;
+        }
+        self.range_deletes.push((start.to_vec(), end.to_vec()));
+    }
+
+    /// Number of point operations in the batch. Range deletes are
+    /// counted separately via [`WriteBatch::range_delete_count`].
     pub fn len(&self) -> usize {
         self.ops.len()
     }
 
-    /// Whether the batch is empty.
+    /// Number of range-delete operations in the batch.
+    pub fn range_delete_count(&self) -> usize {
+        self.range_deletes.len()
+    }
+
+    /// Whether the batch contains no operations of any kind.
     pub fn is_empty(&self) -> bool {
-        self.ops.is_empty()
+        self.ops.is_empty() && self.range_deletes.is_empty()
     }
 }
 
@@ -1658,5 +1700,222 @@ mod tests {
             let db = Db::open(dir.path(), Options::default()).unwrap();
             assert_eq!(db.get(b"persist").unwrap(), Some(b"data".to_vec()));
         }
+    }
+
+    // ── delete_range ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_delete_range_basic() {
+        let (db, _dir) = open_tmp();
+        for c in b'a'..=b'j' {
+            db.put(&[c], &[c]).unwrap();
+        }
+        db.delete_range(b"c", b"g").unwrap();
+
+        assert_eq!(db.get(b"a").unwrap(), Some(b"a".to_vec()));
+        assert_eq!(db.get(b"b").unwrap(), Some(b"b".to_vec()));
+        assert_eq!(db.get(b"c").unwrap(), None);
+        assert_eq!(db.get(b"d").unwrap(), None);
+        assert_eq!(db.get(b"e").unwrap(), None);
+        assert_eq!(db.get(b"f").unwrap(), None);
+        assert_eq!(db.get(b"g").unwrap(), Some(b"g".to_vec())); // end exclusive
+        assert_eq!(db.get(b"j").unwrap(), Some(b"j".to_vec()));
+    }
+
+    #[test]
+    fn test_delete_range_no_op_for_empty_or_inverted() {
+        let (db, _dir) = open_tmp();
+        db.put(b"a", b"1").unwrap();
+        // Inverted range should be a silent no-op.
+        db.delete_range(b"z", b"a").unwrap();
+        // Equal bounds should also be a no-op (half-open empty range).
+        db.delete_range(b"a", b"a").unwrap();
+        assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
+    }
+
+    #[test]
+    fn test_delete_range_then_put_inside_range() {
+        let (db, _dir) = open_tmp();
+        db.put(b"k", b"old").unwrap();
+        db.delete_range(b"a", b"z").unwrap();
+        // A put after the range delete must win — it has a higher seq.
+        db.put(b"k", b"new").unwrap();
+        assert_eq!(db.get(b"k").unwrap(), Some(b"new".to_vec()));
+    }
+
+    #[test]
+    fn test_delete_range_put_then_range_delete_then_overwrite() {
+        let (db, _dir) = open_tmp();
+        db.put(b"k", b"v1").unwrap();
+        db.delete_range(b"a", b"z").unwrap();
+        assert_eq!(db.get(b"k").unwrap(), None);
+        db.put(b"k", b"v2").unwrap();
+        assert_eq!(db.get(b"k").unwrap(), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn test_delete_range_snapshot_isolation() {
+        let (db, _dir) = open_tmp();
+        db.put(b"k", b"v1").unwrap();
+        let snap = db.snapshot();
+        db.delete_range(b"a", b"z").unwrap();
+        assert_eq!(db.get(b"k").unwrap(), None);
+        // Snapshot is anchored before the range delete.
+        assert_eq!(snap.get(b"k").unwrap(), Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn test_delete_range_survives_flush() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+        for i in 0..20 {
+            db.put(format!("key_{:02}", i).as_bytes(), b"v").unwrap();
+        }
+        db.delete_range(b"key_05", b"key_15").unwrap();
+        force_flush(&db, "rt");
+        for i in 0..20 {
+            let key = format!("key_{:02}", i);
+            let got = db.get(key.as_bytes()).unwrap();
+            if (5..15).contains(&i) {
+                assert_eq!(got, None, "key {} should be deleted", key);
+            } else {
+                assert_eq!(got, Some(b"v".to_vec()), "key {} should survive", key);
+            }
+        }
+    }
+
+    #[test]
+    fn test_delete_range_survives_compaction() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+        for i in 0..30 {
+            db.put(format!("key_{:02}", i).as_bytes(), b"v").unwrap();
+        }
+        db.delete_range(b"key_10", b"key_20").unwrap();
+        // Force several flushes + a manual compaction down to L1+.
+        for tag in 0..6 {
+            force_flush(&db, &format!("c{}", tag));
+        }
+        db.compact_range(None, None).unwrap();
+
+        for i in 0..30 {
+            let key = format!("key_{:02}", i);
+            let got = db.get(key.as_bytes()).unwrap();
+            if (10..20).contains(&i) {
+                assert_eq!(got, None, "key {} should be deleted post-compact", key);
+            } else {
+                assert_eq!(
+                    got,
+                    Some(b"v".to_vec()),
+                    "key {} should survive compact",
+                    key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_delete_range_iterator_skips_deleted() {
+        let (db, _dir) = open_tmp();
+        for c in b'a'..=b'h' {
+            db.put(&[c], &[c]).unwrap();
+        }
+        db.delete_range(b"c", b"f").unwrap();
+
+        let results = db.scan(None, None).unwrap();
+        let keys: Vec<u8> = results.iter().map(|(k, _)| k[0]).collect();
+        assert_eq!(keys, vec![b'a', b'b', b'f', b'g', b'h']);
+    }
+
+    #[test]
+    fn test_delete_range_reverse_iterator_skips_deleted() {
+        let (db, _dir) = open_tmp();
+        for c in b'a'..=b'h' {
+            db.put(&[c], &[c]).unwrap();
+        }
+        db.delete_range(b"c", b"f").unwrap();
+
+        let mut iter = db.iter();
+        iter.seek_to_last();
+        let mut keys = Vec::new();
+        while iter.valid() {
+            keys.push(iter.key().unwrap()[0]);
+            iter.prev();
+        }
+        assert_eq!(keys, vec![b'h', b'g', b'f', b'b', b'a']);
+    }
+
+    #[test]
+    fn test_delete_range_multi_get_honors_rt() {
+        let (db, _dir) = open_tmp();
+        for c in b'a'..=b'f' {
+            db.put(&[c], &[c]).unwrap();
+        }
+        db.delete_range(b"b", b"e").unwrap();
+
+        let keys: Vec<&[u8]> = vec![b"a", b"b", b"c", b"d", b"e", b"f"];
+        let got = db.multi_get(&keys).unwrap();
+        assert_eq!(got[0], Some(b"a".to_vec()));
+        assert_eq!(got[1], None);
+        assert_eq!(got[2], None);
+        assert_eq!(got[3], None);
+        assert_eq!(got[4], Some(b"e".to_vec()));
+        assert_eq!(got[5], Some(b"f".to_vec()));
+    }
+
+    #[test]
+    fn test_delete_range_crash_recovery() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Db::open(dir.path(), Options::default()).unwrap();
+            for c in b'a'..=b'e' {
+                db.put(&[c], &[c]).unwrap();
+            }
+            db.delete_range(b"b", b"d").unwrap();
+            // Drop without close — only the WAL has the range delete.
+        }
+        let db = Db::open(dir.path(), Options::default()).unwrap();
+        assert_eq!(db.get(b"a").unwrap(), Some(b"a".to_vec()));
+        assert_eq!(db.get(b"b").unwrap(), None);
+        assert_eq!(db.get(b"c").unwrap(), None);
+        assert_eq!(db.get(b"d").unwrap(), Some(b"d".to_vec()));
+        assert_eq!(db.get(b"e").unwrap(), Some(b"e".to_vec()));
+    }
+
+    #[test]
+    fn test_delete_range_in_write_batch() {
+        let (db, _dir) = open_tmp();
+        for c in b'a'..=b'f' {
+            db.put(&[c], &[c]).unwrap();
+        }
+        let mut batch = WriteBatch::new();
+        batch.put(b"x", b"x");
+        batch.delete_range(b"b", b"e");
+        batch.put(b"y", b"y");
+        db.write(batch).unwrap();
+
+        assert_eq!(db.get(b"a").unwrap(), Some(b"a".to_vec()));
+        assert_eq!(db.get(b"b").unwrap(), None);
+        assert_eq!(db.get(b"c").unwrap(), None);
+        assert_eq!(db.get(b"d").unwrap(), None);
+        assert_eq!(db.get(b"e").unwrap(), Some(b"e".to_vec()));
+        assert_eq!(db.get(b"x").unwrap(), Some(b"x".to_vec()));
+        assert_eq!(db.get(b"y").unwrap(), Some(b"y".to_vec()));
+    }
+
+    #[test]
+    fn test_delete_range_overlapping_ranges() {
+        let (db, _dir) = open_tmp();
+        for c in b'a'..=b'j' {
+            db.put(&[c], &[c]).unwrap();
+        }
+        db.delete_range(b"b", b"e").unwrap();
+        db.delete_range(b"d", b"h").unwrap();
+
+        assert_eq!(db.get(b"a").unwrap(), Some(b"a".to_vec()));
+        for c in b'b'..=b'g' {
+            assert_eq!(db.get(&[c]).unwrap(), None, "key {} deleted", c as char);
+        }
+        assert_eq!(db.get(b"h").unwrap(), Some(b"h".to_vec()));
     }
 }
