@@ -6,6 +6,7 @@ pub(crate) mod internal_key;
 pub(crate) mod iterator;
 pub(crate) mod manifest;
 pub(crate) mod memtable;
+pub(crate) mod snapshot_registry;
 pub(crate) mod sstable;
 pub(crate) mod wal;
 
@@ -20,6 +21,7 @@ use block_cache::BlockCache;
 use compaction::{CompactionOptions, CompactionScheduler};
 use manifest::{VersionEdit, VersionSet};
 use memtable::MemTable;
+use snapshot_registry::SnapshotRegistry;
 use sstable::{sst_filename, LiveSst, LookupResult, SsTableMeta, SsTableReader, SsTableWriter};
 use wal::{wal_filename, Wal, WalEntry};
 
@@ -79,6 +81,12 @@ pub(crate) struct LarkEngine {
     /// the background scheduler, and around the whole
     /// [`LarkEngine::compact_range`] walk in the foreground path.
     compaction_lock: Arc<Mutex<()>>,
+    /// Tracks the sequence numbers of every live snapshot so compaction
+    /// can drop versions that no snapshot and no current reader can
+    /// see. A snapshot registers itself on creation and releases on
+    /// drop; compaction queries `oldest_live_seq()` to compute its GC
+    /// horizon.
+    snapshot_registry: Arc<SnapshotRegistry>,
     options: EngineOptions,
     write_lock: Mutex<()>,
 }
@@ -148,8 +156,10 @@ impl LarkEngine {
         };
 
         let compaction_lock = Arc::new(Mutex::new(()));
+        let snapshot_registry = Arc::new(SnapshotRegistry::new());
         let compaction = CompactionScheduler::start(
             Arc::clone(&compaction_lock),
+            Arc::clone(&snapshot_registry),
             Arc::clone(&versions),
             Arc::from(sst_dir.as_path()),
             Arc::clone(&cache),
@@ -168,6 +178,7 @@ impl LarkEngine {
             wal_dir,
             compaction: Mutex::new(compaction),
             compaction_lock,
+            snapshot_registry,
             options,
             write_lock: Mutex::new(()),
         });
@@ -177,6 +188,25 @@ impl LarkEngine {
 
     pub(crate) fn snapshot_seq(&self) -> u64 {
         self.latest_seq.load(Ordering::Acquire)
+    }
+
+    /// Register a new live snapshot at `seq` so compaction keeps
+    /// every version it might need to see. Balanced by
+    /// [`Self::release_snapshot`] when the snapshot drops.
+    pub(crate) fn register_snapshot(&self, seq: u64) {
+        self.snapshot_registry.register(seq);
+    }
+
+    /// Release a snapshot pin previously taken via
+    /// [`Self::register_snapshot`].
+    pub(crate) fn release_snapshot(&self, seq: u64) {
+        self.snapshot_registry.release(seq);
+    }
+
+    /// Current GC horizon for compaction — the smallest live snapshot
+    /// seq, or `u64::MAX` if no snapshot is currently pinned.
+    pub(crate) fn oldest_live_seq(&self) -> u64 {
+        self.snapshot_registry.oldest_live_seq()
     }
 
     /// Construct a streaming iterator rooted at `snapshot_seq`. Captures
@@ -574,7 +604,11 @@ impl LarkEngine {
         //    the range walk.
         let _compact_guard = self.compaction_lock.lock();
 
-        // 3. Run the level-by-level push-down.
+        // 3. Compute the snapshot-pinning GC horizon so compaction can
+        //    drop versions that no live snapshot needs.
+        let pin_seq = self.oldest_live_seq();
+
+        // 4. Run the level-by-level push-down.
         let compaction_opts = compaction::CompactionOptions {
             l0_compaction_trigger: self.options.l0_compaction_trigger,
             level_base_bytes: self.options.level_base_bytes,
@@ -591,6 +625,7 @@ impl LarkEngine {
             &compaction_opts,
             start,
             end,
+            pin_seq,
         )
     }
 
@@ -670,6 +705,33 @@ impl LarkEngine {
     pub(crate) fn total_file_count(&self) -> usize {
         let v = self.versions.lock().current();
         v.levels.iter().map(|level| level.len()).sum()
+    }
+
+    /// Test-only: collect every raw `(seq, value_type)` version of
+    /// `user_key` currently persisted across all SSTables. Used by the
+    /// snapshot-pinning GC tests to check the post-compaction on-disk
+    /// state — not just what reads see.
+    #[cfg(test)]
+    pub(crate) fn all_persisted_versions_of(
+        &self,
+        user_key: &[u8],
+    ) -> std::io::Result<Vec<(u64, u8)>> {
+        use internal_key::decode_internal_key;
+
+        let version = self.versions.lock().current();
+        let mut out = Vec::new();
+        for level in &version.levels {
+            for file in level {
+                for (ik, _v) in file.reader.iter_internal(&self.cache)? {
+                    let (uk, seq, vt) = decode_internal_key(&ik);
+                    if uk == user_key {
+                        out.push((seq, vt));
+                    }
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
     }
 
     /// Flush all data to disk and shut down background threads.

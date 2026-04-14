@@ -147,8 +147,15 @@ impl Db {
     }
 
     /// Create a point-in-time snapshot for consistent reads.
+    ///
+    /// Snapshots also pin the compaction GC horizon: as long as at
+    /// least one `Snapshot` at seq `S` is alive, the compaction
+    /// thread will not drop any version needed to read at seq `S`.
+    /// Dropping the returned `Snapshot` releases the pin and may
+    /// allow subsequent compactions to reclaim space.
     pub fn snapshot(&self) -> Snapshot {
         let seq = self.engine.snapshot_seq();
+        self.engine.register_snapshot(seq);
         Snapshot {
             engine: Arc::clone(&self.engine),
             seq,
@@ -208,6 +215,17 @@ impl Db {
 pub struct Snapshot {
     engine: Arc<LarkEngine>,
     seq: u64,
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        // Release the pin this snapshot held in the engine's
+        // compaction GC registry. Compaction is now free to drop any
+        // version it was keeping alive for this snapshot's sake,
+        // subject to other live snapshots that may still pin older
+        // seqs.
+        self.engine.release_snapshot(self.seq);
+    }
 }
 
 impl std::fmt::Debug for Snapshot {
@@ -711,6 +729,176 @@ mod tests {
             it.next();
         }
         assert_eq!(count, N);
+    }
+
+    // ─── Snapshot-pinning GC tests ──────────────────────────────────────
+
+    /// Thin wrapper around the engine's test-only persisted-versions
+    /// accessor. Returns `(seq, value_type)` for every copy of
+    /// `user_key` currently sitting in an SSTable at any level.
+    fn all_versions_of(db: &Db, user_key: &[u8]) -> Vec<(u64, u8)> {
+        db.engine.all_persisted_versions_of(user_key).unwrap()
+    }
+
+    #[test]
+    fn test_gc_drops_old_versions_without_snapshot() {
+        // With no live snapshot, compact_range(None, None) should
+        // leave only the newest version of each user key on disk.
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        for v in 0..10 {
+            db.put(b"k", format!("v{}", v).as_bytes()).unwrap();
+        }
+
+        db.compact_range(None, None).unwrap();
+
+        let versions = all_versions_of(&db, b"k");
+        assert_eq!(
+            versions.len(),
+            1,
+            "expected a single surviving version, found {:?}",
+            versions
+        );
+        assert_eq!(db.get(b"k").unwrap(), Some(b"v9".to_vec()));
+    }
+
+    #[test]
+    fn test_gc_preserves_versions_pinned_by_snapshot() {
+        // Take a snapshot at seq 5, then write more versions. After
+        // compaction the snapshot must still read its view, which
+        // requires preserving the version it pinned.
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        db.put(b"k", b"v1").unwrap();
+        db.put(b"k", b"v2").unwrap();
+        db.put(b"k", b"v3").unwrap();
+        let snap = db.snapshot();
+        // `snap` now pins seq=3 — the snapshot sees v3.
+
+        for v in 4..10 {
+            db.put(b"k", format!("v{}", v).as_bytes()).unwrap();
+        }
+
+        db.compact_range(None, None).unwrap();
+
+        assert_eq!(snap.get(b"k").unwrap(), Some(b"v3".to_vec()));
+        assert_eq!(db.get(b"k").unwrap(), Some(b"v9".to_vec()));
+    }
+
+    #[test]
+    fn test_gc_releases_pin_when_snapshot_drops() {
+        // Pinning a snapshot and then dropping it should fully
+        // release the horizon so the next compaction can collapse
+        // the key to a single surviving version.
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        for v in 0..5 {
+            db.put(b"k", format!("v{}", v).as_bytes()).unwrap();
+        }
+
+        {
+            let _snap = db.snapshot();
+            assert_eq!(db.engine.oldest_live_seq(), 5);
+        }
+        // Pin released.
+        assert_eq!(db.engine.oldest_live_seq(), u64::MAX);
+
+        for v in 5..10 {
+            db.put(b"k", format!("v{}", v).as_bytes()).unwrap();
+        }
+
+        db.compact_range(None, None).unwrap();
+
+        let versions = all_versions_of(&db, b"k");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(db.get(b"k").unwrap(), Some(b"v9".to_vec()));
+    }
+
+    #[test]
+    fn test_gc_with_multiple_live_snapshots_uses_oldest() {
+        // When two snapshots are live, the older one's seq is the
+        // GC horizon. Every version newer than (or at) the older
+        // snapshot's seq must be preserved so the newer snapshot
+        // can still read its own view too.
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        db.put(b"k", b"v1").unwrap();
+        db.put(b"k", b"v2").unwrap();
+        let old_snap = db.snapshot(); // pins seq 2
+        db.put(b"k", b"v3").unwrap();
+        db.put(b"k", b"v4").unwrap();
+        let new_snap = db.snapshot(); // pins seq 4
+        db.put(b"k", b"v5").unwrap();
+        db.put(b"k", b"v6").unwrap();
+
+        db.compact_range(None, None).unwrap();
+
+        // Both snapshots must still return their respective versions.
+        assert_eq!(old_snap.get(b"k").unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(new_snap.get(b"k").unwrap(), Some(b"v4".to_vec()));
+        assert_eq!(db.get(b"k").unwrap(), Some(b"v6".to_vec()));
+    }
+
+    #[test]
+    fn test_gc_preserves_tombstone_hiding_older_entries() {
+        // A tombstone newer than any live snapshot still needs to
+        // survive compaction — it's the newest version and reads
+        // must resolve to "deleted".
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        for v in 0..5 {
+            db.put(b"k", format!("v{}", v).as_bytes()).unwrap();
+        }
+        db.delete(b"k").unwrap();
+
+        db.compact_range(None, None).unwrap();
+
+        assert_eq!(db.get(b"k").unwrap(), None);
+
+        // The newest surviving version is a tombstone — look for it
+        // on disk.
+        let versions = all_versions_of(&db, b"k");
+        assert!(!versions.is_empty());
+        // Highest seq is the tombstone.
+        let (_, vt) = *versions.iter().max_by_key(|(seq, _)| *seq).unwrap();
+        const VALUE_TYPE_DELETION: u8 = 0;
+        assert_eq!(vt, VALUE_TYPE_DELETION);
+    }
+
+    #[test]
+    fn test_gc_across_many_user_keys() {
+        // Stress the multi-group path: many distinct user keys each
+        // with several versions. No snapshot is live so each key
+        // should collapse to exactly one surviving version.
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        for i in 0..200 {
+            for v in 0..3 {
+                db.put(
+                    format!("k{:03}", i).as_bytes(),
+                    format!("v{}_{}", i, v).as_bytes(),
+                )
+                .unwrap();
+            }
+        }
+
+        db.compact_range(None, None).unwrap();
+
+        for i in 0..200 {
+            let k = format!("k{:03}", i);
+            let versions = all_versions_of(&db, k.as_bytes());
+            assert_eq!(versions.len(), 1, "key {} survived with {:?}", k, versions);
+            assert_eq!(
+                db.get(k.as_bytes()).unwrap(),
+                Some(format!("v{}_2", i).into_bytes())
+            );
+        }
     }
 
     // ─── compact_range tests ────────────────────────────────────────────
