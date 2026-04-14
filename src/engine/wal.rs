@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 /// Record types in the WAL.
 const RECORD_PUT: u8 = 0x01;
 const RECORD_DELETE: u8 = 0x02;
+const RECORD_DELETE_RANGE: u8 = 0x03;
 
 /// A write-ahead log for crash recovery.
 ///
@@ -25,6 +26,11 @@ pub(crate) enum WalEntry {
     },
     Delete {
         key: Vec<u8>,
+        seq: u64,
+    },
+    DeleteRange {
+        start: Vec<u8>,
+        end: Vec<u8>,
         seq: u64,
     },
 }
@@ -66,6 +72,23 @@ impl Wal {
         data.extend_from_slice(&seq.to_le_bytes());
 
         self.write_record(RECORD_DELETE, &data)
+    }
+
+    /// Append a range-delete record covering `[start, end)`.
+    pub(crate) fn append_delete_range(
+        &mut self,
+        start: &[u8],
+        end: &[u8],
+        seq: u64,
+    ) -> io::Result<()> {
+        let mut data = Vec::with_capacity(4 + start.len() + 4 + end.len() + 8);
+        data.extend_from_slice(&(start.len() as u32).to_le_bytes());
+        data.extend_from_slice(start);
+        data.extend_from_slice(&(end.len() as u32).to_le_bytes());
+        data.extend_from_slice(end);
+        data.extend_from_slice(&seq.to_le_bytes());
+
+        self.write_record(RECORD_DELETE_RANGE, &data)
     }
 
     /// Flush and fsync the WAL to disk.
@@ -139,6 +162,10 @@ impl Wal {
                 }
                 RECORD_DELETE => {
                     let entry = parse_delete_record(&data)?;
+                    entries.push(entry);
+                }
+                RECORD_DELETE_RANGE => {
+                    let entry = parse_delete_range_record(&data)?;
                     entries.push(entry);
                 }
                 _ => {
@@ -221,6 +248,44 @@ fn parse_delete_record(data: &[u8]) -> io::Result<WalEntry> {
     let seq = u64::from_le_bytes(data[4 + key_len..4 + key_len + 8].try_into().unwrap());
 
     Ok(WalEntry::Delete { key, seq })
+}
+
+fn parse_delete_range_record(data: &[u8]) -> io::Result<WalEntry> {
+    if data.len() < 16 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "delete_range record too short",
+        ));
+    }
+
+    let mut pos = 0;
+    let start_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+
+    if pos + start_len + 4 > data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "delete_range record start overflow",
+        ));
+    }
+    let start = data[pos..pos + start_len].to_vec();
+    pos += start_len;
+
+    let end_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+
+    if pos + end_len + 8 > data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "delete_range record end overflow",
+        ));
+    }
+    let end = data[pos..pos + end_len].to_vec();
+    pos += end_len;
+
+    let seq = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+
+    Ok(WalEntry::DeleteRange { start, end, seq })
 }
 
 #[cfg(test)]

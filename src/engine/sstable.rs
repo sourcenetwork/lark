@@ -23,19 +23,31 @@ use super::block::{Block, BlockBuilder, BlockHandle, RESTART_INTERVAL};
 use super::block_cache::BlockCache;
 use super::bloom::{decode_bloom_block, encode_bloom_block, BloomFilter, BloomFilterBuilder};
 use super::internal_key::{decode_internal_key, lookup_key, user_key_of, VALUE_TYPE_DELETION};
+use super::range_tombstone::{max_covering_seq, RangeTombstone};
 
-/// SSTable magic number: "LARKSST\0".
-const MAGIC: u64 = 0x4C41524B_53535400;
+/// SSTable magic number: "LARKSST\x01" (format version 2 — added the
+/// range-tombstone meta block at the bottom of the file).
+const MAGIC: u64 = 0x4C41524B_53535401;
 
 /// Footer size in bytes.
-const FOOTER_SIZE: usize = 48;
+const FOOTER_SIZE: usize = 64;
 
 const COMPRESSION_NONE: u8 = 0x00;
 const COMPRESSION_LZ4: u8 = 0x01;
 
-/// SSTable footer (fixed 48 bytes, written at end of file).
+/// SSTable footer (fixed 64 bytes, written at end of file).
+///
+/// Layout on disk:
+/// ```text
+/// [data blocks][range_tombstone_block][bloom_block][index_block][footer]
+/// ```
+///
+/// A `range_tombstone_size` of `0` means the SSTable has no range
+/// tombstones; readers skip loading the block in that case.
 #[derive(Debug)]
 struct Footer {
+    range_tombstone_offset: u64,
+    range_tombstone_size: u64,
     bloom_offset: u64,
     bloom_size: u64,
     index_offset: u64,
@@ -47,17 +59,19 @@ struct Footer {
 impl Footer {
     fn encode(&self) -> [u8; FOOTER_SIZE] {
         let mut buf = [0u8; FOOTER_SIZE];
-        buf[0..8].copy_from_slice(&self.bloom_offset.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.bloom_size.to_le_bytes());
-        buf[16..24].copy_from_slice(&self.index_offset.to_le_bytes());
-        buf[24..32].copy_from_slice(&self.index_size.to_le_bytes());
-        buf[32..40].copy_from_slice(&self.num_entries.to_le_bytes());
-        buf[40..48].copy_from_slice(&self.magic.to_le_bytes());
+        buf[0..8].copy_from_slice(&self.range_tombstone_offset.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.range_tombstone_size.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.bloom_offset.to_le_bytes());
+        buf[24..32].copy_from_slice(&self.bloom_size.to_le_bytes());
+        buf[32..40].copy_from_slice(&self.index_offset.to_le_bytes());
+        buf[40..48].copy_from_slice(&self.index_size.to_le_bytes());
+        buf[48..56].copy_from_slice(&self.num_entries.to_le_bytes());
+        buf[56..64].copy_from_slice(&self.magic.to_le_bytes());
         buf
     }
 
     fn decode(buf: &[u8; FOOTER_SIZE]) -> io::Result<Self> {
-        let magic = u64::from_le_bytes(buf[40..48].try_into().unwrap());
+        let magic = u64::from_le_bytes(buf[56..64].try_into().unwrap());
         if magic != MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -65,14 +79,67 @@ impl Footer {
             ));
         }
         Ok(Self {
-            bloom_offset: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-            bloom_size: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
-            index_offset: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
-            index_size: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
-            num_entries: u64::from_le_bytes(buf[32..40].try_into().unwrap()),
+            range_tombstone_offset: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            range_tombstone_size: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+            bloom_offset: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+            bloom_size: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
+            index_offset: u64::from_le_bytes(buf[32..40].try_into().unwrap()),
+            index_size: u64::from_le_bytes(buf[40..48].try_into().unwrap()),
+            num_entries: u64::from_le_bytes(buf[48..56].try_into().unwrap()),
             magic,
         })
     }
+}
+
+fn encode_range_tombstone_block(tombstones: &[RangeTombstone]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(tombstones.len() as u32).to_le_bytes());
+    for rt in tombstones {
+        buf.extend_from_slice(&(rt.start.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&rt.start);
+        buf.extend_from_slice(&(rt.end.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&rt.end);
+        buf.extend_from_slice(&rt.seq.to_le_bytes());
+    }
+    buf
+}
+
+fn decode_range_tombstone_block(data: &[u8]) -> io::Result<Vec<RangeTombstone>> {
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+    if data.len() < 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "range tombstone block too short",
+        ));
+    }
+    let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let mut out = Vec::with_capacity(count);
+    let mut pos = 4;
+    for _ in 0..count {
+        if pos + 4 > data.len() {
+            break;
+        }
+        let start_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if pos + start_len + 4 > data.len() {
+            break;
+        }
+        let start = data[pos..pos + start_len].to_vec();
+        pos += start_len;
+        let end_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if pos + end_len + 8 > data.len() {
+            break;
+        }
+        let end = data[pos..pos + end_len].to_vec();
+        pos += end_len;
+        let seq = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        out.push(RangeTombstone::new(start, end, seq));
+    }
+    Ok(out)
 }
 
 /// Metadata for an SSTable file, tracked by the manifest.
@@ -117,15 +184,19 @@ struct IndexEntry {
 }
 
 /// Result of looking up a user key in a single SSTable.
+///
+/// The `seq` carried by [`LookupResult::Found`] / [`LookupResult::FoundTombstone`]
+/// is the sequence number of the winning point entry, which the caller
+/// compares against range-tombstone coverage from this and newer sources
+/// to decide the final visibility.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LookupResult {
     /// No visible version for this user key in this SSTable.
     NotInTable,
     /// Found a value at or before the requested snapshot.
-    Found(Vec<u8>),
-    /// Found a tombstone at or before the requested snapshot — the caller
-    /// must treat the key as deleted and stop searching lower levels.
-    FoundTombstone,
+    Found { seq: u64, value: Vec<u8> },
+    /// Found a tombstone at or before the requested snapshot.
+    FoundTombstone { seq: u64 },
 }
 
 /// Summary of a finished SSTable, returned by [`SsTableWriter::finish`].
@@ -194,6 +265,7 @@ pub(crate) struct SsTableWriter {
     block_builder: BlockBuilder,
     index_entries: Vec<(Vec<u8>, BlockHandle)>,
     bloom_builder: BloomFilterBuilder,
+    range_tombstones: Vec<RangeTombstone>,
     block_size: usize,
     current_offset: u64,
     num_entries: u64,
@@ -217,6 +289,7 @@ impl SsTableWriter {
             block_builder: BlockBuilder::new(RESTART_INTERVAL),
             index_entries: Vec::new(),
             bloom_builder: BloomFilterBuilder::new(bloom_bits_per_key),
+            range_tombstones: Vec::new(),
             block_size,
             current_offset: 0,
             num_entries: 0,
@@ -226,6 +299,16 @@ impl SsTableWriter {
             last_bloom_user_key: Vec::new(),
             compression,
         })
+    }
+
+    /// Attach a range tombstone to the SSTable being built. Range
+    /// tombstones are written into a dedicated meta block between the
+    /// data blocks and the bloom block, so they're independent of the
+    /// point-entry stream and do not affect `add`'s sort-order
+    /// invariant.
+    pub(crate) fn add_range_tombstone(&mut self, start: &[u8], end: &[u8], seq: u64) {
+        self.range_tombstones
+            .push(RangeTombstone::new(start.to_vec(), end.to_vec(), seq));
     }
 
     /// Add an `(internal_key, value)` pair. Internal keys must arrive in
@@ -258,16 +341,30 @@ impl SsTableWriter {
         Ok(())
     }
 
-    /// Finalize the SSTable. Returns `None` if no entries were added
-    /// (caller should delete the empty file).
+    /// Finalize the SSTable. Returns `None` only if **nothing** was
+    /// added — no point entries and no range tombstones. A file with
+    /// only range tombstones (and no point entries) is still a valid
+    /// SSTable; its smallest/largest user key range is derived from
+    /// the tombstone bounds instead of point-entry bounds.
     pub(crate) fn finish(mut self) -> io::Result<Option<SsTableWriteSummary>> {
-        if self.num_entries == 0 {
+        if self.num_entries == 0 && self.range_tombstones.is_empty() {
             return Ok(None);
         }
 
         if !self.block_builder.is_empty() {
             self.flush_block()?;
         }
+
+        // Range tombstone meta block comes right after the data blocks
+        // and before the bloom filter. A size of 0 means no tombstones.
+        let range_tombstone_data = if self.range_tombstones.is_empty() {
+            Vec::new()
+        } else {
+            encode_range_tombstone_block(&self.range_tombstones)
+        };
+        let range_tombstone_offset = self.current_offset;
+        self.writer.write_all(&range_tombstone_data)?;
+        self.current_offset += range_tombstone_data.len() as u64;
 
         let bloom = self.bloom_builder.build();
         let bloom_data = encode_bloom_block(&bloom);
@@ -281,6 +378,8 @@ impl SsTableWriter {
         self.current_offset += index_data.len() as u64;
 
         let footer = Footer {
+            range_tombstone_offset,
+            range_tombstone_size: range_tombstone_data.len() as u64,
             bloom_offset,
             bloom_size: bloom_data.len() as u64,
             index_offset,
@@ -291,9 +390,32 @@ impl SsTableWriter {
         self.writer.write_all(&footer.encode())?;
         self.writer.flush()?;
 
+        // Derive the file's declared user-key range. Prefer point
+        // entries; fall back to the union of range-tombstone bounds
+        // when the file has tombstones but no points.
+        let (smallest_user_key, largest_user_key) =
+            match (self.smallest_user_key.take(), self.largest_user_key.take()) {
+                (Some(s), Some(l)) => (s, l),
+                _ => {
+                    let mut iter = self.range_tombstones.iter();
+                    let first = iter.next().expect("checked non-empty above").clone();
+                    let mut smallest = first.start.clone();
+                    let mut largest = first.end.clone();
+                    for rt in iter {
+                        if rt.start < smallest {
+                            smallest = rt.start.clone();
+                        }
+                        if rt.end > largest {
+                            largest = rt.end.clone();
+                        }
+                    }
+                    (smallest, largest)
+                }
+            };
+
         Ok(Some(SsTableWriteSummary {
-            smallest_user_key: self.smallest_user_key.unwrap(),
-            largest_user_key: self.largest_user_key.unwrap(),
+            smallest_user_key,
+            largest_user_key,
             num_entries: self.num_entries,
         }))
     }
@@ -351,6 +473,7 @@ pub(crate) struct SsTableReader {
     pub(crate) file_id: u64,
     index: Vec<IndexEntry>,
     bloom: BloomFilter,
+    range_tombstones: Vec<RangeTombstone>,
 }
 
 impl SsTableReader {
@@ -381,12 +504,39 @@ impl SsTableReader {
         file.read_exact(&mut index_data)?;
         let index = decode_index_block(&index_data)?;
 
+        let range_tombstones = if footer.range_tombstone_size == 0 {
+            Vec::new()
+        } else {
+            file.seek(SeekFrom::Start(footer.range_tombstone_offset))?;
+            let mut rt_data = vec![0u8; footer.range_tombstone_size as usize];
+            file.read_exact(&mut rt_data)?;
+            decode_range_tombstone_block(&rt_data)?
+        };
+
         Ok(Self {
             file: Mutex::new(file),
             file_id,
             index,
             bloom,
+            range_tombstones,
         })
+    }
+
+    /// Largest seq of any range tombstone in this SSTable that covers
+    /// `user_key` and is visible at `snapshot_seq`. Returns `0` when
+    /// nothing covers it — `0` is safe because real seqs start at 1.
+    pub(crate) fn covering_range_tombstone_seq(&self, user_key: &[u8], snapshot_seq: u64) -> u64 {
+        if self.range_tombstones.is_empty() {
+            return 0;
+        }
+        max_covering_seq(&self.range_tombstones, user_key, snapshot_seq)
+    }
+
+    /// Borrow this SSTable's range tombstones. Used by compaction to
+    /// merge them into the output file and by the iterator to honor
+    /// RT coverage during scans.
+    pub(crate) fn range_tombstones(&self) -> &[RangeTombstone] {
+        &self.range_tombstones
     }
 
     /// Point lookup for `user_key` visible at `snapshot_seq`.
@@ -418,13 +568,13 @@ impl SsTableReader {
         let block = self.read_block(entry.handle, cache)?;
         match block.seek_ge(&search_key) {
             Some((ik, value)) => {
-                let (uk, _seq, vt) = decode_internal_key(&ik);
+                let (uk, seq, vt) = decode_internal_key(&ik);
                 if uk != user_key {
                     Ok(LookupResult::NotInTable)
                 } else if vt == VALUE_TYPE_DELETION {
-                    Ok(LookupResult::FoundTombstone)
+                    Ok(LookupResult::FoundTombstone { seq })
                 } else {
-                    Ok(LookupResult::Found(value))
+                    Ok(LookupResult::Found { seq, value })
                 }
             }
             None => Ok(LookupResult::NotInTable),
@@ -575,7 +725,10 @@ mod tests {
         // Point lookups at u64::MAX see the latest version.
         assert_eq!(
             reader.get(b"key_0042", u64::MAX, &cache).unwrap(),
-            LookupResult::Found(b"value_42".to_vec())
+            LookupResult::Found {
+                seq: 1,
+                value: b"value_42".to_vec()
+            }
         );
         assert_eq!(
             reader.get(b"nonexistent", u64::MAX, &cache).unwrap(),
@@ -604,15 +757,21 @@ mod tests {
         let reader = SsTableReader::open(&path, 7).unwrap();
         assert_eq!(
             reader.get(b"k", 6, &cache).unwrap(),
-            LookupResult::FoundTombstone
+            LookupResult::FoundTombstone { seq: 5 }
         );
         assert_eq!(
             reader.get(b"k", 4, &cache).unwrap(),
-            LookupResult::Found(b"v3".to_vec())
+            LookupResult::Found {
+                seq: 3,
+                value: b"v3".to_vec()
+            }
         );
         assert_eq!(
             reader.get(b"k", 2, &cache).unwrap(),
-            LookupResult::Found(b"v1".to_vec())
+            LookupResult::Found {
+                seq: 1,
+                value: b"v1".to_vec()
+            }
         );
         assert_eq!(
             reader.get(b"k", 0, &cache).unwrap(),
@@ -636,11 +795,66 @@ mod tests {
         let reader = SsTableReader::open(&path, 2).unwrap();
         assert_eq!(
             reader.get(b"hello", u64::MAX, &cache).unwrap(),
-            LookupResult::Found(b"world".to_vec())
+            LookupResult::Found {
+                seq: 1,
+                value: b"world".to_vec()
+            }
         );
         assert_eq!(
             reader.get(b"test", u64::MAX, &cache).unwrap(),
-            LookupResult::Found(b"data".to_vec())
+            LookupResult::Found {
+                seq: 1,
+                value: b"data".to_vec()
+            }
         );
+    }
+
+    #[test]
+    fn test_sstable_range_tombstones_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rt.sst");
+
+        {
+            let mut writer = SsTableWriter::new(&path, 4096, 10, false).unwrap();
+            writer.add(&ik(b"a", 1), b"v_a").unwrap();
+            writer.add(&ik(b"m", 2), b"v_m").unwrap();
+            writer.add(&ik(b"z", 3), b"v_z").unwrap();
+            writer.add_range_tombstone(b"b", b"n", 10);
+            writer.add_range_tombstone(b"p", b"y", 15);
+            let summary = writer.finish().unwrap().unwrap();
+            assert_eq!(summary.num_entries, 3);
+        }
+
+        let reader = SsTableReader::open(&path, 1).unwrap();
+        assert_eq!(reader.range_tombstones().len(), 2);
+        assert_eq!(reader.covering_range_tombstone_seq(b"a", 100), 0);
+        assert_eq!(reader.covering_range_tombstone_seq(b"b", 100), 10);
+        assert_eq!(reader.covering_range_tombstone_seq(b"m", 100), 10);
+        assert_eq!(reader.covering_range_tombstone_seq(b"n", 100), 0);
+        assert_eq!(reader.covering_range_tombstone_seq(b"p", 100), 15);
+        assert_eq!(reader.covering_range_tombstone_seq(b"z", 100), 0);
+        // RT at seq 15 is invisible to older snapshots.
+        assert_eq!(reader.covering_range_tombstone_seq(b"p", 14), 0);
+    }
+
+    #[test]
+    fn test_sstable_rt_only_no_points() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rt_only.sst");
+
+        {
+            let mut writer = SsTableWriter::new(&path, 4096, 10, false).unwrap();
+            writer.add_range_tombstone(b"aa", b"kk", 5);
+            writer.add_range_tombstone(b"mm", b"zz", 7);
+            let summary = writer.finish().unwrap().unwrap();
+            assert_eq!(summary.num_entries, 0);
+            assert_eq!(summary.smallest_user_key, b"aa");
+            assert_eq!(summary.largest_user_key, b"zz");
+        }
+
+        let reader = SsTableReader::open(&path, 2).unwrap();
+        assert_eq!(reader.range_tombstones().len(), 2);
+        assert_eq!(reader.covering_range_tombstone_seq(b"bb", 100), 5);
+        assert_eq!(reader.covering_range_tombstone_seq(b"nn", 100), 7);
     }
 }

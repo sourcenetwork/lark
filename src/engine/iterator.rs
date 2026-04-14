@@ -65,6 +65,7 @@ use super::internal_key::{
 };
 use super::manifest::Version;
 use super::memtable::MemTable;
+use super::range_tombstone::{max_covering_seq, RangeTombstone};
 use super::sstable::SsTableReader;
 
 /// Scan direction for [`LarkIterator`].
@@ -532,6 +533,14 @@ pub(crate) struct LarkIterator {
     direction: Direction,
     /// Most recently produced `(user_key, value)` pair, if any.
     curr_user: Option<(Vec<u8>, Vec<u8>)>,
+    /// Flat snapshot of every range tombstone the iterator must honor
+    /// — the union of memtable RTs and SSTable RTs from every level
+    /// reachable through the pinned `Version`. Captured once at
+    /// construction so the merging walk can consult it without
+    /// re-locking memtables on each step. Range tombstone counts are
+    /// expected to be small relative to point entries; a linear scan
+    /// per user-key group is acceptable.
+    range_tombstones: Vec<RangeTombstone>,
     /// Pinning handle — keeping this alive guarantees compaction cannot
     /// drop SSTable metadata out from under us. The SsTableReaders owned
     /// by the level iterators similarly keep file handles live.
@@ -556,12 +565,17 @@ impl LarkIterator {
         snapshot_seq: u64,
     ) -> Self {
         let mut levels: Vec<LevelIter> = Vec::new();
+        let mut range_tombstones: Vec<RangeTombstone> = Vec::new();
+
+        range_tombstones.extend(active.clone_range_tombstones());
         levels.push(LevelIter::Memtable(MemtableLevelIter::new(active)));
         for mt in frozen.iter().rev() {
+            range_tombstones.extend(mt.clone_range_tombstones());
             levels.push(LevelIter::Memtable(MemtableLevelIter::new(Arc::clone(mt))));
         }
         // L0: newest first.
         for file in version.levels[0].iter().rev() {
+            range_tombstones.extend(file.reader.range_tombstones().iter().cloned());
             levels.push(LevelIter::SsTable(SsTableLevelIter::new(
                 Arc::clone(&file.reader),
                 Arc::clone(&cache),
@@ -570,6 +584,7 @@ impl LarkIterator {
         // L1+: within a level file order doesn't matter (non-overlapping).
         for level in 1..version.levels.len() {
             for file in &version.levels[level] {
+                range_tombstones.extend(file.reader.range_tombstones().iter().cloned());
                 levels.push(LevelIter::SsTable(SsTableLevelIter::new(
                     Arc::clone(&file.reader),
                     Arc::clone(&cache),
@@ -582,9 +597,19 @@ impl LarkIterator {
             snapshot_seq,
             direction: Direction::Forward,
             curr_user: None,
+            range_tombstones,
             _version: version,
             error: None,
         }
+    }
+
+    /// Largest seq of any range tombstone covering `user_key` that is
+    /// visible at this iterator's snapshot. Returns 0 when none.
+    fn covering_rt_seq(&self, user_key: &[u8]) -> u64 {
+        if self.range_tombstones.is_empty() {
+            return 0;
+        }
+        max_covering_seq(&self.range_tombstones, user_key, self.snapshot_seq)
     }
 
     pub(crate) fn seek_to_first(&mut self) {
@@ -708,10 +733,17 @@ impl LarkIterator {
                 continue;
             }
 
-            // Newest visible entry for this user key. If it's a tombstone
-            // the whole user key is deleted at this snapshot; otherwise
-            // it's the value the public iterator should yield.
+            // Newest visible entry for this user key. If a range
+            // tombstone with a strictly greater seq covers it, the
+            // whole user key is considered deleted — same effect as a
+            // point tombstone. Otherwise emit the value (or skip if
+            // it's itself a point tombstone).
             let uk_owned = uk.to_vec();
+            let rt_seq = self.covering_rt_seq(&uk_owned);
+            if rt_seq > seq {
+                self.consume_user_key_forward(&uk_owned);
+                continue;
+            }
             if vt == VALUE_TYPE_DELETION {
                 self.consume_user_key_forward(&uk_owned);
                 continue;
@@ -746,7 +778,7 @@ impl LarkIterator {
             // every visible entry we see is strictly newer than the
             // previous one — so a simple "keep overwriting" strategy
             // yields the newest visible entry for the group.
-            let mut latest: Option<(u8, Vec<u8>)> = None;
+            let mut latest: Option<(u8, u64, Vec<u8>)> = None;
 
             while let Some(ik2) = self.inner.key() {
                 let (uk2, seq, vt) = decode_internal_key(ik2);
@@ -755,7 +787,7 @@ impl LarkIterator {
                 }
                 if seq <= self.snapshot_seq {
                     let v = self.inner.value().map(|s| s.to_vec()).unwrap_or_default();
-                    latest = Some((vt, v));
+                    latest = Some((vt, seq, v));
                 }
                 if let Err(e) = self.inner.advance_backward() {
                     self.error = Some(e);
@@ -764,13 +796,19 @@ impl LarkIterator {
                 }
             }
 
+            let rt_seq = self.covering_rt_seq(&group);
             match latest {
-                Some((VALUE_TYPE_DELETION, _)) => {
+                Some((_, seq, _)) if rt_seq > seq => {
+                    // A range tombstone hides the newest visible point
+                    // entry — treat the whole group as deleted.
+                    continue;
+                }
+                Some((VALUE_TYPE_DELETION, _, _)) => {
                     // Newest visible entry is a tombstone — try the next
                     // (alphabetically earlier) user key.
                     continue;
                 }
-                Some((_, v)) => {
+                Some((_, _, v)) => {
                     self.curr_user = Some((group, v));
                     return;
                 }

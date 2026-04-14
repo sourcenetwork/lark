@@ -6,6 +6,7 @@ pub(crate) mod internal_key;
 pub(crate) mod iterator;
 pub(crate) mod manifest;
 pub(crate) mod memtable;
+pub(crate) mod range_tombstone;
 pub(crate) mod snapshot_registry;
 pub(crate) mod sstable;
 pub(crate) mod wal;
@@ -123,6 +124,10 @@ impl LarkEngine {
                                 memtable.delete(&key, seq);
                                 latest_seq = latest_seq.max(seq);
                             }
+                            WalEntry::DeleteRange { start, end, seq } => {
+                                memtable.delete_range(&start, &end, seq);
+                                latest_seq = latest_seq.max(seq);
+                            }
                         }
                     }
                 }
@@ -232,16 +237,38 @@ impl LarkEngine {
     }
 
     /// Point lookup at a given snapshot. Returns `Ok(Some(value))` or `Ok(None)`.
+    ///
+    /// Walks sources newest→oldest (active memtable, frozen memtables
+    /// newest first, L0 newest first, L1..Ln). At each source we check
+    /// both the newest visible point entry and the newest visible
+    /// covering range tombstone, carrying the largest RT seq forward so
+    /// a range delete in a newer source can override a point entry in
+    /// an older source. The first source yielding a decisive answer
+    /// wins — a point entry with `seq > max_rt_so_far` gives its value;
+    /// otherwise the range tombstone hides it.
     pub(crate) fn get(&self, key: &[u8], snapshot_seq: u64) -> std::io::Result<Option<Vec<u8>>> {
-        if let Some(result) = self.active_memtable.read().get(key, snapshot_seq) {
-            return Ok(result);
+        let mut max_rt_seq: u64 = 0;
+
+        {
+            let active = self.active_memtable.read();
+            let rt = active.covering_range_tombstone_seq(key, snapshot_seq);
+            if rt > max_rt_seq {
+                max_rt_seq = rt;
+            }
+            if let Some((pseq, popt)) = active.get(key, snapshot_seq) {
+                return Ok(if pseq > max_rt_seq { popt } else { None });
+            }
         }
 
         {
             let frozen = self.frozen_memtables.read();
             for mt in frozen.iter().rev() {
-                if let Some(result) = mt.get(key, snapshot_seq) {
-                    return Ok(result);
+                let rt = mt.covering_range_tombstone_seq(key, snapshot_seq);
+                if rt > max_rt_seq {
+                    max_rt_seq = rt;
+                }
+                if let Some((pseq, popt)) = mt.get(key, snapshot_seq) {
+                    return Ok(if pseq > max_rt_seq { popt } else { None });
                 }
             }
         }
@@ -253,9 +280,15 @@ impl LarkEngine {
         // happens here — concurrent compaction unlinking paths cannot
         // break us.
         for file in version.levels[0].iter().rev() {
+            let rt = file.reader.covering_range_tombstone_seq(key, snapshot_seq);
+            if rt > max_rt_seq {
+                max_rt_seq = rt;
+            }
             match file.reader.get(key, snapshot_seq, &self.cache)? {
-                LookupResult::Found(value) => return Ok(Some(value)),
-                LookupResult::FoundTombstone => return Ok(None),
+                LookupResult::Found { seq, value } => {
+                    return Ok(if seq > max_rt_seq { Some(value) } else { None });
+                }
+                LookupResult::FoundTombstone { .. } => return Ok(None),
                 LookupResult::NotInTable => {}
             }
         }
@@ -267,12 +300,29 @@ impl LarkEngine {
                 continue;
             }
 
+            // Range tombstones can be stored in any file at this level whose
+            // user-key range covers `key`, even if the point entry for `key`
+            // lives in a different file (e.g. an RT-only SSTable). Scan each
+            // overlapping file for RT coverage before the point lookup.
+            for file in files {
+                if file.meta.smallest_key.as_slice() <= key
+                    && key <= file.meta.largest_key.as_slice()
+                {
+                    let rt = file.reader.covering_range_tombstone_seq(key, snapshot_seq);
+                    if rt > max_rt_seq {
+                        max_rt_seq = rt;
+                    }
+                }
+            }
+
             let idx = files.partition_point(|f| f.meta.largest_key.as_slice() < key);
             if idx < files.len() && files[idx].meta.smallest_key.as_slice() <= key {
                 let file = &files[idx];
                 match file.reader.get(key, snapshot_seq, &self.cache)? {
-                    LookupResult::Found(value) => return Ok(Some(value)),
-                    LookupResult::FoundTombstone => return Ok(None),
+                    LookupResult::Found { seq, value } => {
+                        return Ok(if seq > max_rt_seq { Some(value) } else { None });
+                    }
+                    LookupResult::FoundTombstone { .. } => return Ok(None),
                     LookupResult::NotInTable => {}
                 }
             }
@@ -296,13 +346,24 @@ impl LarkEngine {
         snapshot_seq: u64,
     ) -> std::io::Result<Vec<Option<Vec<u8>>>> {
         let mut results: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
-        // `None` = still pending, `Some(_)` = resolved (the result is
-        // already stored in `results[i]`).
         let mut resolved: Vec<bool> = vec![false; keys.len()];
+        // Running max of range-tombstone seq covering `keys[i]` across
+        // all sources walked so far (newest → oldest).
+        let mut max_rt: Vec<u64> = vec![0; keys.len()];
         let mut unresolved = keys.len();
         if unresolved == 0 {
             return Ok(results);
         }
+
+        // Helper that, given a point lookup result and the accumulated
+        // max RT seq, decides the final per-key outcome.
+        let resolve = |pseq: u64, popt: Option<Vec<u8>>, rt_seq: u64| -> Option<Vec<u8>> {
+            if pseq > rt_seq {
+                popt
+            } else {
+                None
+            }
+        };
 
         // 1. Active memtable.
         {
@@ -311,8 +372,12 @@ impl LarkEngine {
                 if resolved[i] {
                     continue;
                 }
-                if let Some(result) = mt.get(k, snapshot_seq) {
-                    results[i] = result;
+                let rt = mt.covering_range_tombstone_seq(k, snapshot_seq);
+                if rt > max_rt[i] {
+                    max_rt[i] = rt;
+                }
+                if let Some((pseq, popt)) = mt.get(k, snapshot_seq) {
+                    results[i] = resolve(pseq, popt, max_rt[i]);
                     resolved[i] = true;
                     unresolved -= 1;
                 }
@@ -330,8 +395,12 @@ impl LarkEngine {
                     if resolved[i] {
                         continue;
                     }
-                    if let Some(result) = mt.get(k, snapshot_seq) {
-                        results[i] = result;
+                    let rt = mt.covering_range_tombstone_seq(k, snapshot_seq);
+                    if rt > max_rt[i] {
+                        max_rt[i] = rt;
+                    }
+                    if let Some((pseq, popt)) = mt.get(k, snapshot_seq) {
+                        results[i] = resolve(pseq, popt, max_rt[i]);
                         resolved[i] = true;
                         unresolved -= 1;
                     }
@@ -350,14 +419,17 @@ impl LarkEngine {
                 if resolved[i] {
                     continue;
                 }
+                let rt = file.reader.covering_range_tombstone_seq(k, snapshot_seq);
+                if rt > max_rt[i] {
+                    max_rt[i] = rt;
+                }
                 match file.reader.get(k, snapshot_seq, &self.cache)? {
-                    LookupResult::Found(v) => {
-                        results[i] = Some(v);
+                    LookupResult::Found { seq, value } => {
+                        results[i] = resolve(seq, Some(value), max_rt[i]);
                         resolved[i] = true;
                         unresolved -= 1;
                     }
-                    LookupResult::FoundTombstone => {
-                        // tombstone hides any older versions.
+                    LookupResult::FoundTombstone { .. } => {
                         results[i] = None;
                         resolved[i] = true;
                         unresolved -= 1;
@@ -372,7 +444,9 @@ impl LarkEngine {
 
         // 4. L1..Ln: within each level files are non-overlapping, so a
         //    single partition_point locates the at-most-one file that
-        //    could contain a given key.
+        //    could contain a given key's point entry. Range tombstones
+        //    may live in a sibling file, though, so we scan all files
+        //    whose user-key range covers `k` for RT coverage first.
         for level in 1..version.levels.len() {
             let files = &version.levels[level];
             if files.is_empty() {
@@ -382,18 +456,28 @@ impl LarkEngine {
                 if resolved[i] {
                     continue;
                 }
+                for file in files {
+                    if file.meta.smallest_key.as_slice() <= *k
+                        && *k <= file.meta.largest_key.as_slice()
+                    {
+                        let rt = file.reader.covering_range_tombstone_seq(k, snapshot_seq);
+                        if rt > max_rt[i] {
+                            max_rt[i] = rt;
+                        }
+                    }
+                }
                 let idx = files.partition_point(|f| f.meta.largest_key.as_slice() < k);
                 if idx >= files.len() || files[idx].meta.smallest_key.as_slice() > *k {
                     continue;
                 }
                 let file = &files[idx];
                 match file.reader.get(k, snapshot_seq, &self.cache)? {
-                    LookupResult::Found(v) => {
-                        results[i] = Some(v);
+                    LookupResult::Found { seq, value } => {
+                        results[i] = resolve(seq, Some(value), max_rt[i]);
                         resolved[i] = true;
                         unresolved -= 1;
                     }
-                    LookupResult::FoundTombstone => {
+                    LookupResult::FoundTombstone { .. } => {
                         results[i] = None;
                         resolved[i] = true;
                         unresolved -= 1;
@@ -409,31 +493,45 @@ impl LarkEngine {
         Ok(results)
     }
 
-    /// Apply a batch of writes atomically.
+    /// Apply a batch of point writes and range deletes atomically.
+    ///
+    /// `point_ops` carries put/delete operations keyed by user key;
+    /// `range_deletes` is a list of `(start, end)` half-open intervals,
+    /// each of which tombstones every user key in the range as of the
+    /// same sequence number batch.
+    ///
+    /// All operations in a single call are assigned consecutive
+    /// sequence numbers: point ops first, then range deletes.
     pub(crate) fn apply_batch(
         &self,
-        writes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+        point_ops: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+        range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
         durability: DurabilityMode,
     ) -> std::io::Result<()> {
-        if writes.is_empty() {
+        if point_ops.is_empty() && range_deletes.is_empty() {
             return Ok(());
         }
 
         let _write_guard = self.write_lock.lock();
 
+        let total_ops = point_ops.len() + range_deletes.len();
         let base_seq = self
             .latest_seq
-            .fetch_add(writes.len() as u64, Ordering::AcqRel)
+            .fetch_add(total_ops as u64, Ordering::AcqRel)
             + 1;
 
         {
             let mut wal = self.active_wal.lock();
-            for (i, (key, value)) in writes.iter().enumerate() {
+            for (i, (key, value)) in point_ops.iter().enumerate() {
                 let seq = base_seq + i as u64;
                 match value {
                     Some(v) => wal.append_put(key, v, seq)?,
                     None => wal.append_delete(key, seq)?,
                 }
+            }
+            for (j, (start, end)) in range_deletes.iter().enumerate() {
+                let seq = base_seq + (point_ops.len() + j) as u64;
+                wal.append_delete_range(start, end, seq)?;
             }
             match durability {
                 DurabilityMode::Immediate => wal.sync()?,
@@ -443,12 +541,16 @@ impl LarkEngine {
 
         {
             let memtable = self.active_memtable.read();
-            for (i, (key, value)) in writes.iter().enumerate() {
+            for (i, (key, value)) in point_ops.iter().enumerate() {
                 let seq = base_seq + i as u64;
                 match value {
                     Some(v) => memtable.put(key, v, seq),
                     None => memtable.delete(key, seq),
                 }
+            }
+            for (j, (start, end)) in range_deletes.iter().enumerate() {
+                let seq = base_seq + (point_ops.len() + j) as u64;
+                memtable.delete_range(start, end, seq);
             }
         }
 
@@ -500,7 +602,9 @@ impl LarkEngine {
             Arc::clone(&frozen[0])
         };
 
-        if memtable.is_empty() {
+        let range_tombstones = memtable.clone_range_tombstones();
+
+        if memtable.is_empty() && range_tombstones.is_empty() {
             self.frozen_memtables.write().remove(0);
             let _ = Wal::remove(old_wal.path());
             return Ok(());
@@ -528,6 +632,11 @@ impl LarkEngine {
         let entries = memtable.iter_internal();
         for (internal_key, value) in &entries {
             writer.add(internal_key, value)?;
+        }
+
+        // Persist range tombstones alongside the point entries.
+        for rt in &range_tombstones {
+            writer.add_range_tombstone(&rt.start, &rt.end, rt.seq);
         }
 
         let summary = match writer.finish()? {
@@ -592,10 +701,12 @@ impl LarkEngine {
     ) -> std::io::Result<()> {
         // 1. Flush the active memtable so any in-memory data that
         //    overlaps the range is materialized in L0. We only touch
-        //    the write lock if there's actually data to flush.
-        if !self.active_memtable.read().is_empty() {
+        //    the write lock if there's actually data to flush. "Data"
+        //    here includes range tombstones, not just point entries.
+        let needs_flush = |mt: &MemTable| !mt.is_empty() || !mt.clone_range_tombstones().is_empty();
+        if needs_flush(&self.active_memtable.read()) {
             let _write_guard = self.write_lock.lock();
-            if !self.active_memtable.read().is_empty() {
+            if needs_flush(&self.active_memtable.read()) {
                 self.rotate_memtable()?;
             }
         }
@@ -691,6 +802,11 @@ impl LarkEngine {
     #[cfg(test)]
     pub(crate) fn active_memtable_is_empty(&self) -> bool {
         self.active_memtable.read().is_empty()
+            && self
+                .active_memtable
+                .read()
+                .clone_range_tombstones()
+                .is_empty()
     }
 
     /// Test-only: number of SSTable files at `level` in the current
@@ -736,7 +852,11 @@ impl LarkEngine {
 
     /// Flush all data to disk and shut down background threads.
     pub(crate) fn close(&self) -> std::io::Result<()> {
-        if !self.active_memtable.read().is_empty() {
+        let has_any = {
+            let mt = self.active_memtable.read();
+            !mt.is_empty() || !mt.clone_range_tombstones().is_empty()
+        };
+        if has_any {
             let _write_guard = self.write_lock.lock();
 
             let old_memtable = {

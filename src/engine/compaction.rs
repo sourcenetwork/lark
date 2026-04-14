@@ -6,6 +6,7 @@ use std::thread;
 use super::block_cache::BlockCache;
 use super::internal_key::{decode_internal_key, user_key_of};
 use super::manifest::{VersionEdit, VersionSet, MAX_LEVELS};
+use super::range_tombstone::{max_covering_seq, RangeTombstone};
 use super::snapshot_registry::SnapshotRegistry;
 use super::sstable::{
     remove_sst, sst_filename, LiveSst, SsTableMeta, SsTableReader, SsTableWriter,
@@ -378,8 +379,12 @@ fn perform_compaction(
     // version and tombstone is preserved through the merge. Readers are
     // already open in the pinned version — no fresh `File::open`.
     let mut all_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut merged_range_tombstones: Vec<RangeTombstone> = Vec::new();
     for file in input_files.iter().chain(overlap_files.iter()) {
         all_entries.extend(file.reader.iter_internal(cache)?);
+        for rt in file.reader.range_tombstones() {
+            merged_range_tombstones.push(rt.clone());
+        }
     }
 
     // Sort by internal key (which orders newer seqs first within each user
@@ -387,9 +392,34 @@ fn perform_compaction(
     all_entries.sort_by(|a, b| a.0.cmp(&b.0));
     all_entries.dedup_by(|a, b| a.0 == b.0);
 
+    // Drop point entries that a range tombstone from the merged input
+    // set shadows — i.e. any `(user_key, seq)` where some RT covering
+    // `user_key` has `rt_seq > seq`. This shrinks the live set before
+    // the snapshot-pin GC so we don't rewrite bytes that no reader can
+    // ever see. We still keep range tombstones themselves in the output
+    // SSTable (see below), since a future compaction with lower levels
+    // may still need them to shadow older point entries.
+    all_entries.retain(|(ik, _v)| {
+        let (uk, seq, _vt) = decode_internal_key(ik);
+        let rt_seq = max_covering_seq(&merged_range_tombstones, uk, u64::MAX);
+        rt_seq <= seq
+    });
+
     // Snapshot-pinning GC: drop versions that no live snapshot and no
     // current reader can see. See `gc_old_versions` for the rule.
     let all_entries = gc_old_versions(all_entries, pin_seq);
+
+    // Dedup merged range tombstones by (start, end, seq) — a single
+    // logical RT may appear in multiple input files after previous
+    // compactions carried it forward.
+    merged_range_tombstones.sort_by(|a, b| {
+        (a.start.as_slice(), a.end.as_slice(), a.seq).cmp(&(
+            b.start.as_slice(),
+            b.end.as_slice(),
+            b.seq,
+        ))
+    });
+    merged_range_tombstones.dedup_by(|a, b| a.start == b.start && a.end == b.end && a.seq == b.seq);
 
     let mut edits = Vec::new();
 
@@ -406,7 +436,7 @@ fn perform_compaction(
         });
     }
 
-    if all_entries.is_empty() {
+    if all_entries.is_empty() && merged_range_tombstones.is_empty() {
         versions.lock().apply(&edits)?;
         delete_old_files(sst_dir, &input_files, &overlap_files, cache);
         return Ok(());
@@ -415,8 +445,22 @@ fn perform_compaction(
     // Split output across multiple SSTables at user-key boundaries so that
     // all versions of a given user key live in exactly one file (required
     // for the non-overlap invariant at L1+).
+    //
+    // Range tombstones are replicated into every output file produced by
+    // this compaction. A future compaction of any of these files will
+    // merge and dedup the RTs again, so there's no runaway duplication.
+    // Replicating keeps each file self-sufficient for reads: a scan that
+    // only picks up one of the files still sees the right RT coverage.
     let mut chunk_start = 0;
-    while chunk_start < all_entries.len() {
+    let rt_only_output = all_entries.is_empty() && !merged_range_tombstones.is_empty();
+    let mut wrote_rt_only = false;
+    loop {
+        if !rt_only_output && chunk_start >= all_entries.len() {
+            break;
+        }
+        if rt_only_output && wrote_rt_only {
+            break;
+        }
         // Allocate the output file_id atomically from the *current*
         // version inside `versions.lock()` — same pattern
         // `flush_frozen_memtable` uses. Using a captured
@@ -459,6 +503,13 @@ fn perform_compaction(
                 current_user_key = Some(uk.to_vec());
             }
             chunk_start += 1;
+        }
+
+        for rt in &merged_range_tombstones {
+            writer.add_range_tombstone(&rt.start, &rt.end, rt.seq);
+        }
+        if rt_only_output {
+            wrote_rt_only = true;
         }
 
         let summary = match writer.finish()? {
