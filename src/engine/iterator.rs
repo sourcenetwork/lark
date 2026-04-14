@@ -280,32 +280,30 @@ impl SsTableLevelIter {
     }
 
     fn seek_for_prev(&mut self, target: &[u8]) -> io::Result<()> {
-        // Find the block that could contain the largest key <= target.
-        // `seek_block` returns the first block whose last-key is >= target,
-        // which is where such a key would live. If no block qualifies (all
-        // last-keys are > target), the target could still live in the very
-        // first block if its first key is <= target.
-        let candidate_block = self.reader.seek_block(target).or_else(|| {
-            if self.reader.num_blocks() > 0 {
-                Some(0)
-            } else {
-                None
-            }
-        });
-        let block_idx = match candidate_block {
-            Some(i) => i,
-            None => {
-                self.curr = None;
-                return Ok(());
-            }
-        };
+        // Pick the block that could contain the largest entry `<= target`.
+        //
+        // `seek_block` returns the first block whose last key is `>= target`
+        // — that is the "containing" block, i.e. the earliest block that
+        // might hold `target` or the smallest key greater than `target`.
+        //
+        // If `seek_block` returns `None` every block's last key is `<
+        // target`, which means `target` is greater than every entry in
+        // the table. The correct answer is then the last entry of the
+        // **last** block (not block 0).
+        let num_blocks = self.reader.num_blocks();
+        if num_blocks == 0 {
+            self.curr = None;
+            return Ok(());
+        }
+        let block_idx = self.reader.seek_block(target).unwrap_or(num_blocks - 1);
+
         self.block_idx = block_idx;
         self.block_entries = self
             .reader
             .load_block_entries(self.block_idx, &self.cache)?;
-        // Within the block, find the largest entry <= target by a linear
-        // walk. This is O(block_size / entry_size), which is fine — one
-        // block is ~hundreds of entries.
+
+        // Within the block, find the largest entry `<= target` via linear
+        // walk. One block holds ~hundreds of entries, so this is cheap.
         let mut best: Option<usize> = None;
         for (i, (k, _)) in self.block_entries.iter().enumerate() {
             if k.as_slice() <= target {
@@ -320,8 +318,12 @@ impl SsTableLevelIter {
                 self.curr = self.block_entries.get(i).cloned();
             }
             None => {
-                // No entry in this block is <= target. Try the previous
-                // block if any — its last entry is necessarily < target.
+                // Every entry in this block is `> target`, which can
+                // happen when the containing block's first key already
+                // exceeds `target`. The answer, if one exists, is the
+                // last entry of the previous block — its last key is
+                // known to be `< target` (that's why `seek_block`
+                // skipped it).
                 if self.block_idx == 0 {
                     self.curr = None;
                     return Ok(());

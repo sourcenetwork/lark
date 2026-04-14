@@ -893,6 +893,46 @@ mod tests {
     }
 
     #[test]
+    fn test_iter_reverse_seek_past_end_of_multi_block_sst() {
+        // Regression: SsTableLevelIter::seek_for_prev used to fall back
+        // to block 0 when the target exceeded every entry in the SST.
+        // The correct fallback is the *last* block, so reverse walks
+        // that start past the end actually visit every user key.
+        //
+        // Forces a multi-block SSTable with a small `block_size`, flushes
+        // to L0 via `close()` so the data is guaranteed to be on disk,
+        // then reopens and runs `seek_for_prev` with a target larger
+        // than every key.
+        let dir = TempDir::new().unwrap();
+        let opts = Options {
+            block_size: 128,
+            write_buffer_size: 64 * 1024,
+            ..Options::default()
+        };
+        {
+            let db = Db::open(dir.path(), opts.clone()).unwrap();
+            for i in 0..60u32 {
+                let k = format!("k{:03}", i);
+                db.put(k.as_bytes(), b"v").unwrap();
+            }
+            db.close().unwrap();
+        }
+
+        let db = Db::open(dir.path(), opts).unwrap();
+        let mut it = db.iter();
+        it.seek_for_prev(b"~"); // '~' sorts after 'k'
+
+        let mut seen = Vec::new();
+        while it.valid() {
+            seen.push(it.key().unwrap().to_vec());
+            it.prev();
+        }
+        assert_eq!(seen.len(), 60);
+        assert_eq!(seen.first().map(|k| k.as_slice()), Some(&b"k059"[..]));
+        assert_eq!(seen.last().map(|k| k.as_slice()), Some(&b"k000"[..]));
+    }
+
+    #[test]
     fn test_iter_seek_for_prev_on_tombstoned_key() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
