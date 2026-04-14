@@ -4,8 +4,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use super::block_cache::BlockCache;
-use super::internal_key::user_key_of;
+use super::internal_key::{decode_internal_key, user_key_of};
 use super::manifest::{VersionEdit, VersionSet, MAX_LEVELS};
+use super::snapshot_registry::SnapshotRegistry;
 use super::sstable::{
     remove_sst, sst_filename, LiveSst, SsTableMeta, SsTableReader, SsTableWriter,
 };
@@ -37,8 +38,12 @@ impl CompactionScheduler {
     /// [`run_compact_range`] — acquiring it around every compaction pass
     /// ensures both paths don't try to pick overlapping input sets or
     /// double-delete the same file.
+    ///
+    /// `snapshot_registry` lets each compaction pass query the current
+    /// pin seq so it can drop versions that no live snapshot needs.
     pub(crate) fn start(
         compaction_lock: Arc<parking_lot::Mutex<()>>,
+        snapshot_registry: Arc<SnapshotRegistry>,
         versions: Arc<parking_lot::Mutex<VersionSet>>,
         sst_dir: Arc<Path>,
         cache: Arc<BlockCache>,
@@ -57,6 +62,7 @@ impl CompactionScheduler {
                     shutdown_clone,
                     trigger_clone,
                     compaction_lock,
+                    snapshot_registry,
                     versions,
                     sst_dir,
                     cache,
@@ -121,10 +127,12 @@ impl Default for CompactionOptions {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compaction_loop(
     shutdown: Arc<AtomicBool>,
     trigger: Arc<(Mutex<bool>, Condvar)>,
     compaction_lock: Arc<parking_lot::Mutex<()>>,
+    snapshot_registry: Arc<SnapshotRegistry>,
     versions: Arc<parking_lot::Mutex<VersionSet>>,
     sst_dir: Arc<Path>,
     cache: Arc<BlockCache>,
@@ -153,7 +161,11 @@ fn compaction_loop(
         loop {
             let did_work = {
                 let _guard = compaction_lock.lock();
-                match pick_and_run_compaction(&versions, &sst_dir, &cache, &opts) {
+                // Recompute the GC horizon on every pass: a snapshot
+                // may have dropped since the previous pass, unpinning
+                // more versions.
+                let pin_seq = snapshot_registry.oldest_live_seq();
+                match pick_and_run_compaction(&versions, &sst_dir, &cache, &opts, pin_seq) {
                     Ok(did_work) => did_work,
                     Err(e) => {
                         tracing::error!(error = %e, "Compaction failed");
@@ -174,19 +186,20 @@ fn pick_and_run_compaction(
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
+    pin_seq: u64,
 ) -> std::io::Result<bool> {
     let version = versions.lock().current();
 
     // Check L0 first
     if version.l0_count() >= opts.l0_compaction_trigger {
-        return compact_l0(versions, sst_dir, cache, opts);
+        return compact_l0(versions, sst_dir, cache, opts, pin_seq);
     }
 
     // Check other levels
     for level in 1..MAX_LEVELS - 1 {
         let target = level_target_size(level, opts);
         if version.level_size(level) > target {
-            return compact_level(versions, sst_dir, cache, opts, level);
+            return compact_level(versions, sst_dir, cache, opts, level, pin_seq);
         }
     }
 
@@ -207,8 +220,9 @@ fn compact_l0(
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
+    pin_seq: u64,
 ) -> std::io::Result<bool> {
-    compact_level(versions, sst_dir, cache, opts, 0)
+    compact_level(versions, sst_dir, cache, opts, 0, pin_seq)
 }
 
 /// Compact a level into the next level using the standard size-based
@@ -220,6 +234,7 @@ fn compact_level(
     cache: &BlockCache,
     opts: &CompactionOptions,
     level: usize,
+    pin_seq: u64,
 ) -> std::io::Result<bool> {
     let target_level = level + 1;
     if target_level >= MAX_LEVELS {
@@ -254,6 +269,7 @@ fn compact_level(
         level,
         input_files,
         overlap_files,
+        pin_seq,
     )?;
     Ok(true)
 }
@@ -272,6 +288,7 @@ pub(crate) fn run_compact_range(
     opts: &CompactionOptions,
     start: Option<&[u8]>,
     end: Option<&[u8]>,
+    pin_seq: u64,
 ) -> std::io::Result<()> {
     for level in 0..MAX_LEVELS - 1 {
         loop {
@@ -311,7 +328,16 @@ pub(crate) fn run_compact_range(
             let target_level = level + 1;
             let overlap_files = find_overlapping(&version.levels[target_level], &min_key, &max_key);
 
-            perform_compaction(versions, sst_dir, cache, opts, level, inputs, overlap_files)?;
+            perform_compaction(
+                versions,
+                sst_dir,
+                cache,
+                opts,
+                level,
+                inputs,
+                overlap_files,
+                pin_seq,
+            )?;
 
             // At L0 we handled every range-overlapping file in one
             // shot, so we're done with this level.
@@ -330,6 +356,12 @@ pub(crate) fn run_compact_range(
 /// `target_level`, and atomically apply the version edit (Remove old
 /// files, Add new ones). File descriptors of old files stay alive via
 /// any `Arc<LiveSst>` still referenced by older versions / iterators.
+///
+/// `pin_seq` is the snapshot-pinning GC horizon: every version with a
+/// seq older than the version visible to `pin_seq` can be dropped.
+/// When no snapshot is live, callers pass `u64::MAX` and only the
+/// newest version of each user key is retained.
+#[allow(clippy::too_many_arguments)]
 fn perform_compaction(
     versions: &Arc<parking_lot::Mutex<VersionSet>>,
     sst_dir: &Path,
@@ -338,6 +370,7 @@ fn perform_compaction(
     level: usize,
     input_files: Vec<Arc<LiveSst>>,
     overlap_files: Vec<Arc<LiveSst>>,
+    pin_seq: u64,
 ) -> std::io::Result<()> {
     let target_level = level + 1;
 
@@ -353,6 +386,10 @@ fn perform_compaction(
     // key) and drop any exact duplicates (same user_key + seq + type).
     all_entries.sort_by(|a, b| a.0.cmp(&b.0));
     all_entries.dedup_by(|a, b| a.0 == b.0);
+
+    // Snapshot-pinning GC: drop versions that no live snapshot and no
+    // current reader can see. See `gc_old_versions` for the rule.
+    let all_entries = gc_old_versions(all_entries, pin_seq);
 
     let mut edits = Vec::new();
 
@@ -469,6 +506,60 @@ fn perform_compaction(
     );
 
     Ok(())
+}
+
+/// Drop every version that no live snapshot and no current reader
+/// can observe.
+///
+/// Input `entries` is in internal-key order, so within a user-key
+/// group entries appear **newest-seq first** (because the internal
+/// key encodes `!seq`). The rule is:
+///
+/// 1. Keep every entry with `seq > pin_seq`. These are visible to
+///    newer snapshots or to current reads.
+/// 2. For the stretch of entries with `seq <= pin_seq`, keep only
+///    the *first* one we see — that's the largest seq not exceeding
+///    `pin_seq`, i.e. the version the oldest live snapshot actually
+///    reads. Drop everything strictly older than that.
+///
+/// When `pin_seq == u64::MAX` (no live snapshot), rule (1) vacuously
+/// keeps nothing and rule (2) keeps only the newest version of each
+/// user key — the aggressive GC case. When `pin_seq` is somewhere in
+/// the middle, older versions still visible to some snapshot are
+/// conservatively preserved.
+///
+/// Tombstones participate in the same rule: the newest tombstone in
+/// a user-key group survives as long as `seq > pin_seq`, or as the
+/// single pin entry if all versions fall at or below `pin_seq`.
+/// Dropping tombstones at the bottommost level when no deeper data
+/// references them is a future optimization (tracked as a follow-up).
+fn gc_old_versions(entries: Vec<(Vec<u8>, Vec<u8>)>, pin_seq: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::with_capacity(entries.len());
+    let mut current_user_key: Option<Vec<u8>> = None;
+    let mut pin_emitted = false;
+
+    for (ik, value) in entries {
+        let (uk, seq, _) = decode_internal_key(&ik);
+
+        if current_user_key.as_deref() != Some(uk) {
+            current_user_key = Some(uk.to_vec());
+            pin_emitted = false;
+        }
+
+        if seq > pin_seq {
+            out.push((ik, value));
+            continue;
+        }
+
+        // `seq <= pin_seq` — first one is the pin entry for this
+        // group, every later one is strictly older and shadowed.
+        if !pin_emitted {
+            out.push((ik, value));
+            pin_emitted = true;
+        }
+    }
+
+    out
 }
 
 /// Whether a file's user-key range intersects `[start, end)`. `None`
