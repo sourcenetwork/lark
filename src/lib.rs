@@ -49,7 +49,7 @@ mod options;
 
 pub use error::Error;
 pub use iter::Iter;
-pub use options::{CompressionType, DurabilityMode, Options};
+pub use options::{CompactionDecision, CompactionFilter, CompressionType, DurabilityMode, Options};
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -2043,6 +2043,211 @@ mod tests {
         for i in 0..50 {
             assert_eq!(
                 db.get(format!("k_{i:03}").as_bytes()).unwrap(),
+                Some(b"v".to_vec())
+            );
+        }
+    }
+
+    // ── compaction filter ───────────────────────────────────────────────────
+
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// Test filter that drops every entry whose user key ends in an
+    /// odd ASCII digit. Also counts invocations so tests can verify
+    /// the filter actually ran.
+    struct DropOddKeysFilter {
+        calls: AtomicUsize,
+    }
+
+    impl CompactionFilter for DropOddKeysFilter {
+        fn filter(&self, _level: usize, key: &[u8], _value: &[u8]) -> CompactionDecision {
+            self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+            match key.last() {
+                Some(b) if b.is_ascii_digit() && (b - b'0') % 2 == 1 => CompactionDecision::Remove,
+                _ => CompactionDecision::Keep,
+            }
+        }
+        fn name(&self) -> &'static str {
+            "drop_odd_keys"
+        }
+    }
+
+    /// Test filter that uppercases every ASCII-lowercase byte in the
+    /// value. Exercises `Change`.
+    struct UppercaseValuesFilter;
+
+    impl CompactionFilter for UppercaseValuesFilter {
+        fn filter(&self, _level: usize, _key: &[u8], value: &[u8]) -> CompactionDecision {
+            let up: Vec<u8> = value.iter().map(|b| b.to_ascii_uppercase()).collect();
+            if up == value {
+                CompactionDecision::Keep
+            } else {
+                CompactionDecision::Change(up)
+            }
+        }
+        fn name(&self) -> &'static str {
+            "uppercase_values"
+        }
+    }
+
+    /// Filter that drops every range tombstone it sees.
+    struct DropRangeTombstonesFilter;
+
+    impl CompactionFilter for DropRangeTombstonesFilter {
+        fn filter(&self, _level: usize, _key: &[u8], _value: &[u8]) -> CompactionDecision {
+            CompactionDecision::Keep
+        }
+        fn filter_range_delete(
+            &self,
+            _level: usize,
+            _start: &[u8],
+            _end: &[u8],
+        ) -> CompactionDecision {
+            CompactionDecision::Remove
+        }
+        fn name(&self) -> &'static str {
+            "drop_range_tombstones"
+        }
+    }
+
+    #[test]
+    fn test_compaction_filter_removes_matching_entries() {
+        let dir = TempDir::new().unwrap();
+        let filter = Arc::new(DropOddKeysFilter {
+            calls: AtomicUsize::new(0),
+        });
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            compaction_filter: Some(filter.clone()),
+            ..Options::default()
+        };
+        let db = Db::open(dir.path(), opts).unwrap();
+        // 20 keys: k0..k9 written twice so compaction has work. Use
+        // longer payloads so the tiny write buffer triggers flushes.
+        let payload = vec![b'v'; 512];
+        for _round in 0..4 {
+            for i in 0..10 {
+                db.put(format!("k{i}").as_bytes(), &payload).unwrap();
+            }
+        }
+        db.compact_range(None, None).unwrap();
+
+        // After compaction, odd-suffix keys are gone.
+        for i in 0..10 {
+            let got = db.get(format!("k{i}").as_bytes()).unwrap();
+            if i % 2 == 1 {
+                assert_eq!(got, None, "k{i} should be filtered");
+            } else {
+                assert_eq!(got, Some(payload.clone()), "k{i} should survive");
+            }
+        }
+        assert!(
+            filter.calls.load(AtomicOrdering::Relaxed) > 0,
+            "filter should have been invoked"
+        );
+    }
+
+    #[test]
+    fn test_compaction_filter_rewrites_values() {
+        let dir = TempDir::new().unwrap();
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            compaction_filter: Some(Arc::new(UppercaseValuesFilter)),
+            ..Options::default()
+        };
+        let db = Db::open(dir.path(), opts).unwrap();
+        for i in 0..20 {
+            db.put(format!("k{i:02}").as_bytes(), b"hello world")
+                .unwrap();
+        }
+        // Force enough flushes + manual compaction to run the filter.
+        force_flush(&db, "filter");
+        db.compact_range(None, None).unwrap();
+
+        for i in 0..20 {
+            assert_eq!(
+                db.get(format!("k{i:02}").as_bytes()).unwrap(),
+                Some(b"HELLO WORLD".to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn test_compaction_filter_skipped_while_snapshot_alive() {
+        let dir = TempDir::new().unwrap();
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            compaction_filter: Some(Arc::new(UppercaseValuesFilter)),
+            ..Options::default()
+        };
+        let db = Db::open(dir.path(), opts).unwrap();
+        for i in 0..20 {
+            db.put(format!("k{i:02}").as_bytes(), b"hello").unwrap();
+        }
+        // Hold a snapshot so the compaction filter is skipped entirely.
+        let snap = db.snapshot();
+        force_flush(&db, "snap_filter");
+        db.compact_range(None, None).unwrap();
+
+        // The snapshot still observes the pre-filter value because
+        // the filter was suppressed while it was alive. The live db
+        // reads also see the unmodified value since compaction left
+        // it intact.
+        for i in 0..20 {
+            assert_eq!(
+                snap.get(format!("k{i:02}").as_bytes()).unwrap(),
+                Some(b"hello".to_vec())
+            );
+            assert_eq!(
+                db.get(format!("k{i:02}").as_bytes()).unwrap(),
+                Some(b"hello".to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn test_compaction_filter_drops_range_tombstones() {
+        let dir = TempDir::new().unwrap();
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            compaction_filter: Some(Arc::new(DropRangeTombstonesFilter)),
+            ..Options::default()
+        };
+        let db = Db::open(dir.path(), opts).unwrap();
+        for c in b'a'..=b'f' {
+            db.put(&[c], &[c]).unwrap();
+        }
+        db.delete_range(b"b", b"e").unwrap();
+        // Before compaction, the range-delete is honored — no snapshot
+        // pinning, so the read path sees the memtable RT directly.
+        for c in b'b'..=b'd' {
+            assert_eq!(db.get(&[c]).unwrap(), None);
+        }
+        force_flush(&db, "drop_rt");
+        db.compact_range(None, None).unwrap();
+
+        // After compaction the filter dropped the RT, so the original
+        // values come back (they were never actually overwritten).
+        for c in b'a'..=b'f' {
+            assert_eq!(
+                db.get(&[c]).unwrap(),
+                Some(vec![c]),
+                "key {} restored",
+                c as char
+            );
+        }
+    }
+
+    #[test]
+    fn test_compaction_filter_none_is_noop() {
+        let (db, _dir) = open_tmp();
+        for i in 0..10 {
+            db.put(format!("k{i}").as_bytes(), b"v").unwrap();
+        }
+        db.compact_range(None, None).unwrap();
+        for i in 0..10 {
+            assert_eq!(
+                db.get(format!("k{i}").as_bytes()).unwrap(),
                 Some(b"v".to_vec())
             );
         }
