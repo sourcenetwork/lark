@@ -3,6 +3,7 @@ pub(crate) mod block_cache;
 pub(crate) mod bloom;
 pub(crate) mod compaction;
 pub(crate) mod internal_key;
+pub(crate) mod iterator;
 pub(crate) mod manifest;
 pub(crate) mod memtable;
 pub(crate) mod sstable;
@@ -168,6 +169,29 @@ impl LarkEngine {
         self.latest_seq.load(Ordering::Acquire)
     }
 
+    /// Construct a streaming iterator rooted at `snapshot_seq`. Captures
+    /// the current memtable state, the current version, and eagerly
+    /// opens every SSTable file so in-flight compaction cannot
+    /// invalidate the iterator.
+    pub(crate) fn new_iter(&self, snapshot_seq: u64) -> std::io::Result<iterator::LarkIterator> {
+        let active = Arc::clone(&self.active_memtable.read());
+        let frozen: Vec<Arc<MemTable>> = self
+            .frozen_memtables
+            .read()
+            .iter()
+            .map(Arc::clone)
+            .collect();
+        let version = self.versions.lock().current();
+        iterator::LarkIterator::new(
+            active,
+            frozen,
+            version,
+            &self.sst_dir,
+            Arc::clone(&self.cache),
+            snapshot_seq,
+        )
+    }
+
     /// Point lookup at a given snapshot. Returns `Ok(Some(value))` or `Ok(None)`.
     pub(crate) fn get(&self, key: &[u8], snapshot_seq: u64) -> std::io::Result<Option<Vec<u8>>> {
         if let Some(result) = self.active_memtable.read().get(key, snapshot_seq) {
@@ -217,64 +241,6 @@ impl LarkEngine {
         }
 
         Ok(None)
-    }
-
-    /// Scan a key range at a given snapshot.
-    ///
-    /// Sources are processed in priority order — active memtable, then
-    /// frozen memtables (newest-first), then L0 SSTables (newest-first),
-    /// then L1, L2, … — and the first entry seen for each user key wins.
-    /// Tombstones in the winning source hide the key entirely.
-    pub(crate) fn scan(
-        &self,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-        snapshot_seq: u64,
-    ) -> std::io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let mut seen: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-        let mut insert = |k: Vec<u8>, v: Option<Vec<u8>>| {
-            seen.entry(k).or_insert(v);
-        };
-
-        for (key, value) in self.active_memtable.read().iter(snapshot_seq) {
-            if in_range(&key, start, end) {
-                insert(key, value);
-            }
-        }
-
-        {
-            let frozen = self.frozen_memtables.read();
-            for mt in frozen.iter().rev() {
-                for (key, value) in mt.iter(snapshot_seq) {
-                    if in_range(&key, start, end) {
-                        insert(key, value);
-                    }
-                }
-            }
-        }
-
-        let version = self.versions.lock().current();
-        for meta in version.levels[0].iter().rev() {
-            let path = self.sst_dir.join(sst_filename(meta.file_id));
-            let reader = SsTableReader::open(&path, meta.file_id)?;
-            for (key, value) in reader.range_iter(start, end, snapshot_seq, &self.cache)? {
-                insert(key, value);
-            }
-        }
-        for level in 1..version.levels.len() {
-            for meta in &version.levels[level] {
-                let path = self.sst_dir.join(sst_filename(meta.file_id));
-                let reader = SsTableReader::open(&path, meta.file_id)?;
-                for (key, value) in reader.range_iter(start, end, snapshot_seq, &self.cache)? {
-                    insert(key, value);
-                }
-            }
-        }
-
-        Ok(seen
-            .into_iter()
-            .filter_map(|(k, v)| v.map(|vv| (k, vv)))
-            .collect())
     }
 
     /// Apply a batch of writes atomically.
@@ -525,20 +491,6 @@ impl LarkEngine {
 
         Ok(())
     }
-}
-
-fn in_range(key: &[u8], start: Option<&[u8]>, end: Option<&[u8]>) -> bool {
-    if let Some(s) = start {
-        if key < s {
-            return false;
-        }
-    }
-    if let Some(e) = end {
-        if key >= e {
-            return false;
-        }
-    }
-    true
 }
 
 fn list_wal_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
