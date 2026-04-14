@@ -50,7 +50,9 @@ mod ttl;
 
 pub use error::Error;
 pub use iter::Iter;
-pub use options::{CompactionDecision, CompactionFilter, CompressionType, DurabilityMode, Options};
+pub use options::{
+    CompactionDecision, CompactionFilter, CompressionType, DurabilityMode, Options, WriteOptions,
+};
 pub use ttl::{strip_timestamp, DbWithTtl, TtlCompactionFilter};
 
 use std::collections::BTreeMap;
@@ -104,21 +106,36 @@ impl Db {
         self.engine.multi_get(keys, seq).map_err(Error::Io)
     }
 
-    /// Set a key-value pair.
+    /// Set a key-value pair using the database-global durability mode
+    /// and default write options.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.put_opt(&WriteOptions::default(), key, value)
+    }
+
+    /// Set a key-value pair with an explicit [`WriteOptions`] override.
+    /// Overrides on a per-call basis the database-global
+    /// [`Options::durability`] mode.
+    pub fn put_opt(&self, opts: &WriteOptions, key: &[u8], value: &[u8]) -> Result<()> {
         let mut batch = BTreeMap::new();
         batch.insert(key.to_vec(), Some(value.to_vec()));
+        let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
-            .apply_batch(batch, Vec::new(), self.durability)
+            .apply_batch(batch, Vec::new(), dm, disable_wal)
             .map_err(Error::Io)
     }
 
-    /// Delete a key.
+    /// Delete a key using the database-global durability mode.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
+        self.delete_opt(&WriteOptions::default(), key)
+    }
+
+    /// Delete a key with an explicit [`WriteOptions`] override.
+    pub fn delete_opt(&self, opts: &WriteOptions, key: &[u8]) -> Result<()> {
         let mut batch = BTreeMap::new();
         batch.insert(key.to_vec(), None);
+        let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
-            .apply_batch(batch, Vec::new(), self.durability)
+            .apply_batch(batch, Vec::new(), dm, disable_wal)
             .map_err(Error::Io)
     }
 
@@ -132,44 +149,73 @@ impl Db {
     ///
     /// If `start >= end` the call is a no-op.
     pub fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()> {
+        self.delete_range_opt(&WriteOptions::default(), start, end)
+    }
+
+    /// Delete every key in `[start, end)` with an explicit
+    /// [`WriteOptions`] override.
+    pub fn delete_range_opt(&self, opts: &WriteOptions, start: &[u8], end: &[u8]) -> Result<()> {
         if start >= end {
             return Ok(());
         }
+        let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
             .apply_batch(
                 BTreeMap::new(),
                 vec![(start.to_vec(), end.to_vec())],
-                self.durability,
+                dm,
+                disable_wal,
             )
             .map_err(Error::Io)
     }
 
-    /// Apply a batch of writes atomically.
+    /// Apply a batch of writes atomically using the database-global
+    /// durability mode.
     pub fn write(&self, batch: WriteBatch) -> Result<()> {
+        self.write_opt(&WriteOptions::default(), batch)
+    }
+
+    /// Apply a batch of writes atomically with an explicit
+    /// [`WriteOptions`] override.
+    pub fn write_opt(&self, opts: &WriteOptions, batch: WriteBatch) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
+        let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
-            .apply_batch(batch.ops, batch.range_deletes, self.durability)
+            .apply_batch(batch.ops, batch.range_deletes, dm, disable_wal)
             .map_err(Error::Io)
     }
 
-    /// Apply a batch of writes atomically with explicit durability mode.
+    /// Apply a batch of writes atomically with an explicit
+    /// [`DurabilityMode`] override. Retained for backwards
+    /// compatibility — prefer [`Db::write_opt`] for new code.
     pub fn write_with_durability(
         &self,
         batch: WriteBatch,
         durability: DurabilityMode,
     ) -> Result<()> {
-        if batch.is_empty() {
-            return Ok(());
-        }
-        let dm = match durability {
-            DurabilityMode::Immediate => engine::DurabilityMode::Immediate,
-            DurabilityMode::Eventual => engine::DurabilityMode::Eventual,
+        let opts = WriteOptions {
+            sync: matches!(durability, DurabilityMode::Immediate),
+            ..WriteOptions::default()
         };
-        self.engine
-            .apply_batch(batch.ops, batch.range_deletes, dm)
-            .map_err(Error::Io)
+        self.write_opt(&opts, batch)
+    }
+
+    /// Resolve a [`WriteOptions`] into the pair the engine's
+    /// `apply_batch` actually consumes: a concrete
+    /// `engine::DurabilityMode` and a `disable_wal` bool. `sync: true`
+    /// maps to `Immediate` regardless of the database-global default;
+    /// otherwise the default wins. `low_pri` and `no_slowdown` are
+    /// accepted but currently no-ops — they're reserved for future
+    /// write-stall / rate-limiter plumbing.
+    fn resolve_write_opts(&self, opts: &WriteOptions) -> (engine::DurabilityMode, bool) {
+        let dm = if opts.sync {
+            engine::DurabilityMode::Immediate
+        } else {
+            self.durability
+        };
+        (dm, opts.disable_wal)
     }
 
     /// Create a point-in-time snapshot for consistent reads.
@@ -2253,5 +2299,127 @@ mod tests {
                 Some(b"v".to_vec())
             );
         }
+    }
+
+    // ── per-write WriteOptions ──────────────────────────────────────────────
+
+    #[test]
+    fn test_write_options_defaults_unchanged() {
+        // `put_opt` with a default-constructed WriteOptions must
+        // behave identically to `put`.
+        let (db, _dir) = open_tmp();
+        db.put_opt(&WriteOptions::default(), b"a", b"1").unwrap();
+        assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
+    }
+
+    #[test]
+    fn test_write_options_sync_override_persists_across_reopen() {
+        // With Eventual default, a sync write should still land on
+        // disk such that a reopen recovers it. (Eventual alone
+        // already survives a clean close — this test's real content
+        // is that the sync flag doesn't break the normal code path.)
+        let dir = TempDir::new().unwrap();
+        let opts = Options {
+            durability: DurabilityMode::Eventual,
+            ..Options::default()
+        };
+        {
+            let db = Db::open(dir.path(), opts.clone()).unwrap();
+            db.put_opt(&WriteOptions::sync(), b"critical", b"payload")
+                .unwrap();
+            // Deliberately skip close() — sync must have forced the
+            // WAL to durable storage already.
+        }
+        let db = Db::open(dir.path(), opts).unwrap();
+        assert_eq!(db.get(b"critical").unwrap(), Some(b"payload".to_vec()));
+    }
+
+    #[test]
+    fn test_write_options_disable_wal_loses_data_on_drop_without_flush() {
+        // disable_wal skips the WAL append entirely. Without a clean
+        // close(), a reopen cannot recover the write because neither
+        // the WAL nor an SSTable has it.
+        let dir = TempDir::new().unwrap();
+        let opts = Options::default();
+        {
+            let db = Db::open(dir.path(), opts.clone()).unwrap();
+            db.put_opt(&WriteOptions::disable_wal(), b"ephemeral", b"ghost")
+                .unwrap();
+            // No close() — simulate a crash. The memtable holds the
+            // write but nothing on disk does.
+        }
+        let db = Db::open(dir.path(), opts).unwrap();
+        assert_eq!(db.get(b"ephemeral").unwrap(), None);
+    }
+
+    #[test]
+    fn test_write_options_disable_wal_visible_within_session() {
+        // Within the same process, a disable_wal write is visible
+        // to subsequent reads via the memtable — only a crash
+        // erases it.
+        let (db, _dir) = open_tmp();
+        db.put_opt(&WriteOptions::disable_wal(), b"k", b"v")
+            .unwrap();
+        assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn test_write_options_disable_wal_survives_clean_close() {
+        // A clean close() flushes the memtable to an SSTable before
+        // shutting down. A disable_wal write still made it into the
+        // memtable, so close() + reopen recovers it via the SSTable
+        // (not the WAL).
+        let dir = TempDir::new().unwrap();
+        let opts = Options::default();
+        {
+            let db = Db::open(dir.path(), opts.clone()).unwrap();
+            db.put_opt(&WriteOptions::disable_wal(), b"bulk", b"loaded")
+                .unwrap();
+            db.close().unwrap();
+        }
+        let db = Db::open(dir.path(), opts).unwrap();
+        assert_eq!(db.get(b"bulk").unwrap(), Some(b"loaded".to_vec()));
+    }
+
+    #[test]
+    fn test_write_options_batch_overrides() {
+        let (db, _dir) = open_tmp();
+        let mut batch = WriteBatch::new();
+        batch.put(b"a", b"1");
+        batch.put(b"b", b"2");
+        batch.delete(b"ghost");
+        db.write_opt(&WriteOptions::sync(), batch).unwrap();
+        assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(db.get(b"b").unwrap(), Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn test_write_options_delete_and_delete_range_opts() {
+        let (db, _dir) = open_tmp();
+        for c in b'a'..=b'f' {
+            db.put(&[c], &[c]).unwrap();
+        }
+        db.delete_opt(&WriteOptions::sync(), b"c").unwrap();
+        db.delete_range_opt(&WriteOptions::sync(), b"d", b"f")
+            .unwrap();
+        assert_eq!(db.get(b"a").unwrap(), Some(b"a".to_vec()));
+        assert_eq!(db.get(b"c").unwrap(), None);
+        assert_eq!(db.get(b"d").unwrap(), None);
+        assert_eq!(db.get(b"e").unwrap(), None);
+        assert_eq!(db.get(b"f").unwrap(), Some(b"f".to_vec()));
+    }
+
+    #[test]
+    fn test_write_options_low_pri_and_no_slowdown_are_no_ops() {
+        // Accepted but currently ignored. Reserved for future
+        // write-stall / priority-queue plumbing.
+        let (db, _dir) = open_tmp();
+        let opts = WriteOptions {
+            low_pri: true,
+            no_slowdown: true,
+            ..WriteOptions::default()
+        };
+        db.put_opt(&opts, b"k", b"v").unwrap();
+        assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
     }
 }

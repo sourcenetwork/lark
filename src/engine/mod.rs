@@ -520,11 +520,17 @@ impl LarkEngine {
     ///
     /// All operations in a single call are assigned consecutive
     /// sequence numbers: point ops first, then range deletes.
+    ///
+    /// `durability` controls WAL fsync semantics (`Immediate` = fsync
+    /// per call, `Eventual` = buffered flush). `disable_wal` skips
+    /// the WAL append entirely — the caller accepts that a crash
+    /// before the next memtable flush loses the write.
     pub(crate) fn apply_batch(
         &self,
         point_ops: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
         durability: DurabilityMode,
+        disable_wal: bool,
     ) -> std::io::Result<()> {
         if point_ops.is_empty() && range_deletes.is_empty() {
             return Ok(());
@@ -538,7 +544,7 @@ impl LarkEngine {
             .fetch_add(total_ops as u64, Ordering::AcqRel)
             + 1;
 
-        {
+        if !disable_wal {
             let mut wal = self.active_wal.lock();
             for (i, (key, value)) in point_ops.iter().enumerate() {
                 let seq = base_seq + i as u64;
