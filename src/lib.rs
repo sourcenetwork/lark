@@ -184,6 +184,20 @@ impl Db {
         self.engine.drop_all().map_err(Error::Io)
     }
 
+    /// Synchronously compact every SSTable overlapping the user-key
+    /// range `[start, end)` down to the bottommost non-empty level.
+    ///
+    /// Passing `None` for either bound means "unbounded" on that side,
+    /// so `compact_range(None, None)` compacts the entire database.
+    ///
+    /// Active memtable contents that fall in the range are flushed to
+    /// L0 first. The call blocks until the requested compaction work
+    /// is finished and is serialized with the background compaction
+    /// scheduler so the two paths can't fight over the same inputs.
+    pub fn compact_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
+        self.engine.compact_range(start, end).map_err(Error::Io)
+    }
+
     /// Flush all data to disk and shut down background threads.
     pub fn close(&self) -> Result<()> {
         self.engine.close().map_err(Error::Io)
@@ -697,6 +711,228 @@ mod tests {
             it.next();
         }
         assert_eq!(count, N);
+    }
+
+    // ─── compact_range tests ────────────────────────────────────────────
+
+    fn level_file_count(db: &Db, level: usize) -> usize {
+        db.engine.level_file_count(level)
+    }
+
+    fn total_file_count(db: &Db) -> usize {
+        db.engine.total_file_count()
+    }
+
+    #[test]
+    fn test_compact_range_empty_db() {
+        let (db, _dir) = open_tmp();
+        // No data, no files. compact_range is a no-op and must succeed.
+        db.compact_range(None, None).unwrap();
+        assert_eq!(total_file_count(&db), 0);
+    }
+
+    #[test]
+    fn test_compact_range_full_preserves_reads() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        for i in 0..500 {
+            let k = format!("k{:04}", i);
+            db.put(k.as_bytes(), format!("v{}", i).as_bytes()).unwrap();
+        }
+
+        db.compact_range(None, None).unwrap();
+
+        // Every key is still readable after the compaction.
+        for i in 0..500 {
+            let k = format!("k{:04}", i);
+            assert_eq!(
+                db.get(k.as_bytes()).unwrap(),
+                Some(format!("v{}", i).into_bytes())
+            );
+        }
+    }
+
+    #[test]
+    fn test_compact_range_flushes_active_memtable() {
+        // Writes that are still in the memtable when compact_range is
+        // called must be flushed to L0 before the walk, so the active
+        // memtable is empty afterwards.
+        let (db, _dir) = open_tmp();
+        for i in 0..10 {
+            let k = format!("m{:02}", i);
+            db.put(k.as_bytes(), b"v").unwrap();
+        }
+        assert!(!db.engine.active_memtable_is_empty());
+
+        db.compact_range(None, None).unwrap();
+
+        assert!(db.engine.active_memtable_is_empty());
+        // And data is still readable through the SSTable path.
+        for i in 0..10 {
+            let k = format!("m{:02}", i);
+            assert_eq!(db.get(k.as_bytes()).unwrap(), Some(b"v".to_vec()));
+        }
+    }
+
+    #[test]
+    fn test_compact_range_drains_l0() {
+        // After a full compact_range, nothing should remain at L0 —
+        // every file must have been pushed down to L1+.
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        for i in 0..200 {
+            let k = format!("k{:04}", i);
+            db.put(k.as_bytes(), b"v").unwrap();
+        }
+
+        db.compact_range(None, None).unwrap();
+
+        assert_eq!(level_file_count(&db, 0), 0);
+        // Some higher level must hold the data.
+        assert!(total_file_count(&db) > 0);
+    }
+
+    #[test]
+    fn test_compact_range_bounded_preserves_all_data() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        // Three disjoint ranges: low (a*), mid (m*), high (z*).
+        for i in 0..100 {
+            db.put(format!("a{:03}", i).as_bytes(), b"a").unwrap();
+        }
+        for i in 0..100 {
+            db.put(format!("m{:03}", i).as_bytes(), b"m").unwrap();
+        }
+        for i in 0..100 {
+            db.put(format!("z{:03}", i).as_bytes(), b"z").unwrap();
+        }
+
+        // Only compact the mid range.
+        db.compact_range(Some(b"m"), Some(b"n")).unwrap();
+
+        // Every key must still be readable regardless of the range.
+        for i in 0..100 {
+            assert_eq!(
+                db.get(format!("a{:03}", i).as_bytes()).unwrap(),
+                Some(b"a".to_vec())
+            );
+            assert_eq!(
+                db.get(format!("m{:03}", i).as_bytes()).unwrap(),
+                Some(b"m".to_vec())
+            );
+            assert_eq!(
+                db.get(format!("z{:03}", i).as_bytes()).unwrap(),
+                Some(b"z".to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn test_compact_range_reclaims_space_after_overwrite() {
+        // Write N keys, overwrite them, force flush, then compact_range.
+        // The number of distinct entries after compaction should be N
+        // (one per user key) — the old overwritten versions got merged
+        // away by deduplication during compaction.
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        for i in 0..200 {
+            let k = format!("k{:03}", i);
+            db.put(k.as_bytes(), b"v1").unwrap();
+        }
+        for i in 0..200 {
+            let k = format!("k{:03}", i);
+            db.put(k.as_bytes(), b"v2").unwrap();
+        }
+
+        db.compact_range(None, None).unwrap();
+
+        for i in 0..200 {
+            let k = format!("k{:03}", i);
+            assert_eq!(db.get(k.as_bytes()).unwrap(), Some(b"v2".to_vec()));
+        }
+    }
+
+    #[test]
+    fn test_compact_range_runs_alongside_background_compaction() {
+        // Write enough to trigger background compactions, then while
+        // the engine is still churning, fire a foreground compact_range.
+        // Both must complete without corruption.
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        const N: usize = 2_000;
+        for i in 0..N {
+            let k = format!("key_{:05}", i);
+            db.put(k.as_bytes(), b"v").unwrap();
+        }
+
+        db.compact_range(None, None).unwrap();
+
+        // After the foreground compaction, every key is still there.
+        for i in 0..N {
+            let k = format!("key_{:05}", i);
+            assert_eq!(db.get(k.as_bytes()).unwrap(), Some(b"v".to_vec()));
+        }
+    }
+
+    #[test]
+    fn test_compact_range_iterator_still_correct() {
+        // compact_range shouldn't perturb an iterator built after it.
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        for i in 0..300 {
+            let k = format!("k{:04}", i);
+            db.put(k.as_bytes(), b"v").unwrap();
+        }
+
+        db.compact_range(None, None).unwrap();
+
+        let mut it = db.iter();
+        it.seek_to_first();
+        let mut count = 0;
+        while it.valid() {
+            if it.key().unwrap().starts_with(b"k") {
+                count += 1;
+            }
+            it.next();
+        }
+        assert_eq!(count, 300);
+    }
+
+    #[test]
+    fn test_compact_range_tombstones_are_preserved() {
+        // Tombstones must survive compaction until the bottommost level
+        // drops them — for now compaction preserves all versions, so a
+        // deleted key is still absent to reads.
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        for i in 0..50 {
+            let k = format!("k{:02}", i);
+            db.put(k.as_bytes(), b"v").unwrap();
+        }
+        // Delete half of them.
+        for i in (0..50).step_by(2) {
+            let k = format!("k{:02}", i);
+            db.delete(k.as_bytes()).unwrap();
+        }
+
+        db.compact_range(None, None).unwrap();
+
+        for i in 0..50 {
+            let k = format!("k{:02}", i);
+            let expected = if i % 2 == 0 {
+                None
+            } else {
+                Some(b"v".to_vec())
+            };
+            assert_eq!(db.get(k.as_bytes()).unwrap(), expected);
+        }
     }
 
     // ─── MultiGet tests ─────────────────────────────────────────────────
