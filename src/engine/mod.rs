@@ -33,6 +33,20 @@ pub(crate) enum DurabilityMode {
     Eventual,
 }
 
+/// Outcome of [`LarkEngine::commit_optimistic`]. `Conflict`
+/// indicates that another writer changed one of the tracked keys
+/// after the transaction's snapshot seq; the caller typically
+/// surfaces this as a retry-able error.
+#[derive(Debug)]
+pub(crate) enum CommitOutcome {
+    Ok,
+    Conflict {
+        key: Vec<u8>,
+        observed_seq: u64,
+        latest_seq: u64,
+    },
+}
+
 /// Configuration for the Lark engine.
 #[derive(Clone)]
 pub(crate) struct EngineOptions {
@@ -751,6 +765,25 @@ impl LarkEngine {
         }
 
         let _write_guard = self.write_lock.lock();
+        self.apply_batch_locked(point_ops, range_deletes, merges, durability, disable_wal)
+    }
+
+    /// Apply a batch assuming the caller already holds
+    /// `self.write_lock`. Used by [`Self::apply_batch`] and by the
+    /// transaction commit path, which needs to interleave a
+    /// conflict-detection step with the write while holding the
+    /// write lock the whole time.
+    fn apply_batch_locked(
+        &self,
+        point_ops: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+        range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
+        merges: Vec<(Vec<u8>, Vec<u8>)>,
+        durability: DurabilityMode,
+        disable_wal: bool,
+    ) -> std::io::Result<()> {
+        if point_ops.is_empty() && range_deletes.is_empty() && merges.is_empty() {
+            return Ok(());
+        }
 
         let total_ops = point_ops.len() + range_deletes.len() + merges.len();
         let base_seq = self
@@ -807,6 +840,100 @@ impl LarkEngine {
         }
 
         Ok(())
+    }
+
+    /// Attempt to commit an optimistic transaction's buffered
+    /// writes. Performs the write-write conflict check under the
+    /// engine write-lock: for every key the transaction wrote (or
+    /// explicitly tracked for conflict detection), verify that no
+    /// version newer than `snapshot_seq` has landed since the
+    /// transaction started. On conflict returns
+    /// `Ok(CommitOutcome::Conflict { key })`. Otherwise applies the
+    /// buffered writes atomically and returns `Ok(CommitOutcome::Ok)`.
+    ///
+    /// Range-delete operations from a transaction are applied
+    /// unconditionally — their conflict semantics require tracking
+    /// every key the range could shadow, which the initial
+    /// transaction impl does not support. See the transaction
+    /// module for the caveat.
+    pub(crate) fn commit_optimistic(
+        &self,
+        conflict_keys: &[Vec<u8>],
+        snapshot_seq: u64,
+        point_ops: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+        range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
+        merges: Vec<(Vec<u8>, Vec<u8>)>,
+        durability: DurabilityMode,
+    ) -> std::io::Result<CommitOutcome> {
+        let _write_guard = self.write_lock.lock();
+
+        // Conflict check: for each tracked key, peek at the latest
+        // visible version without a snapshot bound. If its seq is
+        // newer than `snapshot_seq`, someone wrote to the key after
+        // the transaction began.
+        for key in conflict_keys {
+            if let Some(latest_seq) = self.latest_version_seq(key)? {
+                if latest_seq > snapshot_seq {
+                    return Ok(CommitOutcome::Conflict {
+                        key: key.clone(),
+                        observed_seq: snapshot_seq,
+                        latest_seq,
+                    });
+                }
+            }
+        }
+
+        self.apply_batch_locked(point_ops, range_deletes, merges, durability, false)?;
+        Ok(CommitOutcome::Ok)
+    }
+
+    /// Return the sequence number of the newest visible point
+    /// entry for `key` across every source, or `None` if no live
+    /// version exists. Used by optimistic transaction commit to
+    /// detect write-write conflicts. Ignores range tombstones and
+    /// merge operators — the caller only needs to know "was this
+    /// key written to again?".
+    fn latest_version_seq(&self, key: &[u8]) -> std::io::Result<Option<u64>> {
+        let snap = u64::MAX;
+        {
+            let active = self.active_memtable.read();
+            if let Some((seq, _)) = active.get(key, snap) {
+                return Ok(Some(seq));
+            }
+        }
+        {
+            let frozen = self.frozen_memtables.read();
+            for mt in frozen.iter().rev() {
+                if let Some((seq, _)) = mt.get(key, snap) {
+                    return Ok(Some(seq));
+                }
+            }
+        }
+        let version = self.versions.lock().current();
+        for file in version.levels[0].iter().rev() {
+            match file.reader.get(key, snap, &self.cache)? {
+                LookupResult::Found { seq, .. } | LookupResult::FoundTombstone { seq } => {
+                    return Ok(Some(seq));
+                }
+                LookupResult::NotInTable => {}
+            }
+        }
+        for level in 1..version.levels.len() {
+            let files = &version.levels[level];
+            if files.is_empty() {
+                continue;
+            }
+            let idx = files.partition_point(|f| f.meta.largest_key.as_slice() < key);
+            if idx < files.len() && files[idx].meta.smallest_key.as_slice() <= key {
+                match files[idx].reader.get(key, snap, &self.cache)? {
+                    LookupResult::Found { seq, .. } | LookupResult::FoundTombstone { seq } => {
+                        return Ok(Some(seq));
+                    }
+                    LookupResult::NotInTable => {}
+                }
+            }
+        }
+        Ok(None)
     }
 
     fn rotate_memtable(&self) -> std::io::Result<()> {
