@@ -135,6 +135,7 @@ Tests live inline with `#[cfg(test)]` in the modules they cover — there is no 
 1. `cargo test` passes
 2. `cargo clippy -- -D warnings` clean
 3. `cargo fmt -- --check` clean
+4. `cargo deny check` clean — surfaces RUSTSEC advisories, license violations, and duplicate crates against the allow-list in `deny.toml`
 
 These are exactly what CI runs (`.github/workflows/ci.yml`).
 
