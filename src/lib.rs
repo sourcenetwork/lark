@@ -46,6 +46,7 @@ mod engine;
 mod error;
 mod iter;
 mod options;
+mod sst_file_writer;
 mod ttl;
 
 pub use error::Error;
@@ -53,6 +54,7 @@ pub use iter::Iter;
 pub use options::{
     CompactionDecision, CompactionFilter, CompressionType, DurabilityMode, Options, WriteOptions,
 };
+pub use sst_file_writer::{IngestOptions, SstFileMeta, SstFileWriter};
 pub use ttl::{strip_timestamp, DbWithTtl, TtlCompactionFilter};
 
 use std::collections::BTreeMap;
@@ -277,9 +279,36 @@ impl Db {
         self.engine.compact_range(start, end).map_err(Error::Io)
     }
 
+    /// Bulk-ingest one or more externally-built SSTable files. Each
+    /// file must have been produced by [`SstFileWriter`]; on success
+    /// every ingested file is placed at the appropriate level and its
+    /// keys become visible to new reads and iterators. See
+    /// [`IngestOptions`] for the snapshot-consistency and placement
+    /// rules.
+    ///
+    /// The source files are left untouched on disk — the engine
+    /// re-emits each file into the database's own SSTable directory
+    /// so it can rewrite entry sequence numbers. Callers may delete
+    /// the source files or re-ingest them at any time.
+    pub fn ingest_external_files(
+        &self,
+        files: &[std::path::PathBuf],
+        opts: IngestOptions,
+    ) -> Result<()> {
+        self.engine
+            .ingest_external_files(files, &opts)
+            .map_err(Error::Io)
+    }
+
     /// Flush all data to disk and shut down background threads.
     pub fn close(&self) -> Result<()> {
         self.engine.close().map_err(Error::Io)
+    }
+
+    /// Test-only: number of SSTable files at `level`.
+    #[cfg(test)]
+    pub(crate) fn level_file_count(&self, level: usize) -> usize {
+        self.engine.level_file_count(level)
     }
 }
 
