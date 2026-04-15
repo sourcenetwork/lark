@@ -294,6 +294,7 @@ impl Db {
     /// Set a key-value pair in the default column family with an
     /// explicit [`WriteOptions`] override.
     pub fn put_opt(&self, opts: &WriteOptions, key: &[u8], value: &[u8]) -> Result<()> {
+        self.wait_for_write_capacity(opts)?;
         let stats = self.stats();
         let _scope = statistics::TimeScope::new(stats, Histogram::DbWrite);
         let bytes = (key.len() + value.len()) as u64;
@@ -319,6 +320,7 @@ impl Db {
     /// Delete a key from the default column family with an
     /// explicit [`WriteOptions`] override.
     pub fn delete_opt(&self, opts: &WriteOptions, key: &[u8]) -> Result<()> {
+        self.wait_for_write_capacity(opts)?;
         if let Some(s) = self.stats() {
             s.add(Ticker::KeysDeleted, 1);
         }
@@ -343,6 +345,7 @@ impl Db {
 
     /// [`Db::merge`] with an explicit [`WriteOptions`] override.
     pub fn merge_opt(&self, opts: &WriteOptions, key: &[u8], operand: &[u8]) -> Result<()> {
+        self.wait_for_write_capacity(opts)?;
         if let Some(s) = self.stats() {
             s.add(Ticker::MergesWritten, 1);
         }
@@ -378,6 +381,7 @@ impl Db {
         if start >= end {
             return Ok(());
         }
+        self.wait_for_write_capacity(opts)?;
         if let Some(s) = self.stats() {
             s.add(Ticker::RangeDeletesWritten, 1);
         }
@@ -408,6 +412,7 @@ impl Db {
         if batch.is_empty() {
             return Ok(());
         }
+        self.wait_for_write_capacity(opts)?;
         let stats = self.stats();
         let _scope = statistics::TimeScope::new(stats, Histogram::DbWrite);
         if let Some(s) = stats {
@@ -467,9 +472,9 @@ impl Db {
     /// `apply_batch` actually consumes: a concrete
     /// `engine::DurabilityMode` and a `disable_wal` bool. `sync: true`
     /// maps to `Immediate` regardless of the database-global default;
-    /// otherwise the default wins. `low_pri` and `no_slowdown` are
-    /// accepted but currently no-ops — they're reserved for future
-    /// write-stall / rate-limiter plumbing.
+    /// otherwise the default wins. `low_pri` is accepted but is
+    /// currently a no-op; `no_slowdown` is handled separately by
+    /// the write-stall pre-check.
     fn resolve_write_opts(&self, opts: &WriteOptions) -> (engine::DurabilityMode, bool) {
         let dm = if opts.sync {
             engine::DurabilityMode::Immediate
@@ -477,6 +482,15 @@ impl Db {
             self.durability
         };
         (dm, opts.disable_wal)
+    }
+
+    /// Run the write-stall pre-check. Block the caller until the
+    /// engine is ready to accept another write, or return
+    /// [`Error::Busy`] immediately if `opts.no_slowdown` is set and
+    /// any stall condition is currently active.
+    fn wait_for_write_capacity(&self, opts: &WriteOptions) -> Result<()> {
+        self.engine.wait_for_write_capacity(opts.no_slowdown)?;
+        Ok(())
     }
 
     /// Create a point-in-time snapshot for consistent reads.
@@ -5157,6 +5171,143 @@ mod tests {
             "limiter saw zero background bytes"
         );
         assert_eq!(limiter.get_total_bytes_through(Priority::High), 0);
+    }
+
+    #[test]
+    fn test_write_stall_slowdown_accumulates_micros() {
+        use std::sync::Arc;
+
+        let stats = Arc::new(Statistics::new());
+        let opts = Options {
+            // Tiny memtable so every handful of puts rolls an L0 file.
+            write_buffer_size: 4 * 1024,
+            // Disable automatic compaction so L0 can't drain on us.
+            l0_compaction_trigger: 1000,
+            // Slow down once L0 has 2 files, never stop (high trigger).
+            level0_slowdown_writes_trigger: 2,
+            level0_stop_writes_trigger: 10_000,
+            // Disable the memtable-count trigger for this test so we
+            // isolate the L0 slowdown path.
+            max_write_buffer_number: 0,
+            statistics: Some(stats.clone()),
+            ..Options::default()
+        };
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), opts).unwrap();
+
+        // Write enough data to cross the slowdown trigger and keep
+        // going. Each put is ~600 bytes, so after ~7 puts the
+        // memtable rolls, and after the 2nd flush L0 hits the
+        // slowdown trigger.
+        let payload = vec![0xCDu8; 600];
+        for i in 0..128 {
+            let k = format!("k{i:04}");
+            db.put(k.as_bytes(), &payload).unwrap();
+        }
+
+        let stall = stats.get_ticker(Ticker::WriteStallMicros);
+        assert!(
+            stall > 0,
+            "expected WriteStallMicros > 0 after crossing slowdown trigger, got {stall}"
+        );
+    }
+
+    #[test]
+    fn test_write_stall_no_slowdown_returns_busy() {
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            l0_compaction_trigger: 1000,
+            level0_slowdown_writes_trigger: 2,
+            level0_stop_writes_trigger: 10_000,
+            max_write_buffer_number: 0,
+            ..Options::default()
+        };
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), opts).unwrap();
+
+        // Build up L0 past the slowdown trigger.
+        let payload = vec![0xEFu8; 600];
+        for i in 0..64 {
+            let k = format!("k{i:04}");
+            db.put(k.as_bytes(), &payload).unwrap();
+        }
+
+        // A write with `no_slowdown` must now return Busy rather
+        // than sleep or block.
+        let wo = WriteOptions {
+            no_slowdown: true,
+            ..WriteOptions::default()
+        };
+        let err = db.put_opt(&wo, b"extra", b"value").unwrap_err();
+        assert!(
+            matches!(err, Error::Busy(_)),
+            "expected Error::Busy, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_write_stall_stop_unblocks_after_compaction() {
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        // Stop writes entirely once L0 hits 2 files.
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            l0_compaction_trigger: 1000,
+            level0_slowdown_writes_trigger: 10_000,
+            level0_stop_writes_trigger: 2,
+            max_write_buffer_number: 0,
+            ..Options::default()
+        };
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(Db::open(dir.path(), opts).unwrap());
+
+        // Fill L0 to the stop trigger. Writes go through until the
+        // snapshot after the flush shows L0 >= 2; from then on the
+        // next write would block, so we time it carefully with a
+        // spawned thread.
+        let payload = vec![0x12u8; 600];
+        for i in 0..32 {
+            let k = format!("fill{i:04}");
+            db.put(k.as_bytes(), &payload).unwrap();
+            if db
+                .get_int_property("rocksdb.num-files-at-level0")
+                .unwrap_or(0)
+                >= 2
+            {
+                break;
+            }
+        }
+        let l0 = db
+            .get_int_property("rocksdb.num-files-at-level0")
+            .unwrap_or(0);
+        assert!(l0 >= 2, "precondition: need L0 >= 2, got {l0}");
+
+        let db_writer = db.clone();
+        let blocked = thread::spawn(move || {
+            let start = Instant::now();
+            db_writer.put(b"stopkey", b"stopval").unwrap();
+            start.elapsed()
+        });
+
+        // Give the writer time to fully enter the stall loop.
+        thread::sleep(Duration::from_millis(50));
+        assert!(!blocked.is_finished(), "writer should be blocked on stall");
+
+        // compact_range empties L0 and fires stall_signal.notify_all
+        // from the compaction loop after the pass. The writer should
+        // wake promptly.
+        db.compact_range(None, None).unwrap();
+
+        let waited = blocked.join().unwrap();
+        assert!(
+            waited < Duration::from_secs(5),
+            "blocked writer took too long to unblock: {waited:?}"
+        );
+
+        // The key we wrote while stalled is readable afterwards.
+        assert_eq!(db.get(b"stopkey").unwrap(), Some(b"stopval".to_vec()));
     }
 
     #[test]

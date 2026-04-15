@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 
 use block_cache::BlockCache;
 use compaction::{CompactionOptions, CompactionScheduler};
@@ -68,6 +68,11 @@ pub(crate) struct EngineOptions {
     pub(crate) listeners: Vec<Arc<dyn crate::event_listener::EventListener>>,
     pub(crate) statistics: Option<Arc<crate::statistics::Statistics>>,
     pub(crate) rate_limiter: Option<Arc<dyn crate::rate_limiter::RateLimiter>>,
+    pub(crate) level0_slowdown_writes_trigger: usize,
+    pub(crate) level0_stop_writes_trigger: usize,
+    pub(crate) soft_pending_compaction_bytes_limit: u64,
+    pub(crate) hard_pending_compaction_bytes_limit: u64,
+    pub(crate) max_write_buffer_number: usize,
 }
 
 impl EngineOptions {
@@ -101,6 +106,11 @@ impl Default for EngineOptions {
             listeners: Vec::new(),
             statistics: None,
             rate_limiter: None,
+            level0_slowdown_writes_trigger: 20,
+            level0_stop_writes_trigger: 36,
+            soft_pending_compaction_bytes_limit: 64 * 1024 * 1024 * 1024,
+            hard_pending_compaction_bytes_limit: 256 * 1024 * 1024 * 1024,
+            max_write_buffer_number: 2,
         }
     }
 }
@@ -132,6 +142,34 @@ pub(crate) struct LarkEngine {
     snapshot_registry: Arc<SnapshotRegistry>,
     options: EngineOptions,
     write_lock: Mutex<()>,
+    /// Signal used by foreground writers to wait out a "stop writes"
+    /// condition (too many L0 files, too many unflushed memtables).
+    /// The background compaction thread holds a clone of this `Arc`
+    /// and calls [`StallSignal::notify_all`] after each compaction
+    /// pass so blocked writers can re-check their thresholds.
+    stall_signal: Arc<StallSignal>,
+}
+
+/// Lock + condvar pair shared between foreground writers (which
+/// wait on it during a write stall) and the background compaction
+/// thread (which notifies after each compaction pass).
+pub(crate) struct StallSignal {
+    lock: Mutex<()>,
+    cv: Condvar,
+}
+
+impl StallSignal {
+    pub(crate) fn new() -> Self {
+        Self {
+            lock: Mutex::new(()),
+            cv: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn notify_all(&self) {
+        let _guard = self.lock.lock();
+        self.cv.notify_all();
+    }
 }
 
 impl LarkEngine {
@@ -217,6 +255,7 @@ impl LarkEngine {
 
         let compaction_lock = Arc::new(Mutex::new(()));
         let snapshot_registry = Arc::new(SnapshotRegistry::new());
+        let stall_signal = Arc::new(StallSignal::new());
         let compaction = CompactionScheduler::start(
             Arc::clone(&compaction_lock),
             Arc::clone(&snapshot_registry),
@@ -224,6 +263,7 @@ impl LarkEngine {
             Arc::from(sst_dir.as_path()),
             Arc::clone(&cache),
             compaction_opts,
+            Arc::clone(&stall_signal),
         );
 
         let engine = Arc::new(Self {
@@ -241,6 +281,7 @@ impl LarkEngine {
             snapshot_registry,
             options,
             write_lock: Mutex::new(()),
+            stall_signal,
         });
 
         Ok(engine)
@@ -767,6 +808,119 @@ impl LarkEngine {
         }
 
         Ok(results)
+    }
+
+    /// Snapshot the current write-stall inputs: L0 file count,
+    /// in-memory memtable count (active + frozen), and total bytes
+    /// across all L0 files (lark's approximation of pending
+    /// compaction bytes).
+    fn stall_snapshot(&self) -> (usize, usize, u64) {
+        let version = self.versions.lock().current();
+        let l0 = version.levels[0].len();
+        let pending_bytes: u64 = version.levels[0].iter().map(|f| f.meta.file_size).sum();
+        // `active_memtable` always counts as 1; frozen memtables
+        // are whatever is still waiting for the flush path.
+        let frozen = self.frozen_memtables.read().len();
+        let memtable_count = 1 + frozen;
+        (l0, memtable_count, pending_bytes)
+    }
+
+    /// Classify the current state against the configured stall
+    /// thresholds. Returns:
+    ///
+    /// * `None` — writes may proceed freely.
+    /// * `Some(("...", true))` — hard stop: block writers until
+    ///   compaction relieves the condition.
+    /// * `Some(("...", false))` — slowdown: add a small delay per
+    ///   write so the foreground write rate tracks compaction.
+    fn stall_state(&self) -> Option<(&'static str, bool)> {
+        let (l0, memtables, pending_bytes) = self.stall_snapshot();
+        let opts = &self.options;
+        // Stop conditions dominate over slowdown. An unconfigured
+        // threshold (`0`) disables that particular trigger.
+        if opts.level0_stop_writes_trigger > 0 && l0 >= opts.level0_stop_writes_trigger {
+            return Some(("stop: too many L0 files", true));
+        }
+        if opts.max_write_buffer_number > 0
+            && memtables >= opts.max_write_buffer_number.saturating_mul(2)
+        {
+            return Some(("stop: too many memtables", true));
+        }
+        if opts.hard_pending_compaction_bytes_limit > 0
+            && pending_bytes >= opts.hard_pending_compaction_bytes_limit
+        {
+            return Some(("stop: pending compaction bytes over hard limit", true));
+        }
+        if opts.level0_slowdown_writes_trigger > 0 && l0 >= opts.level0_slowdown_writes_trigger {
+            return Some(("slowdown: L0 files over trigger", false));
+        }
+        if opts.max_write_buffer_number > 0 && memtables > opts.max_write_buffer_number {
+            return Some(("slowdown: memtables over trigger", false));
+        }
+        if opts.soft_pending_compaction_bytes_limit > 0
+            && pending_bytes >= opts.soft_pending_compaction_bytes_limit
+        {
+            return Some(("slowdown: pending compaction bytes over soft limit", false));
+        }
+        None
+    }
+
+    /// Fixed per-write slowdown delay. Keeping this small (1 ms)
+    /// gives foreground writers a steady back-pressure signal
+    /// without freezing progress entirely; compaction gets cycles
+    /// to catch up and the writer learns that the engine is under
+    /// pressure.
+    const SLOWDOWN_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
+
+    /// Block the current writer until the engine is ready to
+    /// accept another write, or (when `no_slowdown` is set) return
+    /// [`crate::Error::Busy`] immediately if any stall condition is
+    /// active. Returns the number of microseconds the caller spent
+    /// stalled, which is also published to the
+    /// [`crate::statistics::Ticker::WriteStallMicros`] counter.
+    pub(crate) fn wait_for_write_capacity(&self, no_slowdown: bool) -> Result<u64, crate::Error> {
+        let start = std::time::Instant::now();
+        let mut any_stall = false;
+
+        // Loop until no stop condition is active. Each iteration
+        // waits on `stall_signal.cv` which the compaction thread
+        // notifies after every pass.
+        loop {
+            match self.stall_state() {
+                None => break,
+                Some((reason, true)) => {
+                    if no_slowdown {
+                        return Err(crate::Error::Busy(reason));
+                    }
+                    any_stall = true;
+                    let mut guard = self.stall_signal.lock.lock();
+                    // Bounded wait so a missed notification can't
+                    // wedge a writer forever.
+                    self.stall_signal
+                        .cv
+                        .wait_for(&mut guard, std::time::Duration::from_millis(100));
+                }
+                Some((reason, false)) => {
+                    if no_slowdown {
+                        return Err(crate::Error::Busy(reason));
+                    }
+                    any_stall = true;
+                    std::thread::sleep(Self::SLOWDOWN_DELAY);
+                    // One slowdown delay per call — don't loop, or
+                    // a writer that just crossed the trigger would
+                    // stall indefinitely at low rates.
+                    break;
+                }
+            }
+        }
+
+        let micros = start.elapsed().as_micros() as u64;
+        if any_stall {
+            if let Some(s) = self.statistics() {
+                s.add(crate::statistics::Ticker::WriteStallMicros, micros);
+            }
+        }
+        Ok(micros)
     }
 
     /// Apply a batch of point writes, range deletes, and merge
