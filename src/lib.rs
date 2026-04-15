@@ -86,6 +86,32 @@ use std::sync::Arc;
 
 use engine::LarkEngine;
 
+/// Minimal snapshot of the currently-configured options, returned
+/// by `Db::get_property("rocksdb.options")`. Deliberately small —
+/// lark doesn't retain the full `Options` past `Db::open`, and
+/// the Debug impl of this struct is the property's string value.
+#[derive(Debug)]
+#[allow(dead_code)]
+struct OptionsSnapshot {
+    durability: engine::DurabilityMode,
+    default_cf: &'static str,
+}
+
+/// Format a raw engine key for inclusion in a property string.
+/// Internal keys in lark carry a 4-byte CF prefix; if the key
+/// is long enough we strip it and ASCII-escape the remainder.
+/// Anything non-printable (or keys too short to strip) falls
+/// back to a hex rendering so the output stays single-line.
+fn format_key_for_display(key: &[u8]) -> String {
+    let payload = if key.len() > 4 { &key[4..] } else { key };
+    if payload.iter().all(|&b| b.is_ascii_graphic() || b == b' ') {
+        format!("\"{}\"", String::from_utf8_lossy(payload))
+    } else {
+        let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
+        format!("0x{hex}")
+    }
+}
+
 /// A half-open key range `[start, end)` passed to the approximate-size
 /// APIs. Borrowed; cheap to construct inline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -529,6 +555,135 @@ impl Db {
     /// scheduler so the two paths can't fight over the same inputs.
     pub fn compact_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
         self.engine.compact_range(start, end).map_err(Error::Io)
+    }
+
+    /// Return the string value of a named property, or `None` if
+    /// `name` isn't recognized. See the module-level docs for the
+    /// full list of supported properties; the most useful ones
+    /// are `"rocksdb.stats"`, `"rocksdb.sstables"`,
+    /// `"rocksdb.levelstats"`, and `"rocksdb.options"`.
+    pub fn get_property(&self, name: &str) -> Option<String> {
+        match name {
+            "rocksdb.stats" => Some(self.format_stats_property()),
+            "rocksdb.sstables" => Some(self.format_sstables_property()),
+            "rocksdb.levelstats" => Some(self.format_levelstats_property()),
+            "rocksdb.options" => Some(format!("{:#?}", self.options_snapshot())),
+            _ => {
+                // Integer properties surfaced through the string
+                // API too — every int property's string form is
+                // just its decimal number.
+                self.get_int_property(name).map(|v| v.to_string())
+            }
+        }
+    }
+
+    /// Return the integer value of a named property, or `None` if
+    /// `name` isn't recognized or doesn't have an integer form.
+    pub fn get_int_property(&self, name: &str) -> Option<u64> {
+        if let Some(level_str) = name.strip_prefix("rocksdb.num-files-at-level") {
+            let level: usize = level_str.parse().ok()?;
+            return Some(self.engine.num_files_at_level(level));
+        }
+        match name {
+            "rocksdb.total-sst-files-size" => Some(self.engine.total_sst_size()),
+            "rocksdb.cur-size-active-mem-table" => Some(self.engine.active_memtable_size()),
+            "rocksdb.cur-size-all-mem-tables" => {
+                Some(self.engine.active_memtable_size() + self.engine.frozen_memtables_size())
+            }
+            "rocksdb.num-entries-active-mem-table" => {
+                // Approximate: the memtable exposes `approximate_size`
+                // in bytes but no direct entry count. Estimate by
+                // assuming a 48-byte average entry (internal key +
+                // value). This is a rough indicator, not an exact
+                // count — RocksDB documents the same caveat on
+                // `num-entries-active-mem-table`.
+                let bytes = self.engine.active_memtable_size();
+                Some(bytes / 48)
+            }
+            "rocksdb.num-entries-imm-mem-tables" => {
+                let bytes = self.engine.frozen_memtables_size();
+                Some(bytes / 48)
+            }
+            "rocksdb.estimate-num-keys" => {
+                // Lower-bound estimate: exact SST entry count plus
+                // a rough guess for the memtable contribution.
+                let sst = self.engine.total_sst_num_entries();
+                let mem_bytes =
+                    self.engine.active_memtable_size() + self.engine.frozen_memtables_size();
+                Some(sst + mem_bytes / 48)
+            }
+            "rocksdb.estimate-live-data-size" => Some(self.engine.total_sst_size()),
+            "rocksdb.num-snapshots" => Some(self.engine.live_snapshot_count()),
+            "rocksdb.oldest-snapshot-time" => self.engine.oldest_snapshot_time_unix(),
+            // Background errors are surfaced through the
+            // `EventListener::on_background_error` callback today
+            // — no dedicated counter yet. Report `0` for API
+            // parity with RocksDB so monitoring dashboards that
+            // consume this property don't see `None`.
+            "rocksdb.background-errors" => Some(0),
+            _ => None,
+        }
+    }
+
+    /// Format the multi-line `rocksdb.stats` property: counters +
+    /// histograms (when statistics are enabled) plus per-level
+    /// file counts and compaction aggregates.
+    fn format_stats_property(&self) -> String {
+        let mut out = String::new();
+        out.push_str("== lark engine stats ==\n");
+        out.push_str(&self.format_levelstats_property());
+        if let Some(stats) = self.engine.statistics() {
+            out.push('\n');
+            out.push_str(&stats.dump());
+        } else {
+            out.push_str("\n(no Statistics object configured — see Options::statistics)\n");
+        }
+        out
+    }
+
+    /// Format the `rocksdb.levelstats` property: one row per
+    /// level with file count and total size in bytes.
+    fn format_levelstats_property(&self) -> String {
+        let version = self.engine.current_version();
+        let mut out = String::from("Level  Files     Size(B)\n");
+        for (lvl, files) in version.levels.iter().enumerate() {
+            let count = files.len();
+            let size: u64 = files.iter().map(|f| f.meta.file_size).sum();
+            out.push_str(&format!("{lvl:5}  {count:5}  {size:10}\n"));
+        }
+        out
+    }
+
+    /// Format the `rocksdb.sstables` property: one row per live
+    /// SSTable with its level, file id, size, and key range.
+    fn format_sstables_property(&self) -> String {
+        let version = self.engine.current_version();
+        let mut out =
+            String::from("Level    FileID       Size(B)     Entries  SmallestKey..LargestKey\n");
+        for (lvl, files) in version.levels.iter().enumerate() {
+            for f in files {
+                // Strip the CF prefix for display when the key
+                // has room for it; otherwise show the raw bytes.
+                let smallest = format_key_for_display(&f.meta.smallest_key);
+                let largest = format_key_for_display(&f.meta.largest_key);
+                out.push_str(&format!(
+                    "{lvl:5}  {:8}  {:12}  {:10}  {}..{}\n",
+                    f.meta.file_id, f.meta.file_size, f.meta.num_entries, smallest, largest
+                ));
+            }
+        }
+        out
+    }
+
+    /// A minimal snapshot of the engine options. We deliberately
+    /// do not carry the full `Options` struct around past
+    /// construction, so this returns a small struct with just
+    /// the observable knobs.
+    fn options_snapshot(&self) -> OptionsSnapshot {
+        OptionsSnapshot {
+            durability: self.durability,
+            default_cf: DEFAULT_CF_NAME,
+        }
     }
 
     /// Return the approximate on-disk bytes in each of the given
@@ -4736,5 +4891,209 @@ mod tests {
         ] {
             assert!(dump.contains(ticker_name), "dump missing {ticker_name}");
         }
+    }
+
+    // ── properties API ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_property_unknown_name_returns_none() {
+        let (db, _dir) = open_tmp();
+        assert!(db.get_property("not.a.real.property").is_none());
+        assert!(db.get_int_property("not.a.real.property").is_none());
+    }
+
+    #[test]
+    fn test_property_num_files_at_level() {
+        let (db, _dir) = open_tmp();
+        assert_eq!(db.get_int_property("rocksdb.num-files-at-level0"), Some(0));
+        assert_eq!(db.get_int_property("rocksdb.num-files-at-level6"), Some(0));
+        // Out-of-range level is a valid query that returns 0.
+        assert_eq!(db.get_int_property("rocksdb.num-files-at-level99"), Some(0));
+    }
+
+    #[test]
+    fn test_property_level_counts_after_flush_and_compact() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+        for i in 0..200 {
+            db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
+        }
+        force_flush(&db, "props");
+        // At this point we expect some L0 files.
+        let l0_before = db.get_int_property("rocksdb.num-files-at-level0").unwrap();
+        assert!(l0_before > 0 || db.get_int_property("rocksdb.num-files-at-level1").unwrap() > 0);
+
+        // Drain everything to the deepest level.
+        db.compact_range(None, None).unwrap();
+        assert_eq!(
+            db.get_int_property("rocksdb.num-files-at-level0"),
+            Some(0),
+            "L0 should be empty after compact_range"
+        );
+    }
+
+    #[test]
+    fn test_property_total_sst_size_after_flush() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+        assert_eq!(db.get_int_property("rocksdb.total-sst-files-size"), Some(0));
+        for i in 0..100 {
+            db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
+        }
+        force_flush(&db, "size");
+        let size = db.get_int_property("rocksdb.total-sst-files-size").unwrap();
+        assert!(size > 0, "SST size should be > 0 after a flush");
+    }
+
+    #[test]
+    fn test_property_cur_size_active_mem_table() {
+        let (db, _dir) = open_tmp();
+        assert_eq!(
+            db.get_int_property("rocksdb.cur-size-active-mem-table"),
+            Some(0)
+        );
+        for i in 0..50 {
+            db.put(format!("k_{i:03}").as_bytes(), b"value").unwrap();
+        }
+        let size = db
+            .get_int_property("rocksdb.cur-size-active-mem-table")
+            .unwrap();
+        assert!(size > 0, "active memtable should have non-zero size");
+    }
+
+    #[test]
+    fn test_property_cur_size_all_mem_tables_aggregates() {
+        let (db, _dir) = open_tmp();
+        db.put(b"k", b"v").unwrap();
+        let active = db
+            .get_int_property("rocksdb.cur-size-active-mem-table")
+            .unwrap();
+        let all = db
+            .get_int_property("rocksdb.cur-size-all-mem-tables")
+            .unwrap();
+        assert!(all >= active, "all mem tables must be >= active");
+    }
+
+    #[test]
+    fn test_property_estimate_num_keys() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+        for i in 0..100 {
+            db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
+        }
+        force_flush(&db, "estimate");
+        db.compact_range(None, None).unwrap();
+        let estimate = db.get_int_property("rocksdb.estimate-num-keys").unwrap();
+        // Exact count per SST includes the flush filler + the 100
+        // writes; the property is a lower bound, so > 50 is a
+        // safe floor.
+        assert!(estimate > 50, "estimate-num-keys={estimate} too low");
+    }
+
+    #[test]
+    fn test_property_num_snapshots_and_oldest_snapshot_time() {
+        let (db, _dir) = open_tmp();
+        assert_eq!(db.get_int_property("rocksdb.num-snapshots"), Some(0));
+        assert!(
+            db.get_int_property("rocksdb.oldest-snapshot-time")
+                .is_none(),
+            "oldest-snapshot-time should be None when no snapshots are live"
+        );
+        let _snap_a = db.snapshot();
+        let _snap_b = db.snapshot();
+        assert_eq!(db.get_int_property("rocksdb.num-snapshots"), Some(2));
+        assert!(db
+            .get_int_property("rocksdb.oldest-snapshot-time")
+            .is_some());
+    }
+
+    #[test]
+    fn test_property_background_errors_returns_zero() {
+        let (db, _dir) = open_tmp();
+        // No background errors on a fresh db.
+        assert_eq!(db.get_int_property("rocksdb.background-errors"), Some(0));
+    }
+
+    #[test]
+    fn test_property_stats_string_includes_level_header_and_counters() {
+        let stats = Arc::new(Statistics::new());
+        let opts = Options {
+            statistics: Some(stats),
+            ..Options::default()
+        };
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), opts).unwrap();
+        db.put(b"k", b"v").unwrap();
+        let text = db.get_property("rocksdb.stats").unwrap();
+        assert!(text.contains("== lark engine stats =="));
+        assert!(text.contains("Level  Files     Size(B)"));
+        assert!(text.contains("lark.keys_written"));
+    }
+
+    #[test]
+    fn test_property_stats_string_without_statistics_configured() {
+        let (db, _dir) = open_tmp();
+        let text = db.get_property("rocksdb.stats").unwrap();
+        assert!(text.contains("== lark engine stats =="));
+        assert!(text.contains("(no Statistics object configured"));
+    }
+
+    #[test]
+    fn test_property_sstables_lists_files_after_flush() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+        for i in 0..50 {
+            db.put(format!("k_{i:03}").as_bytes(), b"v").unwrap();
+        }
+        force_flush(&db, "ssts");
+        let text = db.get_property("rocksdb.sstables").unwrap();
+        assert!(text.contains("Level    FileID"));
+        // Should list at least one file with non-zero size.
+        assert!(
+            text.lines().any(|l| l.contains("\"k_")),
+            "expected a file line to include a user key from the writes"
+        );
+    }
+
+    #[test]
+    fn test_property_levelstats_format() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+        for i in 0..20 {
+            db.put(format!("k_{i:03}").as_bytes(), b"v").unwrap();
+        }
+        force_flush(&db, "lvl");
+        let text = db.get_property("rocksdb.levelstats").unwrap();
+        assert!(text.starts_with("Level  Files     Size(B)"));
+        // Every level row is present, not just the populated ones.
+        for lvl in 0..7 {
+            assert!(
+                text.contains(&format!("{lvl:5}")),
+                "level {lvl} should appear in levelstats"
+            );
+        }
+    }
+
+    #[test]
+    fn test_property_options_debug_dump() {
+        let (db, _dir) = open_tmp();
+        let text = db.get_property("rocksdb.options").unwrap();
+        assert!(text.contains("OptionsSnapshot"));
+        assert!(text.contains("default"));
+    }
+
+    #[test]
+    fn test_property_integer_forms_available_via_get_property() {
+        // Integer properties should also be reachable via
+        // get_property, returning their decimal string form.
+        let (db, _dir) = open_tmp();
+        assert_eq!(
+            db.get_property("rocksdb.num-files-at-level0").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            db.get_property("rocksdb.num-snapshots").as_deref(),
+            Some("0")
+        );
     }
 }

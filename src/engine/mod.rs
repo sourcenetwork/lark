@@ -1561,6 +1561,85 @@ impl LarkEngine {
             .approximate_stats_for_range(start, end)
     }
 
+    // ── property helpers ───────────────────────────────────────────────
+    //
+    // These return raw values consumed by `Db::get_property` /
+    // `Db::get_int_property`. Every method is cheap — no block
+    // reads, no locks held beyond a short `versions.lock()` or
+    // memtable read.
+
+    /// Number of SSTable files at a specific level. Returns 0 for
+    /// out-of-range levels rather than panicking, so
+    /// `rocksdb.num-files-at-level<N>` for unknown levels reads
+    /// cleanly as `Some(0)`.
+    pub(crate) fn num_files_at_level(&self, level: usize) -> u64 {
+        let version = self.versions.lock().current();
+        version
+            .levels
+            .get(level)
+            .map(|files| files.len() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Total size in bytes across every level of the current
+    /// version — sum of every `LiveSst::meta.file_size`.
+    pub(crate) fn total_sst_size(&self) -> u64 {
+        let version = self.versions.lock().current();
+        version
+            .levels
+            .iter()
+            .flat_map(|level| level.iter())
+            .map(|f| f.meta.file_size)
+            .sum()
+    }
+
+    /// Total `num_entries` across every current SSTable. The
+    /// manifest tracks this per file at ingest / flush /
+    /// compaction time, so the sum is free to compute.
+    pub(crate) fn total_sst_num_entries(&self) -> u64 {
+        let version = self.versions.lock().current();
+        version
+            .levels
+            .iter()
+            .flat_map(|level| level.iter())
+            .map(|f| f.meta.num_entries)
+            .sum()
+    }
+
+    /// Approximate size of the active memtable (sum of every
+    /// inserted internal key + value length seen so far; tracked
+    /// by the memtable itself).
+    pub(crate) fn active_memtable_size(&self) -> u64 {
+        self.active_memtable.read().approximate_size() as u64
+    }
+
+    /// Total approximate size of every frozen memtable.
+    pub(crate) fn frozen_memtables_size(&self) -> u64 {
+        self.frozen_memtables
+            .read()
+            .iter()
+            .map(|mt| mt.approximate_size() as u64)
+            .sum()
+    }
+
+    /// Number of live snapshots. Counts pins, not distinct seqs —
+    /// two snapshots taken at the same seq contribute two.
+    pub(crate) fn live_snapshot_count(&self) -> u64 {
+        self.snapshot_registry.live_count()
+    }
+
+    /// Unix-seconds timestamp of the oldest live snapshot, or
+    /// `None` when no snapshot is alive.
+    pub(crate) fn oldest_snapshot_time_unix(&self) -> Option<u64> {
+        self.snapshot_registry.oldest_snapshot_time_unix()
+    }
+
+    /// Borrow the current version so a caller can walk every
+    /// SSTable's metadata — used by `rocksdb.sstables` formatter.
+    pub(crate) fn current_version(&self) -> Arc<manifest::Version> {
+        self.versions.lock().current()
+    }
+
     /// Drop all data in the engine.
     pub(crate) fn drop_all(&self) -> std::io::Result<()> {
         let _write_guard = self.write_lock.lock();
