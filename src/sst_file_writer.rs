@@ -85,6 +85,7 @@ impl SstFileWriter {
             opts.block_size,
             opts.bloom_bits_per_key,
             opts.compression,
+            opts.prefix_extractor.clone(),
         )
         .map_err(crate::Error::Io)?;
         Ok(Self {

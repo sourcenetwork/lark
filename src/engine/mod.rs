@@ -910,6 +910,7 @@ impl LarkEngine {
             self.options.block_size,
             self.options.bloom_bits_per_key,
             self.options.compression_for_level(target_level),
+            self.options.prefix_extractor.clone(),
         )?;
 
         // Re-encode every point entry with the ingest seq.
