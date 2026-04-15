@@ -397,30 +397,42 @@ impl LarkEngine {
         }
         let mut max_rt_seq: u64 = 0;
 
+        // Memtable phase — timed via `PerfContext` at
+        // `PerfLevel::EnableTime` so per-op breakdowns can
+        // attribute time to "memtable vs SSTable".
         {
-            let active = self.active_memtable.read();
-            let rt = active.covering_range_tombstone_seq(key, snapshot_seq);
-            if rt > max_rt_seq {
-                max_rt_seq = rt;
-            }
-            if let Some((pseq, popt)) = active.get(key, snapshot_seq) {
-                return Ok(if pseq > max_rt_seq { popt } else { None });
-            }
-        }
-
-        {
-            let frozen = self.frozen_memtables.read();
-            for mt in frozen.iter().rev() {
-                let rt = mt.covering_range_tombstone_seq(key, snapshot_seq);
+            let _t = crate::perf_context::PerfTimer::new(
+                crate::perf_context::PerfTimerField::GetFromMemtable,
+            );
+            {
+                let active = self.active_memtable.read();
+                let rt = active.covering_range_tombstone_seq(key, snapshot_seq);
                 if rt > max_rt_seq {
                     max_rt_seq = rt;
                 }
-                if let Some((pseq, popt)) = mt.get(key, snapshot_seq) {
+                if let Some((pseq, popt)) = active.get(key, snapshot_seq) {
                     return Ok(if pseq > max_rt_seq { popt } else { None });
+                }
+            }
+            {
+                let frozen = self.frozen_memtables.read();
+                for mt in frozen.iter().rev() {
+                    let rt = mt.covering_range_tombstone_seq(key, snapshot_seq);
+                    if rt > max_rt_seq {
+                        max_rt_seq = rt;
+                    }
+                    if let Some((pseq, popt)) = mt.get(key, snapshot_seq) {
+                        return Ok(if pseq > max_rt_seq { popt } else { None });
+                    }
                 }
             }
         }
 
+        // SSTable phase — likewise timed. Everything below this
+        // line is the "get_from_output_files" time.
+        let _t_ssts = crate::perf_context::PerfTimer::new(
+            crate::perf_context::PerfTimerField::GetFromOutputFiles,
+        );
         let version = self.versions.lock().current();
 
         // L0: check all files (may overlap), newest first. Readers are
@@ -1003,6 +1015,8 @@ impl LarkEngine {
         let merge_base = range_delete_base + range_deletes.len() as u64;
 
         if !disable_wal {
+            let _perf_wal =
+                crate::perf_context::PerfTimer::new(crate::perf_context::PerfTimerField::WriteWal);
             let wal_start = std::time::Instant::now();
             let mut wal = self.active_wal.lock();
             let mut wal_bytes: u64 = 0;
@@ -1046,6 +1060,9 @@ impl LarkEngine {
         }
 
         {
+            let _perf_mt = crate::perf_context::PerfTimer::new(
+                crate::perf_context::PerfTimerField::WriteMemtable,
+            );
             let memtable = self.active_memtable.read();
             for (i, (key, value)) in point_ops.iter().enumerate() {
                 let seq = base_seq + i as u64;

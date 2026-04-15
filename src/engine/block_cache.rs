@@ -236,6 +236,7 @@ impl BlockCache {
                 s.add(Ticker::BlockCacheMiss, 1);
             }
         }
+        crate::perf_context::record_block_cache_lookup(hit.is_some());
         hit
     }
 
@@ -276,6 +277,7 @@ impl BlockCache {
         if let Some(s) = self.stats.as_deref() {
             s.add(Ticker::BloomFilterUseful, 1);
         }
+        crate::perf_context::record_bloom_check(true);
     }
 
     /// Record a "full positive" bloom-filter hit — the filter
@@ -285,6 +287,7 @@ impl BlockCache {
         if let Some(s) = self.stats.as_deref() {
             s.add(Ticker::BloomFilterFullPositive, 1);
         }
+        crate::perf_context::record_bloom_check(false);
     }
 
     /// Evict all blocks belonging to a specific file.
