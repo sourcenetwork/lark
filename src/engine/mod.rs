@@ -1386,6 +1386,42 @@ impl LarkEngine {
         })
     }
 
+    /// Approximate on-disk bytes whose user key falls in
+    /// `[start, end)`. Fans out over every SSTable whose own
+    /// user-key range overlaps the query range and sums their
+    /// per-range estimates. Index-only — no data-block decompression
+    /// happens, so the cost scales with `num_files * log(num_blocks)`.
+    pub(crate) fn approximate_size_in_range(&self, start: &[u8], end: &[u8]) -> u64 {
+        if start >= end {
+            return 0;
+        }
+        let version = self.versions.lock().current();
+        let mut total: u64 = 0;
+        for level in &version.levels {
+            for file in level {
+                if file.meta.largest_key.as_slice() < start {
+                    continue;
+                }
+                if file.meta.smallest_key.as_slice() >= end {
+                    continue;
+                }
+                total += file.reader.approximate_size_in_range(start, end);
+            }
+        }
+        total
+    }
+
+    /// Exact `(count, size)` for every entry in the active memtable
+    /// whose user key falls in `[start, end)`. Frozen memtables are
+    /// *not* included — a caller that wants "everything in memory"
+    /// should call this and also walk the frozen memtables
+    /// separately.
+    pub(crate) fn approximate_memtable_stats(&self, start: &[u8], end: &[u8]) -> (u64, u64) {
+        self.active_memtable
+            .read()
+            .approximate_stats_for_range(start, end)
+    }
+
     /// Drop all data in the engine.
     pub(crate) fn drop_all(&self) -> std::io::Result<()> {
         let _write_guard = self.write_lock.lock();

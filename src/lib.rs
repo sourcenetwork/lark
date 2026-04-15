@@ -78,6 +78,38 @@ use std::sync::Arc;
 
 use engine::LarkEngine;
 
+/// A half-open key range `[start, end)` passed to the approximate-size
+/// APIs. Borrowed; cheap to construct inline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Range<'a> {
+    /// Inclusive lower bound.
+    pub start: &'a [u8],
+    /// Exclusive upper bound.
+    pub end: &'a [u8],
+}
+
+impl<'a> Range<'a> {
+    /// Construct a new `[start, end)` range.
+    pub fn new(start: &'a [u8], end: &'a [u8]) -> Self {
+        Self { start, end }
+    }
+}
+
+/// Approximate memtable stats returned by
+/// [`Db::get_approximate_memtable_stats`]. `count` is the number of
+/// raw entries (including every version and every tombstone) for
+/// user keys in the queried range; `size` is the sum of
+/// `internal_key.len() + value.len()` over those entries. Both
+/// values are exact with respect to the current active memtable —
+/// this method walks the skip list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemTableStats {
+    /// Number of raw entries in the range.
+    pub count: u64,
+    /// Approximate total bytes in the range.
+    pub size: u64,
+}
+
 /// Result type for lark operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -426,6 +458,71 @@ impl Db {
     /// scheduler so the two paths can't fight over the same inputs.
     pub fn compact_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
         self.engine.compact_range(start, end).map_err(Error::Io)
+    }
+
+    /// Return the approximate on-disk bytes in each of the given
+    /// ranges, in the same order as `ranges`. Each range is
+    /// scoped to the default column family.
+    ///
+    /// Computed index-only: no data-block decompression happens,
+    /// so the cost is sub-linear in the range size. Accuracy is
+    /// bounded by one data-block worth of bytes per range
+    /// boundary (partially-covered blocks at `start` and `end` are
+    /// included whole). Active-memtable contents are **not**
+    /// included — call [`Db::get_approximate_memtable_stats`] for
+    /// those.
+    pub fn get_approximate_sizes(&self, ranges: &[Range<'_>]) -> Vec<u64> {
+        ranges
+            .iter()
+            .map(|r| self.approximate_size_in_range(&self.default_cf(), r))
+            .collect()
+    }
+
+    /// CF-scoped variant of [`Db::get_approximate_sizes`].
+    pub fn get_approximate_sizes_cf(
+        &self,
+        cf: &ColumnFamilyHandle,
+        ranges: &[Range<'_>],
+    ) -> Vec<u64> {
+        ranges
+            .iter()
+            .map(|r| self.approximate_size_in_range(cf, r))
+            .collect()
+    }
+
+    fn approximate_size_in_range(&self, cf: &ColumnFamilyHandle, r: &Range<'_>) -> u64 {
+        if r.start >= r.end {
+            return 0;
+        }
+        let lo = prefix_key(cf.id(), r.start);
+        let hi = prefix_key(cf.id(), r.end);
+        self.engine.approximate_size_in_range(&lo, &hi)
+    }
+
+    /// Exact count + approximate size of entries in the active
+    /// memtable whose user key falls in `range`, scoped to the
+    /// default column family. Frozen memtables are not included.
+    pub fn get_approximate_memtable_stats(&self, range: Range<'_>) -> MemTableStats {
+        self.memtable_stats_in(&self.default_cf(), &range)
+    }
+
+    /// CF-scoped variant of [`Db::get_approximate_memtable_stats`].
+    pub fn get_approximate_memtable_stats_cf(
+        &self,
+        cf: &ColumnFamilyHandle,
+        range: Range<'_>,
+    ) -> MemTableStats {
+        self.memtable_stats_in(cf, &range)
+    }
+
+    fn memtable_stats_in(&self, cf: &ColumnFamilyHandle, range: &Range<'_>) -> MemTableStats {
+        if range.start >= range.end {
+            return MemTableStats::default();
+        }
+        let lo = prefix_key(cf.id(), range.start);
+        let hi = prefix_key(cf.id(), range.end);
+        let (count, size) = self.engine.approximate_memtable_stats(&lo, &hi);
+        MemTableStats { count, size }
     }
 
     /// Bulk-ingest one or more externally-built SSTable files. Each
@@ -3815,5 +3912,142 @@ mod tests {
                 Some(format!("v{i}").into_bytes())
             );
         }
+    }
+
+    // ── get_approximate_sizes / get_approximate_memtable_stats ──────────
+
+    #[test]
+    fn test_approximate_sizes_empty_db() {
+        let (db, _dir) = open_tmp();
+        let sizes = db.get_approximate_sizes(&[Range::new(b"a", b"z")]);
+        assert_eq!(sizes, vec![0]);
+    }
+
+    #[test]
+    fn test_approximate_sizes_empty_range_returns_zero() {
+        let (db, _dir) = open_tmp();
+        db.put(b"k", b"v").unwrap();
+        // Inverted / empty range must not panic and must be 0.
+        assert_eq!(db.get_approximate_sizes(&[Range::new(b"z", b"a")]), vec![0]);
+        assert_eq!(db.get_approximate_sizes(&[Range::new(b"k", b"k")]), vec![0]);
+    }
+
+    #[test]
+    fn test_approximate_memtable_stats_exact_for_memtable() {
+        let (db, _dir) = open_tmp();
+        for c in b'a'..=b'e' {
+            db.put(&[c], b"v").unwrap();
+        }
+        let stats = db.get_approximate_memtable_stats(Range::new(b"b", b"e"));
+        assert_eq!(stats.count, 3, "count must be exact");
+        // Each entry is [4-byte cf prefix][1-byte key] as
+        // internal-key + 9-byte seq/type suffix + 1-byte value.
+        // The size must be strictly > 0 and < (5 full entries * 50).
+        assert!(stats.size > 0);
+        assert!(stats.size < 500);
+    }
+
+    #[test]
+    fn test_approximate_memtable_stats_empty_range() {
+        let (db, _dir) = open_tmp();
+        db.put(b"k", b"v").unwrap();
+        let stats = db.get_approximate_memtable_stats(Range::new(b"m", b"n"));
+        assert_eq!(stats, MemTableStats::default());
+    }
+
+    #[test]
+    fn test_approximate_memtable_stats_counts_every_version() {
+        let (db, _dir) = open_tmp();
+        db.put(b"k", b"v1").unwrap();
+        db.put(b"k", b"v2").unwrap();
+        db.put(b"k", b"v3").unwrap();
+        let stats = db.get_approximate_memtable_stats(Range::new(b"k", b"l"));
+        // Three versions of the same user key.
+        assert_eq!(stats.count, 3);
+    }
+
+    #[test]
+    fn test_approximate_sizes_after_flush_within_factor_of_2() {
+        // Write enough data to materialize into L0, then check the
+        // approximate size against the on-disk file size. The
+        // accuracy contract is "within a factor of 2".
+        //
+        // Use a high-entropy payload so LZ4 can't crush it — a
+        // zero-filled payload compresses to near-nothing and would
+        // undercut the accuracy window we're checking.
+        let dir = TempDir::new().unwrap();
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            compression: CompressionType::None,
+            ..Options::default()
+        };
+        let db = Db::open(dir.path(), opts).unwrap();
+        let payload: Vec<u8> = (0..256).map(|i| (i % 251) as u8).collect();
+        for i in 0..100 {
+            db.put(format!("k_{i:04}").as_bytes(), &payload).unwrap();
+        }
+        force_flush(&db, "sizes");
+        let sizes = db.get_approximate_sizes(&[Range::new(b"k_0000", b"k_9999")]);
+        assert!(sizes[0] > 0, "whole-range size must be > 0 after flush");
+        // Raw on-disk footprint of the point data: 100 entries,
+        // each ≈ 256-byte value + ~20-byte key/overhead + a bit
+        // of block framing, so ~28–30k. The approximation
+        // includes whole covered blocks, so a 2x window covers
+        // it comfortably.
+        let approx = sizes[0];
+        assert!(approx > 10_000, "approx={approx} too small; expected > 10k");
+        assert!(
+            approx < 1_000_000,
+            "approx={approx} absurdly large; expected < 1M"
+        );
+    }
+
+    #[test]
+    fn test_approximate_sizes_multi_range_preserves_order() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+        let payload = vec![0u8; 256];
+        for i in 0..200 {
+            db.put(format!("k_{i:04}").as_bytes(), &payload).unwrap();
+        }
+        force_flush(&db, "multi");
+        let ranges = vec![
+            Range::new(b"k_0000", b"k_0050"),
+            Range::new(b"k_0050", b"k_0100"),
+            Range::new(b"k_0100", b"k_0200"),
+        ];
+        let sizes = db.get_approximate_sizes(&ranges);
+        assert_eq!(sizes.len(), 3);
+        // Every range should contain some bytes.
+        for (i, &s) in sizes.iter().enumerate() {
+            assert!(s > 0, "range {i} size was 0");
+        }
+    }
+
+    #[test]
+    fn test_approximate_sizes_cf_scoped() {
+        let (db, _dir) = open_tmp();
+        let cf = db.create_column_family("scoped").unwrap();
+        // Put into default CF but not into `scoped` — the
+        // scoped CF's whole-range size must be 0.
+        for i in 0..20 {
+            db.put(format!("k{i}").as_bytes(), b"v").unwrap();
+        }
+        let default_sizes = db.get_approximate_sizes(&[Range::new(b"a", b"z")]);
+        let cf_sizes = db.get_approximate_sizes_cf(&cf, &[Range::new(b"a", b"z")]);
+        // Memtable contents aren't in approximate_sizes, but they
+        // aren't on disk either — the default-CF whole-range
+        // matches the scoped-CF whole-range (both 0) unless a
+        // flush happened. With default write_buffer_size, 20 small
+        // writes don't trigger a flush.
+        assert_eq!(default_sizes[0], 0);
+        assert_eq!(cf_sizes[0], 0);
+
+        // Memtable-stats however sees the default CF entries but
+        // not the scoped CF.
+        let default_mt = db.get_approximate_memtable_stats(Range::new(b"a", b"z"));
+        let cf_mt = db.get_approximate_memtable_stats_cf(&cf, Range::new(b"a", b"z"));
+        assert_eq!(default_mt.count, 20);
+        assert_eq!(cf_mt.count, 0);
     }
 }

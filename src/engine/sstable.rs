@@ -761,6 +761,43 @@ impl SsTableReader {
         Ok(result)
     }
 
+    /// Approximate on-disk bytes whose user key falls in
+    /// `[start, end)`. Computed from the index alone — no data-block
+    /// decompression — so the cost is `O(log num_blocks)` regardless
+    /// of the range size. The estimate is accurate to about one
+    /// data block per partially-covered range boundary, matching the
+    /// "within ~block_size" contract in the `Db::get_approximate_sizes`
+    /// docs.
+    pub(crate) fn approximate_size_in_range(&self, start: &[u8], end: &[u8]) -> u64 {
+        if self.index.is_empty() || start >= end {
+            return 0;
+        }
+        // Binary-search for the first block whose last internal
+        // key is `>= lookup_key(start, u64::MAX)`. That's the
+        // earliest block that might contain any key in the range.
+        let lo_probe = lookup_key(start, u64::MAX);
+        let hi_probe = lookup_key(end, u64::MAX);
+        let first = self
+            .index
+            .partition_point(|e| e.key.as_slice() < lo_probe.as_slice());
+        let last = self
+            .index
+            .partition_point(|e| e.key.as_slice() < hi_probe.as_slice());
+        // Blocks in `[first..=last]` may contain keys inside the
+        // range. We over-count by at most one block at each
+        // boundary, which is the accuracy bound the public API
+        // documents.
+        let end_idx = last.min(self.index.len() - 1);
+        if first > end_idx {
+            return 0;
+        }
+        let mut total: u64 = 0;
+        for entry in &self.index[first..=end_idx] {
+            total += entry.handle.size;
+        }
+        total
+    }
+
     /// Number of data blocks in this table.
     pub(crate) fn num_blocks(&self) -> usize {
         self.index.len()
