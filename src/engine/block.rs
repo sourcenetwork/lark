@@ -51,6 +51,17 @@ impl Block {
         Ok(Self { data, restarts })
     }
 
+    /// Approximate heap bytes held by this block. Used by the
+    /// block cache to charge accurate sizes against its capacity
+    /// budget. Includes the backing `Vec` allocations plus the
+    /// struct itself; excludes any amortized allocator overhead,
+    /// which is typically small and not worth modeling.
+    pub(crate) fn charge(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.data.capacity()
+            + self.restarts.capacity() * std::mem::size_of::<u32>()
+    }
+
     /// Iterate all entries in this block in sorted order.
     pub(crate) fn iter(&self) -> BlockIterator<'_> {
         let data_end = self.data.len() - 4 - self.restarts.len() * 4;

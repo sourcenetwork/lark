@@ -229,6 +229,18 @@ pub struct Options {
     pub block_size: usize,
     /// Block cache size for decompressed blocks. Default: 512 MB.
     pub block_cache_size: usize,
+    /// Base-2 log of the block cache shard count. The block cache
+    /// is split into `2^block_cache_num_shard_bits` shards keyed
+    /// by `hash(file_id, offset)` so concurrent readers contend
+    /// only with other readers that hash to the same shard.
+    /// Default: 6 (64 shards). Clamped to `[0, 8]`.
+    pub block_cache_num_shard_bits: u32,
+    /// If `true`, the block cache refuses to admit a single entry
+    /// that is larger than one shard's byte capacity; the caller
+    /// uses the block directly without caching it. If `false`
+    /// (default), an oversized entry evicts everything else in
+    /// its shard and is admitted anyway.
+    pub strict_capacity_limit: bool,
     /// Bloom filter bits per key. Default: 10.
     pub bloom_bits_per_key: usize,
     /// Default block compression codec. Used at every level unless
@@ -322,6 +334,8 @@ impl Default for Options {
             write_buffer_size: 64 * 1024 * 1024,
             block_size: 16 * 1024,
             block_cache_size: 512 * 1024 * 1024,
+            block_cache_num_shard_bits: 6,
+            strict_capacity_limit: false,
             bloom_bits_per_key: 10,
             compression: CompressionType::Lz4,
             compression_per_level: None,
@@ -352,6 +366,11 @@ impl std::fmt::Debug for Options {
             .field("write_buffer_size", &self.write_buffer_size)
             .field("block_size", &self.block_size)
             .field("block_cache_size", &self.block_cache_size)
+            .field(
+                "block_cache_num_shard_bits",
+                &self.block_cache_num_shard_bits,
+            )
+            .field("strict_capacity_limit", &self.strict_capacity_limit)
             .field("bloom_bits_per_key", &self.bloom_bits_per_key)
             .field("compression", &self.compression)
             .field("compression_per_level", &self.compression_per_level)
@@ -403,6 +422,8 @@ impl Options {
             write_buffer_size: self.write_buffer_size,
             block_size: self.block_size,
             block_cache_size: self.block_cache_size,
+            block_cache_num_shard_bits: self.block_cache_num_shard_bits,
+            strict_capacity_limit: self.strict_capacity_limit,
             bloom_bits_per_key: self.bloom_bits_per_key,
             compression: self.compression,
             compression_per_level: self.compression_per_level.clone(),
