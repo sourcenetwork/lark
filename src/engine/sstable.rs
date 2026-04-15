@@ -647,6 +647,7 @@ impl SsTableReader {
         cache: &BlockCache,
     ) -> io::Result<LookupResult> {
         if !self.bloom.may_contain(user_key) {
+            cache.record_bloom_useful();
             return Ok(LookupResult::NotInTable);
         }
 
@@ -681,9 +682,11 @@ impl SsTableReader {
                 match vt {
                     VALUE_TYPE_MERGE => continue,
                     VALUE_TYPE_DELETION => {
+                        cache.record_bloom_full_positive();
                         return Ok(LookupResult::FoundTombstone { seq });
                     }
                     _ => {
+                        cache.record_bloom_full_positive();
                         return Ok(LookupResult::Found { seq, value });
                     }
                 }

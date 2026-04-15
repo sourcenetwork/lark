@@ -279,6 +279,13 @@ pub struct Options {
     /// block or re-enter the database**. See
     /// [`crate::EventListener`] for the full contract.
     pub listeners: Vec<Arc<dyn crate::EventListener>>,
+    /// Optional statistics sink. When set, every hot path in
+    /// the engine updates the provided [`crate::Statistics`]
+    /// object with tickers and histograms. The caller polls the
+    /// same object to export metrics to their monitoring stack.
+    /// `None` (default) short-circuits every instrumentation site
+    /// at a branch, so disabled stats cost almost nothing.
+    pub statistics: Option<Arc<crate::Statistics>>,
 }
 
 impl Default for Options {
@@ -300,6 +307,7 @@ impl Default for Options {
             merge_operator: None,
             atomic_flush: false,
             listeners: Vec::new(),
+            statistics: None,
         }
     }
 }
@@ -332,6 +340,7 @@ impl std::fmt::Debug for Options {
             )
             .field("atomic_flush", &self.atomic_flush)
             .field("listeners", &self.listeners.len())
+            .field("statistics", &self.statistics.is_some())
             .finish()
     }
 }
@@ -353,6 +362,7 @@ impl Options {
             prefix_extractor: self.prefix_extractor.clone(),
             merge_operator: self.merge_operator.clone(),
             listeners: self.listeners.clone(),
+            statistics: self.statistics.clone(),
         }
     }
 }
