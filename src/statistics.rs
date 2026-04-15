@@ -162,8 +162,8 @@ impl Ticker {
 }
 
 /// Enumerated histograms recorded by the engine. Every variant
-/// is backed by one [`HistogramData`] slot in [`Statistics`],
-/// guarded by its own short mutex so recording is non-contending
+/// is backed by one histogram slot in [`Statistics`], guarded
+/// by its own short mutex so recording is non-contending
 /// across histograms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(usize)]
