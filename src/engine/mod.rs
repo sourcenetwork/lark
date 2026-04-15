@@ -75,6 +75,8 @@ pub(crate) struct EngineOptions {
     pub(crate) soft_pending_compaction_bytes_limit: u64,
     pub(crate) hard_pending_compaction_bytes_limit: u64,
     pub(crate) max_write_buffer_number: usize,
+    pub(crate) compaction_style: crate::options::CompactionStyle,
+    pub(crate) fifo_compaction_options: crate::options::FifoCompactionOptions,
 }
 
 impl EngineOptions {
@@ -115,6 +117,8 @@ impl Default for EngineOptions {
             soft_pending_compaction_bytes_limit: 64 * 1024 * 1024 * 1024,
             hard_pending_compaction_bytes_limit: 256 * 1024 * 1024 * 1024,
             max_write_buffer_number: 2,
+            compaction_style: crate::options::CompactionStyle::Level,
+            fifo_compaction_options: crate::options::FifoCompactionOptions::default(),
         }
     }
 }
@@ -260,6 +264,8 @@ impl LarkEngine {
             listeners: options.listeners.clone(),
             statistics: options.statistics.clone(),
             rate_limiter: options.rate_limiter.clone(),
+            compaction_style: options.compaction_style,
+            fifo_compaction_options: options.fifo_compaction_options,
         };
 
         let compaction_lock = Arc::new(Mutex::new(()));
@@ -1394,7 +1400,21 @@ impl LarkEngine {
             listeners: self.options.listeners.clone(),
             statistics: self.options.statistics.clone(),
             rate_limiter: self.options.rate_limiter.clone(),
+            compaction_style: self.options.compaction_style,
+            fifo_compaction_options: self.options.fifo_compaction_options,
         };
+        // Under FIFO compaction there is no level push-down; a
+        // synchronous compact_range just flushes the memtable and
+        // runs the FIFO picker so any pending files over the cap
+        // get dropped deterministically.
+        if matches!(
+            self.options.compaction_style,
+            crate::options::CompactionStyle::Fifo
+        ) {
+            let _ = compaction::run_fifo_pass(&self.versions, &self.sst_dir, &compaction_opts)?;
+            return Ok(());
+        }
+
         compaction::run_compact_range(
             &self.versions,
             &self.sst_dir,

@@ -188,6 +188,51 @@ impl PrefixExtractor for FixedLengthPrefix {
     }
 }
 
+/// Compaction strategy used by the background compaction thread.
+///
+/// Lark currently ships two styles. More can be added in follow-up
+/// work (universal / size-tiered is the obvious next one) without
+/// breaking callers, since the field is consumed by name.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionStyle {
+    /// Standard leveled compaction: L0 collects flushes, then files
+    /// are pushed down through L1..L6 with each level ~10× larger
+    /// than the previous one. Best fit for mixed read/write
+    /// workloads where space amplification matters more than
+    /// write amplification. This is the default.
+    #[default]
+    Level,
+    /// FIFO: lark never merges files. Once the total size of all
+    /// SSTables exceeds [`FifoCompactionOptions::max_table_files_size`],
+    /// the oldest SSTable is unlinked. Best fit for time-series and
+    /// append-only log workloads where the oldest data is also the
+    /// least valuable. Reads still consult every L0 file (there is
+    /// no L1+) so read amplification grows with the number of
+    /// retained files; this is the trade-off for ~zero write
+    /// amplification.
+    Fifo,
+}
+
+/// Tunables for [`CompactionStyle::Fifo`]. Ignored when
+/// [`Options::compaction_style`] is [`CompactionStyle::Level`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FifoCompactionOptions {
+    /// Soft cap on the total bytes held by SSTables. After every
+    /// flush, if the sum of file sizes exceeds this number, the
+    /// background compaction thread unlinks the oldest SSTables
+    /// (smallest `file_id` first) until the cap is satisfied or
+    /// only one file remains. Default: 1 GiB.
+    pub max_table_files_size: u64,
+}
+
+impl Default for FifoCompactionOptions {
+    fn default() -> Self {
+        Self {
+            max_table_files_size: 1024 * 1024 * 1024,
+        }
+    }
+}
+
 /// Controls when data is flushed to disk after a write.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum DurabilityMode {
@@ -326,6 +371,12 @@ pub struct Options {
     /// frozen). Reaching this count slows writes; reaching
     /// `2 * max_write_buffer_number` stops them. Default: 2.
     pub max_write_buffer_number: usize,
+    /// Compaction strategy. See [`CompactionStyle`] for the
+    /// trade-offs. Default: [`CompactionStyle::Level`].
+    pub compaction_style: CompactionStyle,
+    /// Tunables for [`CompactionStyle::Fifo`]. Ignored when the
+    /// style is [`CompactionStyle::Level`].
+    pub fifo_compaction_options: FifoCompactionOptions,
 }
 
 impl Default for Options {
@@ -356,6 +407,8 @@ impl Default for Options {
             soft_pending_compaction_bytes_limit: 64 * 1024 * 1024 * 1024,
             hard_pending_compaction_bytes_limit: 256 * 1024 * 1024 * 1024,
             max_write_buffer_number: 2,
+            compaction_style: CompactionStyle::Level,
+            fifo_compaction_options: FifoCompactionOptions::default(),
         }
     }
 }
@@ -412,6 +465,8 @@ impl std::fmt::Debug for Options {
                 &self.hard_pending_compaction_bytes_limit,
             )
             .field("max_write_buffer_number", &self.max_write_buffer_number)
+            .field("compaction_style", &self.compaction_style)
+            .field("fifo_compaction_options", &self.fifo_compaction_options)
             .finish()
     }
 }
@@ -442,6 +497,8 @@ impl Options {
             soft_pending_compaction_bytes_limit: self.soft_pending_compaction_bytes_limit,
             hard_pending_compaction_bytes_limit: self.hard_pending_compaction_bytes_limit,
             max_write_buffer_number: self.max_write_buffer_number,
+            compaction_style: self.compaction_style,
+            fifo_compaction_options: self.fifo_compaction_options,
         }
     }
 }

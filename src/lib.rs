@@ -68,8 +68,9 @@ pub use event_listener::{
 };
 pub use iter::Iter;
 pub use options::{
-    CompactionDecision, CompactionFilter, CompressionType, DurabilityMode, FixedLengthPrefix,
-    MergeOperator, Options, PrefixExtractor, WriteOptions,
+    CompactionDecision, CompactionFilter, CompactionStyle, CompressionType, DurabilityMode,
+    FifoCompactionOptions, FixedLengthPrefix, MergeOperator, Options, PrefixExtractor,
+    WriteOptions,
 };
 pub use rate_limiter::{Priority, RateLimiter, TokenBucketRateLimiter};
 pub use sst_file_writer::{IngestOptions, SstFileMeta, SstFileWriter};
@@ -5121,6 +5122,113 @@ mod tests {
             Some("0")
         );
         assert_eq!(db.get_property("lark.num-snapshots").as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn test_fifo_compaction_bounds_total_size() {
+        // Tiny memtable + tight FIFO cap: sustained writes should
+        // produce many L0 files, and after each flush the oldest
+        // ones should be unlinked so the total stays bounded.
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            compaction_style: CompactionStyle::Fifo,
+            fifo_compaction_options: FifoCompactionOptions {
+                max_table_files_size: 32 * 1024,
+            },
+            ..Options::default()
+        };
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), opts).unwrap();
+
+        // Write enough data to produce ~16 flushes of ~4 KB each,
+        // well over the 32 KB cap. Each write has a distinct
+        // monotonically increasing key so flushes don't overlap.
+        let payload = vec![0xEEu8; 256];
+        for i in 0..256 {
+            let k = format!("k{i:06}");
+            db.put(k.as_bytes(), &payload).unwrap();
+        }
+
+        // Give the background compaction thread a moment to
+        // process the trailing flushes + FIFO drops.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Force any remaining flushes through and run one more
+        // FIFO pass via compact_range (which acquires the
+        // compaction lock and drains pending work).
+        db.compact_range(None, None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let total = db
+            .get_int_property("lark.total-sst-files-size")
+            .unwrap_or(0);
+        assert!(
+            total <= 64 * 1024,
+            "FIFO cap 32KB should keep total < 64KB slack, got {total}"
+        );
+        // Meanwhile the newest keys must still be readable (the
+        // oldest ones may have been dropped by FIFO).
+        assert_eq!(
+            db.get(b"k000255").unwrap(),
+            Some(payload.clone()),
+            "newest key must survive FIFO compaction"
+        );
+    }
+
+    #[test]
+    fn test_fifo_compaction_keeps_at_least_one_file() {
+        // A single oversized file must not be deleted — FIFO
+        // refuses to drop the last surviving SST because that
+        // would wipe the database.
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            compaction_style: CompactionStyle::Fifo,
+            fifo_compaction_options: FifoCompactionOptions {
+                max_table_files_size: 1, // 1 byte cap: always over limit
+            },
+            ..Options::default()
+        };
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), opts).unwrap();
+        for i in 0..32 {
+            let k = format!("k{i:04}");
+            db.put(k.as_bytes(), &vec![0xAA; 512]).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        db.compact_range(None, None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let l0 = db.get_int_property("lark.num-files-at-level0").unwrap();
+        assert!(
+            l0 >= 1,
+            "FIFO must keep at least one L0 file even when over the cap"
+        );
+    }
+
+    #[test]
+    fn test_fifo_compaction_never_promotes_to_l1() {
+        // Under FIFO, the background scheduler should never
+        // promote files from L0 to L1. The `l0_compaction_trigger`
+        // knob is a level-style knob and must have no effect.
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            l0_compaction_trigger: 2,
+            compaction_style: CompactionStyle::Fifo,
+            fifo_compaction_options: FifoCompactionOptions {
+                max_table_files_size: 10 * 1024 * 1024,
+            },
+            ..Options::default()
+        };
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), opts).unwrap();
+        for i in 0..64 {
+            let k = format!("k{i:04}");
+            db.put(k.as_bytes(), &vec![0xBB; 256]).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let l1 = db.get_int_property("lark.num-files-at-level1").unwrap();
+        assert_eq!(l1, 0, "FIFO must not produce L1 files, saw {l1}");
     }
 
     #[test]
