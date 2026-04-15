@@ -31,17 +31,13 @@
 
 #[cfg(target_os = "linux")]
 pub(crate) fn drop_page_cache(file: &std::fs::File) {
-    use std::os::unix::io::AsRawFd;
-    // SAFETY: `file.as_raw_fd()` returns a valid file descriptor
-    // for the lifetime of `file`, and `posix_fadvise` is
-    // documented to accept any int fd. The `0, 0` range means
-    // "the whole file". We deliberately ignore the return code:
-    // this is a best-effort hint, and a failure (e.g. the file
-    // is backed by a filesystem that doesn't implement the
-    // advice) is not a correctness issue.
-    unsafe {
-        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
-    }
+    // `rustix::fs::fadvise` is a safe wrapper around
+    // `posix_fadvise`; a range of `(0, 0)` means "the whole
+    // file". We deliberately ignore the return — this is a
+    // best-effort hint, and a failure (e.g. the file is backed
+    // by a filesystem that doesn't implement the advice) is not
+    // a correctness issue.
+    let _ = rustix::fs::fadvise(file, 0, 0, rustix::fs::Advice::DontNeed);
 }
 
 #[cfg(not(target_os = "linux"))]
