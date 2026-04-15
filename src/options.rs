@@ -432,6 +432,24 @@ pub struct Options {
     /// Tunables for [`CompactionStyle::Universal`]. Ignored when
     /// the style is not Universal.
     pub universal_compaction_options: UniversalCompactionOptions,
+    /// Parallelism used to write a single compaction's output
+    /// SSTables.
+    ///
+    /// When `>= 2`, the compaction thread splits a single job's
+    /// sorted entries into this many chunks at user-key
+    /// boundaries and writes each chunk on its own OS thread.
+    /// Each chunk still goes through the usual `target_file_size`
+    /// splitting, so a large subcompaction may produce multiple
+    /// output files per worker. All resulting files land in the
+    /// same atomic version edit.
+    ///
+    /// `1` (default) keeps compactions single-threaded and
+    /// matches pre-subcompaction behavior byte-for-byte. Values
+    /// greater than the number of user-key groups in the
+    /// compaction's input are silently capped to the group
+    /// count, and very small compactions fall back to a single
+    /// worker so the thread-spawn overhead is never a loss.
+    pub max_subcompactions: usize,
     /// Hint the OS page cache to drop pages backing SSTables
     /// that are read or written by background compaction.
     ///
@@ -482,6 +500,7 @@ impl Default for Options {
             fifo_compaction_options: FifoCompactionOptions::default(),
             universal_compaction_options: UniversalCompactionOptions::default(),
             use_direct_io_for_compaction: false,
+            max_subcompactions: 1,
         }
     }
 }
@@ -548,6 +567,7 @@ impl std::fmt::Debug for Options {
                 "use_direct_io_for_compaction",
                 &self.use_direct_io_for_compaction,
             )
+            .field("max_subcompactions", &self.max_subcompactions)
             .finish()
     }
 }
@@ -582,6 +602,7 @@ impl Options {
             fifo_compaction_options: self.fifo_compaction_options,
             universal_compaction_options: self.universal_compaction_options,
             use_direct_io_for_compaction: self.use_direct_io_for_compaction,
+            max_subcompactions: self.max_subcompactions,
         }
     }
 }

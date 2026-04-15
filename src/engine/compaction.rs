@@ -125,6 +125,7 @@ pub(crate) struct CompactionOptions {
     pub(crate) fifo_compaction_options: crate::options::FifoCompactionOptions,
     pub(crate) universal_compaction_options: crate::options::UniversalCompactionOptions,
     pub(crate) use_direct_io_for_compaction: bool,
+    pub(crate) max_subcompactions: usize,
 }
 
 impl CompactionOptions {
@@ -159,6 +160,7 @@ impl Default for CompactionOptions {
             fifo_compaction_options: crate::options::FifoCompactionOptions::default(),
             universal_compaction_options: crate::options::UniversalCompactionOptions::default(),
             use_direct_io_for_compaction: false,
+            max_subcompactions: 1,
         }
     }
 }
@@ -859,130 +861,32 @@ fn perform_compaction_to(
         return Ok(());
     }
 
-    // Split output across multiple SSTables at user-key boundaries so that
-    // all versions of a given user key live in exactly one file (required
-    // for the non-overlap invariant at L1+).
+    // Split output across multiple SSTables at user-key boundaries so
+    // that all versions of a given user key live in exactly one file
+    // (required for the non-overlap invariant at L1+).
     //
     // Range tombstones are replicated into every output file produced by
     // this compaction. A future compaction of any of these files will
     // merge and dedup the RTs again, so there's no runaway duplication.
     // Replicating keeps each file self-sufficient for reads: a scan that
     // only picks up one of the files still sees the right RT coverage.
-    let mut output_file_infos: Vec<OutputFileInfo> = Vec::new();
-    let mut chunk_start = 0;
-    let rt_only_output = all_entries.is_empty() && !merged_range_tombstones.is_empty();
-    let mut wrote_rt_only = false;
-    loop {
-        if !rt_only_output && chunk_start >= all_entries.len() {
-            break;
-        }
-        if rt_only_output && wrote_rt_only {
-            break;
-        }
-        // Allocate the output file_id atomically from the *current*
-        // version inside `versions.lock()` — same pattern
-        // `flush_frozen_memtable` uses. Using a captured
-        // `version.next_file_id` would race with a concurrent flush
-        // that advances the counter on the current version; both
-        // paths would then pick the same id and the second
-        // `File::create(path)` would truncate the first path's newly
-        // written file.
-        let file_id = {
-            let mut guard = versions.lock();
-            let current = guard.current();
-            let id = current.next_file_id;
-            guard.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
-            id
-        };
-
-        let path = sst_dir.join(sst_filename(file_id));
-        // Output files land at `target_level`, so pick that level's
-        // codec — this is what makes `compression_per_level` actually
-        // shape the on-disk layout as files migrate down through the
-        // tree.
-        let mut writer = SsTableWriter::new(
-            &path,
-            opts.block_size,
-            opts.bloom_bits_per_key,
-            opts.compression_for_level(target_level),
-            opts.prefix_extractor.clone(),
-        )?;
-
-        let mut estimated_size: u64 = 0;
-        let mut current_user_key: Option<Vec<u8>> = None;
-
-        while chunk_start < all_entries.len() {
-            let (ik, value) = &all_entries[chunk_start];
-            let uk = user_key_of(ik);
-            let at_boundary = current_user_key.as_deref() != Some(uk);
-
-            if estimated_size >= opts.target_file_size && at_boundary {
-                break;
-            }
-
-            writer.add(ik, value)?;
-            estimated_size += (ik.len() + value.len()) as u64;
-            if at_boundary {
-                current_user_key = Some(uk.to_vec());
-            }
-            chunk_start += 1;
-        }
-
-        for rt in &merged_range_tombstones {
-            writer.add_range_tombstone(&rt.start, &rt.end, rt.seq);
-        }
-        if rt_only_output {
-            wrote_rt_only = true;
-        }
-
-        let summary = match writer.finish()? {
-            Some(s) => s,
-            None => {
-                let _ = std::fs::remove_file(&path);
-                continue;
-            }
-        };
-
-        let file_size = std::fs::metadata(&path)?.len();
-
-        // Throttle background I/O. Opt-in via `Options::rate_limiter`;
-        // a `None` limiter is a no-op.
-        if let Some(limiter) = &opts.rate_limiter {
-            limiter.request(file_size, crate::rate_limiter::Priority::Low);
-        }
-
-        // Tell the OS it can drop the pages we just wrote from the
-        // page cache so they don't evict hot foreground reads.
-        // `use_direct_io_for_compaction` gates the hint; on
-        // non-Linux targets `drop_page_cache_by_path` is a no-op.
-        if opts.use_direct_io_for_compaction {
-            crate::os_hint::drop_page_cache_by_path(&path);
-        }
-
-        let reader = Arc::new(SsTableReader::open(&path, file_id)?);
-        let new_file = LiveSst::new(
-            SsTableMeta {
-                file_id,
-                smallest_key: summary.smallest_user_key,
-                largest_key: summary.largest_user_key,
-                file_size,
-                num_entries: summary.num_entries,
-            },
-            reader,
-        );
-
-        output_file_infos.push(OutputFileInfo {
-            file_id,
-            path: path.clone(),
-            file_size,
-            num_entries: summary.num_entries,
-        });
-
-        edits.push(VersionEdit::AddFile {
-            level: target_level,
-            file: new_file,
-        });
-    }
+    //
+    // When `max_subcompactions > 1`, the sorted entry list is split at
+    // user-key boundaries into that many chunks and each chunk is
+    // written on its own scoped OS thread; output file ids are still
+    // allocated atomically via the version lock. An empty-entries
+    // "RT-only" output is always single-threaded because it produces
+    // exactly one file.
+    let (new_file_edits, new_output_infos) = write_compaction_outputs(
+        versions,
+        sst_dir,
+        opts,
+        target_level,
+        &all_entries,
+        &merged_range_tombstones,
+    )?;
+    let output_file_infos: Vec<OutputFileInfo> = new_output_infos;
+    edits.extend(new_file_edits);
 
     // Atomically apply the remove / add edits. `SetNextFileId` is not
     // needed here — each output file already advanced it when it was
@@ -1348,6 +1252,292 @@ struct OutputFileInfo {
     path: PathBuf,
     file_size: u64,
     num_entries: u64,
+}
+
+/// Smallest subcompaction a worker will ever take on. Below this
+/// many user-key groups per worker, the thread-spawn overhead
+/// eats any parallel speedup and we fall back to single-threaded
+/// writing.
+const MIN_GROUPS_PER_SUBCOMPACTION: usize = 64;
+
+/// Dispatch the output-writing phase of a compaction across
+/// one or more worker threads depending on `opts.max_subcompactions`.
+/// Returns the `AddFile` edits and `OutputFileInfo`s for every
+/// file this compaction produced.
+///
+/// Subcompactions always split at user-key boundaries so the
+/// non-overlap invariant at L1+ is preserved: every version of a
+/// given user key lives in exactly one output file, just as the
+/// single-threaded writer guaranteed.
+fn write_compaction_outputs(
+    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    sst_dir: &Path,
+    opts: &CompactionOptions,
+    target_level: usize,
+    all_entries: &[(Vec<u8>, Vec<u8>)],
+    merged_range_tombstones: &[RangeTombstone],
+) -> std::io::Result<(Vec<VersionEdit>, Vec<OutputFileInfo>)> {
+    // Empty point entries + non-empty RTs → one RT-only output.
+    // Always single-threaded.
+    if all_entries.is_empty() && !merged_range_tombstones.is_empty() {
+        return write_chunk_outputs(
+            versions,
+            sst_dir,
+            opts,
+            target_level,
+            &[],
+            merged_range_tombstones,
+            /* rt_only */ true,
+        );
+    }
+
+    // Decide how many workers we actually want. Capped by the
+    // number of user-key groups in the input so chunks never end
+    // up empty.
+    let group_count = count_user_key_groups(all_entries);
+    let requested = opts.max_subcompactions.max(1);
+    let worker_count = requested.min(group_count.max(1));
+    let worker_count =
+        if worker_count > 1 && group_count / worker_count >= MIN_GROUPS_PER_SUBCOMPACTION {
+            worker_count
+        } else {
+            1
+        };
+
+    if worker_count <= 1 {
+        return write_chunk_outputs(
+            versions,
+            sst_dir,
+            opts,
+            target_level,
+            all_entries,
+            merged_range_tombstones,
+            /* rt_only */ false,
+        );
+    }
+
+    // Split indices at user-key boundaries roughly equidistant
+    // by group count (not by bytes — good enough in practice and
+    // avoids a second full pass over the entry list).
+    let split_indices = compute_subcompaction_splits(all_entries, group_count, worker_count);
+
+    // One sub-slice per worker. Each thread runs `write_chunk_outputs`
+    // independently against its slice; they do not share any
+    // mutable state beyond the `versions` lock (used only inside
+    // atomic file-id allocation) and the optional rate limiter.
+    let chunks: Vec<&[(Vec<u8>, Vec<u8>)]> = split_indices
+        .windows(2)
+        .map(|w| &all_entries[w[0]..w[1]])
+        .collect();
+
+    let mut aggregated_edits: Vec<VersionEdit> = Vec::new();
+    let mut aggregated_infos: Vec<OutputFileInfo> = Vec::new();
+
+    std::thread::scope(|scope| -> std::io::Result<()> {
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|chunk| {
+                scope.spawn(move || {
+                    write_chunk_outputs(
+                        versions,
+                        sst_dir,
+                        opts,
+                        target_level,
+                        chunk,
+                        merged_range_tombstones,
+                        /* rt_only */ false,
+                    )
+                })
+            })
+            .collect();
+        for h in handles {
+            let (edits, infos) = h
+                .join()
+                .map_err(|_| std::io::Error::other("subcompaction worker panicked"))??;
+            aggregated_edits.extend(edits);
+            aggregated_infos.extend(infos);
+        }
+        Ok(())
+    })?;
+
+    Ok((aggregated_edits, aggregated_infos))
+}
+
+/// Count the number of distinct user keys in a sorted internal-
+/// key entry list. Used by the subcompaction planner to decide
+/// how many workers to spin up and where to split.
+fn count_user_key_groups(entries: &[(Vec<u8>, Vec<u8>)]) -> usize {
+    let mut count = 0usize;
+    let mut prev: Option<&[u8]> = None;
+    for (ik, _) in entries {
+        let uk = user_key_of(ik);
+        if prev != Some(uk) {
+            count += 1;
+            prev = Some(uk);
+        }
+    }
+    count
+}
+
+/// Compute split indices into `entries` so every subcompaction
+/// chunk boundary falls on a user-key boundary. Returns a vector
+/// with `workers + 1` entries where element 0 is always 0 and
+/// element `workers` is always `entries.len()`.
+fn compute_subcompaction_splits(
+    entries: &[(Vec<u8>, Vec<u8>)],
+    group_count: usize,
+    workers: usize,
+) -> Vec<usize> {
+    debug_assert!(workers > 1);
+    debug_assert!(group_count >= workers);
+    let groups_per_worker = group_count / workers;
+
+    let mut result: Vec<usize> = Vec::with_capacity(workers + 1);
+    result.push(0);
+    let mut groups_seen = 0usize;
+    let mut prev_uk: Option<&[u8]> = None;
+    let mut target_boundary = groups_per_worker;
+    for (idx, (ik, _)) in entries.iter().enumerate() {
+        let uk = user_key_of(ik);
+        if prev_uk != Some(uk) {
+            groups_seen += 1;
+            prev_uk = Some(uk);
+            if groups_seen > target_boundary && result.len() < workers {
+                result.push(idx);
+                target_boundary += groups_per_worker;
+            }
+        }
+    }
+    // Pad out any missing split points (happens when the last
+    // couple of groups fall past the final target) and cap at
+    // `entries.len()` exactly.
+    while result.len() < workers {
+        result.push(entries.len());
+    }
+    result.push(entries.len());
+    result
+}
+
+/// Inner body that writes one chunk's worth of entries as one
+/// or more output SSTables. Factored out of the old single-
+/// threaded writer loop so both the single- and multi-threaded
+/// paths share exactly the same file-building logic.
+#[allow(clippy::too_many_arguments)]
+fn write_chunk_outputs(
+    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    sst_dir: &Path,
+    opts: &CompactionOptions,
+    target_level: usize,
+    entries: &[(Vec<u8>, Vec<u8>)],
+    merged_range_tombstones: &[RangeTombstone],
+    rt_only: bool,
+) -> std::io::Result<(Vec<VersionEdit>, Vec<OutputFileInfo>)> {
+    let mut edits: Vec<VersionEdit> = Vec::new();
+    let mut infos: Vec<OutputFileInfo> = Vec::new();
+    let mut chunk_start = 0usize;
+    let mut wrote_rt_only = false;
+
+    loop {
+        if !rt_only && chunk_start >= entries.len() {
+            break;
+        }
+        if rt_only && wrote_rt_only {
+            break;
+        }
+
+        // Allocate an output file id under the version lock. This
+        // is a short critical section (one atomic counter bump),
+        // so many subcompaction workers contending for it is
+        // fine in practice — writes are the expensive part and
+        // they happen without holding the lock.
+        let file_id = {
+            let mut guard = versions.lock();
+            let current = guard.current();
+            let id = current.next_file_id;
+            guard.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
+            id
+        };
+
+        let path = sst_dir.join(sst_filename(file_id));
+        let mut writer = SsTableWriter::new(
+            &path,
+            opts.block_size,
+            opts.bloom_bits_per_key,
+            opts.compression_for_level(target_level),
+            opts.prefix_extractor.clone(),
+        )?;
+
+        let mut estimated_size: u64 = 0;
+        let mut current_user_key: Option<Vec<u8>> = None;
+
+        while chunk_start < entries.len() {
+            let (ik, value) = &entries[chunk_start];
+            let uk = user_key_of(ik);
+            let at_boundary = current_user_key.as_deref() != Some(uk);
+
+            if estimated_size >= opts.target_file_size && at_boundary {
+                break;
+            }
+
+            writer.add(ik, value)?;
+            estimated_size += (ik.len() + value.len()) as u64;
+            if at_boundary {
+                current_user_key = Some(uk.to_vec());
+            }
+            chunk_start += 1;
+        }
+
+        for rt in merged_range_tombstones {
+            writer.add_range_tombstone(&rt.start, &rt.end, rt.seq);
+        }
+        if rt_only {
+            wrote_rt_only = true;
+        }
+
+        let summary = match writer.finish()? {
+            Some(s) => s,
+            None => {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+        };
+
+        let file_size = std::fs::metadata(&path)?.len();
+
+        if let Some(limiter) = &opts.rate_limiter {
+            limiter.request(file_size, crate::rate_limiter::Priority::Low);
+        }
+
+        if opts.use_direct_io_for_compaction {
+            crate::os_hint::drop_page_cache_by_path(&path);
+        }
+
+        let reader = Arc::new(SsTableReader::open(&path, file_id)?);
+        let new_file = LiveSst::new(
+            SsTableMeta {
+                file_id,
+                smallest_key: summary.smallest_user_key,
+                largest_key: summary.largest_user_key,
+                file_size,
+                num_entries: summary.num_entries,
+            },
+            reader,
+        );
+
+        infos.push(OutputFileInfo {
+            file_id,
+            path: path.clone(),
+            file_size,
+            num_entries: summary.num_entries,
+        });
+
+        edits.push(VersionEdit::AddFile {
+            level: target_level,
+            file: new_file,
+        });
+    }
+
+    Ok((edits, infos))
 }
 
 fn key_range(files: &[Arc<LiveSst>]) -> (Vec<u8>, Vec<u8>) {
