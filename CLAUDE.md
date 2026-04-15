@@ -139,6 +139,8 @@ Tests live inline with `#[cfg(test)]` in the modules they cover — there is no 
 
 These are exactly what CI runs (`.github/workflows/ci.yml`).
 
+CI also publishes a coverage summary via `cargo llvm-cov --summary-only` on every push; run it locally with `cargo llvm-cov` (HTML report lands in `target/llvm-cov/html/`) when a change touches a file whose coverage you care about. No hard gate yet — the baseline at the time of writing is ~93% regions / ~91% lines.
+
 ## Goal
 
 **A new contributor should be able to read this file, skim `src/lib.rs`, and start making productive changes to the engine within an hour.**
