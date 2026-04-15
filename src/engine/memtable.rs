@@ -159,6 +159,35 @@ impl MemTable {
             .collect()
     }
 
+    /// Walk every raw entry whose user key falls in `[start, end)` and
+    /// return the count and approximate total size (sum of internal-key
+    /// length + value length). Every version and every tombstone is
+    /// counted — this is a raw-entry stat, not a distinct-user-key stat.
+    ///
+    /// Used by [`crate::Db::get_approximate_memtable_stats`] to give
+    /// callers a cheap-ish estimate of how big a range is inside the
+    /// active memtable without doing a full visible scan.
+    pub(crate) fn approximate_stats_for_range(&self, start: &[u8], end: &[u8]) -> (u64, u64) {
+        if start >= end {
+            return (0, 0);
+        }
+        // Walk from the smallest possible internal key for `start`
+        // (seq=MAX, value_type=0) to the smallest for `end`. Every
+        // entry in between has user key in `[start, end)`.
+        let lo = lookup_key(start, u64::MAX);
+        let hi = lookup_key(end, u64::MAX);
+        let mut count: u64 = 0;
+        let mut size: u64 = 0;
+        for entry in self.data.range::<[u8], _>((
+            std::ops::Bound::Included(lo.as_slice()),
+            std::ops::Bound::Excluded(hi.as_slice()),
+        )) {
+            count += 1;
+            size += (entry.key().len() + entry.value().len()) as u64;
+        }
+        (count, size)
+    }
+
     /// Return the first `(internal_key, value)` pair whose key is in the
     /// half-open range `[lower, ..)`. Used by the streaming iterator to walk
     /// the memtable statelessly — each call does a fresh `O(log N)` seek in
