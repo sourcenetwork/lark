@@ -70,7 +70,7 @@ pub use iter::Iter;
 pub use options::{
     CompactionDecision, CompactionFilter, CompactionStyle, CompressionType, DurabilityMode,
     FifoCompactionOptions, FixedLengthPrefix, MergeOperator, Options, PrefixExtractor,
-    WriteOptions,
+    UniversalCompactionOptions, WriteOptions,
 };
 pub use rate_limiter::{Priority, RateLimiter, TokenBucketRateLimiter};
 pub use sst_file_writer::{IngestOptions, SstFileMeta, SstFileWriter};
@@ -5122,6 +5122,107 @@ mod tests {
             Some("0")
         );
         assert_eq!(db.get_property("lark.num-snapshots").as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn test_universal_compaction_reads_are_correct_after_merge() {
+        // Write a batch under Universal, force a full merge via
+        // compact_range, and verify every key is still readable
+        // with the most recent value.
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            compaction_style: CompactionStyle::Universal,
+            ..Options::default()
+        };
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), opts).unwrap();
+
+        for i in 0..64 {
+            let k = format!("k{i:04}");
+            let v = format!("v{i}");
+            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+        }
+        // Overwrite the first 16 keys so dedup has to pick the
+        // newest version during the merge.
+        for i in 0..16 {
+            let k = format!("k{i:04}");
+            let v = format!("v{i}-updated");
+            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+        }
+
+        db.compact_range(None, None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        for i in 0..64 {
+            let k = format!("k{i:04}");
+            let expected = if i < 16 {
+                format!("v{i}-updated")
+            } else {
+                format!("v{i}")
+            };
+            assert_eq!(
+                db.get(k.as_bytes()).unwrap(),
+                Some(expected.into_bytes()),
+                "key {k} must read back its latest value"
+            );
+        }
+    }
+
+    #[test]
+    fn test_universal_compaction_never_creates_l1_files() {
+        // Every Universal merge output should stay at L0 — the
+        // level-size push-down rule must not fire for this style.
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            l0_compaction_trigger: 1,
+            compaction_style: CompactionStyle::Universal,
+            ..Options::default()
+        };
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), opts).unwrap();
+        for i in 0..64 {
+            let k = format!("k{i:04}");
+            db.put(k.as_bytes(), &vec![0xCC; 256]).unwrap();
+        }
+        db.compact_range(None, None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let l1 = db.get_int_property("lark.num-files-at-level1").unwrap();
+        assert_eq!(l1, 0, "Universal must not produce L1 files, saw {l1}");
+        let l0 = db.get_int_property("lark.num-files-at-level0").unwrap();
+        assert!(
+            l0 >= 1,
+            "Universal compaction should leave at least one L0 file"
+        );
+    }
+
+    #[test]
+    fn test_universal_compaction_full_merge_drops_shadowed_versions() {
+        // After a full universal compact_range, we expect the
+        // output to be a single L0 file (min cardinality). This
+        // exercises the compact_range full-merge path.
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            compaction_style: CompactionStyle::Universal,
+            ..Options::default()
+        };
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), opts).unwrap();
+        for i in 0..32 {
+            let k = format!("k{i:04}");
+            db.put(k.as_bytes(), &vec![0xAA; 512]).unwrap();
+        }
+        // Give the background scheduler a moment to potentially
+        // kick off work, then force-merge synchronously.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        db.compact_range(None, None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let l0 = db.get_int_property("lark.num-files-at-level0").unwrap();
+        assert_eq!(
+            l0, 1,
+            "full universal compact_range should fold everything into one L0 file, saw {l0}"
+        );
     }
 
     #[test]

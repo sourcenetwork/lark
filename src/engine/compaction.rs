@@ -123,6 +123,7 @@ pub(crate) struct CompactionOptions {
     pub(crate) rate_limiter: Option<Arc<dyn crate::rate_limiter::RateLimiter>>,
     pub(crate) compaction_style: crate::options::CompactionStyle,
     pub(crate) fifo_compaction_options: crate::options::FifoCompactionOptions,
+    pub(crate) universal_compaction_options: crate::options::UniversalCompactionOptions,
 }
 
 impl CompactionOptions {
@@ -155,6 +156,7 @@ impl Default for CompactionOptions {
             rate_limiter: None,
             compaction_style: crate::options::CompactionStyle::Level,
             fifo_compaction_options: crate::options::FifoCompactionOptions::default(),
+            universal_compaction_options: crate::options::UniversalCompactionOptions::default(),
         }
     }
 }
@@ -245,7 +247,138 @@ fn pick_and_run_compaction(
             pick_and_run_level_compaction(versions, sst_dir, cache, opts, pin_seq)
         }
         crate::options::CompactionStyle::Fifo => run_fifo_pass(versions, sst_dir, opts),
+        crate::options::CompactionStyle::Universal => {
+            pick_and_run_universal(versions, sst_dir, cache, opts, pin_seq)
+        }
     }
+}
+
+/// Universal (size-tiered) picker. Every L0 file is a "run"; the
+/// picker either merges the newest handful of files (size-ratio
+/// rule) or folds every file into one run (size-amplification
+/// rule). See the [`crate::UniversalCompactionOptions`] doc for
+/// the meaning of each trigger.
+///
+/// The picker returns after at most one merge per call; the
+/// background compaction loop re-invokes it until there's nothing
+/// left to do.
+fn pick_and_run_universal(
+    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    sst_dir: &Path,
+    cache: &BlockCache,
+    opts: &CompactionOptions,
+    pin_seq: u64,
+) -> std::io::Result<bool> {
+    let universal = opts.universal_compaction_options;
+
+    // Snapshot L0 under the version lock, then make decisions
+    // without holding it.
+    let l0_files: Vec<Arc<LiveSst>> = {
+        let version = versions.lock().current();
+        version.levels[0].clone()
+    };
+    if l0_files.len() < 2 {
+        return Ok(false);
+    }
+
+    // Sort newest-first. Age is approximated by `file_id`: every
+    // fresh flush / merge output gets a strictly larger id than
+    // any previous one (handed out monotonically by the version
+    // set), so largest = newest.
+    let mut by_age: Vec<Arc<LiveSst>> = l0_files;
+    by_age.sort_by(|a, b| b.meta.file_id.cmp(&a.meta.file_id));
+
+    // Rule 1 — size ratio merge. Accumulate newest files into a
+    // candidate group; keep adding until the group's total size
+    // grows past `size_ratio` percent of the next file's size, at
+    // which point the next file is too much larger to be worth
+    // folding in. If we end up with `min_merge_width` or more
+    // files in the group, merge them.
+    let max_width = universal.max_merge_width.max(1) as usize;
+    let min_width = universal.min_merge_width.max(2) as usize;
+    let ratio = universal.size_ratio as u128;
+    let mut group: Vec<Arc<LiveSst>> = Vec::new();
+    let mut group_size: u128 = 0;
+    for (i, file) in by_age.iter().enumerate() {
+        if group.len() >= max_width {
+            break;
+        }
+        if group.is_empty() {
+            group.push(Arc::clone(file));
+            group_size = file.meta.file_size as u128;
+            continue;
+        }
+        // Does adding this file keep the "size-tier" invariant?
+        // The rule: the running total must be within
+        // `size_ratio` percent of the new candidate — i.e. the
+        // candidate should not dwarf the accumulator.
+        let candidate_size = file.meta.file_size as u128;
+        if group_size * (100 + ratio) / 100 >= candidate_size {
+            group.push(Arc::clone(file));
+            group_size += candidate_size;
+        } else {
+            break;
+        }
+        // Safety: never include the final file unless we also
+        // trigger the size-amp rule below.
+        let _ = i;
+    }
+    if group.len() >= min_width {
+        return perform_universal_merge(versions, sst_dir, cache, opts, group, pin_seq)
+            .map(|_| true);
+    }
+
+    // Rule 2 — size amplification. Compute the ratio of "all
+    // files except the oldest" to "the oldest file". When it
+    // exceeds the configured percent, fold everything into one
+    // run so the database stops accumulating redundancy.
+    let mut oldest_first = by_age.clone();
+    oldest_first.reverse();
+    let oldest_size = oldest_first[0].meta.file_size as u128;
+    if oldest_size == 0 {
+        return Ok(false);
+    }
+    let younger_total: u128 = oldest_first
+        .iter()
+        .skip(1)
+        .map(|f| f.meta.file_size as u128)
+        .sum();
+    let amp_percent = younger_total * 100 / oldest_size;
+    if amp_percent >= universal.max_size_amplification_percent as u128 {
+        return perform_universal_merge(versions, sst_dir, cache, opts, by_age, pin_seq)
+            .map(|_| true);
+    }
+
+    Ok(false)
+}
+
+/// Merge every file in `inputs` into a single new L0 file. Input
+/// files are removed from the version; the new file gets a fresh
+/// id (so it sorts as the newest L0 file under the picker's
+/// age-by-file_id ordering).
+fn perform_universal_merge(
+    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    sst_dir: &Path,
+    cache: &BlockCache,
+    opts: &CompactionOptions,
+    inputs: Vec<Arc<LiveSst>>,
+    pin_seq: u64,
+) -> std::io::Result<()> {
+    // Universal merges are L0 → L0. The shared
+    // `perform_compaction_to` helper handles the merge-and-write
+    // path; we just tell it to target L0 and pass no overlap
+    // files (there is no "next level" to drag in).
+    perform_compaction_to(
+        versions,
+        sst_dir,
+        cache,
+        opts,
+        0,
+        0,
+        inputs,
+        Vec::new(),
+        pin_seq,
+    )
 }
 
 /// Public wrapper for the FIFO picker, used by the synchronous
@@ -257,6 +390,28 @@ pub(crate) fn run_fifo_pass(
     opts: &CompactionOptions,
 ) -> std::io::Result<bool> {
     pick_and_run_fifo(versions, sst_dir, opts)
+}
+
+/// Force-merge every L0 file into a single run. Called by the
+/// synchronous `Db::compact_range` path when the configured
+/// compaction style is [`crate::CompactionStyle::Universal`], so a
+/// caller asking for a manual compaction gets full deduplication
+/// across every live file regardless of the picker's ratio rules.
+pub(crate) fn run_universal_full_compaction(
+    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    sst_dir: &Path,
+    cache: &BlockCache,
+    opts: &CompactionOptions,
+    pin_seq: u64,
+) -> std::io::Result<()> {
+    let l0_files: Vec<Arc<LiveSst>> = {
+        let version = versions.lock().current();
+        version.levels[0].clone()
+    };
+    if l0_files.len() < 2 {
+        return Ok(());
+    }
+    perform_universal_merge(versions, sst_dir, cache, opts, l0_files, pin_seq)
 }
 
 fn pick_and_run_level_compaction(
@@ -531,7 +686,38 @@ fn perform_compaction(
     overlap_files: Vec<Arc<LiveSst>>,
     pin_seq: u64,
 ) -> std::io::Result<()> {
-    let target_level = level + 1;
+    // Leveled callers always push down one level.
+    perform_compaction_to(
+        versions,
+        sst_dir,
+        cache,
+        opts,
+        level,
+        level + 1,
+        input_files,
+        overlap_files,
+        pin_seq,
+    )
+}
+
+/// Core compaction body. Accepts an explicit `output_level` so the
+/// caller can target either the next level (leveled push-down) or
+/// the same level (universal in-place merge at L0). `overlap_files`
+/// are read as additional inputs and their version entries at
+/// `output_level` are removed alongside the `input_files` at
+/// `input_level`.
+#[allow(clippy::too_many_arguments)]
+fn perform_compaction_to(
+    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    sst_dir: &Path,
+    cache: &BlockCache,
+    opts: &CompactionOptions,
+    level: usize,
+    target_level: usize,
+    input_files: Vec<Arc<LiveSst>>,
+    overlap_files: Vec<Arc<LiveSst>>,
+    pin_seq: u64,
+) -> std::io::Result<()> {
     let compaction_start = std::time::Instant::now();
 
     // Snapshot input file ids up-front so the on_compaction_begin

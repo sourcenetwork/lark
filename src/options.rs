@@ -211,6 +211,18 @@ pub enum CompactionStyle {
     /// retained files; this is the trade-off for ~zero write
     /// amplification.
     Fifo,
+    /// Universal (size-tiered): all files live at L0 and are
+    /// merged into progressively larger runs based on size ratios
+    /// instead of fixed level targets. Each merge produces one
+    /// larger L0 file; an over-sized database periodically
+    /// triggers a full compaction that folds every existing file
+    /// into a single run. Write amplification is roughly
+    /// `log_ratio(total_size / memtable_size)`, much lower than
+    /// leveled at the cost of higher space amplification during
+    /// the merge and more read amplification than leveled. Best
+    /// fit for write-heavy workloads where disk is cheap and read
+    /// latency is tolerant.
+    Universal,
 }
 
 /// Tunables for [`CompactionStyle::Fifo`]. Ignored when
@@ -229,6 +241,46 @@ impl Default for FifoCompactionOptions {
     fn default() -> Self {
         Self {
             max_table_files_size: 1024 * 1024 * 1024,
+        }
+    }
+}
+
+/// Tunables for [`CompactionStyle::Universal`]. Ignored when the
+/// style is not [`CompactionStyle::Universal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UniversalCompactionOptions {
+    /// Percent tolerance used by the size-ratio merge rule. Walk
+    /// the L0 files newest-first; accumulate files while the
+    /// running total is within `size_ratio` percent of the next
+    /// candidate's size. When the accumulator hits
+    /// [`UniversalCompactionOptions::min_merge_width`] files, the
+    /// picker merges them into one new L0 file. A larger
+    /// `size_ratio` groups more files per merge (lower write
+    /// amplification, larger output); smaller is pickier.
+    /// Default: 1 (percent).
+    pub size_ratio: u32,
+    /// Smallest number of files the size-ratio rule is willing to
+    /// merge. Pass `2` for the most aggressive grouping. Default: 2.
+    pub min_merge_width: u32,
+    /// Cap on the number of files a single size-ratio merge can
+    /// consume. `u32::MAX` disables the cap. Default: `u32::MAX`.
+    pub max_merge_width: u32,
+    /// Size-amplification trigger, as a percent. When
+    /// `total_size_of_all_older_files * 100 / size_of_oldest_file`
+    /// exceeds this value, the picker forces a full merge of
+    /// every L0 file into one run. Default: 200 (i.e., full merge
+    /// fires once the accumulated non-oldest content is ~2× the
+    /// oldest run).
+    pub max_size_amplification_percent: u32,
+}
+
+impl Default for UniversalCompactionOptions {
+    fn default() -> Self {
+        Self {
+            size_ratio: 1,
+            min_merge_width: 2,
+            max_merge_width: u32::MAX,
+            max_size_amplification_percent: 200,
         }
     }
 }
@@ -377,6 +429,9 @@ pub struct Options {
     /// Tunables for [`CompactionStyle::Fifo`]. Ignored when the
     /// style is [`CompactionStyle::Level`].
     pub fifo_compaction_options: FifoCompactionOptions,
+    /// Tunables for [`CompactionStyle::Universal`]. Ignored when
+    /// the style is not Universal.
+    pub universal_compaction_options: UniversalCompactionOptions,
 }
 
 impl Default for Options {
@@ -409,6 +464,7 @@ impl Default for Options {
             max_write_buffer_number: 2,
             compaction_style: CompactionStyle::Level,
             fifo_compaction_options: FifoCompactionOptions::default(),
+            universal_compaction_options: UniversalCompactionOptions::default(),
         }
     }
 }
@@ -467,6 +523,10 @@ impl std::fmt::Debug for Options {
             .field("max_write_buffer_number", &self.max_write_buffer_number)
             .field("compaction_style", &self.compaction_style)
             .field("fifo_compaction_options", &self.fifo_compaction_options)
+            .field(
+                "universal_compaction_options",
+                &self.universal_compaction_options,
+            )
             .finish()
     }
 }
@@ -499,6 +559,7 @@ impl Options {
             max_write_buffer_number: self.max_write_buffer_number,
             compaction_style: self.compaction_style,
             fifo_compaction_options: self.fifo_compaction_options,
+            universal_compaction_options: self.universal_compaction_options,
         }
     }
 }
