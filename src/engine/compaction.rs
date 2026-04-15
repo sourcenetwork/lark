@@ -114,6 +114,7 @@ pub(crate) struct CompactionOptions {
     pub(crate) compression: crate::options::CompressionType,
     pub(crate) compression_per_level: Option<Vec<crate::options::CompressionType>>,
     pub(crate) compaction_filter: Option<Arc<dyn crate::options::CompactionFilter>>,
+    pub(crate) prefix_extractor: Option<Arc<dyn crate::options::PrefixExtractor>>,
 }
 
 impl CompactionOptions {
@@ -139,6 +140,7 @@ impl Default for CompactionOptions {
             compression: crate::options::CompressionType::Lz4,
             compression_per_level: None,
             compaction_filter: None,
+            prefix_extractor: None,
         }
     }
 }
@@ -529,6 +531,7 @@ fn perform_compaction(
             opts.block_size,
             opts.bloom_bits_per_key,
             opts.compression_for_level(target_level),
+            opts.prefix_extractor.clone(),
         )?;
 
         let mut estimated_size: u64 = 0;

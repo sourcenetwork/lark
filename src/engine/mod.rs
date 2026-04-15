@@ -47,6 +47,7 @@ pub(crate) struct EngineOptions {
     pub(crate) level_size_multiplier: u64,
     pub(crate) target_file_size: u64,
     pub(crate) compaction_filter: Option<Arc<dyn crate::options::CompactionFilter>>,
+    pub(crate) prefix_extractor: Option<Arc<dyn crate::options::PrefixExtractor>>,
 }
 
 impl EngineOptions {
@@ -75,6 +76,7 @@ impl Default for EngineOptions {
             level_size_multiplier: compaction::LEVEL_SIZE_MULTIPLIER,
             target_file_size: compaction::DEFAULT_TARGET_FILE_SIZE,
             compaction_filter: None,
+            prefix_extractor: None,
         }
     }
 }
@@ -176,6 +178,7 @@ impl LarkEngine {
             compression: options.compression,
             compression_per_level: options.compression_per_level.clone(),
             compaction_filter: options.compaction_filter.clone(),
+            prefix_extractor: options.prefix_extractor.clone(),
         };
 
         let compaction_lock = Arc::new(Mutex::new(()));
@@ -251,6 +254,7 @@ impl LarkEngine {
             version,
             Arc::clone(&self.cache),
             snapshot_seq,
+            self.options.prefix_extractor.clone(),
         )
     }
 
@@ -650,6 +654,7 @@ impl LarkEngine {
             self.options.block_size,
             self.options.bloom_bits_per_key,
             self.options.compression_for_level(0),
+            self.options.prefix_extractor.clone(),
         )?;
 
         // Walk the memtable in internal-key order and copy every version
@@ -755,6 +760,7 @@ impl LarkEngine {
             compression: self.options.compression,
             compression_per_level: self.options.compression_per_level.clone(),
             compaction_filter: self.options.compaction_filter.clone(),
+            prefix_extractor: self.options.prefix_extractor.clone(),
         };
         compaction::run_compact_range(
             &self.versions,

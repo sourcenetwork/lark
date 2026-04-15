@@ -2,8 +2,12 @@
 //!
 //! Layout:
 //! ```text
-//! [data block 0][data block 1]...[data block n][bloom block][index block][footer (48 B)]
+//! [data block 0][data block 1]...[data block n][range_tombstone block][bloom region][index block][footer (64 B)]
 //! ```
+//!
+//! The bloom region is two blooms concatenated behind a length header:
+//! `[prefix_bloom_len: u64 LE][prefix_bloom_bytes][user_key_bloom_bytes]`.
+//! A zero length means the file was written without a prefix extractor.
 //!
 //! Data blocks store **internal keys** — `user_key || !seq || value_type` —
 //! sorted so that newer versions of the same user key appear before older
@@ -24,7 +28,7 @@ use super::block_cache::BlockCache;
 use super::bloom::{decode_bloom_block, encode_bloom_block, BloomFilter, BloomFilterBuilder};
 use super::internal_key::{decode_internal_key, lookup_key, user_key_of, VALUE_TYPE_DELETION};
 use super::range_tombstone::{max_covering_seq, RangeTombstone};
-use crate::options::CompressionType;
+use crate::options::{CompressionType, PrefixExtractor};
 
 /// SSTable magic number: "LARKSST\x01" (format version 2 — added the
 /// range-tombstone meta block at the bottom of the file).
@@ -267,6 +271,9 @@ pub(crate) struct SsTableWriter {
     block_builder: BlockBuilder,
     index_entries: Vec<(Vec<u8>, BlockHandle)>,
     bloom_builder: BloomFilterBuilder,
+    prefix_bloom_builder: Option<BloomFilterBuilder>,
+    prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
+    last_prefix: Option<Vec<u8>>,
     range_tombstones: Vec<RangeTombstone>,
     block_size: usize,
     current_offset: u64,
@@ -284,13 +291,20 @@ impl SsTableWriter {
         block_size: usize,
         bloom_bits_per_key: usize,
         compression: CompressionType,
+        prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
     ) -> io::Result<Self> {
         let file = File::create(path)?;
+        let prefix_bloom_builder = prefix_extractor
+            .as_ref()
+            .map(|_| BloomFilterBuilder::new(bloom_bits_per_key));
         Ok(Self {
             writer: BufWriter::new(file),
             block_builder: BlockBuilder::new(RESTART_INTERVAL),
             index_entries: Vec::new(),
             bloom_builder: BloomFilterBuilder::new(bloom_bits_per_key),
+            prefix_bloom_builder,
+            prefix_extractor,
+            last_prefix: None,
             range_tombstones: Vec::new(),
             block_size,
             current_offset: 0,
@@ -322,6 +336,25 @@ impl SsTableWriter {
         if user_key != self.last_bloom_user_key.as_slice() {
             self.bloom_builder.add_key(user_key);
             self.last_bloom_user_key = user_key.to_vec();
+
+            // Prefix bloom: keys arrive in sorted user-key order, so
+            // distinct prefixes form contiguous runs. Only hash each
+            // distinct prefix once.
+            if let (Some(extractor), Some(builder)) = (
+                self.prefix_extractor.as_ref(),
+                self.prefix_bloom_builder.as_mut(),
+            ) {
+                if let Some(prefix) = extractor.extract(user_key) {
+                    let changed = match &self.last_prefix {
+                        Some(p) => p.as_slice() != prefix,
+                        None => true,
+                    };
+                    if changed {
+                        builder.add_key(prefix);
+                        self.last_prefix = Some(prefix.to_vec());
+                    }
+                }
+            }
         }
 
         self.block_builder.add(internal_key, value);
@@ -368,11 +401,28 @@ impl SsTableWriter {
         self.writer.write_all(&range_tombstone_data)?;
         self.current_offset += range_tombstone_data.len() as u64;
 
-        let bloom = self.bloom_builder.build();
-        let bloom_data = encode_bloom_block(&bloom);
+        // Bloom region layout:
+        //   [prefix_bloom_len: u64 LE][prefix_bloom_bytes][user_key_bloom_bytes]
+        //
+        // A `prefix_bloom_len` of 0 means "no prefix bloom" — the file
+        // was built without a prefix extractor (or there were zero
+        // extractable prefixes). The reader keeps backward compatibility
+        // with pre-prefix SSTables via the same 0 marker written
+        // unconditionally.
+        let prefix_bloom_data = match self.prefix_bloom_builder.take() {
+            Some(builder) => encode_bloom_block(&builder.build()),
+            None => Vec::new(),
+        };
+        let user_bloom = self.bloom_builder.build();
+        let user_bloom_data = encode_bloom_block(&user_bloom);
+
         let bloom_offset = self.current_offset;
-        self.writer.write_all(&bloom_data)?;
-        self.current_offset += bloom_data.len() as u64;
+        let prefix_len_bytes = (prefix_bloom_data.len() as u64).to_le_bytes();
+        self.writer.write_all(&prefix_len_bytes)?;
+        self.writer.write_all(&prefix_bloom_data)?;
+        self.writer.write_all(&user_bloom_data)?;
+        let bloom_size = 8 + prefix_bloom_data.len() as u64 + user_bloom_data.len() as u64;
+        self.current_offset += bloom_size;
 
         let index_data = encode_index_block(&self.index_entries);
         let index_offset = self.current_offset;
@@ -383,7 +433,7 @@ impl SsTableWriter {
             range_tombstone_offset,
             range_tombstone_size: range_tombstone_data.len() as u64,
             bloom_offset,
-            bloom_size: bloom_data.len() as u64,
+            bloom_size,
             index_offset,
             index_size: index_data.len() as u64,
             num_entries: self.num_entries,
@@ -478,6 +528,11 @@ pub(crate) struct SsTableReader {
     pub(crate) file_id: u64,
     index: Vec<IndexEntry>,
     bloom: BloomFilter,
+    /// Optional prefix bloom filter. `None` when the file was built
+    /// without a prefix extractor (or the extractor yielded no prefixes).
+    /// A query against a reader without a prefix bloom conservatively
+    /// returns `true` — the file might contain the prefix.
+    prefix_bloom: Option<BloomFilter>,
     range_tombstones: Vec<RangeTombstone>,
 }
 
@@ -502,7 +557,26 @@ impl SsTableReader {
         file.seek(SeekFrom::Start(footer.bloom_offset))?;
         let mut bloom_data = vec![0u8; footer.bloom_size as usize];
         file.read_exact(&mut bloom_data)?;
-        let bloom = decode_bloom_block(&bloom_data);
+        // Peel [prefix_bloom_len: u64 LE][prefix_bytes][user_bytes].
+        if bloom_data.len() < 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bloom region too short for prefix-bloom length header",
+            ));
+        }
+        let prefix_len = u64::from_le_bytes(bloom_data[0..8].try_into().unwrap()) as usize;
+        if 8 + prefix_len > bloom_data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "prefix bloom length exceeds bloom region",
+            ));
+        }
+        let prefix_bloom = if prefix_len == 0 {
+            None
+        } else {
+            Some(decode_bloom_block(&bloom_data[8..8 + prefix_len]))
+        };
+        let bloom = decode_bloom_block(&bloom_data[8 + prefix_len..]);
 
         file.seek(SeekFrom::Start(footer.index_offset))?;
         let mut index_data = vec![0u8; footer.index_size as usize];
@@ -523,8 +597,21 @@ impl SsTableReader {
             file_id,
             index,
             bloom,
+            prefix_bloom,
             range_tombstones,
         })
+    }
+
+    /// Whether this SSTable *might* contain a user key whose prefix
+    /// equals `prefix`. Returns `true` conservatively when the file
+    /// was built without a prefix bloom (no negative information
+    /// available). Returns `false` only when the prefix bloom is
+    /// present and positively rules the prefix out.
+    pub(crate) fn may_have_prefix(&self, prefix: &[u8]) -> bool {
+        match &self.prefix_bloom {
+            Some(b) => b.may_contain(prefix),
+            None => true,
+        }
     }
 
     /// Largest seq of any range tombstone in this SSTable that covers
@@ -729,7 +816,8 @@ mod tests {
         let cache = BlockCache::new(64 * 1024 * 1024);
 
         {
-            let mut writer = SsTableWriter::new(&path, 4096, 10, CompressionType::Lz4).unwrap();
+            let mut writer =
+                SsTableWriter::new(&path, 4096, 10, CompressionType::Lz4, None).unwrap();
             // Add 100 distinct user keys at seq=1 in sorted order.
             for i in 0..100 {
                 let user_key = format!("key_{:04}", i);
@@ -770,7 +858,8 @@ mod tests {
         let cache = BlockCache::new(1024 * 1024);
 
         {
-            let mut writer = SsTableWriter::new(&path, 4096, 10, CompressionType::None).unwrap();
+            let mut writer =
+                SsTableWriter::new(&path, 4096, 10, CompressionType::None, None).unwrap();
             // Must be written in internal-key order: newest seq first.
             writer.add(&tombstone(b"k", 5), b"").unwrap();
             writer.add(&ik(b"k", 3), b"v3").unwrap();
@@ -810,7 +899,8 @@ mod tests {
         let cache = BlockCache::new(1024 * 1024);
 
         {
-            let mut writer = SsTableWriter::new(&path, 4096, 10, CompressionType::None).unwrap();
+            let mut writer =
+                SsTableWriter::new(&path, 4096, 10, CompressionType::None, None).unwrap();
             writer.add(&ik(b"hello", 1), b"world").unwrap();
             writer.add(&ik(b"test", 1), b"data").unwrap();
             writer.finish().unwrap().unwrap();
@@ -839,7 +929,8 @@ mod tests {
         let path = dir.path().join("rt.sst");
 
         {
-            let mut writer = SsTableWriter::new(&path, 4096, 10, CompressionType::None).unwrap();
+            let mut writer =
+                SsTableWriter::new(&path, 4096, 10, CompressionType::None, None).unwrap();
             writer.add(&ik(b"a", 1), b"v_a").unwrap();
             writer.add(&ik(b"m", 2), b"v_m").unwrap();
             writer.add(&ik(b"z", 3), b"v_z").unwrap();
@@ -867,7 +958,8 @@ mod tests {
         let path = dir.path().join("rt_only.sst");
 
         {
-            let mut writer = SsTableWriter::new(&path, 4096, 10, CompressionType::None).unwrap();
+            let mut writer =
+                SsTableWriter::new(&path, 4096, 10, CompressionType::None, None).unwrap();
             writer.add_range_tombstone(b"aa", b"kk", 5);
             writer.add_range_tombstone(b"mm", b"zz", 7);
             let summary = writer.finish().unwrap().unwrap();
@@ -880,5 +972,83 @@ mod tests {
         assert_eq!(reader.range_tombstones().len(), 2);
         assert_eq!(reader.covering_range_tombstone_seq(b"bb", 100), 5);
         assert_eq!(reader.covering_range_tombstone_seq(b"nn", 100), 7);
+    }
+
+    #[test]
+    fn test_sstable_prefix_bloom_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("prefix.sst");
+        let cache = BlockCache::new(1024 * 1024);
+        let extractor: Arc<dyn PrefixExtractor> = Arc::new(crate::options::FixedLengthPrefix(4));
+
+        {
+            let mut writer = SsTableWriter::new(
+                &path,
+                4096,
+                10,
+                CompressionType::None,
+                Some(extractor.clone()),
+            )
+            .unwrap();
+            for tenant in &["aaaa", "bbbb", "cccc"] {
+                for i in 0..4 {
+                    let user_key = format!("{}:key{}", tenant, i);
+                    writer.add(&ik(user_key.as_bytes(), 1), b"v").unwrap();
+                }
+            }
+            writer.finish().unwrap().unwrap();
+        }
+
+        let reader = SsTableReader::open(&path, 1).unwrap();
+        // Present prefixes
+        assert!(reader.may_have_prefix(b"aaaa"));
+        assert!(reader.may_have_prefix(b"bbbb"));
+        assert!(reader.may_have_prefix(b"cccc"));
+        // Absent prefixes (with 10 bits/key the FP rate is ~1%; these
+        // specific strings should all be rejected).
+        let mut false_positives = 0;
+        for i in 0..200u32 {
+            let p = format!("zz{:02}", i);
+            if reader.may_have_prefix(p.as_bytes()) {
+                false_positives += 1;
+            }
+        }
+        assert!(
+            false_positives < 20,
+            "too many prefix bloom false positives: {}",
+            false_positives
+        );
+
+        // Point lookups still work — user-key bloom is independent.
+        assert_eq!(
+            reader.get(b"bbbb:key2", u64::MAX, &cache).unwrap(),
+            LookupResult::Found {
+                seq: 1,
+                value: b"v".to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn test_sstable_without_prefix_bloom_is_superset() {
+        // A file written without an extractor reports every prefix as
+        // possibly present — readers must fall back to conservative
+        // behavior, not crash.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("noprefix.sst");
+
+        {
+            let mut writer =
+                SsTableWriter::new(&path, 4096, 10, CompressionType::None, None).unwrap();
+            writer.add(&ik(b"aaaa:1", 1), b"v").unwrap();
+            writer.add(&ik(b"bbbb:1", 1), b"v").unwrap();
+            writer.finish().unwrap().unwrap();
+        }
+
+        let reader = SsTableReader::open(&path, 1).unwrap();
+        // Every query comes back `true` — no negative information.
+        assert!(reader.may_have_prefix(b"aaaa"));
+        assert!(reader.may_have_prefix(b"zzzz"));
+        assert!(reader.may_have_prefix(b"anything"));
     }
 }

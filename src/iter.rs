@@ -75,6 +75,22 @@ impl<'a> Iter<'a> {
         self.inner.seek_for_prev(target);
     }
 
+    /// Position the iterator at the first user key starting with
+    /// `prefix` and confine forward iteration to keys that share that
+    /// prefix. The scan ends (iterator becomes invalid) as soon as the
+    /// next candidate key falls outside the prefix range.
+    ///
+    /// When the database was built with a [`PrefixExtractor`] matching
+    /// the prefix width, SSTables that demonstrably cannot contain the
+    /// prefix are skipped via the prefix bloom filter. Files without a
+    /// prefix bloom are consulted normally (conservative superset).
+    /// Point lookups are unaffected.
+    ///
+    /// [`PrefixExtractor`]: crate::PrefixExtractor
+    pub fn seek_prefix(&mut self, prefix: &[u8]) {
+        self.inner.seek_prefix(prefix);
+    }
+
     /// Position the iterator at the smallest user key in the database.
     /// Sets the scan direction to forward.
     pub fn seek_to_first(&mut self) {

@@ -101,6 +101,48 @@ impl WriteOptions {
     }
 }
 
+/// Carves a prefix out of a user key so the SSTable bloom filter can
+/// answer "does this file contain any key with prefix P?" queries.
+///
+/// A configured extractor is consulted when building an SSTable: in
+/// addition to the user-key bloom filter (which powers point lookups),
+/// the writer builds a second, prefix-keyed bloom filter. Prefix-bounded
+/// range scans (`Iter::seek_prefix`) consult the prefix bloom and skip
+/// SSTables that demonstrably cannot contain the requested prefix.
+///
+/// Point lookups are unaffected — they always consult the user-key
+/// bloom filter and do not call the extractor.
+pub trait PrefixExtractor: Send + Sync + 'static {
+    /// Return the portion of `key` that the prefix bloom should index,
+    /// or `None` if `key` cannot produce a prefix (e.g., it's shorter
+    /// than a fixed-length extractor's width). Keys that return `None`
+    /// are simply absent from the prefix bloom.
+    fn extract<'a>(&self, key: &'a [u8]) -> Option<&'a [u8]>;
+
+    /// A stable, human-readable identifier for this extractor. Used
+    /// by tracing and diagnostics.
+    fn name(&self) -> &'static str;
+}
+
+/// A [`PrefixExtractor`] that takes the first `N` bytes of every key.
+/// Keys shorter than `N` contribute no prefix.
+#[derive(Debug, Clone, Copy)]
+pub struct FixedLengthPrefix(pub usize);
+
+impl PrefixExtractor for FixedLengthPrefix {
+    fn extract<'a>(&self, key: &'a [u8]) -> Option<&'a [u8]> {
+        if key.len() >= self.0 {
+            Some(&key[..self.0])
+        } else {
+            None
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "FixedLengthPrefix"
+    }
+}
+
 /// Controls when data is flushed to disk after a write.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum DurabilityMode {
@@ -166,6 +208,11 @@ pub struct Options {
     /// entry and range tombstone. See [`CompactionFilter`] for
     /// semantics and snapshot-isolation rules.
     pub compaction_filter: Option<Arc<dyn CompactionFilter>>,
+    /// Optional prefix extractor. When set, SSTable writers build an
+    /// additional prefix-keyed bloom filter that `Iter::seek_prefix`
+    /// consults to skip files that cannot contain the scanned prefix.
+    /// Point lookups are unaffected.
+    pub prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
 }
 
 impl Default for Options {
@@ -183,6 +230,7 @@ impl Default for Options {
             target_file_size: 64 * 1024 * 1024,
             durability: DurabilityMode::Eventual,
             compaction_filter: None,
+            prefix_extractor: None,
         }
     }
 }
@@ -205,6 +253,10 @@ impl std::fmt::Debug for Options {
                 "compaction_filter",
                 &self.compaction_filter.as_ref().map(|f| f.name()),
             )
+            .field(
+                "prefix_extractor",
+                &self.prefix_extractor.as_ref().map(|p| p.name()),
+            )
             .finish()
     }
 }
@@ -223,6 +275,22 @@ impl Options {
             level_size_multiplier: self.level_size_multiplier,
             target_file_size: self.target_file_size,
             compaction_filter: self.compaction_filter.clone(),
+            prefix_extractor: self.prefix_extractor.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_length_prefix_extract() {
+        let ex = FixedLengthPrefix(4);
+        assert_eq!(ex.extract(b"tenant_001"), Some(&b"tena"[..]));
+        assert_eq!(ex.extract(b"abcd"), Some(&b"abcd"[..]));
+        assert_eq!(ex.extract(b"abc"), None);
+        assert_eq!(ex.extract(b""), None);
+        assert_eq!(ex.name(), "FixedLengthPrefix");
     }
 }

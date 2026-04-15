@@ -406,7 +406,7 @@ mod tests {
         use crate::options::CompressionType;
 
         let path = dir.join(sst_filename(file_id));
-        let mut writer = SsTableWriter::new(&path, 4096, 10, CompressionType::None).unwrap();
+        let mut writer = SsTableWriter::new(&path, 4096, 10, CompressionType::None, None).unwrap();
         writer
             .add(
                 &encode_internal_key(smallest, 1, VALUE_TYPE_VALUE),
