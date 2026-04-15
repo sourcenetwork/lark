@@ -55,6 +55,8 @@ pub(crate) struct EngineOptions {
     pub(crate) write_buffer_size: usize,
     pub(crate) block_size: usize,
     pub(crate) block_cache_size: usize,
+    pub(crate) block_cache_num_shard_bits: u32,
+    pub(crate) strict_capacity_limit: bool,
     pub(crate) bloom_bits_per_key: usize,
     pub(crate) compression: crate::options::CompressionType,
     pub(crate) compression_per_level: Option<Vec<crate::options::CompressionType>>,
@@ -93,6 +95,8 @@ impl Default for EngineOptions {
             write_buffer_size: 64 * 1024 * 1024,
             block_size: 16 * 1024,
             block_cache_size: 512 * 1024 * 1024,
+            block_cache_num_shard_bits: 6,
+            strict_capacity_limit: false,
             bloom_bits_per_key: 10,
             compression: crate::options::CompressionType::Lz4,
             compression_per_level: None,
@@ -232,7 +236,12 @@ impl LarkEngine {
         version_set.apply(&[VersionEdit::SetNextFileId(wal_id + 1)])?;
 
         let cache = Arc::new(
-            BlockCache::new(options.block_cache_size).with_stats(options.statistics.clone()),
+            BlockCache::with_config(
+                options.block_cache_size,
+                options.block_cache_num_shard_bits,
+                options.strict_capacity_limit,
+            )
+            .with_stats(options.statistics.clone()),
         );
         let versions = Arc::new(Mutex::new(version_set));
 
@@ -1791,6 +1800,19 @@ impl LarkEngine {
     /// two snapshots taken at the same seq contribute two.
     pub(crate) fn live_snapshot_count(&self) -> u64 {
         self.snapshot_registry.live_count()
+    }
+
+    /// Total bytes currently held by the block cache across all
+    /// shards. Used by the `rocksdb.block-cache-usage` property.
+    pub(crate) fn block_cache_usage(&self) -> usize {
+        self.cache.usage()
+    }
+
+    /// Block cache capacity in bytes (the sum of every shard's
+    /// budget). Used by the `rocksdb.block-cache-capacity`
+    /// property.
+    pub(crate) fn block_cache_capacity(&self) -> usize {
+        self.cache.capacity()
     }
 
     /// Unix-seconds timestamp of the oldest live snapshot, or

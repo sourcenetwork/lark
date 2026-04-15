@@ -631,6 +631,8 @@ impl Db {
             "rocksdb.estimate-live-data-size" => Some(self.engine.total_sst_size()),
             "rocksdb.num-snapshots" => Some(self.engine.live_snapshot_count()),
             "rocksdb.oldest-snapshot-time" => self.engine.oldest_snapshot_time_unix(),
+            "rocksdb.block-cache-usage" => Some(self.engine.block_cache_usage() as u64),
+            "rocksdb.block-cache-capacity" => Some(self.engine.block_cache_capacity() as u64),
             // Background errors are surfaced through the
             // `EventListener::on_background_error` callback today
             // — no dedicated counter yet. Report `0` for API
@@ -5111,6 +5113,52 @@ mod tests {
             db.get_property("rocksdb.num-snapshots").as_deref(),
             Some("0")
         );
+    }
+
+    #[test]
+    fn test_block_cache_usage_property_reports_nonzero_after_reads() {
+        // A cache with a small-but-nonzero budget fills with
+        // decompressed data blocks as reads touch SSTables. The
+        // `rocksdb.block-cache-usage` property must report a
+        // positive number once at least one read has happened
+        // against a file that isn't entirely in the memtable.
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            block_cache_size: 1024 * 1024,
+            ..Options::default()
+        };
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), opts).unwrap();
+
+        let payload = vec![0xABu8; 256];
+        for i in 0..200 {
+            let k = format!("k{i:04}");
+            db.put(k.as_bytes(), &payload).unwrap();
+        }
+        // Force a flush so the reads below have to touch SST blocks.
+        db.compact_range(None, None).unwrap();
+
+        // Read a few keys to populate the block cache.
+        for i in 0..50 {
+            let k = format!("k{i:04}");
+            let _ = db.get(k.as_bytes()).unwrap();
+        }
+
+        let usage = db
+            .get_int_property("rocksdb.block-cache-usage")
+            .expect("property must exist");
+        assert!(
+            usage > 0,
+            "expected block-cache-usage > 0 after reads, got {usage}"
+        );
+        let cap = db
+            .get_int_property("rocksdb.block-cache-capacity")
+            .expect("property must exist");
+        assert!(
+            cap >= 512 * 1024,
+            "expected at least 512KB capacity, got {cap}"
+        );
+        assert!(usage <= cap, "usage {usage} must not exceed capacity {cap}");
     }
 
     #[test]
