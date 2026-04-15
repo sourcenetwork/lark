@@ -17,14 +17,26 @@
 //! live snapshot and to current reads, and can be discarded.
 
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 
 /// Thread-safe registry of live snapshot sequence numbers.
 pub(crate) struct SnapshotRegistry {
-    /// `seq -> refcount`. `BTreeMap` keeps the smallest seq at the
-    /// front so `oldest_live_seq` is O(log n).
-    active: Mutex<BTreeMap<u64, usize>>,
+    /// `seq -> (refcount, earliest_register_unix)`. `BTreeMap`
+    /// keeps the smallest seq at the front so `oldest_live_seq`
+    /// is O(log n). `earliest_register_unix` is captured on the
+    /// first `register` call at a given seq and reused by
+    /// subsequent increments so the property
+    /// `rocksdb.oldest-snapshot-time` is stable across refcount
+    /// changes.
+    active: Mutex<BTreeMap<u64, SlotState>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SlotState {
+    refcount: usize,
+    registered_at_unix: u64,
 }
 
 impl SnapshotRegistry {
@@ -38,8 +50,18 @@ impl SnapshotRegistry {
     /// [`release`](Self::release) call — typically from the
     /// `Drop` impl of the owning snapshot type.
     pub(crate) fn register(&self, seq: u64) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let mut active = self.active.lock();
-        *active.entry(seq).or_insert(0) += 1;
+        active
+            .entry(seq)
+            .or_insert(SlotState {
+                refcount: 0,
+                registered_at_unix: now,
+            })
+            .refcount += 1;
     }
 
     /// Release one pin at `seq`. A no-op if no pin at that seq is
@@ -47,9 +69,9 @@ impl SnapshotRegistry {
     /// teardown races.
     pub(crate) fn release(&self, seq: u64) {
         let mut active = self.active.lock();
-        if let Some(count) = active.get_mut(&seq) {
-            *count -= 1;
-            if *count == 0 {
+        if let Some(slot) = active.get_mut(&seq) {
+            slot.refcount -= 1;
+            if slot.refcount == 0 {
                 active.remove(&seq);
             }
         }
@@ -66,6 +88,29 @@ impl SnapshotRegistry {
             .next()
             .copied()
             .unwrap_or(u64::MAX)
+    }
+
+    /// Number of distinct live snapshots. Counts pins, not
+    /// distinct seqs — two snapshots taken at the same seq
+    /// contribute two.
+    pub(crate) fn live_count(&self) -> u64 {
+        self.active
+            .lock()
+            .values()
+            .map(|slot| slot.refcount as u64)
+            .sum()
+    }
+
+    /// Unix-seconds timestamp when the oldest currently-live
+    /// snapshot was registered, or `None` when no snapshot is
+    /// alive. Used to populate the
+    /// `rocksdb.oldest-snapshot-time` property.
+    pub(crate) fn oldest_snapshot_time_unix(&self) -> Option<u64> {
+        self.active
+            .lock()
+            .values()
+            .next()
+            .map(|slot| slot.registered_at_unix)
     }
 
     /// Test-only: number of distinct seq values currently pinned.
