@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 const RECORD_PUT: u8 = 0x01;
 const RECORD_DELETE: u8 = 0x02;
 const RECORD_DELETE_RANGE: u8 = 0x03;
+const RECORD_MERGE: u8 = 0x04;
 
 /// A write-ahead log for crash recovery.
 ///
@@ -31,6 +32,11 @@ pub(crate) enum WalEntry {
     DeleteRange {
         start: Vec<u8>,
         end: Vec<u8>,
+        seq: u64,
+    },
+    Merge {
+        key: Vec<u8>,
+        operand: Vec<u8>,
         seq: u64,
     },
 }
@@ -72,6 +78,18 @@ impl Wal {
         data.extend_from_slice(&seq.to_le_bytes());
 
         self.write_record(RECORD_DELETE, &data)
+    }
+
+    /// Append a merge record — an operand layered on top of any
+    /// existing value/merge chain for `key`.
+    pub(crate) fn append_merge(&mut self, key: &[u8], operand: &[u8], seq: u64) -> io::Result<()> {
+        let mut data = Vec::with_capacity(4 + key.len() + 4 + operand.len() + 8);
+        data.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        data.extend_from_slice(key);
+        data.extend_from_slice(&(operand.len() as u32).to_le_bytes());
+        data.extend_from_slice(operand);
+        data.extend_from_slice(&seq.to_le_bytes());
+        self.write_record(RECORD_MERGE, &data)
     }
 
     /// Append a range-delete record covering `[start, end)`.
@@ -166,6 +184,10 @@ impl Wal {
                 }
                 RECORD_DELETE_RANGE => {
                     let entry = parse_delete_range_record(&data)?;
+                    entries.push(entry);
+                }
+                RECORD_MERGE => {
+                    let entry = parse_merge_record(&data)?;
                     entries.push(entry);
                 }
                 _ => {
@@ -286,6 +308,46 @@ fn parse_delete_range_record(data: &[u8]) -> io::Result<WalEntry> {
     let seq = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
 
     Ok(WalEntry::DeleteRange { start, end, seq })
+}
+
+fn parse_merge_record(data: &[u8]) -> io::Result<WalEntry> {
+    if data.len() < 16 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "merge record too short",
+        ));
+    }
+
+    let mut pos = 0;
+    let key_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+
+    if pos + key_len + 4 > data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "merge record key overflow",
+        ));
+    }
+
+    let key = data[pos..pos + key_len].to_vec();
+    pos += key_len;
+
+    let operand_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+
+    if pos + operand_len + 8 > data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "merge record operand overflow",
+        ));
+    }
+
+    let operand = data[pos..pos + operand_len].to_vec();
+    pos += operand_len;
+
+    let seq = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+
+    Ok(WalEntry::Merge { key, operand, seq })
 }
 
 #[cfg(test)]

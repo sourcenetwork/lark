@@ -115,6 +115,7 @@ pub(crate) struct CompactionOptions {
     pub(crate) compression_per_level: Option<Vec<crate::options::CompressionType>>,
     pub(crate) compaction_filter: Option<Arc<dyn crate::options::CompactionFilter>>,
     pub(crate) prefix_extractor: Option<Arc<dyn crate::options::PrefixExtractor>>,
+    pub(crate) merge_operator: Option<Arc<dyn crate::options::MergeOperator>>,
 }
 
 impl CompactionOptions {
@@ -141,6 +142,7 @@ impl Default for CompactionOptions {
             compression_per_level: None,
             compaction_filter: None,
             prefix_extractor: None,
+            merge_operator: None,
         }
     }
 }
@@ -453,6 +455,24 @@ fn perform_compaction(
         all_entries
     };
 
+    // Merge-operator chain collapse. For each user-key group, if a
+    // terminator (`Value` / `Deletion`) is present in the merged
+    // input, call `full_merge` and replace the entire group with a
+    // single `Value` entry at the terminator's seq. Otherwise, if
+    // `partial_merge` is available, fold the operand chain pairwise
+    // into a single operand. Snapshot-gated for the same reason as
+    // the compaction filter: with a live snapshot we cannot safely
+    // drop intermediate versions the snapshot might still read.
+    let all_entries = if pin_seq == u64::MAX {
+        if let Some(op) = opts.merge_operator.as_ref() {
+            collapse_merge_chains(all_entries, op.as_ref())
+        } else {
+            all_entries
+        }
+    } else {
+        all_entries
+    };
+
     // Dedup merged range tombstones by (start, end, seq) — a single
     // logical RT may appear in multiple input files after previous
     // compactions carried it forward.
@@ -634,16 +654,23 @@ fn perform_compaction(
 /// Dropping tombstones at the bottommost level when no deeper data
 /// references them is a future optimization (tracked as a follow-up).
 fn gc_old_versions(entries: Vec<(Vec<u8>, Vec<u8>)>, pin_seq: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
+    use super::internal_key::VALUE_TYPE_MERGE;
+
     let mut out = Vec::with_capacity(entries.len());
     let mut current_user_key: Option<Vec<u8>> = None;
-    let mut pin_emitted = false;
+    // Once set to `true`, every subsequent entry for the current
+    // user key that sits at or below `pin_seq` is shadowed by an
+    // already-emitted terminator and can be dropped. Merge
+    // operands do *not* set this flag — they form an open chain
+    // that must be preserved until a non-merge terminator arrives.
+    let mut chain_terminated = false;
 
     for (ik, value) in entries {
-        let (uk, seq, _) = decode_internal_key(&ik);
+        let (uk, seq, vt) = decode_internal_key(&ik);
 
         if current_user_key.as_deref() != Some(uk) {
             current_user_key = Some(uk.to_vec());
-            pin_emitted = false;
+            chain_terminated = false;
         }
 
         if seq > pin_seq {
@@ -651,11 +678,16 @@ fn gc_old_versions(entries: Vec<(Vec<u8>, Vec<u8>)>, pin_seq: u64) -> Vec<(Vec<u
             continue;
         }
 
-        // `seq <= pin_seq` — first one is the pin entry for this
-        // group, every later one is strictly older and shadowed.
-        if !pin_emitted {
-            out.push((ik, value));
-            pin_emitted = true;
+        // `seq <= pin_seq` and we've already reached a terminator
+        // for this user key — the entry is strictly older and
+        // shadowed. Drop it.
+        if chain_terminated {
+            continue;
+        }
+
+        out.push((ik, value));
+        if vt != VALUE_TYPE_MERGE {
+            chain_terminated = true;
         }
     }
 
@@ -701,6 +733,162 @@ fn apply_compaction_filter(
             }
         }
     }
+    out
+}
+
+/// Walk the entries in user-key groups and collapse merge chains
+/// where possible, using the configured [`MergeOperator`]. Entries
+/// arrive in internal-key order, so within each group the newest
+/// seq appears first.
+///
+/// Two transformations happen:
+///
+/// 1. **Full collapse:** if a group contains a `Value` or
+///    `Deletion` terminator AND one or more `Merge` operands
+///    layered on top of it, call `full_merge(base, operands)` and
+///    replace the whole group with a single `Value` entry at the
+///    newest merge's seq (or with the original terminator if
+///    `full_merge` fails — we conservatively keep the raw chain).
+///
+/// 2. **Partial fold:** if a group is pure merges (no terminator in
+///    the compaction's input set) and the operator's
+///    `partial_merge` is available, fold the operand chain pairwise
+///    into a single operand. The result replaces the chain at the
+///    newest merge's seq.
+///
+/// Anything the operator rejects (`None` return) is left intact so
+/// a compaction-time merge failure never loses data — the raw
+/// operands survive to be retried on the next compaction or
+/// materialized by a reader.
+fn collapse_merge_chains(
+    entries: Vec<(Vec<u8>, Vec<u8>)>,
+    op: &dyn crate::options::MergeOperator,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    use super::internal_key::{
+        encode_internal_key, VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE,
+    };
+
+    let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(entries.len());
+    let mut i = 0;
+    while i < entries.len() {
+        // Find the group of entries sharing this user key.
+        let (uk_head, _, _) = decode_internal_key(&entries[i].0);
+        let uk = uk_head.to_vec();
+        let start = i;
+        let mut end = i + 1;
+        while end < entries.len() {
+            let (uk_next, _, _) = decode_internal_key(&entries[end].0);
+            if uk_next != uk.as_slice() {
+                break;
+            }
+            end += 1;
+        }
+
+        // Classify the group.
+        //
+        // Walk newest → oldest: collect merge operands until we hit
+        // a terminator (Value / Deletion) or run off the end.
+        let group = &entries[start..end];
+        let mut operands_newest_first: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut terminator: Option<(u64, u8, Vec<u8>)> = None;
+        let mut chain_end_offset = 0usize;
+        for (offset, entry) in group.iter().enumerate() {
+            let (_, seq, vt) = decode_internal_key(&entry.0);
+            match vt {
+                VALUE_TYPE_MERGE => {
+                    operands_newest_first.push((seq, entry.1.clone()));
+                    chain_end_offset = offset + 1;
+                }
+                VALUE_TYPE_VALUE | VALUE_TYPE_DELETION => {
+                    terminator = Some((seq, vt, entry.1.clone()));
+                    chain_end_offset = offset + 1;
+                    break;
+                }
+                _ => {
+                    chain_end_offset = group.len();
+                    break;
+                }
+            }
+        }
+
+        let everything_scanned = chain_end_offset == group.len();
+        let has_operands = !operands_newest_first.is_empty();
+
+        match (has_operands, &terminator) {
+            (false, _) => {
+                // No merges in this group — nothing to collapse.
+                out.extend(group.iter().cloned());
+            }
+            (true, Some((_term_seq, term_vt, term_value))) => {
+                // Full collapse. Build operands in oldest-first
+                // order, pick base from terminator type, call
+                // full_merge. Newest merge's seq becomes the single
+                // output's seq so it shadows everything that was
+                // already shadowed by the original terminator.
+                let newest_seq = operands_newest_first[0].0;
+                let base: Option<&[u8]> = if *term_vt == VALUE_TYPE_VALUE {
+                    Some(term_value.as_slice())
+                } else {
+                    None
+                };
+                let operand_refs: Vec<&[u8]> = operands_newest_first
+                    .iter()
+                    .rev()
+                    .map(|(_, v)| v.as_slice())
+                    .collect();
+                match op.full_merge(&uk, base, &operand_refs) {
+                    Some(collapsed) => {
+                        let new_key = encode_internal_key(&uk, newest_seq, VALUE_TYPE_VALUE);
+                        out.push((new_key, collapsed));
+                        // Older entries past the terminator are
+                        // already shadowed by it; emit them as-is
+                        // in case a later pass wants them.
+                        out.extend(group[chain_end_offset..].iter().cloned());
+                    }
+                    None => {
+                        // Conservative: keep the raw chain.
+                        out.extend(group.iter().cloned());
+                    }
+                }
+            }
+            (true, None) => {
+                // No terminator in this group. Try pairwise partial
+                // merge to shrink the chain.
+                if everything_scanned && operands_newest_first.len() > 1 {
+                    // Fold oldest→newest, carrying an accumulator.
+                    let mut iter = operands_newest_first.iter().rev();
+                    let first = iter.next().unwrap();
+                    let mut acc: Vec<u8> = first.1.clone();
+                    let mut newest_seq = first.0;
+                    let mut succeeded_any = false;
+                    for (seq, val) in iter {
+                        match op.partial_merge(&uk, &acc, val) {
+                            Some(folded) => {
+                                acc = folded;
+                                newest_seq = *seq;
+                                succeeded_any = true;
+                            }
+                            None => {
+                                succeeded_any = false;
+                                break;
+                            }
+                        }
+                    }
+                    if succeeded_any {
+                        let new_key = encode_internal_key(&uk, newest_seq, VALUE_TYPE_MERGE);
+                        out.push((new_key, acc));
+                    } else {
+                        out.extend(group.iter().cloned());
+                    }
+                } else {
+                    out.extend(group.iter().cloned());
+                }
+            }
+        }
+
+        i = end;
+    }
+
     out
 }
 

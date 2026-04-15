@@ -66,6 +66,11 @@ impl Block {
     /// This is the primitive SSTable readers use for MVCC point lookups: the
     /// caller constructs a search key from `(user_key, snapshot_seq)` and
     /// inspects the returned entry to decide whether it satisfies the query.
+    ///
+    /// Retained for tests and for the iterator's `seek` path even
+    /// though the merge-aware SSTable reader walks blocks manually
+    /// to skip past `Merge` entries.
+    #[allow(dead_code)]
     pub(crate) fn seek_ge(&self, target: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
         let data_end = self.data.len() - 4 - self.restarts.len() * 4;
         let start = self.restart_start_for(target);

@@ -57,7 +57,7 @@ pub use error::Error;
 pub use iter::Iter;
 pub use options::{
     CompactionDecision, CompactionFilter, CompressionType, DurabilityMode, FixedLengthPrefix,
-    Options, PrefixExtractor, WriteOptions,
+    MergeOperator, Options, PrefixExtractor, WriteOptions,
 };
 pub use sst_file_writer::{IngestOptions, SstFileMeta, SstFileWriter};
 pub use ttl::{strip_timestamp, DbWithTtl, TtlCompactionFilter};
@@ -127,7 +127,7 @@ impl Db {
         batch.insert(key.to_vec(), Some(value.to_vec()));
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
-            .apply_batch(batch, Vec::new(), dm, disable_wal)
+            .apply_batch(batch, Vec::new(), Vec::new(), dm, disable_wal)
             .map_err(Error::Io)
     }
 
@@ -142,7 +142,31 @@ impl Db {
         batch.insert(key.to_vec(), None);
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
-            .apply_batch(batch, Vec::new(), dm, disable_wal)
+            .apply_batch(batch, Vec::new(), Vec::new(), dm, disable_wal)
+            .map_err(Error::Io)
+    }
+
+    /// Layer a merge operand on top of `key`.
+    ///
+    /// Requires an [`Options::merge_operator`] to be configured. The
+    /// operand is written cheaply (no read-modify-write); readers
+    /// collapse the chain of merges plus any base value via the
+    /// configured operator at visibility time.
+    pub fn merge(&self, key: &[u8], operand: &[u8]) -> Result<()> {
+        self.merge_opt(&WriteOptions::default(), key, operand)
+    }
+
+    /// [`Db::merge`] with an explicit [`WriteOptions`] override.
+    pub fn merge_opt(&self, opts: &WriteOptions, key: &[u8], operand: &[u8]) -> Result<()> {
+        let (dm, disable_wal) = self.resolve_write_opts(opts);
+        self.engine
+            .apply_batch(
+                BTreeMap::new(),
+                Vec::new(),
+                vec![(key.to_vec(), operand.to_vec())],
+                dm,
+                disable_wal,
+            )
             .map_err(Error::Io)
     }
 
@@ -170,6 +194,7 @@ impl Db {
             .apply_batch(
                 BTreeMap::new(),
                 vec![(start.to_vec(), end.to_vec())],
+                Vec::new(),
                 dm,
                 disable_wal,
             )
@@ -190,7 +215,13 @@ impl Db {
         }
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
-            .apply_batch(batch.ops, batch.range_deletes, dm, disable_wal)
+            .apply_batch(
+                batch.ops,
+                batch.range_deletes,
+                batch.merges,
+                dm,
+                disable_wal,
+            )
             .map_err(Error::Io)
     }
 
@@ -421,6 +452,7 @@ fn collect_range(
 pub struct WriteBatch {
     ops: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
+    merges: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 impl WriteBatch {
@@ -452,8 +484,19 @@ impl WriteBatch {
         self.range_deletes.push((start.to_vec(), end.to_vec()));
     }
 
-    /// Number of point operations in the batch. Range deletes are
-    /// counted separately via [`WriteBatch::range_delete_count`].
+    /// Add a merge operand for `key`. Requires the database to be
+    /// configured with a [`MergeOperator`]; the operand is layered
+    /// on top of any existing value or merge chain and collapsed at
+    /// read time. Multiple merges on the same key in a single batch
+    /// are allowed and applied in insertion order.
+    pub fn merge(&mut self, key: &[u8], operand: &[u8]) {
+        self.merges.push((key.to_vec(), operand.to_vec()));
+    }
+
+    /// Number of point operations in the batch. Range deletes and
+    /// merges are counted separately via
+    /// [`WriteBatch::range_delete_count`] and
+    /// [`WriteBatch::merge_count`].
     pub fn len(&self) -> usize {
         self.ops.len()
     }
@@ -463,9 +506,14 @@ impl WriteBatch {
         self.range_deletes.len()
     }
 
+    /// Number of merge operations in the batch.
+    pub fn merge_count(&self) -> usize {
+        self.merges.len()
+    }
+
     /// Whether the batch contains no operations of any kind.
     pub fn is_empty(&self) -> bool {
-        self.ops.is_empty() && self.range_deletes.is_empty()
+        self.ops.is_empty() && self.range_deletes.is_empty() && self.merges.is_empty()
     }
 }
 
@@ -2613,5 +2661,302 @@ mod tests {
         };
         db.put_opt(&opts, b"k", b"v").unwrap();
         assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    // ── merge operator ──────────────────────────────────────────────────────
+
+    /// Integer-counter merge operator: every operand is the 8-byte
+    /// big-endian i64 delta to add. `full_merge` sums them (starting
+    /// from `base` if present) and emits the new counter value.
+    /// `partial_merge` folds two deltas by adding them.
+    struct CounterMerge;
+
+    impl MergeOperator for CounterMerge {
+        fn full_merge(
+            &self,
+            _key: &[u8],
+            base: Option<&[u8]>,
+            operands: &[&[u8]],
+        ) -> Option<Vec<u8>> {
+            let mut total: i64 = match base {
+                Some(b) if b.len() == 8 => i64::from_be_bytes(b.try_into().unwrap()),
+                Some(_) => return None,
+                None => 0,
+            };
+            for op in operands {
+                if op.len() != 8 {
+                    return None;
+                }
+                total = total.wrapping_add(i64::from_be_bytes((*op).try_into().unwrap()));
+            }
+            Some(total.to_be_bytes().to_vec())
+        }
+
+        fn partial_merge(&self, _key: &[u8], left: &[u8], right: &[u8]) -> Option<Vec<u8>> {
+            if left.len() != 8 || right.len() != 8 {
+                return None;
+            }
+            let l = i64::from_be_bytes(left.try_into().unwrap());
+            let r = i64::from_be_bytes(right.try_into().unwrap());
+            Some(l.wrapping_add(r).to_be_bytes().to_vec())
+        }
+
+        fn name(&self) -> &'static str {
+            "CounterMerge"
+        }
+    }
+
+    /// String-append merge operator: every operand is raw bytes;
+    /// `full_merge` concatenates the base (if any) with every
+    /// operand in oldest-first order.
+    struct AppendMerge;
+
+    impl MergeOperator for AppendMerge {
+        fn full_merge(
+            &self,
+            _key: &[u8],
+            base: Option<&[u8]>,
+            operands: &[&[u8]],
+        ) -> Option<Vec<u8>> {
+            let mut out: Vec<u8> = base.map(|b| b.to_vec()).unwrap_or_default();
+            for op in operands {
+                out.extend_from_slice(op);
+            }
+            Some(out)
+        }
+
+        fn name(&self) -> &'static str {
+            "AppendMerge"
+        }
+    }
+
+    fn counter_opts() -> Options {
+        Options {
+            write_buffer_size: 4 * 1024,
+            merge_operator: Some(Arc::new(CounterMerge)),
+            ..Options::default()
+        }
+    }
+
+    fn encode_i64(n: i64) -> Vec<u8> {
+        n.to_be_bytes().to_vec()
+    }
+
+    #[test]
+    fn test_merge_counter_basic_chain_of_one() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), counter_opts()).unwrap();
+        db.merge(b"counter", &encode_i64(5)).unwrap();
+        assert_eq!(db.get(b"counter").unwrap(), Some(encode_i64(5)));
+    }
+
+    #[test]
+    fn test_merge_counter_chain_of_two() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), counter_opts()).unwrap();
+        db.put(b"counter", &encode_i64(10)).unwrap();
+        db.merge(b"counter", &encode_i64(3)).unwrap();
+        assert_eq!(db.get(b"counter").unwrap(), Some(encode_i64(13)));
+    }
+
+    #[test]
+    fn test_merge_counter_chain_of_ten() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), counter_opts()).unwrap();
+        db.put(b"counter", &encode_i64(100)).unwrap();
+        for i in 1..=10 {
+            db.merge(b"counter", &encode_i64(i)).unwrap();
+        }
+        // 100 + (1+2+...+10) = 155
+        assert_eq!(db.get(b"counter").unwrap(), Some(encode_i64(155)));
+    }
+
+    #[test]
+    fn test_merge_counter_chain_of_1000() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), counter_opts()).unwrap();
+        for _ in 0..1000 {
+            db.merge(b"counter", &encode_i64(1)).unwrap();
+        }
+        assert_eq!(db.get(b"counter").unwrap(), Some(encode_i64(1000)));
+    }
+
+    #[test]
+    fn test_merge_without_base_defaults_to_none() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), counter_opts()).unwrap();
+        // No put — counter starts at 0 (base=None).
+        db.merge(b"counter", &encode_i64(7)).unwrap();
+        db.merge(b"counter", &encode_i64(5)).unwrap();
+        assert_eq!(db.get(b"counter").unwrap(), Some(encode_i64(12)));
+    }
+
+    #[test]
+    fn test_merge_snapshot_isolation() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), counter_opts()).unwrap();
+        db.put(b"counter", &encode_i64(10)).unwrap();
+        let snap = db.snapshot();
+        db.merge(b"counter", &encode_i64(5)).unwrap();
+        // Live read sees 15; snapshot still sees 10.
+        assert_eq!(db.get(b"counter").unwrap(), Some(encode_i64(15)));
+        assert_eq!(snap.get(b"counter").unwrap(), Some(encode_i64(10)));
+    }
+
+    #[test]
+    fn test_merge_survives_flush() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), counter_opts()).unwrap();
+        db.put(b"counter", &encode_i64(0)).unwrap();
+        for i in 1..=20 {
+            db.merge(b"counter", &encode_i64(i)).unwrap();
+        }
+        // Push past the tiny write buffer so the chain crosses a
+        // flush boundary (memtable → L0).
+        force_flush(&db, "merge");
+        // Sum = 1+2+...+20 = 210
+        assert_eq!(db.get(b"counter").unwrap(), Some(encode_i64(210)));
+    }
+
+    #[test]
+    fn test_merge_survives_compaction_and_collapses() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), counter_opts()).unwrap();
+        db.put(b"counter", &encode_i64(0)).unwrap();
+        for i in 1..=50 {
+            db.merge(b"counter", &encode_i64(i)).unwrap();
+        }
+        for tag in 0..4 {
+            force_flush(&db, &format!("c{tag}"));
+        }
+        db.compact_range(None, None).unwrap();
+        // Sum 1..=50 = 1275
+        assert_eq!(db.get(b"counter").unwrap(), Some(encode_i64(1275)));
+    }
+
+    #[test]
+    fn test_merge_tombstone_interaction() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), counter_opts()).unwrap();
+        // Value=10, then two merges, then delete, then two more merges.
+        db.put(b"k", &encode_i64(10)).unwrap();
+        db.merge(b"k", &encode_i64(5)).unwrap();
+        db.merge(b"k", &encode_i64(3)).unwrap();
+        db.delete(b"k").unwrap();
+        db.merge(b"k", &encode_i64(7)).unwrap();
+        db.merge(b"k", &encode_i64(1)).unwrap();
+        // Reads layer the two latest merges on top of the deletion
+        // (which resets the base to None → 0): 0 + 7 + 1 = 8.
+        assert_eq!(db.get(b"k").unwrap(), Some(encode_i64(8)));
+    }
+
+    #[test]
+    fn test_merge_range_tombstone_interaction() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), counter_opts()).unwrap();
+        db.put(b"k", &encode_i64(10)).unwrap();
+        db.merge(b"k", &encode_i64(5)).unwrap();
+        db.delete_range(b"j", b"l").unwrap(); // hides the base
+        db.merge(b"k", &encode_i64(7)).unwrap();
+        // After the RT, only the latest merge (7) applies to a None base.
+        assert_eq!(db.get(b"k").unwrap(), Some(encode_i64(7)));
+    }
+
+    #[test]
+    fn test_merge_write_batch() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), counter_opts()).unwrap();
+        let mut batch = WriteBatch::new();
+        batch.put(b"a", &encode_i64(1));
+        batch.merge(b"a", &encode_i64(2));
+        batch.merge(b"a", &encode_i64(3));
+        batch.put(b"b", &encode_i64(100));
+        db.write(batch).unwrap();
+        assert_eq!(db.get(b"a").unwrap(), Some(encode_i64(6)));
+        assert_eq!(db.get(b"b").unwrap(), Some(encode_i64(100)));
+    }
+
+    #[test]
+    fn test_merge_append_operator() {
+        let dir = TempDir::new().unwrap();
+        let opts = Options {
+            merge_operator: Some(Arc::new(AppendMerge)),
+            ..Options::default()
+        };
+        let db = Db::open(dir.path(), opts).unwrap();
+        db.put(b"s", b"hello").unwrap();
+        db.merge(b"s", b" ").unwrap();
+        db.merge(b"s", b"world").unwrap();
+        assert_eq!(db.get(b"s").unwrap(), Some(b"hello world".to_vec()));
+    }
+
+    #[test]
+    fn test_merge_iterator_sees_collapsed_value() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), counter_opts()).unwrap();
+        db.put(b"a", &encode_i64(0)).unwrap();
+        db.merge(b"a", &encode_i64(5)).unwrap();
+        db.put(b"b", &encode_i64(100)).unwrap();
+        db.merge(b"b", &encode_i64(10)).unwrap();
+        db.merge(b"b", &encode_i64(2)).unwrap();
+
+        let pairs = db.scan(None, None).unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                (b"a".to_vec(), encode_i64(5)),
+                (b"b".to_vec(), encode_i64(112)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_merge_iterator_reverse() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), counter_opts()).unwrap();
+        db.put(b"a", &encode_i64(0)).unwrap();
+        db.merge(b"a", &encode_i64(1)).unwrap();
+        db.put(b"b", &encode_i64(0)).unwrap();
+        db.merge(b"b", &encode_i64(2)).unwrap();
+        db.merge(b"b", &encode_i64(3)).unwrap();
+
+        let mut iter = db.iter();
+        iter.seek_to_last();
+        let mut collected = Vec::new();
+        while iter.valid() {
+            collected.push((iter.key().unwrap().to_vec(), iter.value().unwrap().to_vec()));
+            iter.prev();
+        }
+        assert_eq!(
+            collected,
+            vec![
+                (b"b".to_vec(), encode_i64(5)),
+                (b"a".to_vec(), encode_i64(1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_merge_crash_recovery() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Db::open(dir.path(), counter_opts()).unwrap();
+            db.put(b"counter", &encode_i64(0)).unwrap();
+            db.merge(b"counter", &encode_i64(7)).unwrap();
+            db.merge(b"counter", &encode_i64(3)).unwrap();
+            // No close — memtable flush didn't happen; WAL must
+            // survive the chain.
+        }
+        let db = Db::open(dir.path(), counter_opts()).unwrap();
+        assert_eq!(db.get(b"counter").unwrap(), Some(encode_i64(10)));
+    }
+
+    #[test]
+    fn test_merge_operator_name_plumbs_through() {
+        // Surface-area smoke test: the configured operator's `name`
+        // is reachable via Options::debug.
+        let opts = counter_opts();
+        let dbg = format!("{opts:?}");
+        assert!(dbg.contains("CounterMerge"));
     }
 }

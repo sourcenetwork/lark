@@ -26,7 +26,9 @@ use parking_lot::Mutex;
 use super::block::{Block, BlockBuilder, BlockHandle, RESTART_INTERVAL};
 use super::block_cache::BlockCache;
 use super::bloom::{decode_bloom_block, encode_bloom_block, BloomFilter, BloomFilterBuilder};
-use super::internal_key::{decode_internal_key, lookup_key, user_key_of, VALUE_TYPE_DELETION};
+use super::internal_key::{
+    decode_internal_key, lookup_key, user_key_of, VALUE_TYPE_DELETION, VALUE_TYPE_MERGE,
+};
 use super::range_tombstone::{max_covering_seq, RangeTombstone};
 use crate::options::{CompressionType, PrefixExtractor};
 
@@ -632,6 +634,12 @@ impl SsTableReader {
     }
 
     /// Point lookup for `user_key` visible at `snapshot_seq`.
+    ///
+    /// Skips past merge operands (they're not valid point-lookup
+    /// terminators) and returns the first `Value` / `Deletion` entry
+    /// visible at the requested snapshot. A caller that cares about
+    /// merge chains uses [`SsTableReader::collect_merge_chain`]
+    /// instead.
     pub(crate) fn get(
         &self,
         user_key: &[u8],
@@ -643,7 +651,7 @@ impl SsTableReader {
         }
 
         let search_key = lookup_key(user_key, snapshot_seq);
-        let block_idx = match self
+        let mut block_idx = match self
             .index
             .binary_search_by(|e| e.key.as_slice().cmp(&search_key))
         {
@@ -656,20 +664,87 @@ impl SsTableReader {
             }
         };
 
-        let entry = &self.index[block_idx];
-        let block = self.read_block(entry.handle, cache)?;
-        match block.seek_ge(&search_key) {
-            Some((ik, value)) => {
+        // Walk forward past `Merge` entries — they are collapsed
+        // separately by `collect_merge_chain` and shouldn't be
+        // mistaken for a point terminator here.
+        loop {
+            let entry = &self.index[block_idx];
+            let block = self.read_block(entry.handle, cache)?;
+            for (ik, value) in block.iter() {
+                if ik.as_slice() < search_key.as_slice() {
+                    continue;
+                }
                 let (uk, seq, vt) = decode_internal_key(&ik);
                 if uk != user_key {
-                    Ok(LookupResult::NotInTable)
-                } else if vt == VALUE_TYPE_DELETION {
-                    Ok(LookupResult::FoundTombstone { seq })
-                } else {
-                    Ok(LookupResult::Found { seq, value })
+                    return Ok(LookupResult::NotInTable);
+                }
+                match vt {
+                    VALUE_TYPE_MERGE => continue,
+                    VALUE_TYPE_DELETION => {
+                        return Ok(LookupResult::FoundTombstone { seq });
+                    }
+                    _ => {
+                        return Ok(LookupResult::Found { seq, value });
+                    }
                 }
             }
-            None => Ok(LookupResult::NotInTable),
+            block_idx += 1;
+            if block_idx >= self.index.len() {
+                return Ok(LookupResult::NotInTable);
+            }
+        }
+    }
+
+    /// Walk every visible entry for `user_key` at `snapshot_seq` in
+    /// newest-seq-first order, appending `(seq, value_type, value)`
+    /// tuples onto `out` and stopping at (and including) the first
+    /// terminator (`VALUE_TYPE_VALUE` or `VALUE_TYPE_DELETION`).
+    /// Returns `true` if a terminator was reached.
+    pub(crate) fn collect_merge_chain(
+        &self,
+        user_key: &[u8],
+        snapshot_seq: u64,
+        cache: &BlockCache,
+        out: &mut Vec<(u64, u8, Vec<u8>)>,
+    ) -> io::Result<bool> {
+        if !self.bloom.may_contain(user_key) {
+            return Ok(false);
+        }
+
+        let search_key = lookup_key(user_key, snapshot_seq);
+        let mut block_idx = match self
+            .index
+            .binary_search_by(|e| e.key.as_slice().cmp(&search_key))
+        {
+            Ok(i) => i,
+            Err(i) => {
+                if i >= self.index.len() {
+                    return Ok(false);
+                }
+                i
+            }
+        };
+
+        loop {
+            let entry = &self.index[block_idx];
+            let block = self.read_block(entry.handle, cache)?;
+            for (ik, value) in block.iter() {
+                if ik.as_slice() < search_key.as_slice() {
+                    continue;
+                }
+                let (uk, seq, vt) = decode_internal_key(&ik);
+                if uk != user_key {
+                    return Ok(false);
+                }
+                out.push((seq, vt, value));
+                if vt != VALUE_TYPE_MERGE {
+                    return Ok(true);
+                }
+            }
+            block_idx += 1;
+            if block_idx >= self.index.len() {
+                return Ok(false);
+            }
         }
     }
 

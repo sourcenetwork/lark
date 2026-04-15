@@ -62,11 +62,13 @@ use std::sync::Arc;
 use super::block_cache::BlockCache;
 use super::internal_key::{
     decode_internal_key, lookup_key, INTERNAL_KEY_SUFFIX_LEN, VALUE_TYPE_DELETION,
+    VALUE_TYPE_MERGE, VALUE_TYPE_VALUE,
 };
 use super::manifest::Version;
 use super::memtable::MemTable;
 use super::range_tombstone::{max_covering_seq, RangeTombstone};
 use super::sstable::SsTableReader;
+use crate::options::MergeOperator;
 use crate::options::PrefixExtractor;
 
 /// Scan direction for [`LarkIterator`].
@@ -589,6 +591,10 @@ pub(crate) struct LarkIterator {
     /// byte string (in which case we fall back to a plain upper-bound
     /// scan without bloom skipping).
     prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
+    /// Optional merge operator. When `Some`, the iterator collapses
+    /// merge chains encountered during materialization into a
+    /// single final value via [`MergeOperator::full_merge`].
+    merge_operator: Option<Arc<dyn MergeOperator>>,
 }
 
 /// Compute the exclusive upper bound of all keys that start with
@@ -622,6 +628,7 @@ impl LarkIterator {
         cache: Arc<BlockCache>,
         snapshot_seq: u64,
         prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
+        merge_operator: Option<Arc<dyn MergeOperator>>,
     ) -> Self {
         let mut levels: Vec<LevelIter> = Vec::new();
         let mut range_tombstones: Vec<RangeTombstone> = Vec::new();
@@ -661,6 +668,7 @@ impl LarkIterator {
             error: None,
             upper_bound: None,
             prefix_extractor,
+            merge_operator,
         }
     }
 
@@ -847,21 +855,143 @@ impl LarkIterator {
             // tombstone with a strictly greater seq covers it, the
             // whole user key is considered deleted — same effect as a
             // point tombstone. Otherwise emit the value (or skip if
-            // it's itself a point tombstone).
+            // it's itself a point tombstone; or collapse a merge
+            // chain via the configured merge operator).
             let uk_owned = uk.to_vec();
             let rt_seq = self.covering_rt_seq(&uk_owned);
             if rt_seq > seq {
                 self.consume_user_key_forward(&uk_owned);
                 continue;
             }
-            if vt == VALUE_TYPE_DELETION {
-                self.consume_user_key_forward(&uk_owned);
+            match vt {
+                VALUE_TYPE_DELETION => {
+                    self.consume_user_key_forward(&uk_owned);
+                    continue;
+                }
+                VALUE_TYPE_MERGE => match self.collapse_merge_chain_forward(&uk_owned, rt_seq) {
+                    Ok(Some(v)) => {
+                        self.curr_user = Some((uk_owned, v));
+                        return;
+                    }
+                    Ok(None) => continue,
+                    Err(e) => {
+                        self.error = Some(e);
+                        self.curr_user = None;
+                        return;
+                    }
+                },
+                _ => {
+                    let v = self.inner.value().map(|s| s.to_vec()).unwrap_or_default();
+                    self.curr_user = Some((uk_owned.clone(), v));
+                    self.consume_user_key_forward(&uk_owned);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Collect every visible entry for `user_key` starting from the
+    /// iterator's current forward position, expecting the newest
+    /// entry to be a merge operand. Walks through successive older
+    /// entries in the same user-key group (which sort after the
+    /// merge in internal-key order) until a terminator (Value or
+    /// Deletion) is reached, the user key changes, or we run off
+    /// the end. Calls the merge operator to materialize the final
+    /// value and advances the inner iterator past the entire group.
+    ///
+    /// Returns `Ok(Some(value))` on success, `Ok(None)` when the
+    /// chain collapses to a deletion (caller should try the next
+    /// user key), or `Err` when the merge operator fails.
+    ///
+    /// `rt_seq` is the covering range-tombstone seq; entries with
+    /// `seq <= rt_seq` are hidden by it and terminate the walk as
+    /// if a deletion had been reached.
+    fn collapse_merge_chain_forward(
+        &mut self,
+        user_key: &[u8],
+        rt_seq: u64,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let merge_op = match self.merge_operator.clone() {
+            Some(op) => op,
+            None => {
+                // No merge operator — can't collapse. Treat merges
+                // as invisible (RocksDB parity: merges without an
+                // operator are read as missing).
+                self.consume_user_key_forward(user_key);
+                return Ok(None);
+            }
+        };
+
+        // Operands collected oldest-first so we can pass them to
+        // `full_merge` in the expected order. We build newest-first
+        // while walking forward and reverse at the end.
+        let mut operands_newest_first: Vec<Vec<u8>> = Vec::new();
+        let mut base: Option<Vec<u8>> = None;
+        let mut had_terminator = false;
+
+        #[allow(clippy::while_let_loop)]
+        loop {
+            let Some(ik) = self.inner.key() else { break };
+            let (uk, seq, vt) = decode_internal_key(ik);
+            if uk != user_key {
+                break;
+            }
+            if seq > self.snapshot_seq {
+                // Invisible: skip without adding to chain.
+                self.inner.advance()?;
                 continue;
             }
-            let v = self.inner.value().map(|s| s.to_vec()).unwrap_or_default();
-            self.curr_user = Some((uk_owned.clone(), v));
-            self.consume_user_key_forward(&uk_owned);
-            return;
+            if rt_seq > 0 && seq <= rt_seq {
+                // Range tombstone hides this and every older entry
+                // for the same user key — synthesize a deletion
+                // terminator and stop.
+                base = None;
+                had_terminator = true;
+                self.consume_user_key_forward(user_key);
+                break;
+            }
+            let value = self.inner.value().map(|s| s.to_vec()).unwrap_or_default();
+            match vt {
+                VALUE_TYPE_MERGE => {
+                    operands_newest_first.push(value);
+                    self.inner.advance()?;
+                }
+                VALUE_TYPE_VALUE => {
+                    base = Some(value);
+                    had_terminator = true;
+                    self.consume_user_key_forward(user_key);
+                    break;
+                }
+                VALUE_TYPE_DELETION => {
+                    base = None;
+                    had_terminator = true;
+                    self.consume_user_key_forward(user_key);
+                    break;
+                }
+                _ => {
+                    self.inner.advance()?;
+                }
+            }
+        }
+        let _ = had_terminator;
+
+        if operands_newest_first.is_empty() {
+            // No merges — shouldn't happen because caller saw a
+            // merge at the head, but handle it safely.
+            return Ok(base);
+        }
+
+        let operand_refs: Vec<&[u8]> = operands_newest_first
+            .iter()
+            .rev()
+            .map(|v| v.as_slice())
+            .collect();
+        match merge_op.full_merge(user_key, base.as_deref(), &operand_refs) {
+            Some(v) => Ok(Some(v)),
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("merge operator {} failed", merge_op.name()),
+            )),
         }
     }
 
@@ -883,21 +1013,24 @@ impl LarkIterator {
             let (uk, _, _) = decode_internal_key(ik);
             let group = uk.to_vec();
 
-            // Newest visible entry seen so far in this group. Because
-            // reverse walk visits seqs in ascending order within a group,
-            // every visible entry we see is strictly newer than the
-            // previous one — so a simple "keep overwriting" strategy
-            // yields the newest visible entry for the group.
-            let mut latest: Option<(u8, u64, Vec<u8>)> = None;
+            // Collect every visible entry in this group in walk
+            // order (ascending seq). After the walk we know the
+            // full group and can classify its winning outcome.
+            // Within a user-key group, entries with
+            // `seq > snapshot_seq` and entries hidden by a range
+            // tombstone are skipped. We retain merges so we can
+            // collapse them at the end via the configured operator.
+            let rt_seq = self.covering_rt_seq(&group);
+            let mut collected: Vec<(u64, u8, Vec<u8>)> = Vec::new();
 
             while let Some(ik2) = self.inner.key() {
                 let (uk2, seq, vt) = decode_internal_key(ik2);
                 if uk2 != group.as_slice() {
                     break;
                 }
-                if seq <= self.snapshot_seq {
+                if seq <= self.snapshot_seq && (rt_seq == 0 || seq > rt_seq) {
                     let v = self.inner.value().map(|s| s.to_vec()).unwrap_or_default();
-                    latest = Some((vt, seq, v));
+                    collected.push((seq, vt, v));
                 }
                 if let Err(e) = self.inner.advance_backward() {
                     self.error = Some(e);
@@ -906,26 +1039,68 @@ impl LarkIterator {
                 }
             }
 
-            let rt_seq = self.covering_rt_seq(&group);
-            match latest {
-                Some((_, seq, _)) if rt_seq > seq => {
-                    // A range tombstone hides the newest visible point
-                    // entry — treat the whole group as deleted.
-                    continue;
+            // `collected` is ascending by seq (oldest visible first,
+            // newest visible last). Find the newest terminator and
+            // fold any operands that sit on top of it.
+            //
+            // Walk backwards to locate the terminator seq; collect
+            // operands that are strictly newer than the terminator.
+            if collected.is_empty() {
+                continue;
+            }
+
+            let mut terminator_idx: Option<usize> = None;
+            for (i, (_, vt, _)) in collected.iter().enumerate().rev() {
+                if *vt != VALUE_TYPE_MERGE {
+                    terminator_idx = Some(i);
+                    break;
                 }
-                Some((VALUE_TYPE_DELETION, _, _)) => {
-                    // Newest visible entry is a tombstone — try the next
-                    // (alphabetically earlier) user key.
-                    continue;
+            }
+
+            // Operands that apply are everything from `terminator_idx + 1`
+            // through the end. If there's no terminator, every entry
+            // is a merge operand and the base is None.
+            let (base, operand_range_start) = match terminator_idx {
+                Some(i) => match collected[i].1 {
+                    VALUE_TYPE_VALUE => (Some(collected[i].2.clone()), i + 1),
+                    VALUE_TYPE_DELETION => (None, i + 1),
+                    _ => (None, i + 1),
+                },
+                None => (None, 0),
+            };
+
+            let operand_slice = &collected[operand_range_start..];
+            if operand_slice.is_empty() {
+                // Plain value or deletion — no merge fold required.
+                match terminator_idx {
+                    Some(i) if collected[i].1 == VALUE_TYPE_VALUE => {
+                        self.curr_user = Some((group, base.unwrap()));
+                        return;
+                    }
+                    _ => continue, // deletion or nothing visible
                 }
-                Some((_, _, v)) => {
+            }
+
+            // Collapse the merge chain. We need a merge operator to
+            // materialize it — without one, treat the group as
+            // missing.
+            let Some(merge_op) = self.merge_operator.clone() else {
+                continue;
+            };
+            // `operand_slice` is already oldest-first.
+            let operand_refs: Vec<&[u8]> = operand_slice.iter().map(|e| e.2.as_slice()).collect();
+            match merge_op.full_merge(&group, base.as_deref(), &operand_refs) {
+                Some(v) => {
                     self.curr_user = Some((group, v));
                     return;
                 }
                 None => {
-                    // No visible entries in this group (all seqs are in
-                    // the future of our snapshot). Try the next.
-                    continue;
+                    self.error = Some(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("merge operator {} failed", merge_op.name()),
+                    ));
+                    self.curr_user = None;
+                    return;
                 }
             }
         }
