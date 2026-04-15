@@ -50,6 +50,7 @@ mod error;
 mod event_listener;
 mod iter;
 mod options;
+mod os_hint;
 mod rate_limiter;
 mod sst_file_writer;
 mod statistics;
@@ -5122,6 +5123,50 @@ mod tests {
             Some("0")
         );
         assert_eq!(db.get_property("lark.num-snapshots").as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn test_use_direct_io_for_compaction_is_correctness_neutral() {
+        // Enabling the page-cache hint must not change what a
+        // compaction produces. On Linux the `posix_fadvise`
+        // syscall runs but is a best-effort hint; on other
+        // platforms it's a no-op. Either way, the output SSTs
+        // contain the same data as the leveled baseline, so
+        // readers must see identical values afterward.
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            use_direct_io_for_compaction: true,
+            ..Options::default()
+        };
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), opts).unwrap();
+
+        for i in 0..128 {
+            let k = format!("k{i:04}");
+            let v = format!("v{i}");
+            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+        }
+        // Overwrite a few so dedup runs through the hint path.
+        for i in 0..32 {
+            let k = format!("k{i:04}");
+            let v = format!("v{i}-new");
+            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+        }
+        db.compact_range(None, None).unwrap();
+
+        for i in 0..128 {
+            let k = format!("k{i:04}");
+            let expected = if i < 32 {
+                format!("v{i}-new")
+            } else {
+                format!("v{i}")
+            };
+            assert_eq!(
+                db.get(k.as_bytes()).unwrap(),
+                Some(expected.into_bytes()),
+                "key {k} must still read its latest value"
+            );
+        }
     }
 
     #[test]

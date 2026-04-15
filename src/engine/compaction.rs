@@ -124,6 +124,7 @@ pub(crate) struct CompactionOptions {
     pub(crate) compaction_style: crate::options::CompactionStyle,
     pub(crate) fifo_compaction_options: crate::options::FifoCompactionOptions,
     pub(crate) universal_compaction_options: crate::options::UniversalCompactionOptions,
+    pub(crate) use_direct_io_for_compaction: bool,
 }
 
 impl CompactionOptions {
@@ -157,6 +158,7 @@ impl Default for CompactionOptions {
             compaction_style: crate::options::CompactionStyle::Level,
             fifo_compaction_options: crate::options::FifoCompactionOptions::default(),
             universal_compaction_options: crate::options::UniversalCompactionOptions::default(),
+            use_direct_io_for_compaction: false,
         }
     }
 }
@@ -748,6 +750,13 @@ fn perform_compaction_to(
         for rt in file.reader.range_tombstones() {
             merged_range_tombstones.push(rt.clone());
         }
+        // Tell the OS it can drop pages we just read from the
+        // page cache. Opt-in via `use_direct_io_for_compaction`;
+        // on non-Linux targets the hint is a no-op.
+        if opts.use_direct_io_for_compaction {
+            let path = sst_dir.join(sst_filename(file.meta.file_id));
+            crate::os_hint::drop_page_cache_by_path(&path);
+        }
     }
 
     // Sort by internal key (which orders newer seqs first within each user
@@ -940,6 +949,14 @@ fn perform_compaction_to(
         // a `None` limiter is a no-op.
         if let Some(limiter) = &opts.rate_limiter {
             limiter.request(file_size, crate::rate_limiter::Priority::Low);
+        }
+
+        // Tell the OS it can drop the pages we just wrote from the
+        // page cache so they don't evict hot foreground reads.
+        // `use_direct_io_for_compaction` gates the hint; on
+        // non-Linux targets `drop_page_cache_by_path` is a no-op.
+        if opts.use_direct_io_for_compaction {
+            crate::os_hint::drop_page_cache_by_path(&path);
         }
 
         let reader = Arc::new(SsTableReader::open(&path, file_id)?);
