@@ -27,8 +27,7 @@
 //! begin the current engine seq is captured, and every read within
 //! the transaction sees the database as of that seq (except reads
 //! that hit the transaction's own buffered writes — those see the
-//! written value). This matches RocksDB's default transaction
-//! isolation. Serializable isolation is out of scope for v1.
+//! written value). Serializable isolation is out of scope for v1.
 //!
 //! # Out of scope (follow-ups)
 //!

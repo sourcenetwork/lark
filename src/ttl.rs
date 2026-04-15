@@ -18,9 +18,8 @@
 //!
 //! # Year 2106 problem
 //!
-//! The 4-byte timestamp overflows on 2106-02-07. Matches RocksDB's
-//! on-disk layout for `DBWithTTL`. A format bump to 8-byte timestamps
-//! is a future change.
+//! The 4-byte timestamp overflows on 2106-02-07. A format bump to
+//! 8-byte timestamps is a future change.
 
 use std::path::Path;
 use std::sync::Arc;

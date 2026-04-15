@@ -1,6 +1,6 @@
 # Lark
 
-A pure Rust, embedded key-value store built on an LSM-tree architecture. Designed as a lightweight, zero-dependency-on-C alternative to RocksDB.
+A pure Rust, embedded key-value store built from scratch on an LSM-tree architecture inspired by LevelDB. The public API is shaped to slot into common embedded-KV abstraction layers, so callers that already hide a storage backend behind a trait can add lark as another implementation with minimal glue.
 
 ## Features
 

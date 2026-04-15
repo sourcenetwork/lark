@@ -2,7 +2,7 @@
 
 ## 0. What Lark Is
 
-**lark** (crate: `lark-kv`, v0.1.0) is a pure Rust, embedded LSM-tree key-value store — a lightweight, zero-C-dependency alternative to RocksDB.
+**lark** (crate: `lark-kv`, v0.1.0) is a pure Rust, embedded LSM-tree key-value store built from scratch. The architecture follows the LevelDB design (memtable → WAL → leveled SSTables → background compaction); the public API is shaped to slot into common embedded-KV abstraction layers so consuming applications can swap lark in alongside other backends through the same trait.
 
 Early-stage. The public API (`Db`, `Snapshot`, `WriteBatch`, `Options`) is small and stable-shaped, but breakage is allowed pre-1.0.
 
