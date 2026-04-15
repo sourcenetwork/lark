@@ -4,7 +4,8 @@ use crossbeam_skiplist::SkipMap;
 use parking_lot::Mutex;
 
 use super::internal_key::{
-    decode_internal_key, encode_internal_key, lookup_key, VALUE_TYPE_DELETION, VALUE_TYPE_VALUE,
+    decode_internal_key, encode_internal_key, lookup_key, VALUE_TYPE_DELETION, VALUE_TYPE_MERGE,
+    VALUE_TYPE_VALUE,
 };
 use super::range_tombstone::{max_covering_seq, RangeTombstone};
 
@@ -45,6 +46,16 @@ impl MemTable {
         let internal_key = encode_internal_key(key, seq, VALUE_TYPE_DELETION);
         let size = internal_key.len();
         self.data.insert(internal_key, Vec::new());
+        self.approximate_size.fetch_add(size, Ordering::Relaxed);
+    }
+
+    /// Insert a merge operand for the given key. The operand will
+    /// be combined with any older base value (or other operands) at
+    /// read time via the configured [`crate::MergeOperator`].
+    pub(crate) fn merge(&self, key: &[u8], operand: &[u8], seq: u64) {
+        let internal_key = encode_internal_key(key, seq, VALUE_TYPE_MERGE);
+        let size = internal_key.len() + operand.len();
+        self.data.insert(internal_key, operand.to_vec());
         self.approximate_size.fetch_add(size, Ordering::Relaxed);
     }
 
@@ -101,6 +112,40 @@ impl MemTable {
         }
 
         None
+    }
+
+    /// Walk every visible entry for `key` at `snapshot_seq` in
+    /// newest-seq-first order, appending `(seq, value_type, bytes)`
+    /// tuples onto `out` and stopping at (and including) the first
+    /// terminator (`VALUE_TYPE_VALUE` or `VALUE_TYPE_DELETION`).
+    /// Returns `true` when a terminator was reached — callers walking
+    /// multiple sources use this to decide whether to continue the
+    /// walk into the next source.
+    ///
+    /// Used by the merge-operator read path to collect a chain of
+    /// merge operands layered on top of the underlying base value.
+    pub(crate) fn collect_merge_chain(
+        &self,
+        key: &[u8],
+        snapshot_seq: u64,
+        out: &mut Vec<(u64, u8, Vec<u8>)>,
+    ) -> bool {
+        let search_key = lookup_key(key, snapshot_seq);
+
+        for entry in self.data.range(search_key..) {
+            let (user_key, seq, value_type) = decode_internal_key(entry.key());
+            if user_key != key {
+                return false;
+            }
+            if seq > snapshot_seq {
+                continue;
+            }
+            out.push((seq, value_type, entry.value().clone()));
+            if value_type != VALUE_TYPE_MERGE {
+                return true;
+            }
+        }
+        false
     }
 
     /// Iterate **all** raw entries in internal-key order, preserving every

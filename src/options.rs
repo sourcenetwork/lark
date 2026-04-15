@@ -51,6 +51,51 @@ pub trait CompactionFilter: Send + Sync + 'static {
     fn name(&self) -> &'static str;
 }
 
+/// A user-supplied associative merge operator.
+///
+/// A merge operator lets callers emit `Merge(key, operand)` records
+/// cheaply instead of doing a read-modify-write. Readers and
+/// compaction collapse a chain of merge operands by calling
+/// [`MergeOperator::full_merge`] (combine a base value with an
+/// ordered list of operands) or [`MergeOperator::partial_merge`]
+/// (fold two adjacent operands, without a base).
+///
+/// # Determinism and safety
+///
+/// Implementations must be deterministic functions of their inputs.
+/// They MUST NOT read from the database — doing so will deadlock —
+/// and they should not block. Returning `None` from either method is
+/// interpreted as a merge failure: readers surface it as
+/// [`crate::Error::MergeFailed`], while compaction treats it
+/// conservatively (keeps the raw chain intact rather than losing data).
+///
+/// # Operand order
+///
+/// `operands` in [`MergeOperator::full_merge`] is ordered oldest
+/// first: `operands[0]` was written before `operands[1]`, which was
+/// written before `operands[2]`, etc. The base value (if any) was
+/// written before every operand.
+pub trait MergeOperator: Send + Sync + 'static {
+    /// Combine a `base` value (possibly `None` if the key didn't
+    /// exist) with the ordered list of merge `operands`, returning
+    /// the final value. Returning `None` signals merge failure.
+    fn full_merge(&self, key: &[u8], base: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>>;
+
+    /// Optionally fold two adjacent operands `left` (older) and
+    /// `right` (newer) into a single equivalent operand without a
+    /// base value. Compaction calls this to shrink merge chains in
+    /// the middle of an LSM level. The default implementation
+    /// returns `None`, which disables compaction-time collapse.
+    fn partial_merge(&self, key: &[u8], left: &[u8], right: &[u8]) -> Option<Vec<u8>> {
+        let _ = (key, left, right);
+        None
+    }
+
+    /// A stable, human-readable identifier for this operator. Used
+    /// by tracing and diagnostics.
+    fn name(&self) -> &'static str;
+}
+
 /// Per-call knobs for point and batch writes. Overrides the database-
 /// global [`Options::durability`] on a single operation so callers can
 /// opt a critical write into synchronous fsync, or opt a bulk-load
@@ -213,6 +258,12 @@ pub struct Options {
     /// consults to skip files that cannot contain the scanned prefix.
     /// Point lookups are unaffected.
     pub prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
+    /// Optional associative merge operator. When set, callers may
+    /// emit merge operands via [`crate::Db::merge`] /
+    /// [`crate::WriteBatch::merge`] instead of doing
+    /// read-modify-write, and readers collapse the merge chain via
+    /// [`MergeOperator::full_merge`] at visibility time.
+    pub merge_operator: Option<Arc<dyn MergeOperator>>,
 }
 
 impl Default for Options {
@@ -231,6 +282,7 @@ impl Default for Options {
             durability: DurabilityMode::Eventual,
             compaction_filter: None,
             prefix_extractor: None,
+            merge_operator: None,
         }
     }
 }
@@ -257,6 +309,10 @@ impl std::fmt::Debug for Options {
                 "prefix_extractor",
                 &self.prefix_extractor.as_ref().map(|p| p.name()),
             )
+            .field(
+                "merge_operator",
+                &self.merge_operator.as_ref().map(|m| m.name()),
+            )
             .finish()
     }
 }
@@ -276,6 +332,7 @@ impl Options {
             target_file_size: self.target_file_size,
             compaction_filter: self.compaction_filter.clone(),
             prefix_extractor: self.prefix_extractor.clone(),
+            merge_operator: self.merge_operator.clone(),
         }
     }
 }

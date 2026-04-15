@@ -11,4 +11,11 @@ pub enum Error {
     /// is currently unreachable via the public API.
     #[error("engine busy: {0}")]
     Busy(&'static str),
+    /// The configured [`crate::MergeOperator`] returned `None` when
+    /// asked to combine a value with one or more merge operands,
+    /// indicating that the operands were corrupt or the merge
+    /// semantics failed. The offending user key is included for
+    /// diagnostics.
+    #[error("merge operator failed for key {0:?}")]
+    MergeFailed(Vec<u8>),
 }

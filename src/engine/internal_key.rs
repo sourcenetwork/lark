@@ -13,6 +13,10 @@
 pub(crate) const VALUE_TYPE_VALUE: u8 = 1;
 /// Entry is a deletion tombstone.
 pub(crate) const VALUE_TYPE_DELETION: u8 = 0;
+/// Entry is a merge operand — a piece of data that will be combined
+/// with an older base value (or other operands) at read time via the
+/// configured [`crate::MergeOperator`].
+pub(crate) const VALUE_TYPE_MERGE: u8 = 2;
 
 /// Size of the trailing `(seq, value_type)` suffix in an internal key.
 pub(crate) const INTERNAL_KEY_SUFFIX_LEN: usize = 9;

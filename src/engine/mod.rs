@@ -48,6 +48,7 @@ pub(crate) struct EngineOptions {
     pub(crate) target_file_size: u64,
     pub(crate) compaction_filter: Option<Arc<dyn crate::options::CompactionFilter>>,
     pub(crate) prefix_extractor: Option<Arc<dyn crate::options::PrefixExtractor>>,
+    pub(crate) merge_operator: Option<Arc<dyn crate::options::MergeOperator>>,
 }
 
 impl EngineOptions {
@@ -77,6 +78,7 @@ impl Default for EngineOptions {
             target_file_size: compaction::DEFAULT_TARGET_FILE_SIZE,
             compaction_filter: None,
             prefix_extractor: None,
+            merge_operator: None,
         }
     }
 }
@@ -146,6 +148,10 @@ impl LarkEngine {
                                 memtable.delete_range(&start, &end, seq);
                                 latest_seq = latest_seq.max(seq);
                             }
+                            WalEntry::Merge { key, operand, seq } => {
+                                memtable.merge(&key, &operand, seq);
+                                latest_seq = latest_seq.max(seq);
+                            }
                         }
                     }
                 }
@@ -179,6 +185,7 @@ impl LarkEngine {
             compression_per_level: options.compression_per_level.clone(),
             compaction_filter: options.compaction_filter.clone(),
             prefix_extractor: options.prefix_extractor.clone(),
+            merge_operator: options.merge_operator.clone(),
         };
 
         let compaction_lock = Arc::new(Mutex::new(()));
@@ -255,6 +262,7 @@ impl LarkEngine {
             Arc::clone(&self.cache),
             snapshot_seq,
             self.options.prefix_extractor.clone(),
+            self.options.merge_operator.clone(),
         )
     }
 
@@ -268,7 +276,15 @@ impl LarkEngine {
     /// an older source. The first source yielding a decisive answer
     /// wins — a point entry with `seq > max_rt_so_far` gives its value;
     /// otherwise the range tombstone hides it.
+    ///
+    /// When a [`crate::MergeOperator`] is configured, the walk also
+    /// collects any merge operands that sit on top of the terminator
+    /// and calls the operator to collapse the chain into a final
+    /// value at visibility time.
     pub(crate) fn get(&self, key: &[u8], snapshot_seq: u64) -> std::io::Result<Option<Vec<u8>>> {
+        if self.options.merge_operator.is_some() {
+            return self.get_with_merge(key, snapshot_seq);
+        }
         let mut max_rt_seq: u64 = 0;
 
         {
@@ -353,6 +369,183 @@ impl LarkEngine {
         Ok(None)
     }
 
+    /// Merge-aware point lookup. Walks every source newest→oldest
+    /// collecting merge operands and any base value / deletion into
+    /// a single chain, honors range-tombstone coverage, and calls
+    /// [`crate::MergeOperator::full_merge`] at the end to materialize
+    /// the final value.
+    ///
+    /// Callers are responsible for having checked that
+    /// `self.options.merge_operator.is_some()`; this helper asserts
+    /// internally.
+    fn get_with_merge(&self, key: &[u8], snapshot_seq: u64) -> std::io::Result<Option<Vec<u8>>> {
+        use internal_key::{VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE};
+
+        let merge_op = self
+            .options
+            .merge_operator
+            .as_ref()
+            .expect("get_with_merge called without a merge operator");
+
+        // `chain` records visible entries for `key` in newest-seq-
+        // first order, stopping at (and including) the first
+        // terminator (`VALUE` or `DELETION`). Range tombstones that
+        // cover the key are treated as virtual deletion terminators.
+        let mut chain: Vec<(u64, u8, Vec<u8>)> = Vec::new();
+        let mut max_rt_seq: u64 = 0;
+        let mut terminated;
+
+        // `consume_partial` appends entries from one source into the
+        // running chain, short-circuiting if a terminator (real or
+        // RT-synthesized) is reached.
+        let consume_partial = |partial: Vec<(u64, u8, Vec<u8>)>,
+                               max_rt_seq: u64,
+                               chain: &mut Vec<(u64, u8, Vec<u8>)>|
+         -> bool {
+            for (seq, vt, value) in partial {
+                if seq <= max_rt_seq {
+                    // Range tombstone hides this and every older
+                    // entry for the same key.
+                    chain.push((max_rt_seq, VALUE_TYPE_DELETION, Vec::new()));
+                    return true;
+                }
+                chain.push((seq, vt, value));
+                if vt != VALUE_TYPE_MERGE {
+                    return true;
+                }
+            }
+            false
+        };
+
+        // Walk sources newest → oldest.
+        {
+            let active = self.active_memtable.read();
+            let rt = active.covering_range_tombstone_seq(key, snapshot_seq);
+            if rt > max_rt_seq {
+                max_rt_seq = rt;
+            }
+            let mut partial = Vec::new();
+            let _ = active.collect_merge_chain(key, snapshot_seq, &mut partial);
+            terminated = consume_partial(partial, max_rt_seq, &mut chain);
+        }
+
+        if !terminated {
+            let frozen = self.frozen_memtables.read();
+            for mt in frozen.iter().rev() {
+                let rt = mt.covering_range_tombstone_seq(key, snapshot_seq);
+                if rt > max_rt_seq {
+                    max_rt_seq = rt;
+                }
+                let mut partial = Vec::new();
+                let _ = mt.collect_merge_chain(key, snapshot_seq, &mut partial);
+                terminated = consume_partial(partial, max_rt_seq, &mut chain);
+                if terminated {
+                    break;
+                }
+            }
+        }
+
+        if !terminated {
+            let version = self.versions.lock().current();
+
+            // L0: newest-first.
+            for file in version.levels[0].iter().rev() {
+                let rt = file.reader.covering_range_tombstone_seq(key, snapshot_seq);
+                if rt > max_rt_seq {
+                    max_rt_seq = rt;
+                }
+                let mut partial = Vec::new();
+                file.reader
+                    .collect_merge_chain(key, snapshot_seq, &self.cache, &mut partial)?;
+                terminated = consume_partial(partial, max_rt_seq, &mut chain);
+                if terminated {
+                    break;
+                }
+            }
+
+            // L1+: one file per level could contain the key. Also
+            // scan every file at the level for RT coverage (RTs may
+            // sit in a sibling file).
+            if !terminated {
+                for level in 1..version.levels.len() {
+                    let files = &version.levels[level];
+                    if files.is_empty() {
+                        continue;
+                    }
+                    for file in files {
+                        if file.meta.smallest_key.as_slice() <= key
+                            && key <= file.meta.largest_key.as_slice()
+                        {
+                            let rt = file.reader.covering_range_tombstone_seq(key, snapshot_seq);
+                            if rt > max_rt_seq {
+                                max_rt_seq = rt;
+                            }
+                        }
+                    }
+                    let idx = files.partition_point(|f| f.meta.largest_key.as_slice() < key);
+                    if idx >= files.len() || files[idx].meta.smallest_key.as_slice() > key {
+                        continue;
+                    }
+                    let file = &files[idx];
+                    let mut partial = Vec::new();
+                    file.reader.collect_merge_chain(
+                        key,
+                        snapshot_seq,
+                        &self.cache,
+                        &mut partial,
+                    )?;
+                    terminated = consume_partial(partial, max_rt_seq, &mut chain);
+                    if terminated {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Materialize the chain. `chain` is newest-first; the last
+        // entry (if any) is either a real VALUE / DELETION terminator
+        // or (if !terminated) the oldest visible merge operand.
+        let (base_slice, has_terminator) = match chain.last() {
+            Some((_, vt, _)) if *vt == VALUE_TYPE_VALUE || *vt == VALUE_TYPE_DELETION => {
+                let base = if *vt == VALUE_TYPE_VALUE {
+                    Some(chain.last().unwrap().2.as_slice())
+                } else {
+                    None
+                };
+                (base, true)
+            }
+            _ => (None, false),
+        };
+
+        // Build operands in oldest-first order: walk the merge part
+        // of the chain (everything except the terminator slot, if
+        // one is present) in reverse.
+        let merge_end = if has_terminator {
+            chain.len() - 1
+        } else {
+            chain.len()
+        };
+        let mut operands_owned: Vec<&[u8]> = Vec::with_capacity(merge_end);
+        for entry in chain[..merge_end].iter().rev() {
+            debug_assert_eq!(entry.1, VALUE_TYPE_MERGE);
+            operands_owned.push(entry.2.as_slice());
+        }
+
+        if operands_owned.is_empty() {
+            // No merges at all — the chain is just a plain
+            // Value / Deletion / nothing. Return the base directly.
+            return Ok(base_slice.map(|s| s.to_vec()));
+        }
+
+        match merge_op.full_merge(key, base_slice, &operands_owned) {
+            Some(v) => Ok(Some(v)),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("merge operator {} failed for key", merge_op.name()),
+            )),
+        }
+    }
+
     /// Batched point lookup at a given snapshot. Returns one `Option<Vec<u8>>`
     /// per input key in the same order as `keys`. Duplicate keys in the
     /// input produce duplicate results.
@@ -367,6 +560,19 @@ impl LarkEngine {
         keys: &[&[u8]],
         snapshot_seq: u64,
     ) -> std::io::Result<Vec<Option<Vec<u8>>>> {
+        // When a merge operator is configured, fall back to per-key
+        // resolution — the batched walk's short-circuiting logic
+        // doesn't compose cleanly with merge-chain collection, and
+        // merges are rare enough that the cost difference isn't
+        // worth a specialized batched path.
+        if self.options.merge_operator.is_some() {
+            let mut out = Vec::with_capacity(keys.len());
+            for key in keys {
+                out.push(self.get_with_merge(key, snapshot_seq)?);
+            }
+            return Ok(out);
+        }
+
         let mut results: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
         let mut resolved: Vec<bool> = vec![false; keys.len()];
         // Running max of range-tombstone seq covering `keys[i]` across
@@ -515,15 +721,18 @@ impl LarkEngine {
         Ok(results)
     }
 
-    /// Apply a batch of point writes and range deletes atomically.
+    /// Apply a batch of point writes, range deletes, and merge
+    /// operands atomically.
     ///
     /// `point_ops` carries put/delete operations keyed by user key;
-    /// `range_deletes` is a list of `(start, end)` half-open intervals,
-    /// each of which tombstones every user key in the range as of the
-    /// same sequence number batch.
+    /// `range_deletes` is a list of `(start, end)` half-open
+    /// intervals; `merges` is a list of `(key, operand)` pairs that
+    /// each layer a merge operand on top of whatever base value the
+    /// key currently has.
     ///
     /// All operations in a single call are assigned consecutive
-    /// sequence numbers: point ops first, then range deletes.
+    /// sequence numbers in this order: point ops, then range
+    /// deletes, then merges.
     ///
     /// `durability` controls WAL fsync semantics (`Immediate` = fsync
     /// per call, `Eventual` = buffered flush). `disable_wal` skips
@@ -533,20 +742,23 @@ impl LarkEngine {
         &self,
         point_ops: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
+        merges: Vec<(Vec<u8>, Vec<u8>)>,
         durability: DurabilityMode,
         disable_wal: bool,
     ) -> std::io::Result<()> {
-        if point_ops.is_empty() && range_deletes.is_empty() {
+        if point_ops.is_empty() && range_deletes.is_empty() && merges.is_empty() {
             return Ok(());
         }
 
         let _write_guard = self.write_lock.lock();
 
-        let total_ops = point_ops.len() + range_deletes.len();
+        let total_ops = point_ops.len() + range_deletes.len() + merges.len();
         let base_seq = self
             .latest_seq
             .fetch_add(total_ops as u64, Ordering::AcqRel)
             + 1;
+        let range_delete_base = base_seq + point_ops.len() as u64;
+        let merge_base = range_delete_base + range_deletes.len() as u64;
 
         if !disable_wal {
             let mut wal = self.active_wal.lock();
@@ -558,8 +770,12 @@ impl LarkEngine {
                 }
             }
             for (j, (start, end)) in range_deletes.iter().enumerate() {
-                let seq = base_seq + (point_ops.len() + j) as u64;
+                let seq = range_delete_base + j as u64;
                 wal.append_delete_range(start, end, seq)?;
+            }
+            for (k, (key, operand)) in merges.iter().enumerate() {
+                let seq = merge_base + k as u64;
+                wal.append_merge(key, operand, seq)?;
             }
             match durability {
                 DurabilityMode::Immediate => wal.sync()?,
@@ -577,8 +793,12 @@ impl LarkEngine {
                 }
             }
             for (j, (start, end)) in range_deletes.iter().enumerate() {
-                let seq = base_seq + (point_ops.len() + j) as u64;
+                let seq = range_delete_base + j as u64;
                 memtable.delete_range(start, end, seq);
+            }
+            for (k, (key, operand)) in merges.iter().enumerate() {
+                let seq = merge_base + k as u64;
+                memtable.merge(key, operand, seq);
             }
         }
 
@@ -761,6 +981,7 @@ impl LarkEngine {
             compression_per_level: self.options.compression_per_level.clone(),
             compaction_filter: self.options.compaction_filter.clone(),
             prefix_extractor: self.options.prefix_extractor.clone(),
+            merge_operator: self.options.merge_operator.clone(),
         };
         compaction::run_compact_range(
             &self.versions,

@@ -136,6 +136,9 @@ impl DbWithTtl {
         for (start, end) in batch.range_deletes_iter() {
             stamped_batch.delete_range(start, end);
         }
+        for (key, operand) in batch.merges_iter() {
+            stamped_batch.merge(key, operand);
+        }
         self.inner.write(stamped_batch)
     }
 
@@ -279,6 +282,12 @@ impl WriteBatch {
         self.range_deletes
             .iter()
             .map(|(s, e)| (s.as_slice(), e.as_slice()))
+    }
+
+    pub(crate) fn merges_iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        self.merges
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
     }
 }
 
