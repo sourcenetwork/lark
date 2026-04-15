@@ -293,6 +293,27 @@ pub struct Options {
     /// bytes/second. Foreground (user) writes are not throttled.
     /// `None` (default) means background I/O is uncapped.
     pub rate_limiter: Option<Arc<dyn crate::RateLimiter>>,
+    /// Start slowing foreground writes when the number of L0
+    /// SSTables reaches this threshold. Each affected write
+    /// incurs a small fixed delay, back-pressuring callers so
+    /// background compaction can catch up. Default: 20.
+    pub level0_slowdown_writes_trigger: usize,
+    /// Stop foreground writes entirely when the number of L0
+    /// SSTables reaches this threshold. Writers block on a
+    /// condvar that compaction notifies once it reduces the
+    /// count below the slowdown trigger. Default: 36.
+    pub level0_stop_writes_trigger: usize,
+    /// Start slowing writes when total bytes in L0 (lark's
+    /// approximation of "pending compaction bytes") exceed this
+    /// limit. Default: 64 GB.
+    pub soft_pending_compaction_bytes_limit: u64,
+    /// Stop writes when total bytes in L0 exceed this limit.
+    /// Default: 256 GB.
+    pub hard_pending_compaction_bytes_limit: u64,
+    /// Soft cap on the number of in-memory memtables (active +
+    /// frozen). Reaching this count slows writes; reaching
+    /// `2 * max_write_buffer_number` stops them. Default: 2.
+    pub max_write_buffer_number: usize,
 }
 
 impl Default for Options {
@@ -316,6 +337,11 @@ impl Default for Options {
             listeners: Vec::new(),
             statistics: None,
             rate_limiter: None,
+            level0_slowdown_writes_trigger: 20,
+            level0_stop_writes_trigger: 36,
+            soft_pending_compaction_bytes_limit: 64 * 1024 * 1024 * 1024,
+            hard_pending_compaction_bytes_limit: 256 * 1024 * 1024 * 1024,
+            max_write_buffer_number: 2,
         }
     }
 }
@@ -350,6 +376,23 @@ impl std::fmt::Debug for Options {
             .field("listeners", &self.listeners.len())
             .field("statistics", &self.statistics.is_some())
             .field("rate_limiter", &self.rate_limiter.is_some())
+            .field(
+                "level0_slowdown_writes_trigger",
+                &self.level0_slowdown_writes_trigger,
+            )
+            .field(
+                "level0_stop_writes_trigger",
+                &self.level0_stop_writes_trigger,
+            )
+            .field(
+                "soft_pending_compaction_bytes_limit",
+                &self.soft_pending_compaction_bytes_limit,
+            )
+            .field(
+                "hard_pending_compaction_bytes_limit",
+                &self.hard_pending_compaction_bytes_limit,
+            )
+            .field("max_write_buffer_number", &self.max_write_buffer_number)
             .finish()
     }
 }
@@ -373,6 +416,11 @@ impl Options {
             listeners: self.listeners.clone(),
             statistics: self.statistics.clone(),
             rate_limiter: self.rate_limiter.clone(),
+            level0_slowdown_writes_trigger: self.level0_slowdown_writes_trigger,
+            level0_stop_writes_trigger: self.level0_stop_writes_trigger,
+            soft_pending_compaction_bytes_limit: self.soft_pending_compaction_bytes_limit,
+            hard_pending_compaction_bytes_limit: self.hard_pending_compaction_bytes_limit,
+            max_write_buffer_number: self.max_write_buffer_number,
         }
     }
 }

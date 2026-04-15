@@ -49,6 +49,7 @@ impl CompactionScheduler {
         sst_dir: Arc<Path>,
         cache: Arc<BlockCache>,
         opts: CompactionOptions,
+        stall_signal: Arc<crate::engine::StallSignal>,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let trigger = Arc::new((Mutex::new(false), Condvar::new()));
@@ -68,6 +69,7 @@ impl CompactionScheduler {
                     sst_dir,
                     cache,
                     opts,
+                    stall_signal,
                 );
             })
             .expect("failed to spawn compaction thread");
@@ -163,6 +165,7 @@ fn compaction_loop(
     sst_dir: Arc<Path>,
     cache: Arc<BlockCache>,
     opts: CompactionOptions,
+    stall_signal: Arc<crate::engine::StallSignal>,
 ) {
     loop {
         // Wait for trigger or periodic check
@@ -213,6 +216,11 @@ fn compaction_loop(
                     }
                 }
             };
+
+            // After each pass, wake any foreground writer that was
+            // blocked by a "stop writes" condition so it can re-check
+            // thresholds against the freshly-updated version.
+            stall_signal.notify_all();
 
             if !did_work || shutdown.load(Ordering::Acquire) {
                 break;

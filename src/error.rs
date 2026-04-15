@@ -5,10 +5,11 @@ pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     /// The engine refused to block the caller and returned early.
-    /// Today this is reserved for future use by `WriteOptions::no_slowdown`
-    /// once write-stall / rate-limiter plumbing lands — the flag is
-    /// accepted but the engine never actually stalls, so this variant
-    /// is currently unreachable via the public API.
+    /// Returned when [`crate::WriteOptions::no_slowdown`] is set and
+    /// the engine is currently stalling writes (too many L0 files,
+    /// too many unflushed memtables, or pending compaction bytes
+    /// over the hard limit). The included string names the active
+    /// stall condition for diagnostics.
     #[error("engine busy: {0}")]
     Busy(&'static str),
     /// The configured [`crate::MergeOperator`] returned `None` when
