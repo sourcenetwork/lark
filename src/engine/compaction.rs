@@ -117,6 +117,7 @@ pub(crate) struct CompactionOptions {
     pub(crate) prefix_extractor: Option<Arc<dyn crate::options::PrefixExtractor>>,
     pub(crate) merge_operator: Option<Arc<dyn crate::options::MergeOperator>>,
     pub(crate) listeners: Vec<Arc<dyn crate::event_listener::EventListener>>,
+    pub(crate) statistics: Option<Arc<crate::statistics::Statistics>>,
 }
 
 impl CompactionOptions {
@@ -145,6 +146,7 @@ impl Default for CompactionOptions {
             prefix_extractor: None,
             merge_operator: None,
             listeners: Vec::new(),
+            statistics: None,
         }
     }
 }
@@ -660,6 +662,27 @@ fn perform_compaction(
     // through any `Arc<LiveSst>` still held by older versions or by
     // iterators, so the data remains readable until those Arcs drop.
     delete_old_files(sst_dir, &input_files, &overlap_files, cache);
+
+    // Publish compaction statistics. Bytes-in is the sum of
+    // every input file's on-disk size; bytes-out is the sum of
+    // the freshly-emitted output files. Both the foreground
+    // `compact_range` path and the background scheduler route
+    // through this function, so the tickers cover both.
+    if let Some(s) = opts.statistics.as_deref() {
+        let bytes_in: u64 = input_files
+            .iter()
+            .chain(overlap_files.iter())
+            .map(|f| f.meta.file_size)
+            .sum();
+        let bytes_out: u64 = output_file_infos.iter().map(|f| f.file_size).sum();
+        s.add(crate::statistics::Ticker::CompactionCount, 1);
+        s.add(crate::statistics::Ticker::CompactionBytesRead, bytes_in);
+        s.add(crate::statistics::Ticker::CompactionBytesWritten, bytes_out);
+        s.record(
+            crate::statistics::Histogram::CompactionTime,
+            compaction_start.elapsed().as_micros() as u64,
+        );
+    }
 
     // Dispatch compaction completion + per-file creation +
     // per-file deletion events to registered listeners. The

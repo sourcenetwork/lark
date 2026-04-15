@@ -10,9 +10,11 @@
 //! without invalidating in-flight reads.
 
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::engine::iterator::LarkIterator;
 use crate::engine::LarkEngine;
+use crate::statistics::{Histogram, Statistics, Ticker, TimeScope};
 use crate::Result;
 
 /// Streaming iterator over a consistent view of the database.
@@ -46,6 +48,11 @@ use crate::Result;
 /// ```
 pub struct Iter<'a> {
     inner: LarkIterator,
+    /// Optional statistics sink captured from the parent `Db`'s
+    /// options at construction time. Seek / next / prev all fire
+    /// ticker increments and timing histograms through this
+    /// handle, guarded by a single `Option` branch.
+    stats: Option<Arc<Statistics>>,
     // Ties the iterator's lifetime to its parent `Db` / `Snapshot` so the
     // borrow checker prevents the iterator from outliving the engine it
     // was built from.
@@ -56,7 +63,25 @@ impl<'a> Iter<'a> {
     pub(crate) fn from_internal(inner: LarkIterator) -> Self {
         Self {
             inner,
+            stats: None,
             _marker: PhantomData,
+        }
+    }
+
+    pub(crate) fn with_stats(mut self, stats: Option<Arc<Statistics>>) -> Self {
+        self.stats = stats;
+        self
+    }
+
+    fn tick_seek(&self) {
+        if let Some(s) = self.stats.as_deref() {
+            s.add(Ticker::IterSeekCount, 1);
+        }
+    }
+
+    fn tick_next(&self) {
+        if let Some(s) = self.stats.as_deref() {
+            s.add(Ticker::IterNextCount, 1);
         }
     }
 
@@ -64,6 +89,8 @@ impl<'a> Iter<'a> {
     /// scan direction to forward, so subsequent [`next`](Self::next)
     /// calls advance alphabetically.
     pub fn seek(&mut self, target: &[u8]) {
+        self.tick_seek();
+        let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterSeek);
         self.inner.seek(target);
     }
 
@@ -72,6 +99,8 @@ impl<'a> Iter<'a> {
     /// calls walk backward. Calling [`next`](Self::next) after
     /// `seek_for_prev` flips direction and moves alphabetically forward.
     pub fn seek_for_prev(&mut self, target: &[u8]) {
+        self.tick_seek();
+        let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterSeek);
         self.inner.seek_for_prev(target);
     }
 
@@ -88,18 +117,24 @@ impl<'a> Iter<'a> {
     ///
     /// [`PrefixExtractor`]: crate::PrefixExtractor
     pub fn seek_prefix(&mut self, prefix: &[u8]) {
+        self.tick_seek();
+        let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterSeek);
         self.inner.seek_prefix(prefix);
     }
 
     /// Position the iterator at the smallest user key in the database.
     /// Sets the scan direction to forward.
     pub fn seek_to_first(&mut self) {
+        self.tick_seek();
+        let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterSeek);
         self.inner.seek_to_first();
     }
 
     /// Position the iterator at the largest user key in the database.
     /// Sets the scan direction to reverse.
     pub fn seek_to_last(&mut self) {
+        self.tick_seek();
+        let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterSeek);
         self.inner.seek_to_last();
     }
 
@@ -107,14 +142,25 @@ impl<'a> Iter<'a> {
     /// walking backward, direction flips before the advance. A no-op if
     /// the iterator is not valid.
     pub fn next(&mut self) {
+        let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterNext);
         self.inner.next();
+        // Only count the step when it produced a key — an
+        // end-of-stream `next` that invalidates the iterator
+        // should not inflate the counter.
+        if self.inner.valid() {
+            self.tick_next();
+        }
     }
 
     /// Step back to the previous user key alphabetically. If the
     /// iterator was walking forward, direction flips before the step.
     /// A no-op if the iterator is not valid.
     pub fn prev(&mut self) {
+        let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterNext);
         self.inner.prev();
+        if self.inner.valid() {
+            self.tick_next();
+        }
     }
 
     /// Whether the iterator currently points at a valid `(key, value)`

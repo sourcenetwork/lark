@@ -51,6 +51,7 @@ mod event_listener;
 mod iter;
 mod options;
 mod sst_file_writer;
+mod statistics;
 mod transaction;
 mod ttl;
 
@@ -69,6 +70,7 @@ pub use options::{
     MergeOperator, Options, PrefixExtractor, WriteOptions,
 };
 pub use sst_file_writer::{IngestOptions, SstFileMeta, SstFileWriter};
+pub use statistics::{Histogram, HistogramSnapshot, Statistics, Ticker};
 pub use transaction::{
     OptimisticTransactionDb, Transaction, TransactionDb, TransactionError, TxResult,
 };
@@ -217,8 +219,26 @@ impl Db {
     /// by the CF metadata loader and by other modules (e.g. the
     /// `_cf` wrappers above) that have already prefixed the key.
     fn get_raw(&self, prefixed_key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let stats = self.stats();
+        let _scope = statistics::TimeScope::new(stats, Histogram::DbGet);
+        if let Some(s) = stats {
+            s.add(Ticker::KeysRead, 1);
+        }
         let seq = self.engine.snapshot_seq();
-        self.engine.get(prefixed_key, seq).map_err(Error::Io)
+        let result = self.engine.get(prefixed_key, seq).map_err(Error::Io);
+        if let (Some(s), Ok(Some(v))) = (stats, &result) {
+            s.add(Ticker::BytesRead, v.len() as u64);
+            s.record(Histogram::BytesPerRead, v.len() as u64);
+        }
+        result
+    }
+
+    /// Helper that exposes a borrowed reference to the engine's
+    /// `Statistics` (if any) so instrumented methods can call
+    /// `stats.add(..)` / `stats.record(..)` through a single
+    /// `Option::is_some` check.
+    fn stats(&self) -> Option<&Statistics> {
+        self.engine.statistics()
     }
 
     /// Look up a batch of keys in the default column family.
@@ -246,6 +266,14 @@ impl Db {
     /// Set a key-value pair in the default column family with an
     /// explicit [`WriteOptions`] override.
     pub fn put_opt(&self, opts: &WriteOptions, key: &[u8], value: &[u8]) -> Result<()> {
+        let stats = self.stats();
+        let _scope = statistics::TimeScope::new(stats, Histogram::DbWrite);
+        let bytes = (key.len() + value.len()) as u64;
+        if let Some(s) = stats {
+            s.add(Ticker::KeysWritten, 1);
+            s.add(Ticker::BytesWritten, bytes);
+            s.record(Histogram::BytesPerWrite, bytes);
+        }
         let mut batch = BTreeMap::new();
         batch.insert(prefix_key(DEFAULT_CF_ID, key), Some(value.to_vec()));
         let (dm, disable_wal) = self.resolve_write_opts(opts);
@@ -263,6 +291,9 @@ impl Db {
     /// Delete a key from the default column family with an
     /// explicit [`WriteOptions`] override.
     pub fn delete_opt(&self, opts: &WriteOptions, key: &[u8]) -> Result<()> {
+        if let Some(s) = self.stats() {
+            s.add(Ticker::KeysDeleted, 1);
+        }
         let mut batch = BTreeMap::new();
         batch.insert(prefix_key(DEFAULT_CF_ID, key), None);
         let (dm, disable_wal) = self.resolve_write_opts(opts);
@@ -284,6 +315,9 @@ impl Db {
 
     /// [`Db::merge`] with an explicit [`WriteOptions`] override.
     pub fn merge_opt(&self, opts: &WriteOptions, key: &[u8], operand: &[u8]) -> Result<()> {
+        if let Some(s) = self.stats() {
+            s.add(Ticker::MergesWritten, 1);
+        }
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
             .apply_batch(
@@ -316,6 +350,9 @@ impl Db {
         if start >= end {
             return Ok(());
         }
+        if let Some(s) = self.stats() {
+            s.add(Ticker::RangeDeletesWritten, 1);
+        }
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
             .apply_batch(
@@ -342,6 +379,34 @@ impl Db {
     pub fn write_opt(&self, opts: &WriteOptions, batch: WriteBatch) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
+        }
+        let stats = self.stats();
+        let _scope = statistics::TimeScope::new(stats, Histogram::DbWrite);
+        if let Some(s) = stats {
+            let mut bytes: u64 = 0;
+            let mut puts: u64 = 0;
+            let mut deletes: u64 = 0;
+            for (k, v) in &batch.ops {
+                match v {
+                    Some(val) => {
+                        puts += 1;
+                        bytes += (k.len() + val.len()) as u64;
+                    }
+                    None => {
+                        deletes += 1;
+                        bytes += k.len() as u64;
+                    }
+                }
+            }
+            s.add(Ticker::KeysWritten, puts);
+            s.add(Ticker::KeysDeleted, deletes);
+            s.add(Ticker::BytesWritten, bytes);
+            s.add(
+                Ticker::RangeDeletesWritten,
+                batch.range_deletes.len() as u64,
+            );
+            s.add(Ticker::MergesWritten, batch.merges.len() as u64);
+            s.record(Histogram::BytesPerWrite, bytes);
         }
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
@@ -444,7 +509,7 @@ impl Db {
     /// used by [`Db::iter_cf`] via `CfIter`.
     fn raw_iter(&self) -> Iter<'_> {
         let seq = self.engine.snapshot_seq();
-        Iter::from_internal(self.engine.new_iter(seq))
+        Iter::from_internal(self.engine.new_iter(seq)).with_stats(self.engine.statistics_arc())
     }
 
     /// Delete all data in the database.
@@ -948,7 +1013,8 @@ impl Snapshot {
     /// (default CF). Keys returned have the CF prefix stripped.
     pub fn iter(&self) -> CfIter<'_> {
         CfIter {
-            inner: Iter::from_internal(self.engine.new_iter(self.seq)),
+            inner: Iter::from_internal(self.engine.new_iter(self.seq))
+                .with_stats(self.engine.statistics_arc()),
             cf_id: DEFAULT_CF_ID,
             upper_bound: cf_upper_bound(DEFAULT_CF_ID),
         }
@@ -995,7 +1061,8 @@ impl Snapshot {
     /// CF-scoped streaming iterator at this snapshot.
     pub fn iter_cf<'a>(&'a self, cf: &ColumnFamilyHandle) -> CfIter<'a> {
         CfIter {
-            inner: Iter::from_internal(self.engine.new_iter(self.seq)),
+            inner: Iter::from_internal(self.engine.new_iter(self.seq))
+                .with_stats(self.engine.statistics_arc()),
             cf_id: cf.id(),
             upper_bound: cf_upper_bound(cf.id()),
         }
@@ -4412,5 +4479,262 @@ mod tests {
         );
         assert_eq!(info.output_level, info.input_level + 1);
         assert!(!info.output_files.is_empty(), "compaction produced outputs");
+    }
+
+    // ── statistics ──────────────────────────────────────────────────────
+
+    fn stats_opts(stats: Arc<Statistics>) -> Options {
+        Options {
+            statistics: Some(stats),
+            ..Options::default()
+        }
+    }
+
+    fn tiny_flush_stats_opts(stats: Arc<Statistics>) -> Options {
+        Options {
+            write_buffer_size: 4 * 1024,
+            statistics: Some(stats),
+            ..Options::default()
+        }
+    }
+
+    #[test]
+    fn test_stats_keys_written_and_bytes_written() {
+        let stats = Arc::new(Statistics::new());
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), stats_opts(stats.clone())).unwrap();
+        db.put(b"k1", b"value1").unwrap();
+        db.put(b"k2", b"value2").unwrap();
+        assert_eq!(stats.get_ticker(Ticker::KeysWritten), 2);
+        // Expected bytes = 2 + 6 + 2 + 6 = 16
+        assert_eq!(stats.get_ticker(Ticker::BytesWritten), 16);
+    }
+
+    #[test]
+    fn test_stats_keys_read_and_bytes_read() {
+        let stats = Arc::new(Statistics::new());
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), stats_opts(stats.clone())).unwrap();
+        db.put(b"k", b"value").unwrap();
+        db.get(b"k").unwrap();
+        db.get(b"missing").unwrap();
+        assert_eq!(stats.get_ticker(Ticker::KeysRead), 2);
+        // Only the found value contributes to BytesRead.
+        assert_eq!(stats.get_ticker(Ticker::BytesRead), 5);
+        let get_hist = stats.get_histogram_snapshot(Histogram::DbGet);
+        assert_eq!(get_hist.count, 2);
+    }
+
+    #[test]
+    fn test_stats_delete_counter() {
+        let stats = Arc::new(Statistics::new());
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), stats_opts(stats.clone())).unwrap();
+        db.put(b"k", b"v").unwrap();
+        db.delete(b"k").unwrap();
+        assert_eq!(stats.get_ticker(Ticker::KeysDeleted), 1);
+    }
+
+    #[test]
+    fn test_stats_block_cache_hit_and_miss_populate() {
+        // After a deterministic flush + compact_range (so no
+        // concurrent background compaction can race the reads
+        // and contaminate the counters), every point lookup
+        // that reaches a data block fires either a hit or a
+        // miss on the block cache. We don't assert the strict
+        // `adds == misses` invariant here — LRU eviction plus
+        // any lingering background work can perturb that
+        // equality on fast machines. The weaker "both hits and
+        // misses see traffic" is the observable contract.
+        let stats = Arc::new(Statistics::new());
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_stats_opts(stats.clone())).unwrap();
+        for i in 0..200 {
+            db.put(format!("k_{i:05}").as_bytes(), b"value").unwrap();
+        }
+        force_flush(&db, "cache");
+        // Drain any pending compaction before measuring.
+        db.compact_range(None, None).unwrap();
+        stats.reset();
+        // Read the same few keys twice: the first read is a
+        // miss + add, the second is a hit.
+        for _ in 0..2 {
+            for i in 0..5 {
+                db.get(format!("k_{i:05}").as_bytes()).unwrap();
+            }
+        }
+        let hits = stats.get_ticker(Ticker::BlockCacheHit);
+        let misses = stats.get_ticker(Ticker::BlockCacheMiss);
+        let adds = stats.get_ticker(Ticker::BlockCacheAdd);
+        assert!(misses > 0, "expected at least one block cache miss");
+        assert!(hits > 0, "expected at least one block cache hit");
+        // `adds` tracks inserts after a miss — it can never
+        // exceed `misses`.
+        assert!(adds <= misses, "adds={adds} misses={misses}");
+    }
+
+    #[test]
+    fn test_stats_bloom_filter_useful_increments_on_absent_key() {
+        // Deterministic layout: write 200 keys spaced on even
+        // suffixes (so the resulting SST covers `[k_00000,
+        // k_00398]`), compact to L1, then query odd suffixes
+        // within that range. The partition_point-based file
+        // lookup lands on the single L1 file for every query
+        // and the bloom has a chance to say "not present".
+        let stats = Arc::new(Statistics::new());
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_stats_opts(stats.clone())).unwrap();
+        for i in 0..200 {
+            let even = i * 2;
+            db.put(format!("k_{even:05}").as_bytes(), b"v").unwrap();
+        }
+        force_flush(&db, "bloom");
+        db.compact_range(None, None).unwrap();
+        stats.reset();
+        // Query 100 absent (odd-suffix) keys inside the range.
+        // With ~10 bits/key the false-positive rate is ~1%, so
+        // almost all queries will register as "useful".
+        for i in 0..100 {
+            let odd = i * 2 + 1;
+            db.get(format!("k_{odd:05}").as_bytes()).unwrap();
+        }
+        let useful = stats.get_ticker(Ticker::BloomFilterUseful);
+        assert!(
+            useful > 0,
+            "bloom filter should have ruled out at least one absent key"
+        );
+    }
+
+    #[test]
+    fn test_stats_bloom_filter_full_positive_on_present_key() {
+        let stats = Arc::new(Statistics::new());
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_stats_opts(stats.clone())).unwrap();
+        for i in 0..100 {
+            db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
+        }
+        force_flush(&db, "bloom_pos");
+        db.compact_range(None, None).unwrap();
+        stats.reset();
+        for i in 0..100 {
+            db.get(format!("k_{i:04}").as_bytes()).unwrap();
+        }
+        let pos = stats.get_ticker(Ticker::BloomFilterFullPositive);
+        assert!(
+            pos > 0,
+            "bloom filter should have returned 'maybe' and we found the key"
+        );
+    }
+
+    #[test]
+    fn test_stats_flush_and_compaction_counters() {
+        let stats = Arc::new(Statistics::new());
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_stats_opts(stats.clone())).unwrap();
+        for i in 0..200 {
+            db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
+        }
+        force_flush(&db, "fcstats");
+        db.compact_range(None, None).unwrap();
+        assert!(stats.get_ticker(Ticker::FlushCount) >= 1);
+        assert!(stats.get_ticker(Ticker::FlushBytesWritten) > 0);
+        assert!(stats.get_ticker(Ticker::CompactionCount) >= 1);
+        assert!(stats.get_ticker(Ticker::CompactionBytesRead) > 0);
+        assert!(stats.get_ticker(Ticker::CompactionBytesWritten) > 0);
+        assert!(stats.get_histogram_snapshot(Histogram::FlushTime).count > 0);
+        assert!(
+            stats
+                .get_histogram_snapshot(Histogram::CompactionTime)
+                .count
+                > 0
+        );
+    }
+
+    #[test]
+    fn test_stats_wal_counters() {
+        let stats = Arc::new(Statistics::new());
+        let dir = TempDir::new().unwrap();
+        let opts = Options {
+            statistics: Some(stats.clone()),
+            durability: DurabilityMode::Immediate,
+            ..Options::default()
+        };
+        let db = Db::open(dir.path(), opts).unwrap();
+        db.put(b"k", b"v").unwrap();
+        db.put(b"k2", b"v2").unwrap();
+        assert!(stats.get_ticker(Ticker::WalBytesWritten) > 0);
+        // Immediate durability fsyncs per call.
+        assert_eq!(stats.get_ticker(Ticker::WalSyncCount), 2);
+        assert!(stats.get_histogram_snapshot(Histogram::WalWriteTime).count >= 2);
+    }
+
+    #[test]
+    fn test_stats_iter_seek_and_next_counters() {
+        let stats = Arc::new(Statistics::new());
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), stats_opts(stats.clone())).unwrap();
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        db.put(b"c", b"3").unwrap();
+        let mut it = db.iter();
+        it.seek_to_first();
+        while it.valid() {
+            it.next();
+        }
+        assert!(stats.get_ticker(Ticker::IterSeekCount) >= 1);
+        // Two `next` calls produced keys (b, c); the third
+        // invalidated and doesn't count.
+        assert_eq!(stats.get_ticker(Ticker::IterNextCount), 2);
+    }
+
+    #[test]
+    fn test_stats_snapshot_register_release() {
+        let stats = Arc::new(Statistics::new());
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), stats_opts(stats.clone())).unwrap();
+        {
+            let _snap = db.snapshot();
+        }
+        assert_eq!(stats.get_ticker(Ticker::SnapshotsRegistered), 1);
+        assert_eq!(stats.get_ticker(Ticker::SnapshotsReleased), 1);
+    }
+
+    #[test]
+    fn test_stats_reset_clears_everything() {
+        let stats = Arc::new(Statistics::new());
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), stats_opts(stats.clone())).unwrap();
+        db.put(b"k", b"v").unwrap();
+        assert!(stats.get_ticker(Ticker::KeysWritten) > 0);
+        stats.reset();
+        assert_eq!(stats.get_ticker(Ticker::KeysWritten), 0);
+        assert_eq!(stats.get_ticker(Ticker::BytesWritten), 0);
+    }
+
+    #[test]
+    fn test_stats_none_configured_is_noop() {
+        // Sanity: with statistics disabled every hot path still
+        // works and nothing panics.
+        let (db, _dir) = open_tmp();
+        db.put(b"k", b"v").unwrap();
+        assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn test_stats_dump_is_non_empty_and_contains_every_ticker() {
+        let stats = Arc::new(Statistics::new());
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), stats_opts(stats.clone())).unwrap();
+        db.put(b"k", b"v").unwrap();
+        let dump = stats.dump();
+        for ticker_name in [
+            "lark.bytes_written",
+            "lark.keys_written",
+            "lark.bloom_filter_useful",
+            "lark.compaction_count",
+            "lark.flush_count",
+        ] {
+            assert!(dump.contains(ticker_name), "dump missing {ticker_name}");
+        }
     }
 }

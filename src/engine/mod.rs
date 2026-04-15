@@ -66,6 +66,7 @@ pub(crate) struct EngineOptions {
     pub(crate) prefix_extractor: Option<Arc<dyn crate::options::PrefixExtractor>>,
     pub(crate) merge_operator: Option<Arc<dyn crate::options::MergeOperator>>,
     pub(crate) listeners: Vec<Arc<dyn crate::event_listener::EventListener>>,
+    pub(crate) statistics: Option<Arc<crate::statistics::Statistics>>,
 }
 
 impl EngineOptions {
@@ -97,6 +98,7 @@ impl Default for EngineOptions {
             prefix_extractor: None,
             merge_operator: None,
             listeners: Vec::new(),
+            statistics: None,
         }
     }
 }
@@ -189,7 +191,9 @@ impl LarkEngine {
 
         version_set.apply(&[VersionEdit::SetNextFileId(wal_id + 1)])?;
 
-        let cache = Arc::new(BlockCache::new(options.block_cache_size));
+        let cache = Arc::new(
+            BlockCache::new(options.block_cache_size).with_stats(options.statistics.clone()),
+        );
         let versions = Arc::new(Mutex::new(version_set));
 
         let compaction_opts = CompactionOptions {
@@ -205,6 +209,7 @@ impl LarkEngine {
             prefix_extractor: options.prefix_extractor.clone(),
             merge_operator: options.merge_operator.clone(),
             listeners: options.listeners.clone(),
+            statistics: options.statistics.clone(),
         };
 
         let compaction_lock = Arc::new(Mutex::new(()));
@@ -242,17 +247,38 @@ impl LarkEngine {
         self.latest_seq.load(Ordering::Acquire)
     }
 
+    /// Borrow the engine's `Statistics` sink if one is configured.
+    /// Returning `Option<&Statistics>` lets instrumented call
+    /// sites branch on a single `is_some()` check rather than
+    /// cloning an `Arc` per operation.
+    pub(crate) fn statistics(&self) -> Option<&crate::statistics::Statistics> {
+        self.options.statistics.as_deref()
+    }
+
+    /// Clone the statistics `Arc` for consumers (like the public
+    /// `Iter`) that need to carry the handle across a lifetime
+    /// boundary where a borrowed reference wouldn't reach.
+    pub(crate) fn statistics_arc(&self) -> Option<Arc<crate::statistics::Statistics>> {
+        self.options.statistics.clone()
+    }
+
     /// Register a new live snapshot at `seq` so compaction keeps
     /// every version it might need to see. Balanced by
     /// [`Self::release_snapshot`] when the snapshot drops.
     pub(crate) fn register_snapshot(&self, seq: u64) {
         self.snapshot_registry.register(seq);
+        if let Some(s) = self.statistics() {
+            s.add(crate::statistics::Ticker::SnapshotsRegistered, 1);
+        }
     }
 
     /// Release a snapshot pin previously taken via
     /// [`Self::register_snapshot`].
     pub(crate) fn release_snapshot(&self, seq: u64) {
         self.snapshot_registry.release(seq);
+        if let Some(s) = self.statistics() {
+            s.add(crate::statistics::Ticker::SnapshotsReleased, 1);
+        }
     }
 
     /// Current GC horizon for compaction — the smallest live snapshot
@@ -799,25 +825,45 @@ impl LarkEngine {
         let merge_base = range_delete_base + range_deletes.len() as u64;
 
         if !disable_wal {
+            let wal_start = std::time::Instant::now();
             let mut wal = self.active_wal.lock();
+            let mut wal_bytes: u64 = 0;
             for (i, (key, value)) in point_ops.iter().enumerate() {
                 let seq = base_seq + i as u64;
                 match value {
-                    Some(v) => wal.append_put(key, v, seq)?,
-                    None => wal.append_delete(key, seq)?,
+                    Some(v) => {
+                        wal.append_put(key, v, seq)?;
+                        wal_bytes += (key.len() + v.len() + 8) as u64;
+                    }
+                    None => {
+                        wal.append_delete(key, seq)?;
+                        wal_bytes += (key.len() + 8) as u64;
+                    }
                 }
             }
             for (j, (start, end)) in range_deletes.iter().enumerate() {
                 let seq = range_delete_base + j as u64;
                 wal.append_delete_range(start, end, seq)?;
+                wal_bytes += (start.len() + end.len() + 8) as u64;
             }
             for (k, (key, operand)) in merges.iter().enumerate() {
                 let seq = merge_base + k as u64;
                 wal.append_merge(key, operand, seq)?;
+                wal_bytes += (key.len() + operand.len() + 8) as u64;
             }
             match durability {
                 DurabilityMode::Immediate => wal.sync()?,
                 DurabilityMode::Eventual => wal.flush()?,
+            }
+            if let Some(s) = self.statistics() {
+                s.add(crate::statistics::Ticker::WalBytesWritten, wal_bytes);
+                if matches!(durability, DurabilityMode::Immediate) {
+                    s.add(crate::statistics::Ticker::WalSyncCount, 1);
+                }
+                s.record(
+                    crate::statistics::Histogram::WalWriteTime,
+                    wal_start.elapsed().as_micros() as u64,
+                );
             }
         }
 
@@ -1058,6 +1104,18 @@ impl LarkEngine {
         let _ = Wal::remove(old_wal.path());
         self.compaction.lock().notify();
 
+        // Publish flush statistics before the listener dispatch
+        // so callers that react to `on_flush_completed` can
+        // already see the updated tickers.
+        if let Some(s) = self.statistics() {
+            s.add(crate::statistics::Ticker::FlushCount, 1);
+            s.add(crate::statistics::Ticker::FlushBytesWritten, file_size);
+            s.record(
+                crate::statistics::Histogram::FlushTime,
+                flush_start.elapsed().as_micros() as u64,
+            );
+        }
+
         // Dispatch lifecycle events to any registered listeners.
         // Two callbacks fire per flush: `on_table_file_created`
         // for the new SSTable and `on_flush_completed` with
@@ -1161,6 +1219,7 @@ impl LarkEngine {
             prefix_extractor: self.options.prefix_extractor.clone(),
             merge_operator: self.options.merge_operator.clone(),
             listeners: self.options.listeners.clone(),
+            statistics: self.options.statistics.clone(),
         };
         compaction::run_compact_range(
             &self.versions,
