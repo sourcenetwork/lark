@@ -42,6 +42,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod backup;
+mod checkpoint;
 mod engine;
 mod error;
 mod iter;
@@ -49,6 +51,8 @@ mod options;
 mod sst_file_writer;
 mod ttl;
 
+pub use backup::{BackupEngine, BackupId, BackupInfo};
+pub use checkpoint::Checkpoint;
 pub use error::Error;
 pub use iter::Iter;
 pub use options::{
@@ -310,6 +314,21 @@ impl Db {
     #[cfg(test)]
     pub(crate) fn level_file_count(&self, level: usize) -> usize {
         self.engine.level_file_count(level)
+    }
+
+    /// Create a hard-linked [`Checkpoint`] of the database.
+    ///
+    /// Equivalent to [`Checkpoint::new`] followed by
+    /// [`Checkpoint::create`]. The call briefly flushes the active
+    /// memtable and compacts the manifest before any files are
+    /// linked; concurrent writers continue to make progress.
+    pub fn checkpoint<P: AsRef<Path>>(&self, target_dir: P) -> Result<()> {
+        let cp = Checkpoint::new(self)?;
+        cp.create(target_dir)
+    }
+
+    pub(crate) fn engine(&self) -> &LarkEngine {
+        &self.engine
     }
 }
 

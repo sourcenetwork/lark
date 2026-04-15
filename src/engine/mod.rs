@@ -973,6 +973,71 @@ impl LarkEngine {
         Ok(())
     }
 
+    /// Atomically capture a consistent snapshot of the on-disk state
+    /// for checkpoint / backup purposes.
+    ///
+    /// Flushes the active memtable (if non-empty) under the write
+    /// lock so every live byte is in an SSTable, compacts the
+    /// manifest so the on-disk form is a single rewrite of the
+    /// current version, and returns the captured `Arc<Version>` plus
+    /// the paths of the files a caller needs to copy or hard-link.
+    ///
+    /// The returned [`CheckpointSnapshot`] holds the engine's
+    /// compaction lock, pinning every referenced file against
+    /// concurrent unlink. Callers MUST drop the snapshot as soon as
+    /// their filesystem work is done — a snapshot whose lifetime
+    /// outlives the enclosing function scope can deadlock a
+    /// concurrent `db.close()` / `drop(db)` that joins the background
+    /// compaction thread (the thread will block on the same lock the
+    /// snapshot holds).
+    pub(crate) fn checkpoint_capture(&self) -> std::io::Result<CheckpointSnapshot> {
+        {
+            let has_any = {
+                let mt = self.active_memtable.read();
+                !mt.is_empty() || !mt.clone_range_tombstones().is_empty()
+            };
+            if has_any {
+                let _write_guard = self.write_lock.lock();
+                let still_has_any = {
+                    let mt = self.active_memtable.read();
+                    !mt.is_empty() || !mt.clone_range_tombstones().is_empty()
+                };
+                if still_has_any {
+                    self.rotate_memtable()?;
+                }
+            }
+        }
+
+        let compaction_guard = self.compaction_lock.lock_arc();
+
+        let version;
+        let manifest_path;
+        let manifest_len;
+        {
+            let mut versions = self.versions.lock();
+            versions.compact_manifest()?;
+            version = versions.current();
+            manifest_path = versions.manifest_path().to_path_buf();
+            // Record the manifest's on-disk size immediately after
+            // compaction so a later copy can truncate at the exact
+            // captured boundary. Concurrent flushes still append
+            // `AddFile` records (they take `versions.lock()` but not
+            // the compaction lock we're holding), and those records
+            // reference files that are *not* in the captured version
+            // — copying them into a checkpoint manifest would cause
+            // recovery to fail on the missing files.
+            manifest_len = std::fs::metadata(&manifest_path)?.len();
+        }
+
+        Ok(CheckpointSnapshot {
+            version,
+            manifest_path,
+            manifest_len,
+            sst_dir: self.sst_dir.clone(),
+            _compaction_guard: compaction_guard,
+        })
+    }
+
     /// Drop all data in the engine.
     pub(crate) fn drop_all(&self) -> std::io::Result<()> {
         let _write_guard = self.write_lock.lock();
@@ -1171,6 +1236,39 @@ fn compute_target_level(
     }
     // Every level is disjoint (or empty): land at the deepest level.
     Ok(manifest::MAX_LEVELS - 1)
+}
+
+/// A consistent snapshot of on-disk state captured by
+/// [`LarkEngine::checkpoint_capture`]. Holds the engine's compaction
+/// lock for its entire lifetime, so no background or foreground
+/// compaction can unlink files referenced by `version` while the
+/// snapshot is alive. Callers MUST drop this snapshot as soon as
+/// they are done with the filesystem work — a snapshot whose
+/// lifetime outlives the enclosing function scope can deadlock a
+/// concurrent `db.close()` / `drop(db)` that joins the background
+/// compaction thread (the thread will block waiting for the same
+/// lock the snapshot holds).
+pub(crate) struct CheckpointSnapshot {
+    pub(crate) version: Arc<manifest::Version>,
+    pub(crate) manifest_path: PathBuf,
+    /// Number of bytes at the start of `manifest_path` that belong
+    /// to this captured version. Copiers must truncate at this
+    /// length to avoid picking up `AddFile` records written by
+    /// concurrent flushes after the capture.
+    pub(crate) manifest_len: u64,
+    pub(crate) sst_dir: PathBuf,
+    /// Compaction lock guard, scoped to the snapshot's lifetime.
+    _compaction_guard: parking_lot::ArcMutexGuard<parking_lot::RawMutex, ()>,
+}
+
+impl CheckpointSnapshot {
+    /// Format an SSTable filename for the given file id — exposes
+    /// the engine's naming scheme to callers outside the `engine`
+    /// module so they can stage files into checkpoint / backup
+    /// directories.
+    pub(crate) fn sst_filename(id: u64) -> String {
+        sst_filename(id)
+    }
 }
 
 fn list_wal_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {

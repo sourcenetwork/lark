@@ -234,6 +234,11 @@ impl VersionSet {
         Arc::clone(&*self.current.read())
     }
 
+    /// Path of the manifest file on disk.
+    pub(crate) fn manifest_path(&self) -> &Path {
+        &self.manifest_path
+    }
+
     /// Apply a batch of edits atomically: update the in-memory version
     /// and persist the serialized records to the manifest log.
     pub(crate) fn apply(&mut self, edits: &[VersionEdit]) -> io::Result<()> {
