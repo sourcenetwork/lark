@@ -49,6 +49,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
+use crate::column_family::{prefix_key, DEFAULT_CF_ID};
 use crate::engine::{CommitOutcome, LarkEngine};
 use crate::{Db, Error, Options, Result};
 
@@ -306,17 +307,18 @@ impl<'db> Transaction<'db> {
         }
     }
 
-    /// Read `key`. Returns the buffered write if the transaction
-    /// has already written to `key`, otherwise the value visible
-    /// at the transaction's snapshot. Does **not** register the
-    /// key for conflict detection — use
-    /// [`Transaction::get_for_update`] for that.
+    /// Read `key` from the default column family. Returns the
+    /// buffered write if the transaction has already written to
+    /// `key`, otherwise the value visible at the transaction's
+    /// snapshot. Does **not** register the key for conflict
+    /// detection — use [`Transaction::get_for_update`] for that.
     pub fn get(&self, key: &[u8]) -> TxResult<Option<Vec<u8>>> {
-        if let Some(buffered) = self.writes.get(key) {
+        let prefixed = prefix_key(DEFAULT_CF_ID, key);
+        if let Some(buffered) = self.writes.get(&prefixed) {
             return Ok(buffered.clone());
         }
         self.engine
-            .get(key, self.snapshot_seq)
+            .get(&prefixed, self.snapshot_seq)
             .map_err(TransactionError::Io)
     }
 
@@ -324,24 +326,32 @@ impl<'db> Transaction<'db> {
     /// For pessimistic transactions, also acquires an exclusive
     /// lock on the key for the duration of the transaction.
     pub fn get_for_update(&mut self, key: &[u8]) -> TxResult<Option<Vec<u8>>> {
-        self.acquire_lock_if_needed(key)?;
-        self.conflict_keys.insert(key.to_vec());
-        self.get(key)
+        let prefixed = prefix_key(DEFAULT_CF_ID, key);
+        self.acquire_lock_if_needed(&prefixed)?;
+        self.conflict_keys.insert(prefixed.clone());
+        if let Some(buffered) = self.writes.get(&prefixed) {
+            return Ok(buffered.clone());
+        }
+        self.engine
+            .get(&prefixed, self.snapshot_seq)
+            .map_err(TransactionError::Io)
     }
 
     /// Buffer a put. For pessimistic transactions, acquires an
     /// exclusive lock on the key if not already held.
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> TxResult<()> {
-        self.acquire_lock_if_needed(key)?;
-        self.writes.insert(key.to_vec(), Some(value.to_vec()));
+        let prefixed = prefix_key(DEFAULT_CF_ID, key);
+        self.acquire_lock_if_needed(&prefixed)?;
+        self.writes.insert(prefixed, Some(value.to_vec()));
         Ok(())
     }
 
     /// Buffer a delete. For pessimistic transactions, acquires an
     /// exclusive lock on the key if not already held.
     pub fn delete(&mut self, key: &[u8]) -> TxResult<()> {
-        self.acquire_lock_if_needed(key)?;
-        self.writes.insert(key.to_vec(), None);
+        let prefixed = prefix_key(DEFAULT_CF_ID, key);
+        self.acquire_lock_if_needed(&prefixed)?;
+        self.writes.insert(prefixed, None);
         Ok(())
     }
 
@@ -358,7 +368,10 @@ impl<'db> Transaction<'db> {
         // No lock acquisition for range deletes — the pessimistic
         // lock manager is keyed per user-key, which doesn't match
         // range semantics. A later iteration can add range locks.
-        self.range_deletes.push((start.to_vec(), end.to_vec()));
+        self.range_deletes.push((
+            prefix_key(DEFAULT_CF_ID, start),
+            prefix_key(DEFAULT_CF_ID, end),
+        ));
         Ok(())
     }
 
@@ -366,9 +379,10 @@ impl<'db> Transaction<'db> {
     /// key level — two transactions cannot concurrently merge the
     /// same key under optimistic concurrency control.
     pub fn merge(&mut self, key: &[u8], operand: &[u8]) -> TxResult<()> {
-        self.acquire_lock_if_needed(key)?;
-        self.conflict_keys.insert(key.to_vec());
-        self.merges.push((key.to_vec(), operand.to_vec()));
+        let prefixed = prefix_key(DEFAULT_CF_ID, key);
+        self.acquire_lock_if_needed(&prefixed)?;
+        self.conflict_keys.insert(prefixed.clone());
+        self.merges.push((prefixed, operand.to_vec()));
         Ok(())
     }
 
@@ -460,11 +474,20 @@ impl<'db> Transaction<'db> {
                         key,
                         observed_seq,
                         latest_seq,
-                    } => Err(TransactionError::Conflict {
-                        key,
-                        observed_seq,
-                        latest_seq,
-                    }),
+                    } => {
+                        // Strip the 4-byte CF prefix so the error
+                        // surfaces the user-visible key.
+                        let user_key = if key.len() >= 4 {
+                            key[4..].to_vec()
+                        } else {
+                            key
+                        };
+                        Err(TransactionError::Conflict {
+                            key: user_key,
+                            observed_seq,
+                            latest_seq,
+                        })
+                    }
                 }
             }
             TxMode::Pessimistic { .. } => {
@@ -480,8 +503,16 @@ impl<'db> Transaction<'db> {
         if let TxMode::Pessimistic { tx_id } = self.mode {
             if let Some(lm) = self.lock_manager.as_ref() {
                 if !self.held_locks.iter().any(|k| k.as_slice() == key) {
-                    lm.acquire(key, tx_id, self.lock_timeout)
-                        .map_err(|_| TransactionError::Busy(key.to_vec()))?;
+                    lm.acquire(key, tx_id, self.lock_timeout).map_err(|_| {
+                        // Strip the 4-byte CF prefix so the error
+                        // surfaces the user-visible key.
+                        let user_key = if key.len() >= 4 {
+                            key[4..].to_vec()
+                        } else {
+                            key.to_vec()
+                        };
+                        TransactionError::Busy(user_key)
+                    })?;
                     self.held_locks.push(key.to_vec());
                 }
             }
