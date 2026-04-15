@@ -51,6 +51,7 @@ mod event_listener;
 mod iter;
 mod options;
 mod os_hint;
+mod perf_context;
 mod rate_limiter;
 mod sst_file_writer;
 mod statistics;
@@ -73,6 +74,7 @@ pub use options::{
     FifoCompactionOptions, FixedLengthPrefix, MergeOperator, Options, PrefixExtractor,
     UniversalCompactionOptions, WriteOptions,
 };
+pub use perf_context::{PerfContext, PerfContextSnapshot, PerfLevel};
 pub use rate_limiter::{Priority, RateLimiter, TokenBucketRateLimiter};
 pub use sst_file_writer::{IngestOptions, SstFileMeta, SstFileWriter};
 pub use statistics::{Histogram, HistogramSnapshot, Statistics, Ticker};
@@ -256,6 +258,7 @@ impl Db {
         if let Some(s) = stats {
             s.add(Ticker::KeysRead, 1);
         }
+        perf_context::record_get_call();
         let seq = self.engine.snapshot_seq();
         let result = self.engine.get(prefixed_key, seq).map_err(Error::Io);
         if let (Some(s), Ok(Some(v))) = (stats, &result) {
@@ -307,6 +310,7 @@ impl Db {
             s.add(Ticker::BytesWritten, bytes);
             s.record(Histogram::BytesPerWrite, bytes);
         }
+        perf_context::record_write_call();
         let mut batch = BTreeMap::new();
         batch.insert(prefix_key(DEFAULT_CF_ID, key), Some(value.to_vec()));
         let (dm, disable_wal) = self.resolve_write_opts(opts);
@@ -417,6 +421,7 @@ impl Db {
             return Ok(());
         }
         self.wait_for_write_capacity(opts)?;
+        perf_context::record_write_call();
         let stats = self.stats();
         let _scope = statistics::TimeScope::new(stats, Histogram::DbWrite);
         if let Some(s) = stats {
@@ -5123,6 +5128,50 @@ mod tests {
             Some("0")
         );
         assert_eq!(db.get_property("lark.num-snapshots").as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn test_perf_context_captures_db_get_and_put_activity() {
+        // End-to-end: enable PerfContext timing on the current
+        // thread, do a few writes and reads, then snapshot. The
+        // counters should show one get_count per read, one
+        // write_count per put, and non-zero time in both the
+        // WAL/memtable write phases and the memtable read phase.
+        let (db, _dir) = open_tmp();
+
+        PerfContext::set_level(PerfLevel::EnableTime);
+        PerfContext::reset();
+
+        db.put(b"alpha", b"1").unwrap();
+        db.put(b"beta", b"2").unwrap();
+        db.put(b"gamma", b"3").unwrap();
+
+        let _ = db.get(b"alpha").unwrap();
+        let _ = db.get(b"beta").unwrap();
+
+        let snap = PerfContext::capture();
+        assert_eq!(snap.write_count, 3, "3 puts → write_count 3");
+        assert_eq!(snap.get_count, 2, "2 gets → get_count 2");
+        assert!(
+            snap.write_wal_time_nanos > 0,
+            "WAL phase should record non-zero time under EnableTime"
+        );
+        assert!(
+            snap.write_memtable_time_nanos > 0,
+            "memtable write phase should record non-zero time"
+        );
+        assert!(
+            snap.get_from_memtable_time_nanos > 0,
+            "memtable read phase should record non-zero time"
+        );
+
+        // Disable and confirm subsequent activity is invisible.
+        PerfContext::set_level(PerfLevel::Disable);
+        let before = snap;
+        db.put(b"delta", b"4").unwrap();
+        let _ = db.get(b"alpha").unwrap();
+        let after = PerfContext::capture();
+        assert_eq!(after, before, "Disable level must freeze counters");
     }
 
     #[test]
