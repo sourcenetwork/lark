@@ -121,6 +121,8 @@ pub(crate) struct CompactionOptions {
     pub(crate) listeners: Vec<Arc<dyn crate::event_listener::EventListener>>,
     pub(crate) statistics: Option<Arc<crate::statistics::Statistics>>,
     pub(crate) rate_limiter: Option<Arc<dyn crate::rate_limiter::RateLimiter>>,
+    pub(crate) compaction_style: crate::options::CompactionStyle,
+    pub(crate) fifo_compaction_options: crate::options::FifoCompactionOptions,
 }
 
 impl CompactionOptions {
@@ -151,6 +153,8 @@ impl Default for CompactionOptions {
             listeners: Vec::new(),
             statistics: None,
             rate_limiter: None,
+            compaction_style: crate::options::CompactionStyle::Level,
+            fifo_compaction_options: crate::options::FifoCompactionOptions::default(),
         }
     }
 }
@@ -236,6 +240,32 @@ fn pick_and_run_compaction(
     opts: &CompactionOptions,
     pin_seq: u64,
 ) -> std::io::Result<bool> {
+    match opts.compaction_style {
+        crate::options::CompactionStyle::Level => {
+            pick_and_run_level_compaction(versions, sst_dir, cache, opts, pin_seq)
+        }
+        crate::options::CompactionStyle::Fifo => run_fifo_pass(versions, sst_dir, opts),
+    }
+}
+
+/// Public wrapper for the FIFO picker, used by the synchronous
+/// `compact_range` path so callers can trigger a deterministic
+/// drop of over-cap files.
+pub(crate) fn run_fifo_pass(
+    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    sst_dir: &Path,
+    opts: &CompactionOptions,
+) -> std::io::Result<bool> {
+    pick_and_run_fifo(versions, sst_dir, opts)
+}
+
+fn pick_and_run_level_compaction(
+    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    sst_dir: &Path,
+    cache: &BlockCache,
+    opts: &CompactionOptions,
+    pin_seq: u64,
+) -> std::io::Result<bool> {
     let version = versions.lock().current();
 
     // Check L0 first
@@ -252,6 +282,87 @@ fn pick_and_run_compaction(
     }
 
     Ok(false)
+}
+
+/// FIFO picker: every flush lands a new L0 file, and lark never
+/// merges in this style. After each pass, if the total bytes held
+/// across L0 exceed `max_table_files_size`, we unlink the oldest
+/// file (smallest `file_id`) and emit a `RemoveFile` edit. We stop
+/// when the cap is satisfied or only one file remains — a single
+/// oversized file is not worth deleting because that would lose
+/// data with no successor on disk.
+fn pick_and_run_fifo(
+    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    sst_dir: &Path,
+    opts: &CompactionOptions,
+) -> std::io::Result<bool> {
+    let limit = opts.fifo_compaction_options.max_table_files_size;
+    if limit == 0 {
+        return Ok(false);
+    }
+
+    // Snapshot the current L0 contents under the version lock, then
+    // make decisions outside it so we don't hold the lock across
+    // the unlink syscall.
+    let l0_files: Vec<Arc<crate::engine::sstable::LiveSst>> = {
+        let version = versions.lock().current();
+        version.levels[0].clone()
+    };
+
+    let total: u64 = l0_files.iter().map(|f| f.meta.file_size).sum();
+    if total <= limit {
+        return Ok(false);
+    }
+
+    // Sort by file_id ascending — smaller id was allocated earlier,
+    // so it is the oldest file by construction.
+    let mut by_age: Vec<Arc<crate::engine::sstable::LiveSst>> = l0_files;
+    by_age.sort_by_key(|f| f.meta.file_id);
+
+    let mut running_total = total;
+    let mut edits: Vec<VersionEdit> = Vec::new();
+    let mut removed_paths: Vec<std::path::PathBuf> = Vec::new();
+    for file in &by_age {
+        // Always keep at least one file alive — dropping the only
+        // remaining file would delete every byte of user data the
+        // database currently holds.
+        if by_age.len() - edits.len() <= 1 {
+            break;
+        }
+        if running_total <= limit {
+            break;
+        }
+        edits.push(VersionEdit::RemoveFile {
+            level: 0,
+            file_id: file.meta.file_id,
+        });
+        removed_paths.push(sst_dir.join(sst_filename(file.meta.file_id)));
+        running_total = running_total.saturating_sub(file.meta.file_size);
+    }
+
+    if edits.is_empty() {
+        return Ok(false);
+    }
+
+    versions.lock().apply(&edits)?;
+
+    // Best-effort unlink. The `LiveSst` reader Arcs in older
+    // versions (held by long-running snapshots / iterators) keep
+    // file descriptors open, so the kernel preserves the inode
+    // until those readers drop. A failure here doesn't corrupt the
+    // database — the manifest already reflects the removal.
+    for path in &removed_paths {
+        let _ = std::fs::remove_file(path);
+    }
+
+    if let Some(s) = &opts.statistics {
+        s.add(
+            crate::statistics::Ticker::CompactionCount,
+            edits.len() as u64,
+        );
+    }
+
+    Ok(true)
 }
 
 fn level_target_size(level: usize, opts: &CompactionOptions) -> u64 {
