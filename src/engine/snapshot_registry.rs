@@ -28,7 +28,7 @@ pub(crate) struct SnapshotRegistry {
     /// is O(log n). `earliest_register_unix` is captured on the
     /// first `register` call at a given seq and reused by
     /// subsequent increments so the property
-    /// `rocksdb.oldest-snapshot-time` is stable across refcount
+    /// `lark.oldest-snapshot-time` is stable across refcount
     /// changes.
     active: Mutex<BTreeMap<u64, SlotState>>,
 }
@@ -104,7 +104,7 @@ impl SnapshotRegistry {
     /// Unix-seconds timestamp when the oldest currently-live
     /// snapshot was registered, or `None` when no snapshot is
     /// alive. Used to populate the
-    /// `rocksdb.oldest-snapshot-time` property.
+    /// `lark.oldest-snapshot-time` property.
     pub(crate) fn oldest_snapshot_time_unix(&self) -> Option<u64> {
         self.active
             .lock()

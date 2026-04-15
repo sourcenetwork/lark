@@ -27,17 +27,17 @@
 //!
 //! ## Atomic flush across column families
 //!
-//! RocksDB exposes an `atomic_flush` option that forces every CF's
-//! memtable to flush together so a multi-CF batch cannot be
-//! torn-written across a crash. In lark that guarantee comes for
-//! free from the prefix-based design: one memtable covers every
-//! CF, and flushing it produces one SSTable that either contains
-//! every key in a batch or none of them. The WAL is the source of
-//! truth until the manifest edit lands, so a crash mid-flush
-//! replays the whole batch on reopen.
+//! Because every CF shares one memtable, one WAL, and one
+//! manifest, multi-CF writes are atomic in lark by construction.
+//! A flush produces one SSTable that either contains every key in
+//! a batch or none of them; the WAL is the source of truth until
+//! the manifest edit lands, so a crash mid-flush replays the
+//! whole batch on reopen.
 //!
-//! [`crate::Options::atomic_flush`] is accepted purely for
-//! RocksDB API parity — its value is irrelevant under this design.
+//! [`crate::Options::atomic_flush`] is accepted for parity with
+//! storage engines that require an explicit opt-in to get this
+//! guarantee — under lark's design its value is irrelevant, the
+//! guarantee is always on.
 //!
 //! ## Metadata storage
 //!
