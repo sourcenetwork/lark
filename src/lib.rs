@@ -4050,4 +4050,142 @@ mod tests {
         assert_eq!(default_mt.count, 20);
         assert_eq!(cf_mt.count, 0);
     }
+
+    // ── atomic flush across column families ────────────────────────────
+
+    #[test]
+    fn test_atomic_flush_multi_cf_batch_survives_crash() {
+        // A WriteBatch that touches multiple CFs must be
+        // all-or-nothing across a crash, even when the write
+        // lands in the memtable without an explicit flush.
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Db::open(dir.path(), Options::default()).unwrap();
+            let cf_a = db.create_column_family("a").unwrap();
+            let cf_b = db.create_column_family("b").unwrap();
+            let mut batch = WriteBatch::new();
+            batch.put_cf(&cf_a, b"k1", b"a1");
+            batch.put_cf(&cf_a, b"k2", b"a2");
+            batch.put_cf(&cf_b, b"k1", b"b1");
+            batch.put_cf(&cf_b, b"k2", b"b2");
+            batch.put(b"default_k", b"default_v");
+            db.write(batch).unwrap();
+            // Drop without close — simulate a crash. WAL is the
+            // source of truth; recovery must restore every key.
+        }
+        let db = Db::open(dir.path(), Options::default()).unwrap();
+        let cf_a = db.column_family("a").expect("cf a survives reopen");
+        let cf_b = db.column_family("b").expect("cf b survives reopen");
+        assert_eq!(db.get_cf(&cf_a, b"k1").unwrap(), Some(b"a1".to_vec()));
+        assert_eq!(db.get_cf(&cf_a, b"k2").unwrap(), Some(b"a2".to_vec()));
+        assert_eq!(db.get_cf(&cf_b, b"k1").unwrap(), Some(b"b1".to_vec()));
+        assert_eq!(db.get_cf(&cf_b, b"k2").unwrap(), Some(b"b2".to_vec()));
+        assert_eq!(db.get(b"default_k").unwrap(), Some(b"default_v".to_vec()));
+    }
+
+    #[test]
+    fn test_atomic_flush_cross_cf_survives_rotate_and_flush() {
+        // Drive the memtable past its flush threshold while a
+        // multi-CF batch is in flight. The rotated memtable
+        // produces one L0 SSTable that contains every CF's half
+        // of the batch atomically.
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+        let cf_a = db.create_column_family("a").unwrap();
+        let cf_b = db.create_column_family("b").unwrap();
+
+        // Seed enough filler to push the tiny 4KB buffer over
+        // on the next write.
+        for i in 0..16 {
+            db.put_cf(&cf_a, format!("fill_a_{i:02}").as_bytes(), &[0u8; 256])
+                .unwrap();
+            db.put_cf(&cf_b, format!("fill_b_{i:02}").as_bytes(), &[0u8; 256])
+                .unwrap();
+        }
+
+        let mut batch = WriteBatch::new();
+        batch.put_cf(&cf_a, b"pivot", b"A_PIVOT");
+        batch.put_cf(&cf_b, b"pivot", b"B_PIVOT");
+        db.write(batch).unwrap();
+        force_flush(&db, "atomic");
+
+        assert_eq!(
+            db.get_cf(&cf_a, b"pivot").unwrap(),
+            Some(b"A_PIVOT".to_vec())
+        );
+        assert_eq!(
+            db.get_cf(&cf_b, b"pivot").unwrap(),
+            Some(b"B_PIVOT".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_atomic_flush_empty_cf_mixed_with_populated() {
+        // Creating a CF and leaving it empty while another CF
+        // gets flushed must not corrupt the empty CF.
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+        let cf_populated = db.create_column_family("populated").unwrap();
+        let cf_empty = db.create_column_family("empty").unwrap();
+
+        for i in 0..50 {
+            db.put_cf(&cf_populated, format!("k{i:02}").as_bytes(), b"v")
+                .unwrap();
+        }
+        force_flush(&db, "empty_mix");
+
+        for i in 0..50 {
+            assert_eq!(
+                db.get_cf(&cf_populated, format!("k{i:02}").as_bytes())
+                    .unwrap(),
+                Some(b"v".to_vec())
+            );
+        }
+        assert_eq!(db.get_cf(&cf_empty, b"anything").unwrap(), None);
+
+        // The empty CF still accepts new writes after the flush.
+        db.put_cf(&cf_empty, b"new", b"fresh").unwrap();
+        assert_eq!(
+            db.get_cf(&cf_empty, b"new").unwrap(),
+            Some(b"fresh".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_atomic_flush_option_accepted() {
+        // The flag is a no-op for API parity — both values must
+        // open cleanly and produce the same atomic behavior.
+        let dir = TempDir::new().unwrap();
+        let opts = Options {
+            atomic_flush: true,
+            ..Options::default()
+        };
+        let db = Db::open(dir.path(), opts).unwrap();
+        let cf = db.create_column_family("cf1").unwrap();
+        db.put_cf(&cf, b"k", b"v").unwrap();
+        assert_eq!(db.get_cf(&cf, b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn test_atomic_flush_close_with_pending_multi_cf_writes() {
+        // A clean close with pending multi-CF writes must flush
+        // the active memtable to L0 before returning, so every
+        // CF's state is durable on reopen.
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Db::open(dir.path(), Options::default()).unwrap();
+            let cf_a = db.create_column_family("a").unwrap();
+            let cf_b = db.create_column_family("b").unwrap();
+            let mut batch = WriteBatch::new();
+            batch.put_cf(&cf_a, b"k", b"a");
+            batch.put_cf(&cf_b, b"k", b"b");
+            db.write(batch).unwrap();
+            db.close().unwrap();
+        }
+        let db = Db::open(dir.path(), Options::default()).unwrap();
+        let cf_a = db.column_family("a").unwrap();
+        let cf_b = db.column_family("b").unwrap();
+        assert_eq!(db.get_cf(&cf_a, b"k").unwrap(), Some(b"a".to_vec()));
+        assert_eq!(db.get_cf(&cf_b, b"k").unwrap(), Some(b"b".to_vec()));
+    }
 }

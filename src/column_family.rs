@@ -25,6 +25,20 @@
 //! not available. The issue that introduced this feature explicitly
 //! scopes those out of v1.
 //!
+//! ## Atomic flush across column families
+//!
+//! RocksDB exposes an `atomic_flush` option that forces every CF's
+//! memtable to flush together so a multi-CF batch cannot be
+//! torn-written across a crash. In lark that guarantee comes for
+//! free from the prefix-based design: one memtable covers every
+//! CF, and flushing it produces one SSTable that either contains
+//! every key in a batch or none of them. The WAL is the source of
+//! truth until the manifest edit lands, so a crash mid-flush
+//! replays the whole batch on reopen.
+//!
+//! [`crate::Options::atomic_flush`] is accepted purely for
+//! RocksDB API parity — its value is irrelevant under this design.
+//!
 //! ## Metadata storage
 //!
 //! A reserved [`META_CF_ID`] = `0` holds CF registry entries:

@@ -264,6 +264,15 @@ pub struct Options {
     /// read-modify-write, and readers collapse the merge chain via
     /// [`MergeOperator::full_merge`] at visibility time.
     pub merge_operator: Option<Arc<dyn MergeOperator>>,
+    /// Flag accepted for RocksDB API parity. Lark's column-family
+    /// implementation is key-prefix based: every CF shares one
+    /// memtable, one WAL, one manifest, and one flush path, so a
+    /// multi-CF [`crate::WriteBatch`] is **always** atomic across
+    /// CFs regardless of this flag's value. A flush either
+    /// persists every participant's half of a batch or persists
+    /// none of it — the flag exists so caller code ported from
+    /// RocksDB compiles without modification.
+    pub atomic_flush: bool,
 }
 
 impl Default for Options {
@@ -283,6 +292,7 @@ impl Default for Options {
             compaction_filter: None,
             prefix_extractor: None,
             merge_operator: None,
+            atomic_flush: false,
         }
     }
 }
