@@ -67,6 +67,7 @@ pub(crate) struct EngineOptions {
     pub(crate) merge_operator: Option<Arc<dyn crate::options::MergeOperator>>,
     pub(crate) listeners: Vec<Arc<dyn crate::event_listener::EventListener>>,
     pub(crate) statistics: Option<Arc<crate::statistics::Statistics>>,
+    pub(crate) rate_limiter: Option<Arc<dyn crate::rate_limiter::RateLimiter>>,
 }
 
 impl EngineOptions {
@@ -99,6 +100,7 @@ impl Default for EngineOptions {
             merge_operator: None,
             listeners: Vec::new(),
             statistics: None,
+            rate_limiter: None,
         }
     }
 }
@@ -210,6 +212,7 @@ impl LarkEngine {
             merge_operator: options.merge_operator.clone(),
             listeners: options.listeners.clone(),
             statistics: options.statistics.clone(),
+            rate_limiter: options.rate_limiter.clone(),
         };
 
         let compaction_lock = Arc::new(Mutex::new(()));
@@ -1081,6 +1084,13 @@ impl LarkEngine {
         let file_size = std::fs::metadata(&sst_path)?.len();
         let num_entries = summary.num_entries;
 
+        // Throttle background I/O so bursts of flush writes don't
+        // starve foreground traffic. Rate-limiting is opt-in via
+        // `Options::rate_limiter`; a `None` limiter is a no-op.
+        if let Some(limiter) = &self.options.rate_limiter {
+            limiter.request(file_size, crate::rate_limiter::Priority::Low);
+        }
+
         let reader = Arc::new(SsTableReader::open(&sst_path, file_id)?);
         let file = LiveSst::new(
             SsTableMeta {
@@ -1220,6 +1230,7 @@ impl LarkEngine {
             merge_operator: self.options.merge_operator.clone(),
             listeners: self.options.listeners.clone(),
             statistics: self.options.statistics.clone(),
+            rate_limiter: self.options.rate_limiter.clone(),
         };
         compaction::run_compact_range(
             &self.versions,

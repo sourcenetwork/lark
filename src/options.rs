@@ -286,6 +286,13 @@ pub struct Options {
     /// `None` (default) short-circuits every instrumentation site
     /// at a branch, so disabled stats cost almost nothing.
     pub statistics: Option<Arc<crate::Statistics>>,
+    /// Optional rate limiter. When set, flush and compaction output
+    /// writes are throttled via [`crate::RateLimiter::request`]
+    /// before the engine moves on to the next job, capping the
+    /// combined background-I/O rate at the limiter's configured
+    /// bytes/second. Foreground (user) writes are not throttled.
+    /// `None` (default) means background I/O is uncapped.
+    pub rate_limiter: Option<Arc<dyn crate::RateLimiter>>,
 }
 
 impl Default for Options {
@@ -308,6 +315,7 @@ impl Default for Options {
             atomic_flush: false,
             listeners: Vec::new(),
             statistics: None,
+            rate_limiter: None,
         }
     }
 }
@@ -341,6 +349,7 @@ impl std::fmt::Debug for Options {
             .field("atomic_flush", &self.atomic_flush)
             .field("listeners", &self.listeners.len())
             .field("statistics", &self.statistics.is_some())
+            .field("rate_limiter", &self.rate_limiter.is_some())
             .finish()
     }
 }
@@ -363,6 +372,7 @@ impl Options {
             merge_operator: self.merge_operator.clone(),
             listeners: self.listeners.clone(),
             statistics: self.statistics.clone(),
+            rate_limiter: self.rate_limiter.clone(),
         }
     }
 }
