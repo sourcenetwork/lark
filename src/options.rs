@@ -273,6 +273,12 @@ pub struct Options {
     /// none of it — the flag exists so caller code ported from
     /// RocksDB compiles without modification.
     pub atomic_flush: bool,
+    /// Event listeners subscribed to engine lifecycle events
+    /// (flush, compaction, ingest, background errors). Dispatch
+    /// is synchronous on the firing thread — listeners **must not
+    /// block or re-enter the database**. See
+    /// [`crate::EventListener`] for the full contract.
+    pub listeners: Vec<Arc<dyn crate::EventListener>>,
 }
 
 impl Default for Options {
@@ -293,6 +299,7 @@ impl Default for Options {
             prefix_extractor: None,
             merge_operator: None,
             atomic_flush: false,
+            listeners: Vec::new(),
         }
     }
 }
@@ -323,6 +330,8 @@ impl std::fmt::Debug for Options {
                 "merge_operator",
                 &self.merge_operator.as_ref().map(|m| m.name()),
             )
+            .field("atomic_flush", &self.atomic_flush)
+            .field("listeners", &self.listeners.len())
             .finish()
     }
 }
@@ -343,6 +352,7 @@ impl Options {
             compaction_filter: self.compaction_filter.clone(),
             prefix_extractor: self.prefix_extractor.clone(),
             merge_operator: self.merge_operator.clone(),
+            listeners: self.listeners.clone(),
         }
     }
 }

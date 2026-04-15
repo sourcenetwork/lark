@@ -23,6 +23,8 @@ use compaction::{CompactionOptions, CompactionScheduler};
 use manifest::{VersionEdit, VersionSet};
 use memtable::MemTable;
 use snapshot_registry::SnapshotRegistry;
+
+use crate::event_listener;
 use sstable::{sst_filename, LiveSst, LookupResult, SsTableMeta, SsTableReader, SsTableWriter};
 use wal::{wal_filename, Wal, WalEntry};
 
@@ -63,6 +65,7 @@ pub(crate) struct EngineOptions {
     pub(crate) compaction_filter: Option<Arc<dyn crate::options::CompactionFilter>>,
     pub(crate) prefix_extractor: Option<Arc<dyn crate::options::PrefixExtractor>>,
     pub(crate) merge_operator: Option<Arc<dyn crate::options::MergeOperator>>,
+    pub(crate) listeners: Vec<Arc<dyn crate::event_listener::EventListener>>,
 }
 
 impl EngineOptions {
@@ -93,6 +96,7 @@ impl Default for EngineOptions {
             compaction_filter: None,
             prefix_extractor: None,
             merge_operator: None,
+            listeners: Vec::new(),
         }
     }
 }
@@ -200,6 +204,7 @@ impl LarkEngine {
             compaction_filter: options.compaction_filter.clone(),
             prefix_extractor: options.prefix_extractor.clone(),
             merge_operator: options.merge_operator.clone(),
+            listeners: options.listeners.clone(),
         };
 
         let compaction_lock = Arc::new(Mutex::new(()));
@@ -969,6 +974,7 @@ impl LarkEngine {
     }
 
     fn flush_frozen_memtable(&self, old_wal: Wal) -> std::io::Result<()> {
+        let flush_start = std::time::Instant::now();
         let memtable = {
             let frozen = self.frozen_memtables.read();
             if frozen.is_empty() {
@@ -1052,6 +1058,51 @@ impl LarkEngine {
         let _ = Wal::remove(old_wal.path());
         self.compaction.lock().notify();
 
+        // Dispatch lifecycle events to any registered listeners.
+        // Two callbacks fire per flush: `on_table_file_created`
+        // for the new SSTable and `on_flush_completed` with
+        // memtable-level aggregates.
+        if !self.options.listeners.is_empty() {
+            let (smallest, largest) = {
+                // Version was just applied; pull the newly-added
+                // file's metadata back out so listeners see the
+                // exact bounds the engine committed.
+                let ver = self.versions.lock().current();
+                if let Some(added) = ver.levels[0].iter().find(|f| f.meta.file_id == file_id) {
+                    (
+                        added.meta.smallest_key.clone(),
+                        added.meta.largest_key.clone(),
+                    )
+                } else {
+                    (Vec::new(), Vec::new())
+                }
+            };
+            let duration = flush_start.elapsed();
+            let create_info = event_listener::TableFileCreationInfo {
+                file_id,
+                file_path: sst_path.clone(),
+                level: 0,
+                reason: event_listener::TableFileCreationReason::Flush,
+                file_size,
+                num_entries,
+            };
+            let flush_info = event_listener::FlushJobInfo {
+                file_id,
+                file_path: sst_path.clone(),
+                file_size,
+                num_entries,
+                smallest_key: smallest,
+                largest_key: largest,
+                duration,
+            };
+            event_listener::dispatch(&self.options.listeners, |l| {
+                l.on_table_file_created(&create_info)
+            });
+            event_listener::dispatch(&self.options.listeners, |l| {
+                l.on_flush_completed(&flush_info)
+            });
+        }
+
         tracing::info!(
             file_id,
             entries = num_entries,
@@ -1109,6 +1160,7 @@ impl LarkEngine {
             compaction_filter: self.options.compaction_filter.clone(),
             prefix_extractor: self.options.prefix_extractor.clone(),
             merge_operator: self.options.merge_operator.clone(),
+            listeners: self.options.listeners.clone(),
         };
         compaction::run_compact_range(
             &self.versions,
@@ -1308,6 +1360,34 @@ impl LarkEngine {
             VersionEdit::SetLastSeq(ingest_seq),
         ];
         self.versions.lock().apply(&edits)?;
+
+        if !self.options.listeners.is_empty() {
+            // Fire the table-created event first (file-level
+            // observation) and then the ingest-specific event
+            // (caller-level observation carrying the original
+            // external path).
+            let create_info = event_listener::TableFileCreationInfo {
+                file_id,
+                file_path: dest_path.clone(),
+                level: target_level,
+                reason: event_listener::TableFileCreationReason::Recovery,
+                file_size,
+                num_entries: summary.num_entries,
+            };
+            event_listener::dispatch(&self.options.listeners, |l| {
+                l.on_table_file_created(&create_info)
+            });
+            let ingest_info = event_listener::ExternalFileIngestionInfo {
+                external_file_path: source.path.clone(),
+                internal_file_id: file_id,
+                level: target_level,
+                num_entries: summary.num_entries,
+                file_size,
+            };
+            event_listener::dispatch(&self.options.listeners, |l| {
+                l.on_external_file_ingested(&ingest_info)
+            });
+        }
 
         tracing::info!(
             file_id,
