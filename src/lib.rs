@@ -49,6 +49,7 @@ mod error;
 mod iter;
 mod options;
 mod sst_file_writer;
+mod transaction;
 mod ttl;
 
 pub use backup::{BackupEngine, BackupId, BackupInfo};
@@ -60,6 +61,9 @@ pub use options::{
     MergeOperator, Options, PrefixExtractor, WriteOptions,
 };
 pub use sst_file_writer::{IngestOptions, SstFileMeta, SstFileWriter};
+pub use transaction::{
+    OptimisticTransactionDb, Transaction, TransactionDb, TransactionError, TxResult,
+};
 pub use ttl::{strip_timestamp, DbWithTtl, TtlCompactionFilter};
 
 use std::collections::BTreeMap;
@@ -360,6 +364,19 @@ impl Db {
 
     pub(crate) fn engine(&self) -> &LarkEngine {
         &self.engine
+    }
+
+    /// Clone the engine `Arc` — used by transaction facade types
+    /// that need to carry an engine reference around independent
+    /// of the owning `Db`'s lifetime. Internal-only.
+    pub(crate) fn engine_arc(&self) -> Arc<LarkEngine> {
+        Arc::clone(&self.engine)
+    }
+
+    /// Database-global durability mode. Used by transaction
+    /// commit code to choose fsync semantics.
+    pub(crate) fn durability(&self) -> engine::DurabilityMode {
+        self.durability
     }
 }
 
