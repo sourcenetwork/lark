@@ -47,6 +47,7 @@ mod checkpoint;
 mod column_family;
 mod engine;
 mod error;
+mod event_listener;
 mod iter;
 mod options;
 mod sst_file_writer;
@@ -57,6 +58,11 @@ pub use backup::{BackupEngine, BackupId, BackupInfo};
 pub use checkpoint::Checkpoint;
 pub use column_family::{ColumnFamilyHandle, DEFAULT_CF_NAME};
 pub use error::Error;
+pub use event_listener::{
+    BackgroundErrorReason, CompactionJobInfo, EventListener, ExternalFileIngestionInfo,
+    FlushJobInfo, TableFileCreationInfo, TableFileCreationReason, TableFileDeletionInfo,
+    WalFullInfo,
+};
 pub use iter::Iter;
 pub use options::{
     CompactionDecision, CompactionFilter, CompressionType, DurabilityMode, FixedLengthPrefix,
@@ -4187,5 +4193,224 @@ mod tests {
         let cf_b = db.column_family("b").unwrap();
         assert_eq!(db.get_cf(&cf_a, b"k").unwrap(), Some(b"a".to_vec()));
         assert_eq!(db.get_cf(&cf_b, b"k").unwrap(), Some(b"b".to_vec()));
+    }
+
+    // ── event listeners ─────────────────────────────────────────────────
+
+    /// Test listener that counts every callback it receives and
+    /// records enough detail for assertions.
+    #[derive(Default)]
+    struct CountingListener {
+        flush_completed: AtomicUsize,
+        compaction_begin: AtomicUsize,
+        compaction_completed: AtomicUsize,
+        table_file_created: AtomicUsize,
+        table_file_deleted: AtomicUsize,
+        external_file_ingested: AtomicUsize,
+        background_error: AtomicUsize,
+        last_flush_file_id: AtomicUsize,
+        last_compaction_output_count: AtomicUsize,
+    }
+
+    impl EventListener for CountingListener {
+        fn on_flush_completed(&self, info: &FlushJobInfo) {
+            self.flush_completed.fetch_add(1, AtomicOrdering::Relaxed);
+            self.last_flush_file_id
+                .store(info.file_id as usize, AtomicOrdering::Relaxed);
+        }
+        fn on_compaction_begin(&self, _info: &CompactionJobInfo) {
+            self.compaction_begin.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        fn on_compaction_completed(&self, info: &CompactionJobInfo) {
+            self.compaction_completed
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            self.last_compaction_output_count
+                .store(info.output_files.len(), AtomicOrdering::Relaxed);
+        }
+        fn on_table_file_created(&self, _info: &TableFileCreationInfo) {
+            self.table_file_created
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        fn on_table_file_deleted(&self, _info: &TableFileDeletionInfo) {
+            self.table_file_deleted
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        fn on_external_file_ingested(&self, _info: &ExternalFileIngestionInfo) {
+            self.external_file_ingested
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        fn on_background_error(&self, _reason: BackgroundErrorReason, _err: &Error) {
+            self.background_error.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn test_listener_fires_on_flush() {
+        let listener = Arc::new(CountingListener::default());
+        let dir = TempDir::new().unwrap();
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            listeners: vec![listener.clone() as Arc<dyn EventListener>],
+            ..Options::default()
+        };
+        let db = Db::open(dir.path(), opts).unwrap();
+        force_flush(&db, "listener");
+
+        assert!(
+            listener.flush_completed.load(AtomicOrdering::Relaxed) >= 1,
+            "flush callback should fire at least once"
+        );
+        assert!(
+            listener.table_file_created.load(AtomicOrdering::Relaxed) >= 1,
+            "table_file_created should fire for every flushed file"
+        );
+        assert_ne!(
+            listener.last_flush_file_id.load(AtomicOrdering::Relaxed),
+            0,
+            "file id recorded"
+        );
+    }
+
+    #[test]
+    fn test_listener_fires_on_compaction() {
+        let listener = Arc::new(CountingListener::default());
+        let dir = TempDir::new().unwrap();
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            listeners: vec![listener.clone() as Arc<dyn EventListener>],
+            ..Options::default()
+        };
+        let db = Db::open(dir.path(), opts).unwrap();
+        // Drive enough writes to generate L0 files, then manually
+        // compact the range so the compaction callbacks fire on
+        // the calling thread.
+        for i in 0..400 {
+            db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
+        }
+        force_flush(&db, "listener");
+        db.compact_range(None, None).unwrap();
+
+        let begin = listener.compaction_begin.load(AtomicOrdering::Relaxed);
+        let complete = listener.compaction_completed.load(AtomicOrdering::Relaxed);
+        assert!(
+            begin >= 1,
+            "compaction_begin must fire at least once, got {begin}"
+        );
+        assert_eq!(
+            begin, complete,
+            "begin and completed must fire in matched pairs"
+        );
+        assert!(
+            listener.table_file_created.load(AtomicOrdering::Relaxed) >= 2,
+            "flush + compaction both produce files"
+        );
+        assert!(
+            listener.table_file_deleted.load(AtomicOrdering::Relaxed) >= 1,
+            "old L0 files must be unlinked after compaction"
+        );
+    }
+
+    #[test]
+    fn test_listener_fires_on_ingest() {
+        let listener = Arc::new(CountingListener::default());
+        let dir = TempDir::new().unwrap();
+        let opts = Options {
+            listeners: vec![listener.clone() as Arc<dyn EventListener>],
+            ..Options::default()
+        };
+        let db = Db::open(dir.path(), opts.clone()).unwrap();
+
+        let sst_path = dir.path().join("ingest.sst");
+        {
+            let mut w = SstFileWriter::create(&sst_path, &opts).unwrap();
+            for i in 0..10 {
+                w.put(format!("ik_{i:02}").as_bytes(), b"iv").unwrap();
+            }
+            w.finish().unwrap();
+        }
+        db.ingest_external_files(&[sst_path], IngestOptions::default())
+            .unwrap();
+
+        assert_eq!(
+            listener
+                .external_file_ingested
+                .load(AtomicOrdering::Relaxed),
+            1,
+            "external_file_ingested fires once per ingested file"
+        );
+        assert!(
+            listener.table_file_created.load(AtomicOrdering::Relaxed) >= 1,
+            "ingest re-emits the file and fires table_file_created"
+        );
+    }
+
+    #[test]
+    fn test_listener_multiple_listeners_all_fire() {
+        let a = Arc::new(CountingListener::default());
+        let b = Arc::new(CountingListener::default());
+        let dir = TempDir::new().unwrap();
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            listeners: vec![
+                a.clone() as Arc<dyn EventListener>,
+                b.clone() as Arc<dyn EventListener>,
+            ],
+            ..Options::default()
+        };
+        let db = Db::open(dir.path(), opts).unwrap();
+        force_flush(&db, "multi");
+
+        assert!(a.flush_completed.load(AtomicOrdering::Relaxed) >= 1);
+        assert!(b.flush_completed.load(AtomicOrdering::Relaxed) >= 1);
+    }
+
+    #[test]
+    fn test_listener_none_configured_is_noop() {
+        // Sanity check: with no listeners, all paths still work
+        // and nothing panics.
+        let (db, _dir) = open_tmp();
+        db.put(b"k", b"v").unwrap();
+        force_flush(&db, "none");
+        db.compact_range(None, None).unwrap();
+    }
+
+    #[test]
+    fn test_listener_compaction_job_info_contains_input_files() {
+        // Capture the last CompactionJobInfo on `on_compaction_completed`
+        // and assert it carries the expected input file ids.
+        struct CaptureListener {
+            captured: Mutex<Option<CompactionJobInfo>>,
+        }
+        impl EventListener for CaptureListener {
+            fn on_compaction_completed(&self, info: &CompactionJobInfo) {
+                *self.captured.lock() = Some(info.clone());
+            }
+        }
+        use parking_lot::Mutex;
+
+        let listener = Arc::new(CaptureListener {
+            captured: Mutex::new(None),
+        });
+        let dir = TempDir::new().unwrap();
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            listeners: vec![listener.clone() as Arc<dyn EventListener>],
+            ..Options::default()
+        };
+        let db = Db::open(dir.path(), opts).unwrap();
+        for i in 0..400 {
+            db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
+        }
+        force_flush(&db, "capture");
+        db.compact_range(None, None).unwrap();
+
+        let captured = listener.captured.lock().clone();
+        let info = captured.expect("compaction_completed must have fired");
+        assert!(
+            !info.input_files_input_level.is_empty(),
+            "at least one L0 input file was picked"
+        );
+        assert_eq!(info.output_level, info.input_level + 1);
+        assert!(!info.output_files.is_empty(), "compaction produced outputs");
     }
 }

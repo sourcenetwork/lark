@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -116,6 +116,7 @@ pub(crate) struct CompactionOptions {
     pub(crate) compaction_filter: Option<Arc<dyn crate::options::CompactionFilter>>,
     pub(crate) prefix_extractor: Option<Arc<dyn crate::options::PrefixExtractor>>,
     pub(crate) merge_operator: Option<Arc<dyn crate::options::MergeOperator>>,
+    pub(crate) listeners: Vec<Arc<dyn crate::event_listener::EventListener>>,
 }
 
 impl CompactionOptions {
@@ -143,6 +144,7 @@ impl Default for CompactionOptions {
             compaction_filter: None,
             prefix_extractor: None,
             merge_operator: None,
+            listeners: Vec::new(),
         }
     }
 }
@@ -189,6 +191,20 @@ fn compaction_loop(
                     Ok(did_work) => did_work,
                     Err(e) => {
                         tracing::error!(error = %e, "Compaction failed");
+                        // Surface the failure to any registered
+                        // listeners so metrics pipelines and
+                        // debuggers notice it — the scheduler
+                        // itself keeps running.
+                        if !opts.listeners.is_empty() {
+                            let err =
+                                crate::Error::Io(std::io::Error::new(e.kind(), e.to_string()));
+                            crate::event_listener::dispatch(&opts.listeners, |l| {
+                                l.on_background_error(
+                                    crate::event_listener::BackgroundErrorReason::Compaction,
+                                    &err,
+                                )
+                            });
+                        }
                         false
                     }
                 }
@@ -393,6 +409,25 @@ fn perform_compaction(
     pin_seq: u64,
 ) -> std::io::Result<()> {
     let target_level = level + 1;
+    let compaction_start = std::time::Instant::now();
+
+    // Snapshot input file ids up-front so the on_compaction_begin
+    // callback has them even if the job errors out later.
+    let (begin_inputs_l, begin_inputs_l1): (Vec<u64>, Vec<u64>) = (
+        input_files.iter().map(|f| f.meta.file_id).collect(),
+        overlap_files.iter().map(|f| f.meta.file_id).collect(),
+    );
+    if !opts.listeners.is_empty() {
+        let info = crate::event_listener::CompactionJobInfo {
+            input_level: level,
+            output_level: target_level,
+            input_files_input_level: begin_inputs_l.clone(),
+            input_files_output_level: begin_inputs_l1.clone(),
+            output_files: Vec::new(),
+            duration: std::time::Duration::ZERO,
+        };
+        crate::event_listener::dispatch(&opts.listeners, |l| l.on_compaction_begin(&info));
+    }
 
     // Read all input entries as raw internal-key / value pairs so every
     // version and tombstone is preserved through the merge. Readers are
@@ -515,6 +550,7 @@ fn perform_compaction(
     // merge and dedup the RTs again, so there's no runaway duplication.
     // Replicating keeps each file self-sufficient for reads: a scan that
     // only picks up one of the files still sees the right RT coverage.
+    let mut output_file_infos: Vec<OutputFileInfo> = Vec::new();
     let mut chunk_start = 0;
     let rt_only_output = all_entries.is_empty() && !merged_range_tombstones.is_empty();
     let mut wrote_rt_only = false;
@@ -602,6 +638,13 @@ fn perform_compaction(
             reader,
         );
 
+        output_file_infos.push(OutputFileInfo {
+            file_id,
+            path: path.clone(),
+            file_size,
+            num_entries: summary.num_entries,
+        });
+
         edits.push(VersionEdit::AddFile {
             level: target_level,
             file: new_file,
@@ -617,6 +660,40 @@ fn perform_compaction(
     // through any `Arc<LiveSst>` still held by older versions or by
     // iterators, so the data remains readable until those Arcs drop.
     delete_old_files(sst_dir, &input_files, &overlap_files, cache);
+
+    // Dispatch compaction completion + per-file creation +
+    // per-file deletion events to registered listeners. The
+    // caller may fire many file-level callbacks plus one
+    // compaction-level aggregate.
+    if !opts.listeners.is_empty() {
+        for out in &output_file_infos {
+            let info = crate::event_listener::TableFileCreationInfo {
+                file_id: out.file_id,
+                file_path: out.path.clone(),
+                level: target_level,
+                reason: crate::event_listener::TableFileCreationReason::Compaction,
+                file_size: out.file_size,
+                num_entries: out.num_entries,
+            };
+            crate::event_listener::dispatch(&opts.listeners, |l| l.on_table_file_created(&info));
+        }
+        for f in input_files.iter().chain(overlap_files.iter()) {
+            let info = crate::event_listener::TableFileDeletionInfo {
+                file_id: f.meta.file_id,
+                file_path: sst_dir.join(sst_filename(f.meta.file_id)),
+            };
+            crate::event_listener::dispatch(&opts.listeners, |l| l.on_table_file_deleted(&info));
+        }
+        let job_info = crate::event_listener::CompactionJobInfo {
+            input_level: level,
+            output_level: target_level,
+            input_files_input_level: begin_inputs_l,
+            input_files_output_level: begin_inputs_l1,
+            output_files: output_file_infos.iter().map(|f| f.file_id).collect(),
+            duration: compaction_start.elapsed(),
+        };
+        crate::event_listener::dispatch(&opts.listeners, |l| l.on_compaction_completed(&job_info));
+    }
 
     tracing::info!(
         level,
@@ -906,6 +983,17 @@ fn file_overlaps_range(file: &Arc<LiveSst>, start: Option<&[u8]>, end: Option<&[
         }
     }
     true
+}
+
+/// Info a compaction run accumulates for each output file it
+/// produces, so the listener-dispatch block at the end has
+/// enough data to fire `on_table_file_created` /
+/// `on_compaction_completed` without going back to the version.
+struct OutputFileInfo {
+    file_id: u64,
+    path: PathBuf,
+    file_size: u64,
+    num_entries: u64,
 }
 
 fn key_range(files: &[Arc<LiveSst>]) -> (Vec<u8>, Vec<u8>) {
