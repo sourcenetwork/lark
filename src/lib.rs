@@ -53,6 +53,7 @@ mod options;
 mod rate_limiter;
 mod sst_file_writer;
 mod statistics;
+mod tailing;
 mod transaction;
 mod ttl;
 
@@ -73,6 +74,7 @@ pub use options::{
 pub use rate_limiter::{Priority, RateLimiter, TokenBucketRateLimiter};
 pub use sst_file_writer::{IngestOptions, SstFileMeta, SstFileWriter};
 pub use statistics::{Histogram, HistogramSnapshot, Statistics, Ticker};
+pub use tailing::TailingIter;
 pub use transaction::{
     OptimisticTransactionDb, Transaction, TransactionDb, TransactionError, TxResult,
 };
@@ -997,6 +999,21 @@ impl Db {
             cf_id: cf.id(),
             upper_bound: cf_upper_bound(cf.id()),
         }
+    }
+
+    /// Create a forward-only [`TailingIter`] over the default
+    /// column family. Unlike [`Db::iter`], a tailing iterator
+    /// sees writes that arrive after it was created and does not
+    /// pin the database at a point in time — see [`TailingIter`]
+    /// for the ordering rules.
+    pub fn iter_tailing(&self) -> TailingIter {
+        tailing::new_default(Arc::clone(&self.engine))
+    }
+
+    /// Create a forward-only [`TailingIter`] scoped to column
+    /// family `cf`.
+    pub fn iter_tailing_cf(&self, cf: &ColumnFamilyHandle) -> TailingIter {
+        tailing::new_for_cf(Arc::clone(&self.engine), cf)
     }
 
     pub(crate) fn engine(&self) -> &LarkEngine {
@@ -5104,6 +5121,154 @@ mod tests {
             Some("0")
         );
         assert_eq!(db.get_property("lark.num-snapshots").as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn test_tailing_iter_sees_writes_after_creation() {
+        // Initial writes, then a tailing iterator, then more
+        // writes — the tailing iterator must surface the later
+        // writes once it advances past the initial set.
+        let (db, _dir) = open_tmp();
+        for i in 0..5 {
+            let k = format!("log/{i:04}");
+            db.put(k.as_bytes(), format!("v{i}").as_bytes()).unwrap();
+        }
+
+        let mut tail = db.iter_tailing();
+        tail.seek_to_first();
+
+        // Drain the initial 5 entries.
+        let mut seen: Vec<String> = Vec::new();
+        while tail.valid() {
+            seen.push(String::from_utf8(tail.key().unwrap().to_vec()).unwrap());
+            tail.next();
+        }
+        assert_eq!(seen.len(), 5, "first drain saw {seen:?}");
+
+        // Now push more writes at strictly larger keys.
+        for i in 5..10 {
+            let k = format!("log/{i:04}");
+            db.put(k.as_bytes(), format!("v{i}").as_bytes()).unwrap();
+        }
+
+        // Stepping again should refresh the view and surface
+        // the new entries without re-emitting the first batch.
+        tail.next();
+        while tail.valid() {
+            seen.push(String::from_utf8(tail.key().unwrap().to_vec()).unwrap());
+            tail.next();
+        }
+        assert_eq!(seen.len(), 10, "tail saw {seen:?}");
+        for (i, k) in seen.iter().enumerate() {
+            assert_eq!(k, &format!("log/{i:04}"));
+        }
+    }
+
+    #[test]
+    fn test_tailing_iter_survives_flush_and_compaction() {
+        // Tiny write_buffer so writes between drains roll
+        // memtables and produce L0 files. The tailing iter must
+        // pick up those new SSTs on the next refresh.
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            ..Options::default()
+        };
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), opts).unwrap();
+
+        for i in 0..16 {
+            let k = format!("log/{i:04}");
+            db.put(k.as_bytes(), &vec![0xAA; 256]).unwrap();
+        }
+
+        let mut tail = db.iter_tailing();
+        tail.seek_to_first();
+        let mut seen: usize = 0;
+        while tail.valid() {
+            seen += 1;
+            tail.next();
+        }
+        assert_eq!(seen, 16);
+
+        // Force a flush and a compaction — the existing tail
+        // iter is no longer pinned to anything visible, but a
+        // refresh + new writes should still work.
+        db.compact_range(None, None).unwrap();
+        for i in 16..32 {
+            let k = format!("log/{i:04}");
+            db.put(k.as_bytes(), &vec![0xBB; 256]).unwrap();
+        }
+
+        tail.refresh();
+        let mut seen_after = 0;
+        while tail.valid() {
+            seen_after += 1;
+            tail.next();
+        }
+        assert_eq!(
+            seen_after, 16,
+            "tail should pick up the 16 new entries after refresh"
+        );
+    }
+
+    #[test]
+    fn test_tailing_iter_no_re_emission_after_explicit_refresh() {
+        let (db, _dir) = open_tmp();
+        for i in 0..3 {
+            db.put(format!("k{i}").as_bytes(), b"v").unwrap();
+        }
+        let mut tail = db.iter_tailing();
+        tail.seek_to_first();
+        assert!(tail.valid());
+        let first_key = tail.key().unwrap().to_vec();
+        assert_eq!(first_key, b"k0");
+        tail.next();
+        assert_eq!(tail.key().unwrap(), b"k1");
+
+        // Explicit refresh in the middle of iteration must NOT
+        // re-emit k0.
+        tail.refresh();
+        // After refresh we should be positioned strictly after
+        // the last returned key (k1), so the next valid key is
+        // k2.
+        assert!(tail.valid());
+        assert_eq!(tail.key().unwrap(), b"k2");
+        tail.next();
+        assert!(!tail.valid(), "no more keys after k2");
+    }
+
+    #[test]
+    fn test_tailing_iter_cf_scoping() {
+        // Tailing iterator scoped to one CF must not surface
+        // keys from other CFs.
+        let (db, _dir) = open_tmp();
+        let cf_logs = db.create_column_family("logs").unwrap();
+        let cf_other = db.create_column_family("other").unwrap();
+
+        db.put_cf(&cf_logs, b"a", b"1").unwrap();
+        db.put_cf(&cf_other, b"a", b"x").unwrap();
+        db.put_cf(&cf_logs, b"b", b"2").unwrap();
+
+        let mut tail = db.iter_tailing_cf(&cf_logs);
+        tail.seek_to_first();
+        let mut seen = Vec::new();
+        while tail.valid() {
+            seen.push((tail.key().unwrap().to_vec(), tail.value().unwrap().to_vec()));
+            tail.next();
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec())
+            ]
+        );
+
+        // A write to the other CF must not bleed in even after
+        // refresh.
+        db.put_cf(&cf_other, b"c", b"y").unwrap();
+        tail.refresh();
+        assert!(!tail.valid());
     }
 
     #[test]
