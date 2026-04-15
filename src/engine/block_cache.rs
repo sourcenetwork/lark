@@ -311,7 +311,7 @@ impl BlockCache {
     }
 
     /// Approximate total bytes currently held across every shard.
-    /// Used by the `rocksdb.block-cache-usage` property and by
+    /// Used by the `lark.block-cache-usage` property and by
     /// unit tests to verify eviction.
     pub(crate) fn usage(&self) -> usize {
         self.total_used.load(Ordering::Relaxed)

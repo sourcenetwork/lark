@@ -89,7 +89,7 @@ use std::sync::Arc;
 use engine::LarkEngine;
 
 /// Minimal snapshot of the currently-configured options, returned
-/// by `Db::get_property("rocksdb.options")`. Deliberately small —
+/// by `Db::get_property("lark.options")`. Deliberately small —
 /// lark doesn't retain the full `Options` past `Db::open`, and
 /// the Debug impl of this struct is the property's string value.
 #[derive(Debug)]
@@ -576,14 +576,14 @@ impl Db {
     /// Return the string value of a named property, or `None` if
     /// `name` isn't recognized. See the module-level docs for the
     /// full list of supported properties; the most useful ones
-    /// are `"rocksdb.stats"`, `"rocksdb.sstables"`,
-    /// `"rocksdb.levelstats"`, and `"rocksdb.options"`.
+    /// are `"lark.stats"`, `"lark.sstables"`,
+    /// `"lark.levelstats"`, and `"lark.options"`.
     pub fn get_property(&self, name: &str) -> Option<String> {
         match name {
-            "rocksdb.stats" => Some(self.format_stats_property()),
-            "rocksdb.sstables" => Some(self.format_sstables_property()),
-            "rocksdb.levelstats" => Some(self.format_levelstats_property()),
-            "rocksdb.options" => Some(format!("{:#?}", self.options_snapshot())),
+            "lark.stats" => Some(self.format_stats_property()),
+            "lark.sstables" => Some(self.format_sstables_property()),
+            "lark.levelstats" => Some(self.format_levelstats_property()),
+            "lark.options" => Some(format!("{:#?}", self.options_snapshot())),
             _ => {
                 // Integer properties surfaced through the string
                 // API too — every int property's string form is
@@ -596,17 +596,17 @@ impl Db {
     /// Return the integer value of a named property, or `None` if
     /// `name` isn't recognized or doesn't have an integer form.
     pub fn get_int_property(&self, name: &str) -> Option<u64> {
-        if let Some(level_str) = name.strip_prefix("rocksdb.num-files-at-level") {
+        if let Some(level_str) = name.strip_prefix("lark.num-files-at-level") {
             let level: usize = level_str.parse().ok()?;
             return Some(self.engine.num_files_at_level(level));
         }
         match name {
-            "rocksdb.total-sst-files-size" => Some(self.engine.total_sst_size()),
-            "rocksdb.cur-size-active-mem-table" => Some(self.engine.active_memtable_size()),
-            "rocksdb.cur-size-all-mem-tables" => {
+            "lark.total-sst-files-size" => Some(self.engine.total_sst_size()),
+            "lark.cur-size-active-mem-table" => Some(self.engine.active_memtable_size()),
+            "lark.cur-size-all-mem-tables" => {
                 Some(self.engine.active_memtable_size() + self.engine.frozen_memtables_size())
             }
-            "rocksdb.num-entries-active-mem-table" => {
+            "lark.num-entries-active-mem-table" => {
                 // Approximate: the memtable exposes `approximate_size`
                 // in bytes but no direct entry count. Estimate by
                 // assuming a 48-byte average entry (internal key +
@@ -616,11 +616,11 @@ impl Db {
                 let bytes = self.engine.active_memtable_size();
                 Some(bytes / 48)
             }
-            "rocksdb.num-entries-imm-mem-tables" => {
+            "lark.num-entries-imm-mem-tables" => {
                 let bytes = self.engine.frozen_memtables_size();
                 Some(bytes / 48)
             }
-            "rocksdb.estimate-num-keys" => {
+            "lark.estimate-num-keys" => {
                 // Lower-bound estimate: exact SST entry count plus
                 // a rough guess for the memtable contribution.
                 let sst = self.engine.total_sst_num_entries();
@@ -628,22 +628,22 @@ impl Db {
                     self.engine.active_memtable_size() + self.engine.frozen_memtables_size();
                 Some(sst + mem_bytes / 48)
             }
-            "rocksdb.estimate-live-data-size" => Some(self.engine.total_sst_size()),
-            "rocksdb.num-snapshots" => Some(self.engine.live_snapshot_count()),
-            "rocksdb.oldest-snapshot-time" => self.engine.oldest_snapshot_time_unix(),
-            "rocksdb.block-cache-usage" => Some(self.engine.block_cache_usage() as u64),
-            "rocksdb.block-cache-capacity" => Some(self.engine.block_cache_capacity() as u64),
+            "lark.estimate-live-data-size" => Some(self.engine.total_sst_size()),
+            "lark.num-snapshots" => Some(self.engine.live_snapshot_count()),
+            "lark.oldest-snapshot-time" => self.engine.oldest_snapshot_time_unix(),
+            "lark.block-cache-usage" => Some(self.engine.block_cache_usage() as u64),
+            "lark.block-cache-capacity" => Some(self.engine.block_cache_capacity() as u64),
             // Background errors are surfaced through the
             // `EventListener::on_background_error` callback today
-            // — no dedicated counter yet. Report `0` for API
-            // parity with RocksDB so monitoring dashboards that
-            // consume this property don't see `None`.
-            "rocksdb.background-errors" => Some(0),
+            // — no dedicated counter yet. Report `0` so any
+            // monitoring layer consuming this property gets a
+            // stable numeric value instead of `None`.
+            "lark.background-errors" => Some(0),
             _ => None,
         }
     }
 
-    /// Format the multi-line `rocksdb.stats` property: counters +
+    /// Format the multi-line `lark.stats` property: counters +
     /// histograms (when statistics are enabled) plus per-level
     /// file counts and compaction aggregates.
     fn format_stats_property(&self) -> String {
@@ -659,7 +659,7 @@ impl Db {
         out
     }
 
-    /// Format the `rocksdb.levelstats` property: one row per
+    /// Format the `lark.levelstats` property: one row per
     /// level with file count and total size in bytes.
     fn format_levelstats_property(&self) -> String {
         let version = self.engine.current_version();
@@ -672,7 +672,7 @@ impl Db {
         out
     }
 
-    /// Format the `rocksdb.sstables` property: one row per live
+    /// Format the `lark.sstables` property: one row per live
     /// SSTable with its level, file id, size, and key range.
     fn format_sstables_property(&self) -> String {
         let version = self.engine.current_version();
@@ -4923,10 +4923,10 @@ mod tests {
     #[test]
     fn test_property_num_files_at_level() {
         let (db, _dir) = open_tmp();
-        assert_eq!(db.get_int_property("rocksdb.num-files-at-level0"), Some(0));
-        assert_eq!(db.get_int_property("rocksdb.num-files-at-level6"), Some(0));
+        assert_eq!(db.get_int_property("lark.num-files-at-level0"), Some(0));
+        assert_eq!(db.get_int_property("lark.num-files-at-level6"), Some(0));
         // Out-of-range level is a valid query that returns 0.
-        assert_eq!(db.get_int_property("rocksdb.num-files-at-level99"), Some(0));
+        assert_eq!(db.get_int_property("lark.num-files-at-level99"), Some(0));
     }
 
     #[test]
@@ -4938,13 +4938,13 @@ mod tests {
         }
         force_flush(&db, "props");
         // At this point we expect some L0 files.
-        let l0_before = db.get_int_property("rocksdb.num-files-at-level0").unwrap();
-        assert!(l0_before > 0 || db.get_int_property("rocksdb.num-files-at-level1").unwrap() > 0);
+        let l0_before = db.get_int_property("lark.num-files-at-level0").unwrap();
+        assert!(l0_before > 0 || db.get_int_property("lark.num-files-at-level1").unwrap() > 0);
 
         // Drain everything to the deepest level.
         db.compact_range(None, None).unwrap();
         assert_eq!(
-            db.get_int_property("rocksdb.num-files-at-level0"),
+            db.get_int_property("lark.num-files-at-level0"),
             Some(0),
             "L0 should be empty after compact_range"
         );
@@ -4954,12 +4954,12 @@ mod tests {
     fn test_property_total_sst_size_after_flush() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
-        assert_eq!(db.get_int_property("rocksdb.total-sst-files-size"), Some(0));
+        assert_eq!(db.get_int_property("lark.total-sst-files-size"), Some(0));
         for i in 0..100 {
             db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
         }
         force_flush(&db, "size");
-        let size = db.get_int_property("rocksdb.total-sst-files-size").unwrap();
+        let size = db.get_int_property("lark.total-sst-files-size").unwrap();
         assert!(size > 0, "SST size should be > 0 after a flush");
     }
 
@@ -4967,14 +4967,14 @@ mod tests {
     fn test_property_cur_size_active_mem_table() {
         let (db, _dir) = open_tmp();
         assert_eq!(
-            db.get_int_property("rocksdb.cur-size-active-mem-table"),
+            db.get_int_property("lark.cur-size-active-mem-table"),
             Some(0)
         );
         for i in 0..50 {
             db.put(format!("k_{i:03}").as_bytes(), b"value").unwrap();
         }
         let size = db
-            .get_int_property("rocksdb.cur-size-active-mem-table")
+            .get_int_property("lark.cur-size-active-mem-table")
             .unwrap();
         assert!(size > 0, "active memtable should have non-zero size");
     }
@@ -4984,11 +4984,9 @@ mod tests {
         let (db, _dir) = open_tmp();
         db.put(b"k", b"v").unwrap();
         let active = db
-            .get_int_property("rocksdb.cur-size-active-mem-table")
+            .get_int_property("lark.cur-size-active-mem-table")
             .unwrap();
-        let all = db
-            .get_int_property("rocksdb.cur-size-all-mem-tables")
-            .unwrap();
+        let all = db.get_int_property("lark.cur-size-all-mem-tables").unwrap();
         assert!(all >= active, "all mem tables must be >= active");
     }
 
@@ -5001,7 +4999,7 @@ mod tests {
         }
         force_flush(&db, "estimate");
         db.compact_range(None, None).unwrap();
-        let estimate = db.get_int_property("rocksdb.estimate-num-keys").unwrap();
+        let estimate = db.get_int_property("lark.estimate-num-keys").unwrap();
         // Exact count per SST includes the flush filler + the 100
         // writes; the property is a lower bound, so > 50 is a
         // safe floor.
@@ -5011,25 +5009,22 @@ mod tests {
     #[test]
     fn test_property_num_snapshots_and_oldest_snapshot_time() {
         let (db, _dir) = open_tmp();
-        assert_eq!(db.get_int_property("rocksdb.num-snapshots"), Some(0));
+        assert_eq!(db.get_int_property("lark.num-snapshots"), Some(0));
         assert!(
-            db.get_int_property("rocksdb.oldest-snapshot-time")
-                .is_none(),
+            db.get_int_property("lark.oldest-snapshot-time").is_none(),
             "oldest-snapshot-time should be None when no snapshots are live"
         );
         let _snap_a = db.snapshot();
         let _snap_b = db.snapshot();
-        assert_eq!(db.get_int_property("rocksdb.num-snapshots"), Some(2));
-        assert!(db
-            .get_int_property("rocksdb.oldest-snapshot-time")
-            .is_some());
+        assert_eq!(db.get_int_property("lark.num-snapshots"), Some(2));
+        assert!(db.get_int_property("lark.oldest-snapshot-time").is_some());
     }
 
     #[test]
     fn test_property_background_errors_returns_zero() {
         let (db, _dir) = open_tmp();
         // No background errors on a fresh db.
-        assert_eq!(db.get_int_property("rocksdb.background-errors"), Some(0));
+        assert_eq!(db.get_int_property("lark.background-errors"), Some(0));
     }
 
     #[test]
@@ -5042,7 +5037,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         db.put(b"k", b"v").unwrap();
-        let text = db.get_property("rocksdb.stats").unwrap();
+        let text = db.get_property("lark.stats").unwrap();
         assert!(text.contains("== lark engine stats =="));
         assert!(text.contains("Level  Files     Size(B)"));
         assert!(text.contains("lark.keys_written"));
@@ -5051,7 +5046,7 @@ mod tests {
     #[test]
     fn test_property_stats_string_without_statistics_configured() {
         let (db, _dir) = open_tmp();
-        let text = db.get_property("rocksdb.stats").unwrap();
+        let text = db.get_property("lark.stats").unwrap();
         assert!(text.contains("== lark engine stats =="));
         assert!(text.contains("(no Statistics object configured"));
     }
@@ -5064,7 +5059,7 @@ mod tests {
             db.put(format!("k_{i:03}").as_bytes(), b"v").unwrap();
         }
         force_flush(&db, "ssts");
-        let text = db.get_property("rocksdb.sstables").unwrap();
+        let text = db.get_property("lark.sstables").unwrap();
         assert!(text.contains("Level    FileID"));
         // Should list at least one file with non-zero size.
         assert!(
@@ -5081,7 +5076,7 @@ mod tests {
             db.put(format!("k_{i:03}").as_bytes(), b"v").unwrap();
         }
         force_flush(&db, "lvl");
-        let text = db.get_property("rocksdb.levelstats").unwrap();
+        let text = db.get_property("lark.levelstats").unwrap();
         assert!(text.starts_with("Level  Files     Size(B)"));
         // Every level row is present, not just the populated ones.
         for lvl in 0..7 {
@@ -5095,7 +5090,7 @@ mod tests {
     #[test]
     fn test_property_options_debug_dump() {
         let (db, _dir) = open_tmp();
-        let text = db.get_property("rocksdb.options").unwrap();
+        let text = db.get_property("lark.options").unwrap();
         assert!(text.contains("OptionsSnapshot"));
         assert!(text.contains("default"));
     }
@@ -5106,20 +5101,17 @@ mod tests {
         // get_property, returning their decimal string form.
         let (db, _dir) = open_tmp();
         assert_eq!(
-            db.get_property("rocksdb.num-files-at-level0").as_deref(),
+            db.get_property("lark.num-files-at-level0").as_deref(),
             Some("0")
         );
-        assert_eq!(
-            db.get_property("rocksdb.num-snapshots").as_deref(),
-            Some("0")
-        );
+        assert_eq!(db.get_property("lark.num-snapshots").as_deref(), Some("0"));
     }
 
     #[test]
     fn test_block_cache_usage_property_reports_nonzero_after_reads() {
         // A cache with a small-but-nonzero budget fills with
         // decompressed data blocks as reads touch SSTables. The
-        // `rocksdb.block-cache-usage` property must report a
+        // `lark.block-cache-usage` property must report a
         // positive number once at least one read has happened
         // against a file that isn't entirely in the memtable.
         let opts = Options {
@@ -5145,14 +5137,14 @@ mod tests {
         }
 
         let usage = db
-            .get_int_property("rocksdb.block-cache-usage")
+            .get_int_property("lark.block-cache-usage")
             .expect("property must exist");
         assert!(
             usage > 0,
             "expected block-cache-usage > 0 after reads, got {usage}"
         );
         let cap = db
-            .get_int_property("rocksdb.block-cache-capacity")
+            .get_int_property("lark.block-cache-capacity")
             .expect("property must exist");
         assert!(
             cap >= 512 * 1024,
@@ -5319,17 +5311,11 @@ mod tests {
         for i in 0..32 {
             let k = format!("fill{i:04}");
             db.put(k.as_bytes(), &payload).unwrap();
-            if db
-                .get_int_property("rocksdb.num-files-at-level0")
-                .unwrap_or(0)
-                >= 2
-            {
+            if db.get_int_property("lark.num-files-at-level0").unwrap_or(0) >= 2 {
                 break;
             }
         }
-        let l0 = db
-            .get_int_property("rocksdb.num-files-at-level0")
-            .unwrap_or(0);
+        let l0 = db.get_int_property("lark.num-files-at-level0").unwrap_or(0);
         assert!(l0 >= 2, "precondition: need L0 >= 2, got {l0}");
 
         let db_writer = db.clone();

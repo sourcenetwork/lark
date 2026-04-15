@@ -1744,7 +1744,7 @@ impl LarkEngine {
 
     /// Number of SSTable files at a specific level. Returns 0 for
     /// out-of-range levels rather than panicking, so
-    /// `rocksdb.num-files-at-level<N>` for unknown levels reads
+    /// `lark.num-files-at-level<N>` for unknown levels reads
     /// cleanly as `Some(0)`.
     pub(crate) fn num_files_at_level(&self, level: usize) -> u64 {
         let version = self.versions.lock().current();
@@ -1803,13 +1803,13 @@ impl LarkEngine {
     }
 
     /// Total bytes currently held by the block cache across all
-    /// shards. Used by the `rocksdb.block-cache-usage` property.
+    /// shards. Used by the `lark.block-cache-usage` property.
     pub(crate) fn block_cache_usage(&self) -> usize {
         self.cache.usage()
     }
 
     /// Block cache capacity in bytes (the sum of every shard's
-    /// budget). Used by the `rocksdb.block-cache-capacity`
+    /// budget). Used by the `lark.block-cache-capacity`
     /// property.
     pub(crate) fn block_cache_capacity(&self) -> usize {
         self.cache.capacity()
@@ -1822,7 +1822,7 @@ impl LarkEngine {
     }
 
     /// Borrow the current version so a caller can walk every
-    /// SSTable's metadata — used by `rocksdb.sstables` formatter.
+    /// SSTable's metadata — used by `lark.sstables` formatter.
     pub(crate) fn current_version(&self) -> Arc<manifest::Version> {
         self.versions.lock().current()
     }

@@ -914,9 +914,10 @@ impl LarkIterator {
         let merge_op = match self.merge_operator.clone() {
             Some(op) => op,
             None => {
-                // No merge operator — can't collapse. Treat merges
-                // as invisible (RocksDB parity: merges without an
-                // operator are read as missing).
+                // No merge operator — can't collapse. Treat
+                // merges as invisible: without an operator there
+                // is no way to produce a value from the chain, so
+                // reads see the key as missing.
                 self.consume_user_key_forward(user_key);
                 return Ok(None);
             }

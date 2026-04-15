@@ -26,10 +26,10 @@
 //! - Per-column-family filtering is out of scope. A listener sees
 //!   every event from every CF; callers that only care about a
 //!   subset should filter in the callback.
-//! - `on_wal_full` is declared for API parity with RocksDB but is
-//!   never fired in the current implementation — lark rotates the
-//!   WAL alongside every memtable, so there's no separate
-//!   "WAL-full" condition.
+//! - `on_wal_full` is declared so listener implementations can
+//!   target a common shape across storage backends, but lark
+//!   itself never fires it — the WAL is rotated alongside every
+//!   memtable, so there's no separate "WAL-full" condition.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -139,10 +139,11 @@ pub struct ExternalFileIngestionInfo {
     pub file_size: u64,
 }
 
-/// Information about a full WAL — declared for API parity with
-/// RocksDB but not currently fired by lark. The engine rotates the
-/// WAL alongside every memtable, so there is no separate
-/// "WAL-full" condition.
+/// Information about a full WAL. The struct is declared so that
+/// listener implementations can target a common shape across
+/// storage backends; lark itself never fires this callback,
+/// because the engine rotates the WAL alongside every memtable
+/// and there is no separate "WAL-full" condition.
 #[derive(Debug, Clone)]
 pub struct WalFullInfo {
     /// Numeric id of the full WAL file.
@@ -221,8 +222,9 @@ pub trait EventListener: Send + Sync + 'static {
         let _ = (reason, err);
     }
 
-    /// Declared for API parity with RocksDB but not currently
-    /// fired — see module-level docs.
+    /// Declared so listeners can target a common shape across
+    /// storage backends; lark itself never fires this callback.
+    /// See the module-level docs.
     fn on_wal_full(&self, info: &WalFullInfo) {
         let _ = info;
     }
