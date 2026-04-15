@@ -611,8 +611,7 @@ impl Db {
                 // in bytes but no direct entry count. Estimate by
                 // assuming a 48-byte average entry (internal key +
                 // value). This is a rough indicator, not an exact
-                // count — RocksDB documents the same caveat on
-                // `num-entries-active-mem-table`.
+                // count.
                 let bytes = self.engine.active_memtable_size();
                 Some(bytes / 48)
             }

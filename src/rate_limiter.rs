@@ -90,7 +90,7 @@ struct State {
 /// `refill_period` controls the granularity at which tokens are
 /// credited to the bucket: a smaller period smooths bursts at the cost
 /// of more wakeups; a larger period is cheaper but chunkier. 100 ms is
-/// a reasonable starting point and matches the RocksDB default.
+/// a reasonable starting point for most workloads.
 pub struct TokenBucketRateLimiter {
     state: Mutex<State>,
     cv: Condvar,
