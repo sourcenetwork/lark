@@ -50,6 +50,7 @@ mod error;
 mod event_listener;
 mod iter;
 mod options;
+mod rate_limiter;
 mod sst_file_writer;
 mod statistics;
 mod transaction;
@@ -69,6 +70,7 @@ pub use options::{
     CompactionDecision, CompactionFilter, CompressionType, DurabilityMode, FixedLengthPrefix,
     MergeOperator, Options, PrefixExtractor, WriteOptions,
 };
+pub use rate_limiter::{Priority, RateLimiter, TokenBucketRateLimiter};
 pub use sst_file_writer::{IngestOptions, SstFileMeta, SstFileWriter};
 pub use statistics::{Histogram, HistogramSnapshot, Statistics, Ticker};
 pub use transaction::{
@@ -5095,5 +5097,101 @@ mod tests {
             db.get_property("rocksdb.num-snapshots").as_deref(),
             Some("0")
         );
+    }
+
+    #[test]
+    fn test_rate_limiter_throttles_compaction() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        // 100 KB/s sustained, 5 KB burst. Compression is disabled so
+        // the on-disk SST size stays proportional to the data we
+        // feed in (otherwise LZ4 would collapse the payload to a
+        // few KB and nothing meaningful would be throttled). A
+        // 16 MB buffer keeps everything in the memtable until
+        // compact_range triggers a flush + compaction, both of
+        // which the limiter throttles.
+        let limiter = Arc::new(TokenBucketRateLimiter::new(
+            100_000,
+            Duration::from_millis(50),
+            5_000,
+        ));
+        let opts = Options {
+            write_buffer_size: 16 * 1024 * 1024,
+            compression: CompressionType::None,
+            rate_limiter: Some(limiter.clone() as Arc<dyn RateLimiter>),
+            ..Options::default()
+        };
+
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), opts).unwrap();
+
+        // Write ~100 KB of well-dispersed keys so the resulting SST
+        // is large enough that the limiter has real work to do.
+        for i in 0..200 {
+            let k = format!("key-{i:010}");
+            // Each value is distinct so prefix compression can't
+            // collapse the block.
+            let v = format!("value-for-key-{i:010}-payload-{}", i);
+            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+        }
+
+        let start = Instant::now();
+        db.compact_range(None, None).unwrap();
+        let elapsed = start.elapsed();
+
+        // With ~10 KB of uncompressed output flushed + compacted at
+        // 100 KB/s past a 5 KB burst, we expect the critical path
+        // to block for at least one refill period (~50 ms) and in
+        // practice several. Assert a conservative floor to confirm
+        // the limiter was actually consulted without flaking on
+        // CI variance.
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "compaction with 100KB/s limiter finished in {elapsed:?}, expected >= 100ms"
+        );
+
+        // The limiter must have been consulted for background I/O.
+        assert!(
+            limiter.get_total_bytes_through(Priority::Low) > 0,
+            "limiter saw zero background bytes"
+        );
+        assert_eq!(limiter.get_total_bytes_through(Priority::High), 0);
+    }
+
+    #[test]
+    fn test_rate_limiter_unset_leaves_compaction_uncapped() {
+        // Sanity check: with no limiter in Options, compaction still
+        // runs and produces correct results. This is the default
+        // configuration; the test exists mainly to pin the no-op
+        // branch.
+        use std::time::Instant;
+
+        let opts = Options {
+            write_buffer_size: 64 * 1024,
+            ..Options::default()
+        };
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), opts).unwrap();
+
+        let payload = vec![0xABu8; 1024];
+        for i in 0..256 {
+            let k = format!("k{i:06}");
+            db.put(k.as_bytes(), &payload).unwrap();
+        }
+
+        let start = Instant::now();
+        db.compact_range(None, None).unwrap();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "unthrottled compaction took unreasonably long: {:?}",
+            start.elapsed()
+        );
+
+        // Reads still work after compaction.
+        for i in 0..256 {
+            let k = format!("k{i:06}");
+            assert_eq!(db.get(k.as_bytes()).unwrap(), Some(payload.clone()));
+        }
     }
 }

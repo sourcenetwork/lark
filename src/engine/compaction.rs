@@ -118,6 +118,7 @@ pub(crate) struct CompactionOptions {
     pub(crate) merge_operator: Option<Arc<dyn crate::options::MergeOperator>>,
     pub(crate) listeners: Vec<Arc<dyn crate::event_listener::EventListener>>,
     pub(crate) statistics: Option<Arc<crate::statistics::Statistics>>,
+    pub(crate) rate_limiter: Option<Arc<dyn crate::rate_limiter::RateLimiter>>,
 }
 
 impl CompactionOptions {
@@ -147,6 +148,7 @@ impl Default for CompactionOptions {
             merge_operator: None,
             listeners: Vec::new(),
             statistics: None,
+            rate_limiter: None,
         }
     }
 }
@@ -628,6 +630,13 @@ fn perform_compaction(
         };
 
         let file_size = std::fs::metadata(&path)?.len();
+
+        // Throttle background I/O. Opt-in via `Options::rate_limiter`;
+        // a `None` limiter is a no-op.
+        if let Some(limiter) = &opts.rate_limiter {
+            limiter.request(file_size, crate::rate_limiter::Priority::Low);
+        }
+
         let reader = Arc::new(SsTableReader::open(&path, file_id)?);
         let new_file = LiveSst::new(
             SsTableMeta {
