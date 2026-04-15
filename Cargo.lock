@@ -144,6 +144,7 @@ name = "lark-kv"
 version = "0.1.0"
 dependencies = [
  "crossbeam-skiplist",
+ "libc",
  "lru",
  "lz4_flex",
  "parking_lot",

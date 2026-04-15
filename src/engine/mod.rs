@@ -78,6 +78,7 @@ pub(crate) struct EngineOptions {
     pub(crate) compaction_style: crate::options::CompactionStyle,
     pub(crate) fifo_compaction_options: crate::options::FifoCompactionOptions,
     pub(crate) universal_compaction_options: crate::options::UniversalCompactionOptions,
+    pub(crate) use_direct_io_for_compaction: bool,
 }
 
 impl EngineOptions {
@@ -121,6 +122,7 @@ impl Default for EngineOptions {
             compaction_style: crate::options::CompactionStyle::Level,
             fifo_compaction_options: crate::options::FifoCompactionOptions::default(),
             universal_compaction_options: crate::options::UniversalCompactionOptions::default(),
+            use_direct_io_for_compaction: false,
         }
     }
 }
@@ -269,6 +271,7 @@ impl LarkEngine {
             compaction_style: options.compaction_style,
             fifo_compaction_options: options.fifo_compaction_options,
             universal_compaction_options: options.universal_compaction_options,
+            use_direct_io_for_compaction: options.use_direct_io_for_compaction,
         };
 
         let compaction_lock = Arc::new(Mutex::new(()));
@@ -1406,6 +1409,7 @@ impl LarkEngine {
             compaction_style: self.options.compaction_style,
             fifo_compaction_options: self.options.fifo_compaction_options,
             universal_compaction_options: self.options.universal_compaction_options,
+            use_direct_io_for_compaction: self.options.use_direct_io_for_compaction,
         };
         // Under FIFO compaction there is no level push-down; a
         // synchronous compact_range just flushes the memtable and

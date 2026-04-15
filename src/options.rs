@@ -432,6 +432,22 @@ pub struct Options {
     /// Tunables for [`CompactionStyle::Universal`]. Ignored when
     /// the style is not Universal.
     pub universal_compaction_options: UniversalCompactionOptions,
+    /// Hint the OS page cache to drop pages backing SSTables
+    /// that are read or written by background compaction.
+    ///
+    /// Without the hint, gigabytes of sequentially-consumed
+    /// compaction data pollute the page cache and evict hot
+    /// foreground reads. With the hint, the kernel is told to
+    /// discard those pages immediately after the compaction
+    /// finishes with them, billing the page cache cost strictly
+    /// to foreground data.
+    ///
+    /// Currently implemented as `posix_fadvise(DONTNEED)` on
+    /// Linux; on other targets the flag is accepted but the
+    /// hint is a no-op. `false` by default — callers who care
+    /// about foreground latency stability on Linux should turn
+    /// it on.
+    pub use_direct_io_for_compaction: bool,
 }
 
 impl Default for Options {
@@ -465,6 +481,7 @@ impl Default for Options {
             compaction_style: CompactionStyle::Level,
             fifo_compaction_options: FifoCompactionOptions::default(),
             universal_compaction_options: UniversalCompactionOptions::default(),
+            use_direct_io_for_compaction: false,
         }
     }
 }
@@ -527,6 +544,10 @@ impl std::fmt::Debug for Options {
                 "universal_compaction_options",
                 &self.universal_compaction_options,
             )
+            .field(
+                "use_direct_io_for_compaction",
+                &self.use_direct_io_for_compaction,
+            )
             .finish()
     }
 }
@@ -560,6 +581,7 @@ impl Options {
             compaction_style: self.compaction_style,
             fifo_compaction_options: self.fifo_compaction_options,
             universal_compaction_options: self.universal_compaction_options,
+            use_direct_io_for_compaction: self.use_direct_io_for_compaction,
         }
     }
 }
