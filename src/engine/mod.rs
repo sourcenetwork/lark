@@ -77,6 +77,7 @@ pub(crate) struct EngineOptions {
     pub(crate) max_write_buffer_number: usize,
     pub(crate) compaction_style: crate::options::CompactionStyle,
     pub(crate) fifo_compaction_options: crate::options::FifoCompactionOptions,
+    pub(crate) universal_compaction_options: crate::options::UniversalCompactionOptions,
 }
 
 impl EngineOptions {
@@ -119,6 +120,7 @@ impl Default for EngineOptions {
             max_write_buffer_number: 2,
             compaction_style: crate::options::CompactionStyle::Level,
             fifo_compaction_options: crate::options::FifoCompactionOptions::default(),
+            universal_compaction_options: crate::options::UniversalCompactionOptions::default(),
         }
     }
 }
@@ -266,6 +268,7 @@ impl LarkEngine {
             rate_limiter: options.rate_limiter.clone(),
             compaction_style: options.compaction_style,
             fifo_compaction_options: options.fifo_compaction_options,
+            universal_compaction_options: options.universal_compaction_options,
         };
 
         let compaction_lock = Arc::new(Mutex::new(()));
@@ -1402,6 +1405,7 @@ impl LarkEngine {
             rate_limiter: self.options.rate_limiter.clone(),
             compaction_style: self.options.compaction_style,
             fifo_compaction_options: self.options.fifo_compaction_options,
+            universal_compaction_options: self.options.universal_compaction_options,
         };
         // Under FIFO compaction there is no level push-down; a
         // synchronous compact_range just flushes the memtable and
@@ -1412,6 +1416,23 @@ impl LarkEngine {
             crate::options::CompactionStyle::Fifo
         ) {
             let _ = compaction::run_fifo_pass(&self.versions, &self.sst_dir, &compaction_opts)?;
+            return Ok(());
+        }
+
+        // Under Universal compaction a manual compact_range folds
+        // every L0 file into one run, matching the "force full
+        // compaction" semantics a caller expects.
+        if matches!(
+            self.options.compaction_style,
+            crate::options::CompactionStyle::Universal
+        ) {
+            compaction::run_universal_full_compaction(
+                &self.versions,
+                &self.sst_dir,
+                &self.cache,
+                &compaction_opts,
+                pin_seq,
+            )?;
             return Ok(());
         }
 
