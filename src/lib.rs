@@ -44,6 +44,7 @@
 
 mod backup;
 mod checkpoint;
+mod column_family;
 mod engine;
 mod error;
 mod iter;
@@ -54,6 +55,7 @@ mod ttl;
 
 pub use backup::{BackupEngine, BackupId, BackupInfo};
 pub use checkpoint::Checkpoint;
+pub use column_family::{ColumnFamilyHandle, DEFAULT_CF_NAME};
 pub use error::Error;
 pub use iter::Iter;
 pub use options::{
@@ -65,6 +67,10 @@ pub use transaction::{
     OptimisticTransactionDb, Transaction, TransactionDb, TransactionError, TxResult,
 };
 pub use ttl::{strip_timestamp, DbWithTtl, TtlCompactionFilter};
+
+use column_family::{
+    cf_lower_bound, cf_upper_bound, meta, prefix_key, CfRegistry, DEFAULT_CF_ID, META_CF_ID,
+};
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -79,6 +85,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Db {
     engine: Arc<LarkEngine>,
     durability: engine::DurabilityMode,
+    cfs: Arc<CfRegistry>,
 }
 
 impl std::fmt::Debug for Db {
@@ -91,66 +98,143 @@ impl std::fmt::Debug for Db {
 
 impl Db {
     /// Open or create a database at the given path.
+    ///
+    /// On a fresh database the default column family (`"default"`)
+    /// is created automatically and every non-`*_cf` method uses
+    /// it. Callers who want logical keyspace isolation can then
+    /// call [`Db::create_column_family`] for additional CFs; those
+    /// calls persist into the database and survive reopen.
     pub fn open<P: AsRef<Path>>(path: P, opts: Options) -> Result<Self> {
         let durability = match opts.durability {
             DurabilityMode::Immediate => engine::DurabilityMode::Immediate,
             DurabilityMode::Eventual => engine::DurabilityMode::Eventual,
         };
         let engine = LarkEngine::open(path.as_ref(), opts.to_engine_options())?;
-        Ok(Self { engine, durability })
+        let cfs = Arc::new(CfRegistry::new());
+        let db = Self {
+            engine,
+            durability,
+            cfs,
+        };
+        db.load_cf_registry()?;
+        Ok(db)
     }
 
-    /// Get the value for a key. Returns `None` if the key doesn't exist.
+    /// Populate the in-memory [`CfRegistry`] from the on-disk
+    /// metadata CF, creating the default CF entry if this is a
+    /// fresh database. Called once from [`Db::open`].
+    fn load_cf_registry(&self) -> Result<()> {
+        // Scan every `name:*` entry in the meta CF to rebuild the
+        // name→id map. The default CF is not persisted to disk —
+        // it's always injected into the in-memory registry with a
+        // hardcoded id so an empty database stays byte-free on
+        // disk. User-created CFs are the only thing that produces
+        // on-disk metadata writes.
+        let mut entries: Vec<(String, u32)> = Vec::new();
+        let seq = self.engine.snapshot_seq();
+        let pairs = collect_range(
+            &self.engine,
+            Some(&meta::name_scan_prefix()),
+            Some(&meta::name_scan_upper()),
+            seq,
+        )?;
+        for (key, value) in pairs {
+            if value.len() != 4 {
+                continue;
+            }
+            let Some(name) = meta::name_from_key(&key) else {
+                continue;
+            };
+            let id = u32::from_be_bytes(value.as_slice().try_into().unwrap());
+            entries.push((name.to_string(), id));
+        }
+
+        // Recover `next_id`. Absent on a fresh database.
+        let next_id_raw = self
+            .engine
+            .get(&meta::next_id_key(), self.engine.snapshot_seq())
+            .map_err(Error::Io)?;
+        let next_id = match next_id_raw {
+            Some(bytes) if bytes.len() == 4 => {
+                u32::from_be_bytes(bytes.as_slice().try_into().unwrap())
+            }
+            _ => DEFAULT_CF_ID + 1,
+        };
+
+        // Inject the default CF into the in-memory registry so
+        // `Db::default_cf()` always succeeds. It's never persisted
+        // to the meta CF — any re-open computes the same id.
+        entries.push((DEFAULT_CF_NAME.to_string(), DEFAULT_CF_ID));
+        self.cfs.load(entries, next_id);
+        Ok(())
+    }
+
+    /// Get the value for a key from the default column family.
+    /// Returns `None` if the key doesn't exist.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let seq = self.engine.snapshot_seq();
-        self.engine.get(key, seq).map_err(Error::Io)
+        self.get_raw(&prefix_key(DEFAULT_CF_ID, key))
     }
 
-    /// Look up a batch of keys in one call. Returns a vector with one
-    /// entry per input key (preserving order and duplicates); each entry
-    /// is `None` if the key does not exist or is tombstoned.
+    /// Engine-direct point read that bypasses CF prefixing. Used
+    /// by the CF metadata loader and by other modules (e.g. the
+    /// `_cf` wrappers above) that have already prefixed the key.
+    fn get_raw(&self, prefixed_key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let seq = self.engine.snapshot_seq();
+        self.engine.get(prefixed_key, seq).map_err(Error::Io)
+    }
+
+    /// Look up a batch of keys in the default column family.
+    /// Returns a vector with one entry per input key (preserving
+    /// order and duplicates); each entry is `None` if the key does
+    /// not exist or is tombstoned.
     ///
-    /// All keys in a single call see the **same** consistent view — a
-    /// concurrent writer cannot make two keys disagree about visibility.
+    /// All keys in a single call see the **same** consistent view —
+    /// a concurrent writer cannot make two keys disagree about
+    /// visibility.
     pub fn multi_get(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
+        let owned: Vec<Vec<u8>> = keys.iter().map(|k| prefix_key(DEFAULT_CF_ID, k)).collect();
+        let refs: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
         let seq = self.engine.snapshot_seq();
-        self.engine.multi_get(keys, seq).map_err(Error::Io)
+        self.engine.multi_get(&refs, seq).map_err(Error::Io)
     }
 
-    /// Set a key-value pair using the database-global durability mode
-    /// and default write options.
+    /// Set a key-value pair in the default column family using
+    /// the database-global durability mode and default write
+    /// options.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.put_opt(&WriteOptions::default(), key, value)
     }
 
-    /// Set a key-value pair with an explicit [`WriteOptions`] override.
-    /// Overrides on a per-call basis the database-global
-    /// [`Options::durability`] mode.
+    /// Set a key-value pair in the default column family with an
+    /// explicit [`WriteOptions`] override.
     pub fn put_opt(&self, opts: &WriteOptions, key: &[u8], value: &[u8]) -> Result<()> {
         let mut batch = BTreeMap::new();
-        batch.insert(key.to_vec(), Some(value.to_vec()));
+        batch.insert(prefix_key(DEFAULT_CF_ID, key), Some(value.to_vec()));
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
             .apply_batch(batch, Vec::new(), Vec::new(), dm, disable_wal)
             .map_err(Error::Io)
     }
 
-    /// Delete a key using the database-global durability mode.
+    /// Delete a key from the default column family using the
+    /// database-global durability mode.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         self.delete_opt(&WriteOptions::default(), key)
     }
 
-    /// Delete a key with an explicit [`WriteOptions`] override.
+    /// Delete a key from the default column family with an
+    /// explicit [`WriteOptions`] override.
     pub fn delete_opt(&self, opts: &WriteOptions, key: &[u8]) -> Result<()> {
         let mut batch = BTreeMap::new();
-        batch.insert(key.to_vec(), None);
+        batch.insert(prefix_key(DEFAULT_CF_ID, key), None);
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
             .apply_batch(batch, Vec::new(), Vec::new(), dm, disable_wal)
             .map_err(Error::Io)
     }
 
-    /// Layer a merge operand on top of `key`.
+    /// Layer a merge operand on top of `key` in the default
+    /// column family.
     ///
     /// Requires an [`Options::merge_operator`] to be configured. The
     /// operand is written cheaply (no read-modify-write); readers
@@ -167,14 +251,15 @@ impl Db {
             .apply_batch(
                 BTreeMap::new(),
                 Vec::new(),
-                vec![(key.to_vec(), operand.to_vec())],
+                vec![(prefix_key(DEFAULT_CF_ID, key), operand.to_vec())],
                 dm,
                 disable_wal,
             )
             .map_err(Error::Io)
     }
 
-    /// Delete every key in the half-open range `[start, end)`.
+    /// Delete every key in `[start, end)` in the default column
+    /// family.
     ///
     /// Range deletes are cheap regardless of how many keys the range
     /// covers — internally they are stored as a single range-tombstone
@@ -187,8 +272,8 @@ impl Db {
         self.delete_range_opt(&WriteOptions::default(), start, end)
     }
 
-    /// Delete every key in `[start, end)` with an explicit
-    /// [`WriteOptions`] override.
+    /// Delete every key in `[start, end)` in the default column
+    /// family with an explicit [`WriteOptions`] override.
     pub fn delete_range_opt(&self, opts: &WriteOptions, start: &[u8], end: &[u8]) -> Result<()> {
         if start >= end {
             return Ok(());
@@ -197,7 +282,10 @@ impl Db {
         self.engine
             .apply_batch(
                 BTreeMap::new(),
-                vec![(start.to_vec(), end.to_vec())],
+                vec![(
+                    prefix_key(DEFAULT_CF_ID, start),
+                    prefix_key(DEFAULT_CF_ID, end),
+                )],
                 Vec::new(),
                 dm,
                 disable_wal,
@@ -276,26 +364,47 @@ impl Db {
         }
     }
 
-    /// Scan a key range. Returns all key-value pairs where `start <= key < end`.
+    /// Scan a key range in the default column family. Returns all
+    /// key-value pairs where `start <= key < end`, with keys in
+    /// their user-visible form (no CF prefix).
     pub fn scan(
         &self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let lo = match start {
+            Some(s) => prefix_key(DEFAULT_CF_ID, s),
+            None => cf_lower_bound(DEFAULT_CF_ID),
+        };
+        let hi = match end {
+            Some(e) => prefix_key(DEFAULT_CF_ID, e),
+            None => cf_upper_bound(DEFAULT_CF_ID),
+        };
         let seq = self.engine.snapshot_seq();
-        collect_range(&self.engine, start, end, seq)
+        let raw = collect_range(&self.engine, Some(&lo), Some(&hi), seq)?;
+        Ok(raw.into_iter().map(|(k, v)| (k[4..].to_vec(), v)).collect())
     }
 
-    /// Create a streaming iterator over the current database state.
+    /// Create a streaming iterator over the default column family.
     ///
     /// The iterator captures a consistent view at the moment it is created
     /// — later writes are invisible to this iterator, and concurrent
-    /// background compaction cannot invalidate it.
+    /// background compaction cannot invalidate it. Keys returned from
+    /// the iterator have the CF prefix stripped and appear exactly as
+    /// the caller supplied them on put.
     ///
     /// A fresh iterator is not positioned; call one of
-    /// [`Iter::seek_to_first`], [`Iter::seek`], or
-    /// [`Iter::seek_for_prev`] before reading.
-    pub fn iter(&self) -> Iter<'_> {
+    /// [`CfIter::seek_to_first`], [`CfIter::seek`], or
+    /// [`CfIter::seek_for_prev`] before reading.
+    pub fn iter(&self) -> CfIter<'_> {
+        let default = self.default_cf();
+        self.iter_cf(&default)
+    }
+
+    /// Create a raw streaming iterator over the entire engine
+    /// keyspace, including the reserved metadata CF. Internal —
+    /// used by [`Db::iter_cf`] via `CfIter`.
+    fn raw_iter(&self) -> Iter<'_> {
         let seq = self.engine.snapshot_seq();
         Iter::from_internal(self.engine.new_iter(seq))
     }
@@ -362,6 +471,194 @@ impl Db {
         cp.create(target_dir)
     }
 
+    // ── column families ─────────────────────────────────────────────────
+
+    /// Return a handle to the default column family. Always
+    /// present — [`Db::open`] creates it if the database didn't
+    /// already contain one.
+    pub fn default_cf(&self) -> ColumnFamilyHandle {
+        self.cfs
+            .get(DEFAULT_CF_NAME)
+            .expect("default CF is created at Db::open time")
+    }
+
+    /// Look up a column family by name. Returns `None` when no CF
+    /// with that name has been created (or if the CF was dropped).
+    pub fn column_family(&self, name: &str) -> Option<ColumnFamilyHandle> {
+        self.cfs.get(name)
+    }
+
+    /// Return the names of every live column family, including
+    /// `"default"`. Order is unspecified.
+    pub fn list_column_families(&self) -> Vec<String> {
+        let mut names = self.cfs.names();
+        names.sort();
+        names
+    }
+
+    /// Create a new column family with `name`. The name must be
+    /// non-empty and unique; creating a CF with an existing name
+    /// returns the existing handle (idempotent).
+    ///
+    /// The new CF is persisted to the on-disk metadata before this
+    /// call returns, so it survives a crash and a reopen.
+    pub fn create_column_family(&self, name: &str) -> Result<ColumnFamilyHandle> {
+        if name.is_empty() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "column family name must not be empty",
+            )));
+        }
+        if let Some(existing) = self.cfs.get(name) {
+            return Ok(existing);
+        }
+        let (handle, next_id) = self.cfs.allocate(name);
+        let mut batch = BTreeMap::new();
+        batch.insert(
+            meta::name_key(name),
+            Some(handle.id().to_be_bytes().to_vec()),
+        );
+        batch.insert(meta::next_id_key(), Some(next_id.to_be_bytes().to_vec()));
+        self.engine
+            .apply_batch(batch, Vec::new(), Vec::new(), self.durability, false)
+            .map_err(Error::Io)?;
+        Ok(handle)
+    }
+
+    /// Drop a column family. Every key stored in the CF is removed
+    /// via a single range tombstone (O(1) write work regardless of
+    /// key count) and the CF name is unregistered so future
+    /// lookups via [`Db::column_family`] return `None`. Space is
+    /// physically reclaimed by the next compaction over the range.
+    ///
+    /// Dropping the default column family is not allowed and
+    /// returns an error.
+    pub fn drop_column_family(&self, cf: ColumnFamilyHandle) -> Result<()> {
+        if cf.id() == DEFAULT_CF_ID {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cannot drop the default column family",
+            )));
+        }
+        if cf.id() == META_CF_ID {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cannot drop the reserved metadata column family",
+            )));
+        }
+        let lo = cf_lower_bound(cf.id());
+        let hi = cf_upper_bound(cf.id());
+        // Apply the data range-delete and the metadata entry
+        // removal in a single atomic batch so a crash mid-drop
+        // either leaves the CF fully present or fully removed.
+        let mut point_ops = BTreeMap::new();
+        point_ops.insert(meta::name_key(cf.name()), None);
+        let range_deletes = vec![(lo, hi)];
+        self.engine
+            .apply_batch(point_ops, range_deletes, Vec::new(), self.durability, false)
+            .map_err(Error::Io)?;
+        self.cfs.remove(cf.name());
+        Ok(())
+    }
+
+    /// Read `key` from column family `cf`. Same semantics as
+    /// [`Db::get`] but scoped to the CF's keyspace.
+    pub fn get_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.get_raw(&prefix_key(cf.id(), key))
+    }
+
+    /// Batched point lookup across a single CF.
+    pub fn multi_get_cf(
+        &self,
+        cf: &ColumnFamilyHandle,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        let owned: Vec<Vec<u8>> = keys.iter().map(|k| prefix_key(cf.id(), k)).collect();
+        let refs: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+        let seq = self.engine.snapshot_seq();
+        self.engine.multi_get(&refs, seq).map_err(Error::Io)
+    }
+
+    /// Write `key → value` in column family `cf`.
+    pub fn put_cf(&self, cf: &ColumnFamilyHandle, key: &[u8], value: &[u8]) -> Result<()> {
+        let mut batch = BTreeMap::new();
+        batch.insert(prefix_key(cf.id(), key), Some(value.to_vec()));
+        self.engine
+            .apply_batch(batch, Vec::new(), Vec::new(), self.durability, false)
+            .map_err(Error::Io)
+    }
+
+    /// Delete `key` in column family `cf`.
+    pub fn delete_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<()> {
+        let mut batch = BTreeMap::new();
+        batch.insert(prefix_key(cf.id(), key), None);
+        self.engine
+            .apply_batch(batch, Vec::new(), Vec::new(), self.durability, false)
+            .map_err(Error::Io)
+    }
+
+    /// Delete every key in `[start, end)` in column family `cf`.
+    pub fn delete_range_cf(&self, cf: &ColumnFamilyHandle, start: &[u8], end: &[u8]) -> Result<()> {
+        if start >= end {
+            return Ok(());
+        }
+        self.engine
+            .apply_batch(
+                BTreeMap::new(),
+                vec![(prefix_key(cf.id(), start), prefix_key(cf.id(), end))],
+                Vec::new(),
+                self.durability,
+                false,
+            )
+            .map_err(Error::Io)
+    }
+
+    /// Layer a merge operand on top of `key` in column family `cf`.
+    /// Requires [`Options::merge_operator`] to be set.
+    pub fn merge_cf(&self, cf: &ColumnFamilyHandle, key: &[u8], operand: &[u8]) -> Result<()> {
+        self.engine
+            .apply_batch(
+                BTreeMap::new(),
+                Vec::new(),
+                vec![(prefix_key(cf.id(), key), operand.to_vec())],
+                self.durability,
+                false,
+            )
+            .map_err(Error::Io)
+    }
+
+    /// Scan a key range inside column family `cf`. Returned keys
+    /// have the CF prefix stripped — they appear exactly as the
+    /// caller supplied them on put.
+    pub fn scan_cf(
+        &self,
+        cf: &ColumnFamilyHandle,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let lo = match start {
+            Some(s) => prefix_key(cf.id(), s),
+            None => cf_lower_bound(cf.id()),
+        };
+        let hi = match end {
+            Some(e) => prefix_key(cf.id(), e),
+            None => cf_upper_bound(cf.id()),
+        };
+        let seq = self.engine.snapshot_seq();
+        let raw = collect_range(&self.engine, Some(&lo), Some(&hi), seq)?;
+        Ok(raw.into_iter().map(|(k, v)| (k[4..].to_vec(), v)).collect())
+    }
+
+    /// Streaming iterator bounded to column family `cf`. The
+    /// returned keys have the CF prefix stripped.
+    pub fn iter_cf<'a>(&'a self, cf: &ColumnFamilyHandle) -> CfIter<'a> {
+        CfIter {
+            inner: self.raw_iter(),
+            cf_id: cf.id(),
+            upper_bound: cf_upper_bound(cf.id()),
+        }
+    }
+
     pub(crate) fn engine(&self) -> &LarkEngine {
         &self.engine
     }
@@ -377,6 +674,112 @@ impl Db {
     /// commit code to choose fsync semantics.
     pub(crate) fn durability(&self) -> engine::DurabilityMode {
         self.durability
+    }
+}
+
+/// Streaming iterator scoped to a single column family. Wraps a
+/// regular [`Iter`] and bounds the scan to the CF's prefix range,
+/// stripping the 4-byte CF prefix from every key before returning
+/// it. Created by [`Db::iter_cf`] / [`Snapshot::iter_cf`].
+pub struct CfIter<'a> {
+    inner: Iter<'a>,
+    cf_id: u32,
+    upper_bound: Vec<u8>,
+}
+
+impl<'a> CfIter<'a> {
+    /// Position the cursor at the first key in the CF.
+    pub fn seek_to_first(&mut self) {
+        let lo = self.cf_id.to_be_bytes();
+        self.inner.seek(&lo);
+    }
+
+    /// Position the cursor at the last key in the CF (or before
+    /// the CF's upper bound if the CF is empty).
+    pub fn seek_to_last(&mut self) {
+        // `seek_for_prev(upper_bound - 1)` is the trick: seek to
+        // the largest key strictly less than `upper_bound`.
+        let mut probe = self.upper_bound.clone();
+        // Decrement by one — upper_bound is built by incrementing
+        // the CF id, so it's never all zeros; subtracting one byte
+        // gives a valid probe. Simpler: seek_for_prev(upper_bound)
+        // which lands on the last key < upper_bound.
+        if let Some(last) = probe.last_mut() {
+            if *last > 0 {
+                *last -= 1;
+                // Append 0xff bytes to get a probe strictly less
+                // than upper_bound but larger than every key in
+                // the CF.
+                probe.extend_from_slice(&[0xff; 8]);
+            }
+        }
+        self.inner.seek_for_prev(&probe);
+    }
+
+    /// Position the cursor at the first key `>= target` in the CF.
+    pub fn seek(&mut self, target: &[u8]) {
+        self.inner.seek(&prefix_key(self.cf_id, target));
+    }
+
+    /// Position the cursor at the last key `<= target` in the CF.
+    pub fn seek_for_prev(&mut self, target: &[u8]) {
+        self.inner.seek_for_prev(&prefix_key(self.cf_id, target));
+    }
+
+    /// Position the cursor at the first key in this CF that starts
+    /// with `prefix`, and bound subsequent forward iteration to
+    /// that prefix. Delegates to the underlying [`Iter::seek_prefix`],
+    /// with `prefix` first re-scoped to include the CF prefix.
+    pub fn seek_prefix(&mut self, prefix: &[u8]) {
+        self.inner.seek_prefix(&prefix_key(self.cf_id, prefix));
+    }
+
+    /// Advance the cursor forward. Invalidates the iterator if
+    /// the next key crosses the CF's upper bound.
+    pub fn next(&mut self) {
+        self.inner.next();
+    }
+
+    /// Move the cursor backward. Invalidates the iterator if
+    /// the previous key crosses the CF's lower bound.
+    pub fn prev(&mut self) {
+        self.inner.prev();
+    }
+
+    /// Whether the cursor is positioned on a visible key within
+    /// the CF.
+    pub fn valid(&self) -> bool {
+        let Some(k) = self.inner.key() else {
+            return false;
+        };
+        if k < self.cf_id.to_be_bytes().as_slice() {
+            return false;
+        }
+        if k >= self.upper_bound.as_slice() {
+            return false;
+        }
+        true
+    }
+
+    /// Current key, with the CF prefix stripped.
+    pub fn key(&self) -> Option<&[u8]> {
+        if !self.valid() {
+            return None;
+        }
+        self.inner.key().map(|k| &k[4..])
+    }
+
+    /// Current value.
+    pub fn value(&self) -> Option<&[u8]> {
+        if !self.valid() {
+            return None;
+        }
+        self.inner.value()
+    }
+
+    /// Propagate any I/O error from the underlying iterator.
+    pub fn status(&self) -> Result<()> {
+        self.inner.status()
     }
 }
 
@@ -406,28 +809,93 @@ impl std::fmt::Debug for Snapshot {
 }
 
 impl Snapshot {
-    /// Get the value for a key at this snapshot.
+    /// Get the value for a key at this snapshot (default CF).
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.engine.get(key, self.seq).map_err(Error::Io)
+        self.engine
+            .get(&prefix_key(DEFAULT_CF_ID, key), self.seq)
+            .map_err(Error::Io)
     }
 
-    /// Batched point lookup anchored at this snapshot.
+    /// Batched point lookup anchored at this snapshot (default CF).
     pub fn multi_get(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
-        self.engine.multi_get(keys, self.seq).map_err(Error::Io)
+        let owned: Vec<Vec<u8>> = keys.iter().map(|k| prefix_key(DEFAULT_CF_ID, k)).collect();
+        let refs: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+        self.engine.multi_get(&refs, self.seq).map_err(Error::Io)
     }
 
-    /// Scan a key range at this snapshot.
+    /// Scan a key range at this snapshot (default CF).
     pub fn scan(
         &self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        collect_range(&self.engine, start, end, self.seq)
+        let lo = match start {
+            Some(s) => prefix_key(DEFAULT_CF_ID, s),
+            None => cf_lower_bound(DEFAULT_CF_ID),
+        };
+        let hi = match end {
+            Some(e) => prefix_key(DEFAULT_CF_ID, e),
+            None => cf_upper_bound(DEFAULT_CF_ID),
+        };
+        let raw = collect_range(&self.engine, Some(&lo), Some(&hi), self.seq)?;
+        Ok(raw.into_iter().map(|(k, v)| (k[4..].to_vec(), v)).collect())
     }
 
-    /// Create a streaming iterator anchored at this snapshot.
-    pub fn iter(&self) -> Iter<'_> {
-        Iter::from_internal(self.engine.new_iter(self.seq))
+    /// Create a streaming iterator anchored at this snapshot
+    /// (default CF). Keys returned have the CF prefix stripped.
+    pub fn iter(&self) -> CfIter<'_> {
+        CfIter {
+            inner: Iter::from_internal(self.engine.new_iter(self.seq)),
+            cf_id: DEFAULT_CF_ID,
+            upper_bound: cf_upper_bound(DEFAULT_CF_ID),
+        }
+    }
+
+    /// CF-scoped get at this snapshot.
+    pub fn get_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.engine
+            .get(&prefix_key(cf.id(), key), self.seq)
+            .map_err(Error::Io)
+    }
+
+    /// CF-scoped multi_get at this snapshot.
+    pub fn multi_get_cf(
+        &self,
+        cf: &ColumnFamilyHandle,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        let owned: Vec<Vec<u8>> = keys.iter().map(|k| prefix_key(cf.id(), k)).collect();
+        let refs: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+        self.engine.multi_get(&refs, self.seq).map_err(Error::Io)
+    }
+
+    /// CF-scoped scan at this snapshot. Returned keys have the
+    /// CF prefix stripped.
+    pub fn scan_cf(
+        &self,
+        cf: &ColumnFamilyHandle,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let lo = match start {
+            Some(s) => prefix_key(cf.id(), s),
+            None => cf_lower_bound(cf.id()),
+        };
+        let hi = match end {
+            Some(e) => prefix_key(cf.id(), e),
+            None => cf_upper_bound(cf.id()),
+        };
+        let raw = collect_range(&self.engine, Some(&lo), Some(&hi), self.seq)?;
+        Ok(raw.into_iter().map(|(k, v)| (k[4..].to_vec(), v)).collect())
+    }
+
+    /// CF-scoped streaming iterator at this snapshot.
+    pub fn iter_cf<'a>(&'a self, cf: &ColumnFamilyHandle) -> CfIter<'a> {
+        CfIter {
+            inner: Iter::from_internal(self.engine.new_iter(self.seq)),
+            cf_id: cf.id(),
+            upper_bound: cf_upper_bound(cf.id()),
+        }
     }
 }
 
@@ -478,17 +946,19 @@ impl WriteBatch {
         Self::default()
     }
 
-    /// Add a put operation to the batch.
+    /// Add a put operation to the batch (default column family).
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
-        self.ops.insert(key.to_vec(), Some(value.to_vec()));
+        self.ops
+            .insert(prefix_key(DEFAULT_CF_ID, key), Some(value.to_vec()));
     }
 
-    /// Add a delete operation to the batch.
+    /// Add a delete operation to the batch (default column family).
     pub fn delete(&mut self, key: &[u8]) {
-        self.ops.insert(key.to_vec(), None);
+        self.ops.insert(prefix_key(DEFAULT_CF_ID, key), None);
     }
 
-    /// Delete every key in the half-open range `[start, end)`.
+    /// Delete every key in the half-open range `[start, end)` in
+    /// the default column family.
     ///
     /// When the batch is applied, the range delete is recorded with
     /// the same transactional seq as the other batch operations, so
@@ -498,16 +968,73 @@ impl WriteBatch {
         if start >= end {
             return;
         }
-        self.range_deletes.push((start.to_vec(), end.to_vec()));
+        self.range_deletes.push((
+            prefix_key(DEFAULT_CF_ID, start),
+            prefix_key(DEFAULT_CF_ID, end),
+        ));
     }
 
-    /// Add a merge operand for `key`. Requires the database to be
-    /// configured with a [`MergeOperator`]; the operand is layered
-    /// on top of any existing value or merge chain and collapsed at
-    /// read time. Multiple merges on the same key in a single batch
-    /// are allowed and applied in insertion order.
+    /// Add a merge operand for `key` in the default column family.
+    /// Requires the database to be configured with a
+    /// [`MergeOperator`]; the operand is layered on top of any
+    /// existing value or merge chain and collapsed at read time.
+    /// Multiple merges on the same key in a single batch are
+    /// allowed and applied in insertion order.
     pub fn merge(&mut self, key: &[u8], operand: &[u8]) {
-        self.merges.push((key.to_vec(), operand.to_vec()));
+        self.merges
+            .push((prefix_key(DEFAULT_CF_ID, key), operand.to_vec()));
+    }
+
+    /// Add a put scoped to column family `cf`.
+    pub fn put_cf(&mut self, cf: &ColumnFamilyHandle, key: &[u8], value: &[u8]) {
+        self.ops
+            .insert(prefix_key(cf.id(), key), Some(value.to_vec()));
+    }
+
+    /// Add a delete scoped to column family `cf`.
+    pub fn delete_cf(&mut self, cf: &ColumnFamilyHandle, key: &[u8]) {
+        self.ops.insert(prefix_key(cf.id(), key), None);
+    }
+
+    /// Add a range delete scoped to column family `cf`.
+    pub fn delete_range_cf(&mut self, cf: &ColumnFamilyHandle, start: &[u8], end: &[u8]) {
+        if start >= end {
+            return;
+        }
+        self.range_deletes
+            .push((prefix_key(cf.id(), start), prefix_key(cf.id(), end)));
+    }
+
+    /// Add a merge operand scoped to column family `cf`.
+    pub fn merge_cf(&mut self, cf: &ColumnFamilyHandle, key: &[u8], operand: &[u8]) {
+        self.merges
+            .push((prefix_key(cf.id(), key), operand.to_vec()));
+    }
+
+    /// Insert an already-prefixed put (internal use by wrappers
+    /// like `DbWithTtl` that iterate a source batch's raw entries
+    /// and rebuild a new batch without re-applying the CF prefix).
+    pub(crate) fn insert_raw_put(&mut self, prefixed_key: Vec<u8>, value: Vec<u8>) {
+        self.ops.insert(prefixed_key, Some(value));
+    }
+
+    /// Insert an already-prefixed delete.
+    pub(crate) fn insert_raw_delete(&mut self, prefixed_key: Vec<u8>) {
+        self.ops.insert(prefixed_key, None);
+    }
+
+    /// Insert an already-prefixed range delete.
+    pub(crate) fn insert_raw_range_delete(
+        &mut self,
+        prefixed_start: Vec<u8>,
+        prefixed_end: Vec<u8>,
+    ) {
+        self.range_deletes.push((prefixed_start, prefixed_end));
+    }
+
+    /// Insert an already-prefixed merge operand.
+    pub(crate) fn insert_raw_merge(&mut self, prefixed_key: Vec<u8>, operand: Vec<u8>) {
+        self.merges.push((prefixed_key, operand));
     }
 
     /// Number of point operations in the batch. Range deletes and
@@ -941,7 +1468,10 @@ mod tests {
     /// accessor. Returns `(seq, value_type)` for every copy of
     /// `user_key` currently sitting in an SSTable at any level.
     fn all_versions_of(db: &Db, user_key: &[u8]) -> Vec<(u64, u8)> {
-        db.engine.all_persisted_versions_of(user_key).unwrap()
+        // The helper walks raw engine keys, so re-apply the
+        // default-CF prefix before querying.
+        let prefixed = prefix_key(DEFAULT_CF_ID, user_key);
+        db.engine.all_persisted_versions_of(&prefixed).unwrap()
     }
 
     #[test]
@@ -2975,5 +3505,315 @@ mod tests {
         let opts = counter_opts();
         let dbg = format!("{opts:?}");
         assert!(dbg.contains("CounterMerge"));
+    }
+
+    // ── column families ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_cf_default_exists_on_open() {
+        let (db, _dir) = open_tmp();
+        let default = db.default_cf();
+        assert_eq!(default.name(), DEFAULT_CF_NAME);
+        assert!(db.column_family(DEFAULT_CF_NAME).is_some());
+        assert_eq!(db.list_column_families(), vec![DEFAULT_CF_NAME.to_string()]);
+    }
+
+    #[test]
+    fn test_cf_create_and_lookup() {
+        let (db, _dir) = open_tmp();
+        let users = db.create_column_family("users").unwrap();
+        let orders = db.create_column_family("orders").unwrap();
+        assert_ne!(users, orders);
+        assert_eq!(db.column_family("users"), Some(users.clone()));
+        assert_eq!(db.column_family("orders"), Some(orders.clone()));
+        assert!(db.column_family("missing").is_none());
+
+        let mut names = db.list_column_families();
+        names.sort();
+        assert_eq!(names, vec!["default", "orders", "users"]);
+    }
+
+    #[test]
+    fn test_cf_create_is_idempotent() {
+        let (db, _dir) = open_tmp();
+        let a = db.create_column_family("x").unwrap();
+        let b = db.create_column_family("x").unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_cf_put_get_isolated_from_default() {
+        let (db, _dir) = open_tmp();
+        let users = db.create_column_family("users").unwrap();
+        db.put(b"k", b"default_val").unwrap();
+        db.put_cf(&users, b"k", b"users_val").unwrap();
+        assert_eq!(db.get(b"k").unwrap(), Some(b"default_val".to_vec()));
+        assert_eq!(
+            db.get_cf(&users, b"k").unwrap(),
+            Some(b"users_val".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_cf_writes_to_a_invisible_from_b() {
+        let (db, _dir) = open_tmp();
+        let a = db.create_column_family("a").unwrap();
+        let b = db.create_column_family("b").unwrap();
+        db.put_cf(&a, b"shared_key", b"alpha").unwrap();
+        assert_eq!(
+            db.get_cf(&a, b"shared_key").unwrap(),
+            Some(b"alpha".to_vec())
+        );
+        assert_eq!(db.get_cf(&b, b"shared_key").unwrap(), None);
+    }
+
+    #[test]
+    fn test_cf_delete_cf() {
+        let (db, _dir) = open_tmp();
+        let cf = db.create_column_family("c").unwrap();
+        db.put_cf(&cf, b"k", b"v").unwrap();
+        db.delete_cf(&cf, b"k").unwrap();
+        assert_eq!(db.get_cf(&cf, b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn test_cf_scan_strips_prefix() {
+        let (db, _dir) = open_tmp();
+        let cf = db.create_column_family("s").unwrap();
+        db.put_cf(&cf, b"a", b"1").unwrap();
+        db.put_cf(&cf, b"b", b"2").unwrap();
+        db.put_cf(&cf, b"c", b"3").unwrap();
+        let pairs = db.scan_cf(&cf, None, None).unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec()),
+                (b"c".to_vec(), b"3".to_vec()),
+            ]
+        );
+        // Bounded scan.
+        let pairs = db.scan_cf(&cf, Some(b"b"), Some(b"c")).unwrap();
+        assert_eq!(pairs, vec![(b"b".to_vec(), b"2".to_vec())]);
+    }
+
+    #[test]
+    fn test_cf_iter_bounded_to_cf() {
+        let (db, _dir) = open_tmp();
+        let a = db.create_column_family("a").unwrap();
+        let b = db.create_column_family("b").unwrap();
+        db.put_cf(&a, b"a1", b"A1").unwrap();
+        db.put_cf(&a, b"a2", b"A2").unwrap();
+        db.put_cf(&b, b"b1", b"B1").unwrap();
+        db.put(b"d1", b"D1").unwrap();
+
+        let mut iter = db.iter_cf(&a);
+        iter.seek_to_first();
+        let mut keys = Vec::new();
+        while iter.valid() {
+            keys.push(iter.key().unwrap().to_vec());
+            iter.next();
+        }
+        assert_eq!(keys, vec![b"a1".to_vec(), b"a2".to_vec()]);
+    }
+
+    #[test]
+    fn test_cf_iter_reverse() {
+        let (db, _dir) = open_tmp();
+        let cf = db.create_column_family("rev").unwrap();
+        db.put_cf(&cf, b"a", b"1").unwrap();
+        db.put_cf(&cf, b"b", b"2").unwrap();
+        db.put_cf(&cf, b"c", b"3").unwrap();
+
+        let mut iter = db.iter_cf(&cf);
+        iter.seek_to_last();
+        let mut keys = Vec::new();
+        while iter.valid() {
+            keys.push(iter.key().unwrap().to_vec());
+            iter.prev();
+        }
+        assert_eq!(keys, vec![b"c".to_vec(), b"b".to_vec(), b"a".to_vec()]);
+    }
+
+    #[test]
+    fn test_cf_drop_removes_all_keys_in_cf() {
+        let (db, _dir) = open_tmp();
+        let cf = db.create_column_family("tmp").unwrap();
+        db.put_cf(&cf, b"a", b"1").unwrap();
+        db.put_cf(&cf, b"b", b"2").unwrap();
+        db.put_cf(&cf, b"c", b"3").unwrap();
+        db.put(b"default_key", b"default_val").unwrap();
+
+        db.drop_column_family(cf.clone()).unwrap();
+
+        // The CF name is unregistered.
+        assert!(db.column_family("tmp").is_none());
+        // Default CF survives.
+        assert_eq!(
+            db.get(b"default_key").unwrap(),
+            Some(b"default_val".to_vec())
+        );
+        // Re-creating with the same name yields a fresh, empty CF.
+        let cf2 = db.create_column_family("tmp").unwrap();
+        assert_eq!(db.get_cf(&cf2, b"a").unwrap(), None);
+    }
+
+    #[test]
+    fn test_cf_cannot_drop_default() {
+        let (db, _dir) = open_tmp();
+        let default = db.default_cf();
+        assert!(db.drop_column_family(default).is_err());
+    }
+
+    #[test]
+    fn test_cf_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Db::open(dir.path(), Options::default()).unwrap();
+            let cf = db.create_column_family("persistent").unwrap();
+            db.put_cf(&cf, b"k", b"v").unwrap();
+            db.close().unwrap();
+        }
+        let db = Db::open(dir.path(), Options::default()).unwrap();
+        let cf = db
+            .column_family("persistent")
+            .expect("CF must survive reopen");
+        assert_eq!(db.get_cf(&cf, b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn test_cf_dropped_cf_does_not_survive_reopen() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Db::open(dir.path(), Options::default()).unwrap();
+            let cf = db.create_column_family("doomed").unwrap();
+            db.put_cf(&cf, b"k", b"v").unwrap();
+            db.drop_column_family(cf).unwrap();
+            db.close().unwrap();
+        }
+        let db = Db::open(dir.path(), Options::default()).unwrap();
+        assert!(db.column_family("doomed").is_none());
+    }
+
+    #[test]
+    fn test_cf_write_batch_cross_cf_atomic() {
+        let (db, _dir) = open_tmp();
+        let a = db.create_column_family("a").unwrap();
+        let b = db.create_column_family("b").unwrap();
+        let mut batch = WriteBatch::new();
+        batch.put_cf(&a, b"k1", b"v_a1");
+        batch.put_cf(&b, b"k1", b"v_b1");
+        batch.put(b"k1", b"v_default");
+        batch.delete_cf(&a, b"ghost");
+        db.write(batch).unwrap();
+
+        assert_eq!(db.get_cf(&a, b"k1").unwrap(), Some(b"v_a1".to_vec()));
+        assert_eq!(db.get_cf(&b, b"k1").unwrap(), Some(b"v_b1".to_vec()));
+        assert_eq!(db.get(b"k1").unwrap(), Some(b"v_default".to_vec()));
+    }
+
+    #[test]
+    fn test_cf_write_batch_survives_crash_recovery() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Db::open(dir.path(), Options::default()).unwrap();
+            let cf = db.create_column_family("txn").unwrap();
+            let mut batch = WriteBatch::new();
+            batch.put_cf(&cf, b"a", b"1");
+            batch.put_cf(&cf, b"b", b"2");
+            batch.put(b"default_k", b"default_v");
+            db.write(batch).unwrap();
+            // No close — simulate a crash. WAL must survive.
+        }
+        let db = Db::open(dir.path(), Options::default()).unwrap();
+        let cf = db.column_family("txn").expect("CF must survive");
+        assert_eq!(db.get_cf(&cf, b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(db.get_cf(&cf, b"b").unwrap(), Some(b"2".to_vec()));
+        assert_eq!(db.get(b"default_k").unwrap(), Some(b"default_v".to_vec()));
+    }
+
+    #[test]
+    fn test_cf_snapshot_isolation_per_cf() {
+        let (db, _dir) = open_tmp();
+        let a = db.create_column_family("a").unwrap();
+        db.put_cf(&a, b"k", b"v0").unwrap();
+        let snap = db.snapshot();
+        db.put_cf(&a, b"k", b"v1").unwrap();
+        assert_eq!(snap.get_cf(&a, b"k").unwrap(), Some(b"v0".to_vec()));
+        assert_eq!(db.get_cf(&a, b"k").unwrap(), Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn test_cf_scan_across_cfs_is_isolated() {
+        let (db, _dir) = open_tmp();
+        let a = db.create_column_family("a").unwrap();
+        let b = db.create_column_family("b").unwrap();
+        db.put_cf(&a, b"apple", b"A").unwrap();
+        db.put_cf(&b, b"apple", b"B").unwrap();
+        db.put(b"apple", b"D").unwrap();
+
+        assert_eq!(
+            db.scan_cf(&a, None, None).unwrap(),
+            vec![(b"apple".to_vec(), b"A".to_vec())]
+        );
+        assert_eq!(
+            db.scan_cf(&b, None, None).unwrap(),
+            vec![(b"apple".to_vec(), b"B".to_vec())]
+        );
+        assert_eq!(
+            db.scan(None, None).unwrap(),
+            vec![(b"apple".to_vec(), b"D".to_vec())]
+        );
+    }
+
+    #[test]
+    fn test_cf_multi_get_cf() {
+        let (db, _dir) = open_tmp();
+        let cf = db.create_column_family("mg").unwrap();
+        db.put_cf(&cf, b"a", b"1").unwrap();
+        db.put_cf(&cf, b"b", b"2").unwrap();
+        let keys: Vec<&[u8]> = vec![b"a", b"missing", b"b"];
+        let got = db.multi_get_cf(&cf, &keys).unwrap();
+        assert_eq!(got, vec![Some(b"1".to_vec()), None, Some(b"2".to_vec())]);
+    }
+
+    #[test]
+    fn test_cf_delete_range_cf() {
+        let (db, _dir) = open_tmp();
+        let cf = db.create_column_family("r").unwrap();
+        for c in b'a'..=b'f' {
+            db.put_cf(&cf, &[c], &[c]).unwrap();
+        }
+        db.delete_range_cf(&cf, b"b", b"e").unwrap();
+        assert_eq!(db.get_cf(&cf, b"a").unwrap(), Some(b"a".to_vec()));
+        assert_eq!(db.get_cf(&cf, b"b").unwrap(), None);
+        assert_eq!(db.get_cf(&cf, b"c").unwrap(), None);
+        assert_eq!(db.get_cf(&cf, b"d").unwrap(), None);
+        assert_eq!(db.get_cf(&cf, b"e").unwrap(), Some(b"e".to_vec()));
+        assert_eq!(db.get_cf(&cf, b"f").unwrap(), Some(b"f".to_vec()));
+    }
+
+    #[test]
+    fn test_cf_create_empty_name_errors() {
+        let (db, _dir) = open_tmp();
+        assert!(db.create_column_family("").is_err());
+    }
+
+    #[test]
+    fn test_cf_many_cfs_all_isolated() {
+        let (db, _dir) = open_tmp();
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            handles.push(db.create_column_family(&format!("cf{i}")).unwrap());
+        }
+        for (i, h) in handles.iter().enumerate() {
+            db.put_cf(h, b"k", format!("v{i}").as_bytes()).unwrap();
+        }
+        for (i, h) in handles.iter().enumerate() {
+            assert_eq!(
+                db.get_cf(h, b"k").unwrap(),
+                Some(format!("v{i}").into_bytes())
+            );
+        }
     }
 }

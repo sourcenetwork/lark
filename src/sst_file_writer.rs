@@ -11,6 +11,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::column_family::{prefix_key, ColumnFamilyHandle, DEFAULT_CF_ID};
 use crate::engine::internal_key::{encode_internal_key, VALUE_TYPE_DELETION, VALUE_TYPE_VALUE};
 use crate::engine::sstable::SsTableWriter;
 use crate::options::Options;
@@ -96,16 +97,38 @@ impl SstFileWriter {
         })
     }
 
-    /// Append a `(key, value)` pair. `key` must be strictly greater
-    /// than every previously added key.
+    /// Append a `(key, value)` pair to the default column family.
+    /// `key` must be strictly greater than every previously added
+    /// key.
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> crate::Result<()> {
-        self.add(key, value, VALUE_TYPE_VALUE)
+        let prefixed = prefix_key(DEFAULT_CF_ID, key);
+        self.add(&prefixed, value, VALUE_TYPE_VALUE)
     }
 
-    /// Append a deletion tombstone for `key`. `key` must be strictly
-    /// greater than every previously added key.
+    /// Append a deletion tombstone for `key` in the default column
+    /// family.
     pub fn delete(&mut self, key: &[u8]) -> crate::Result<()> {
-        self.add(key, &[], VALUE_TYPE_DELETION)
+        let prefixed = prefix_key(DEFAULT_CF_ID, key);
+        self.add(&prefixed, &[], VALUE_TYPE_DELETION)
+    }
+
+    /// Append a `(key, value)` pair scoped to column family `cf`.
+    /// Keys across CFs must still arrive in strictly ascending
+    /// order (by prefixed bytes).
+    pub fn put_cf(
+        &mut self,
+        cf: &ColumnFamilyHandle,
+        key: &[u8],
+        value: &[u8],
+    ) -> crate::Result<()> {
+        let prefixed = prefix_key(cf.id(), key);
+        self.add(&prefixed, value, VALUE_TYPE_VALUE)
+    }
+
+    /// Append a deletion tombstone scoped to column family `cf`.
+    pub fn delete_cf(&mut self, cf: &ColumnFamilyHandle, key: &[u8]) -> crate::Result<()> {
+        let prefixed = prefix_key(cf.id(), key);
+        self.add(&prefixed, &[], VALUE_TYPE_DELETION)
     }
 
     fn add(&mut self, key: &[u8], value: &[u8], value_type: u8) -> crate::Result<()> {
@@ -195,8 +218,10 @@ mod tests {
             ],
         );
         assert_eq!(meta.num_entries, 4);
-        assert_eq!(meta.smallest_user_key, b"a");
-        assert_eq!(meta.largest_user_key, b"d");
+        // The meta reports the on-disk CF-prefixed keys; the
+        // default CF's prefix is `[0,0,0,1]`.
+        assert_eq!(meta.smallest_user_key, vec![0, 0, 0, 1, b'a']);
+        assert_eq!(meta.largest_user_key, vec![0, 0, 0, 1, b'd']);
         assert!(meta.path.exists());
     }
 

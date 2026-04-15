@@ -127,17 +127,20 @@ impl DbWithTtl {
     pub fn write(&self, batch: WriteBatch) -> Result<()> {
         let ts = now_seconds();
         let mut stamped_batch = WriteBatch::new();
+        // Source batch keys are already CF-prefixed by the public
+        // `put`/`delete`/... methods. Pass them through via raw
+        // inserts so we don't double-prefix.
         for (key, value) in batch.ops_iter() {
             match value {
-                Some(v) => stamped_batch.put(key, &stamp(v, ts)),
-                None => stamped_batch.delete(key),
+                Some(v) => stamped_batch.insert_raw_put(key.to_vec(), stamp(v, ts)),
+                None => stamped_batch.insert_raw_delete(key.to_vec()),
             }
         }
         for (start, end) in batch.range_deletes_iter() {
-            stamped_batch.delete_range(start, end);
+            stamped_batch.insert_raw_range_delete(start.to_vec(), end.to_vec());
         }
         for (key, operand) in batch.merges_iter() {
-            stamped_batch.merge(key, operand);
+            stamped_batch.insert_raw_merge(key.to_vec(), operand.to_vec());
         }
         self.inner.write(stamped_batch)
     }
