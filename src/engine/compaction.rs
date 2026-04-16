@@ -290,7 +290,7 @@ fn pick_and_run_universal(
     // any previous one (handed out monotonically by the version
     // set), so largest = newest.
     let mut by_age: Vec<Arc<LiveSst>> = l0_files;
-    by_age.sort_by(|a, b| b.meta.file_id.cmp(&a.meta.file_id));
+    by_age.sort_by_key(|f| std::cmp::Reverse(f.meta.file_id));
 
     // Rule 1 — size ratio merge. Accumulate newest files into a
     // candidate group; keep adding until the group's total size
