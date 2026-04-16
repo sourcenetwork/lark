@@ -697,14 +697,17 @@ impl SsTableReader {
     }
 
     /// Resolve a lookup key against the (possibly partitioned) index to
-    /// find the data-block entries starting from the block that may
-    /// contain `search_key`. Returns a flat vector of index entries
-    /// starting from the matching block through the end, so the caller
-    /// can walk forward.
-    fn resolve_index_for_lookup(
-        &self,
-        search_key: &[u8],
-    ) -> io::Result<Option<(Vec<IndexEntry>, usize)>> {
+    /// Binary-search the (possibly two-level) index for the first
+    /// data block whose last key is `>= search_key`. Returns the
+    /// `BlockHandle` of that data block, or `None` if every block's
+    /// last key is strictly less than `search_key`.
+    ///
+    /// For non-partitioned (V1) files, this is a single binary
+    /// search on the in-memory `self.index`. For partitioned (V2)
+    /// files, this is two binary searches: one on the top-level
+    /// index, then one on the single leaf that covers `search_key`
+    /// (loaded from disk on demand).
+    fn find_block_handle(&self, search_key: &[u8]) -> io::Result<Option<BlockHandle>> {
         if !self.partitioned {
             let idx = match self
                 .index
@@ -718,7 +721,7 @@ impl SsTableReader {
                     i
                 }
             };
-            return Ok(Some((self.index.clone(), idx)));
+            return Ok(Some(self.index[idx].handle));
         }
 
         // Partitioned: binary search top-level to find which leaf.
@@ -735,27 +738,18 @@ impl SsTableReader {
             }
         };
 
-        // Read the leaf and all subsequent leaves so the caller can
-        // walk forward across leaf boundaries.
-        let mut all_entries = Vec::new();
-        let mut block_offset = 0usize;
-        for (li, top_entry) in self.index.iter().enumerate() {
-            let leaf = self.read_index_leaf(top_entry.handle)?;
-            if li == top_idx {
-                // Binary search within this leaf.
-                let inner_idx =
-                    match leaf.binary_search_by(|e| compare_internal_keys(&e.key, search_key)) {
-                        Ok(i) => i,
-                        Err(i) => i,
-                    };
-                block_offset = all_entries.len() + inner_idx;
+        // Read ONLY the one leaf that may contain the key.
+        let leaf = self.read_index_leaf(self.index[top_idx].handle)?;
+        let inner_idx = match leaf.binary_search_by(|e| compare_internal_keys(&e.key, search_key)) {
+            Ok(i) => i,
+            Err(i) => {
+                if i >= leaf.len() {
+                    return Ok(None);
+                }
+                i
             }
-            all_entries.extend(leaf);
-        }
-        if block_offset >= all_entries.len() {
-            return Ok(None);
-        }
-        Ok(Some((all_entries, block_offset)))
+        };
+        Ok(Some(leaf[inner_idx].handle))
     }
 
     /// Whether this SSTable *might* contain a user key whose prefix
@@ -806,42 +800,33 @@ impl SsTableReader {
         }
 
         let search_key = lookup_key(user_key, snapshot_seq);
-        let (resolved_index, mut block_idx) = match self.resolve_index_for_lookup(&search_key)? {
-            Some(pair) => pair,
+        let handle = match self.find_block_handle(&search_key)? {
+            Some(h) => h,
             None => return Ok(LookupResult::NotInTable),
         };
 
-        // Walk forward past `Merge` entries — they are collapsed
-        // separately by `collect_merge_chain` and shouldn't be
-        // mistaken for a point terminator here.
-        loop {
-            let entry = &resolved_index[block_idx];
-            let block = self.read_block(entry.handle, cache)?;
-            for (ik, value) in block.iter() {
-                if compare_internal_keys(ik.as_slice(), search_key.as_slice()).is_lt() {
-                    continue;
-                }
-                let (uk, seq, vt) = decode_internal_key(&ik);
-                if uk != user_key {
-                    return Ok(LookupResult::NotInTable);
-                }
-                match vt {
-                    VALUE_TYPE_MERGE => continue,
-                    VALUE_TYPE_DELETION => {
-                        cache.record_bloom_full_positive();
-                        return Ok(LookupResult::FoundTombstone { seq });
-                    }
-                    _ => {
-                        cache.record_bloom_full_positive();
-                        return Ok(LookupResult::Found { seq, value });
-                    }
-                }
+        let block = self.read_block(handle, cache)?;
+        for (ik, value) in block.iter() {
+            if compare_internal_keys(ik.as_slice(), search_key.as_slice()).is_lt() {
+                continue;
             }
-            block_idx += 1;
-            if block_idx >= resolved_index.len() {
+            let (uk, seq, vt) = decode_internal_key(&ik);
+            if uk != user_key {
                 return Ok(LookupResult::NotInTable);
             }
+            match vt {
+                VALUE_TYPE_MERGE => continue,
+                VALUE_TYPE_DELETION => {
+                    cache.record_bloom_full_positive();
+                    return Ok(LookupResult::FoundTombstone { seq });
+                }
+                _ => {
+                    cache.record_bloom_full_positive();
+                    return Ok(LookupResult::Found { seq, value });
+                }
+            }
         }
+        Ok(LookupResult::NotInTable)
     }
 
     /// Walk every visible entry for `user_key` at `snapshot_seq` in
@@ -861,44 +846,40 @@ impl SsTableReader {
         }
 
         let search_key = lookup_key(user_key, snapshot_seq);
-        let (resolved_index, mut block_idx) = match self.resolve_index_for_lookup(&search_key)? {
-            Some(pair) => pair,
+        let handle = match self.find_block_handle(&search_key)? {
+            Some(h) => h,
             None => return Ok(false),
         };
 
-        loop {
-            let entry = &resolved_index[block_idx];
-            let block = self.read_block(entry.handle, cache)?;
-            for (ik, value) in block.iter() {
-                if compare_internal_keys(ik.as_slice(), search_key.as_slice()).is_lt() {
-                    continue;
-                }
-                let (uk, seq, vt) = decode_internal_key(&ik);
-                if uk != user_key {
-                    return Ok(false);
-                }
-                out.push((seq, vt, value));
-                if vt != VALUE_TYPE_MERGE {
-                    return Ok(true);
-                }
+        let block = self.read_block(handle, cache)?;
+        for (ik, value) in block.iter() {
+            if compare_internal_keys(ik.as_slice(), search_key.as_slice()).is_lt() {
+                continue;
             }
-            block_idx += 1;
-            if block_idx >= resolved_index.len() {
+            let (uk, seq, vt) = decode_internal_key(&ik);
+            if uk != user_key {
                 return Ok(false);
             }
+            out.push((seq, vt, value));
+            if vt != VALUE_TYPE_MERGE {
+                return Ok(true);
+            }
         }
+        Ok(false)
     }
 
     /// Read every entry in internal-key order with no dedup or filtering.
     /// Used by compaction to merge tables without losing versions.
     pub(crate) fn iter_internal(&self, cache: &BlockCache) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let data_index = if self.partitioned {
-            self.expand_all_leaves()?
+        let owned_index;
+        let data_index: &[IndexEntry] = if self.partitioned {
+            owned_index = self.expand_all_leaves()?;
+            &owned_index
         } else {
-            self.index.clone()
+            &self.index
         };
         let mut result = Vec::new();
-        for entry in &data_index {
+        for entry in data_index {
             let block = self.read_block(entry.handle, cache)?;
             for (ik, value) in block.iter() {
                 result.push((ik, value));
@@ -918,13 +899,17 @@ impl SsTableReader {
         if self.index.is_empty() || start >= end {
             return 0;
         }
-        let data_index = if self.partitioned {
+        let owned_approx;
+        let data_index: &[IndexEntry] = if self.partitioned {
             match self.expand_all_leaves() {
-                Ok(v) => v,
+                Ok(v) => {
+                    owned_approx = v;
+                    &owned_approx
+                }
                 Err(_) => return 0,
             }
         } else {
-            self.index.clone()
+            &self.index
         };
         if data_index.is_empty() {
             return 0;
