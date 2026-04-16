@@ -27,7 +27,8 @@ use super::block::{Block, BlockBuilder, BlockHandle, RESTART_INTERVAL};
 use super::block_cache::BlockCache;
 use super::bloom::{decode_bloom_block, encode_bloom_block, BloomFilter, BloomFilterBuilder};
 use super::internal_key::{
-    decode_internal_key, lookup_key, user_key_of, VALUE_TYPE_DELETION, VALUE_TYPE_MERGE,
+    compare_internal_keys, decode_internal_key, lookup_key, user_key_of, VALUE_TYPE_DELETION,
+    VALUE_TYPE_MERGE,
 };
 use super::range_tombstone::{max_covering_seq, RangeTombstone};
 use crate::options::{CompressionType, PrefixExtractor};
@@ -654,7 +655,7 @@ impl SsTableReader {
         let search_key = lookup_key(user_key, snapshot_seq);
         let mut block_idx = match self
             .index
-            .binary_search_by(|e| e.key.as_slice().cmp(&search_key))
+            .binary_search_by(|e| compare_internal_keys(&e.key, &search_key))
         {
             Ok(i) => i,
             Err(i) => {
@@ -672,7 +673,7 @@ impl SsTableReader {
             let entry = &self.index[block_idx];
             let block = self.read_block(entry.handle, cache)?;
             for (ik, value) in block.iter() {
-                if ik.as_slice() < search_key.as_slice() {
+                if compare_internal_keys(ik.as_slice(), search_key.as_slice()).is_lt() {
                     continue;
                 }
                 let (uk, seq, vt) = decode_internal_key(&ik);
@@ -717,7 +718,7 @@ impl SsTableReader {
         let search_key = lookup_key(user_key, snapshot_seq);
         let mut block_idx = match self
             .index
-            .binary_search_by(|e| e.key.as_slice().cmp(&search_key))
+            .binary_search_by(|e| compare_internal_keys(&e.key, &search_key))
         {
             Ok(i) => i,
             Err(i) => {
@@ -732,7 +733,7 @@ impl SsTableReader {
             let entry = &self.index[block_idx];
             let block = self.read_block(entry.handle, cache)?;
             for (ik, value) in block.iter() {
-                if ik.as_slice() < search_key.as_slice() {
+                if compare_internal_keys(ik.as_slice(), search_key.as_slice()).is_lt() {
                     continue;
                 }
                 let (uk, seq, vt) = decode_internal_key(&ik);
@@ -782,10 +783,10 @@ impl SsTableReader {
         let hi_probe = lookup_key(end, u64::MAX);
         let first = self
             .index
-            .partition_point(|e| e.key.as_slice() < lo_probe.as_slice());
+            .partition_point(|e| compare_internal_keys(&e.key, &lo_probe).is_lt());
         let last = self
             .index
-            .partition_point(|e| e.key.as_slice() < hi_probe.as_slice());
+            .partition_point(|e| compare_internal_keys(&e.key, &hi_probe).is_lt());
         // Blocks in `[first..=last]` may contain keys inside the
         // range. We over-count by at most one block at each
         // boundary, which is the accuracy bound the public API
@@ -811,7 +812,7 @@ impl SsTableReader {
     pub(crate) fn seek_block(&self, target: &[u8]) -> Option<usize> {
         match self
             .index
-            .binary_search_by(|e| e.key.as_slice().cmp(target))
+            .binary_search_by(|e| compare_internal_keys(&e.key, target))
         {
             Ok(i) => Some(i),
             Err(i) => {

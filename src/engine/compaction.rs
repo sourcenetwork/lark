@@ -4,7 +4,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use super::block_cache::BlockCache;
-use super::internal_key::{decode_internal_key, user_key_of};
+use super::internal_key::{compare_internal_keys, decode_internal_key, user_key_of};
 use super::manifest::{VersionEdit, VersionSet, MAX_LEVELS};
 use super::range_tombstone::{max_covering_seq, RangeTombstone};
 use super::snapshot_registry::SnapshotRegistry;
@@ -763,7 +763,7 @@ fn perform_compaction_to(
 
     // Sort by internal key (which orders newer seqs first within each user
     // key) and drop any exact duplicates (same user_key + seq + type).
-    all_entries.sort_by(|a, b| a.0.cmp(&b.0));
+    all_entries.sort_by(|a, b| compare_internal_keys(&a.0, &b.0));
     all_entries.dedup_by(|a, b| a.0 == b.0);
 
     // User compaction filter for range tombstones. Run this **before**
