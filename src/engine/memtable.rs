@@ -4,8 +4,8 @@ use crossbeam_skiplist::SkipMap;
 use parking_lot::Mutex;
 
 use super::internal_key::{
-    decode_internal_key, encode_internal_key, lookup_key, VALUE_TYPE_DELETION, VALUE_TYPE_MERGE,
-    VALUE_TYPE_VALUE,
+    decode_internal_key, encode_internal_key, lookup_key, InternalKey, VALUE_TYPE_DELETION,
+    VALUE_TYPE_MERGE, VALUE_TYPE_VALUE,
 };
 use super::range_tombstone::{max_covering_seq, RangeTombstone};
 
@@ -19,7 +19,7 @@ use super::range_tombstone::{max_covering_seq, RangeTombstone};
 /// magnitude rarer than point writes so the lock is cheap, and
 /// keeping them separate lets point-entry lookups stay lock-free.
 pub(crate) struct MemTable {
-    data: SkipMap<Vec<u8>, Vec<u8>>,
+    data: SkipMap<InternalKey, Vec<u8>>,
     range_tombstones: Mutex<Vec<RangeTombstone>>,
     approximate_size: AtomicUsize,
 }
@@ -35,17 +35,17 @@ impl MemTable {
 
     /// Insert a key-value pair with the given sequence number.
     pub(crate) fn put(&self, key: &[u8], value: &[u8], seq: u64) {
-        let internal_key = encode_internal_key(key, seq, VALUE_TYPE_VALUE);
-        let size = internal_key.len() + value.len();
-        self.data.insert(internal_key, value.to_vec());
+        let ik = encode_internal_key(key, seq, VALUE_TYPE_VALUE);
+        let size = ik.len() + value.len();
+        self.data.insert(InternalKey(ik), value.to_vec());
         self.approximate_size.fetch_add(size, Ordering::Relaxed);
     }
 
     /// Insert a deletion tombstone for the given key.
     pub(crate) fn delete(&self, key: &[u8], seq: u64) {
-        let internal_key = encode_internal_key(key, seq, VALUE_TYPE_DELETION);
-        let size = internal_key.len();
-        self.data.insert(internal_key, Vec::new());
+        let ik = encode_internal_key(key, seq, VALUE_TYPE_DELETION);
+        let size = ik.len();
+        self.data.insert(InternalKey(ik), Vec::new());
         self.approximate_size.fetch_add(size, Ordering::Relaxed);
     }
 
@@ -53,9 +53,9 @@ impl MemTable {
     /// be combined with any older base value (or other operands) at
     /// read time via the configured [`crate::MergeOperator`].
     pub(crate) fn merge(&self, key: &[u8], operand: &[u8], seq: u64) {
-        let internal_key = encode_internal_key(key, seq, VALUE_TYPE_MERGE);
-        let size = internal_key.len() + operand.len();
-        self.data.insert(internal_key, operand.to_vec());
+        let ik = encode_internal_key(key, seq, VALUE_TYPE_MERGE);
+        let size = ik.len() + operand.len();
+        self.data.insert(InternalKey(ik), operand.to_vec());
         self.approximate_size.fetch_add(size, Ordering::Relaxed);
     }
 
@@ -93,10 +93,10 @@ impl MemTable {
     /// is responsible for merging range-tombstone coverage across
     /// sources and comparing seqs.
     pub(crate) fn get(&self, key: &[u8], snapshot_seq: u64) -> Option<(u64, Option<Vec<u8>>)> {
-        let search_key = lookup_key(key, snapshot_seq);
+        let search_key = InternalKey(lookup_key(key, snapshot_seq));
 
         for entry in self.data.range(search_key..) {
-            let (user_key, seq, value_type) = decode_internal_key(entry.key());
+            let (user_key, seq, value_type) = decode_internal_key(entry.key().as_slice());
 
             if user_key != key {
                 return None;
@@ -130,10 +130,10 @@ impl MemTable {
         snapshot_seq: u64,
         out: &mut Vec<(u64, u8, Vec<u8>)>,
     ) -> bool {
-        let search_key = lookup_key(key, snapshot_seq);
+        let search_key = InternalKey(lookup_key(key, snapshot_seq));
 
         for entry in self.data.range(search_key..) {
-            let (user_key, seq, value_type) = decode_internal_key(entry.key());
+            let (user_key, seq, value_type) = decode_internal_key(entry.key().as_slice());
             if user_key != key {
                 return false;
             }
@@ -155,7 +155,7 @@ impl MemTable {
     pub(crate) fn iter_internal(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         self.data
             .iter()
-            .map(|e| (e.key().clone(), e.value().clone()))
+            .map(|e| (e.key().0.clone(), e.value().clone()))
             .collect()
     }
 
@@ -174,14 +174,14 @@ impl MemTable {
         // Walk from the smallest possible internal key for `start`
         // (seq=MAX, value_type=0) to the smallest for `end`. Every
         // entry in between has user key in `[start, end)`.
-        let lo = lookup_key(start, u64::MAX);
-        let hi = lookup_key(end, u64::MAX);
+        let lo = InternalKey(lookup_key(start, u64::MAX));
+        let hi = InternalKey(lookup_key(end, u64::MAX));
         let mut count: u64 = 0;
         let mut size: u64 = 0;
-        for entry in self.data.range::<[u8], _>((
-            std::ops::Bound::Included(lo.as_slice()),
-            std::ops::Bound::Excluded(hi.as_slice()),
-        )) {
+        for entry in self
+            .data
+            .range((std::ops::Bound::Included(lo), std::ops::Bound::Excluded(hi)))
+        {
             count += 1;
             size += (entry.key().len() + entry.value().len()) as u64;
         }
@@ -196,10 +196,15 @@ impl MemTable {
         &self,
         lower: std::ops::Bound<&[u8]>,
     ) -> Option<(Vec<u8>, Vec<u8>)> {
+        let bound = match lower {
+            std::ops::Bound::Included(b) => std::ops::Bound::Included(InternalKey(b.to_vec())),
+            std::ops::Bound::Excluded(b) => std::ops::Bound::Excluded(InternalKey(b.to_vec())),
+            std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+        };
         self.data
-            .range::<[u8], _>((lower, std::ops::Bound::Unbounded))
+            .range((bound, std::ops::Bound::<InternalKey>::Unbounded))
             .next()
-            .map(|e| (e.key().clone(), e.value().clone()))
+            .map(|e| (e.key().0.clone(), e.value().clone()))
     }
 
     /// Return the last `(internal_key, value)` pair whose key is in the
@@ -209,10 +214,15 @@ impl MemTable {
         &self,
         upper: std::ops::Bound<&[u8]>,
     ) -> Option<(Vec<u8>, Vec<u8>)> {
+        let bound = match upper {
+            std::ops::Bound::Included(b) => std::ops::Bound::Included(InternalKey(b.to_vec())),
+            std::ops::Bound::Excluded(b) => std::ops::Bound::Excluded(InternalKey(b.to_vec())),
+            std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+        };
         self.data
-            .range::<[u8], _>((std::ops::Bound::Unbounded, upper))
+            .range((std::ops::Bound::<InternalKey>::Unbounded, bound))
             .next_back()
-            .map(|e| (e.key().clone(), e.value().clone()))
+            .map(|e| (e.key().0.clone(), e.value().clone()))
     }
 
     pub(crate) fn approximate_size(&self) -> usize {

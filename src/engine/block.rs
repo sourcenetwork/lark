@@ -12,6 +12,8 @@
 
 use std::io;
 
+use super::internal_key::compare_internal_keys;
+
 /// Entries per restart point. Smaller = faster lookups, larger = better compression.
 pub(crate) const RESTART_INTERVAL: usize = 16;
 
@@ -94,7 +96,7 @@ impl Block {
             pos += entry_size;
             current_key = key;
 
-            if current_key.as_slice() >= target {
+            if compare_internal_keys(&current_key, target).is_ge() {
                 return Some((current_key, value));
             }
         }
@@ -112,7 +114,7 @@ impl Block {
             let mid = left + (right - left) / 2;
             let restart_pos = self.restarts[mid] as usize;
             let (key, _) = decode_block_entry(&self.data[..data_end], restart_pos, &[]);
-            if key.as_slice() < target {
+            if compare_internal_keys(&key, target).is_lt() {
                 left = mid + 1;
             } else {
                 right = mid;

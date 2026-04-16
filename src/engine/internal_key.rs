@@ -8,6 +8,17 @@
 //! "most recent version visible at snapshot_seq" with a single forward seek:
 //! seek to `user_key || !snapshot_seq || 0x00`, then the first entry with the
 //! matching user key has the largest seq ≤ snapshot_seq.
+//!
+//! # Comparison
+//!
+//! Raw byte comparison of internal keys is **incorrect** when two
+//! user keys have different lengths and one is a prefix of the
+//! other — the `!seq` bytes of the shorter key collide with the
+//! literal data bytes of the longer key. Every comparison site
+//! must use [`compare_internal_keys`] (or the [`InternalKey`]
+//! newtype's `Ord` impl, which delegates to the same function).
+//! The memtable skip-list stores `InternalKey` directly so its
+//! built-in `Ord`-based ordering is correct.
 
 /// Entry is a live value.
 pub(crate) const VALUE_TYPE_VALUE: u8 = 1;
@@ -49,6 +60,72 @@ pub(crate) fn user_key_of(internal_key: &[u8]) -> &[u8] {
 pub(crate) fn lookup_key(user_key: &[u8], snapshot_seq: u64) -> Vec<u8> {
     encode_internal_key(user_key, snapshot_seq, VALUE_TYPE_DELETION)
 }
+
+/// Compare two internal keys correctly: user-key portion first
+/// (standard lexicographic byte comparison), then the `!seq ||
+/// vt` trailer on tie. This is the lark equivalent of LevelDB's
+/// `InternalKeyComparator` — raw byte comparison of the encoded
+/// form is NOT correct when user keys have different lengths.
+pub(crate) fn compare_internal_keys(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    // Guard: keys shorter than the suffix are not valid internal
+    // keys (they can appear in unit tests that build raw blocks).
+    // Fall back to raw byte comparison for those.
+    if a.len() < INTERNAL_KEY_SUFFIX_LEN || b.len() < INTERNAL_KEY_SUFFIX_LEN {
+        return a.cmp(b);
+    }
+    let a_uk = user_key_of(a);
+    let b_uk = user_key_of(b);
+    match a_uk.cmp(b_uk) {
+        std::cmp::Ordering::Equal => {
+            // Same user key — compare the trailer. The trailer
+            // is `!seq || vt`, and because !seq is inverted, a
+            // SMALLER trailer value corresponds to a NEWER entry
+            // (higher seq). We want newer entries to sort first
+            // so the raw byte comparison of the trailer is
+            // already the correct order.
+            let a_trailer = &a[a_uk.len()..];
+            let b_trailer = &b[b_uk.len()..];
+            a_trailer.cmp(b_trailer)
+        }
+        ord => ord,
+    }
+}
+
+/// Newtype around a raw internal key `Vec<u8>` whose `Ord` impl
+/// delegates to [`compare_internal_keys`] so the
+/// crossbeam skip-list and any sorted container orders entries
+/// correctly regardless of user-key length.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InternalKey(pub(crate) Vec<u8>);
+
+impl InternalKey {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for InternalKey {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Ord for InternalKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        compare_internal_keys(&self.0, &other.0)
+    }
+}
+
+impl PartialOrd for InternalKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+// Deliberately NOT implementing `Borrow<[u8]>` — that would let
+// range queries fall through to `[u8]::Ord` (raw byte comparison)
+// which disagrees with our custom ordering on prefix keys.
 
 #[cfg(test)]
 mod tests {

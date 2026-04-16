@@ -61,8 +61,8 @@ use std::sync::Arc;
 
 use super::block_cache::BlockCache;
 use super::internal_key::{
-    decode_internal_key, lookup_key, INTERNAL_KEY_SUFFIX_LEN, VALUE_TYPE_DELETION,
-    VALUE_TYPE_MERGE, VALUE_TYPE_VALUE,
+    compare_internal_keys, decode_internal_key, lookup_key, INTERNAL_KEY_SUFFIX_LEN,
+    VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE,
 };
 use super::manifest::Version;
 use super::memtable::MemTable;
@@ -523,7 +523,7 @@ impl MergingIter {
                 Some(bi) => {
                     // Safe: best is set so bi has Some key too.
                     let bk = self.levels[bi].key().unwrap();
-                    if k < bk {
+                    if compare_internal_keys(k, bk).is_lt() {
                         best = Some(i);
                     }
                 }
@@ -540,7 +540,7 @@ impl MergingIter {
                 None => best = Some(i),
                 Some(bi) => {
                     let bk = self.levels[bi].key().unwrap();
-                    if k > bk {
+                    if compare_internal_keys(k, bk).is_gt() {
                         best = Some(i);
                     }
                 }
@@ -1148,23 +1148,15 @@ impl LarkIterator {
             return;
         };
         // `lookup_key(uk, u64::MAX)` is the smallest internal key for
-        // `uk`. `seek_for_prev` lands at the largest entry strictly less
-        // than that — some entry of the preceding user key (or nothing
-        // if `uk` is the first user key).
+        // `uk` under `compare_internal_keys`: same user key, trailer
+        // `!MAX_SEQ || 0` = `[0,0,...,0]` which is the lowest possible
+        // trailer. `seek_for_prev` is inclusive (lands on the largest
+        // entry `<=` the probe). Since no real entry has seq=u64::MAX
+        // (the engine starts at 0 and counts up), nothing in the skip
+        // list will match the probe exactly, and `seek_for_prev` lands
+        // on the last entry of the user key immediately preceding `uk`.
         let probe = lookup_key(uk, u64::MAX);
-        // Subtract one logically: `seek_for_prev` is inclusive, but the
-        // entry at exactly `probe` would be for `uk` itself (unlikely —
-        // that's `uk` at seq u64::MAX, which we don't generate). If it
-        // ever matched we'd want to step past it; simpler to use a
-        // probe that's guaranteed strictly less.
-        let mut strict_probe = probe;
-        // Drop the final byte to make the probe shorter than any real
-        // internal key for `uk`. Any entry for `uk` is len(uk)+9 bytes;
-        // the truncated probe is len(uk)+8 bytes — shorter prefixes
-        // compare lex-less. This yields the largest entry strictly less
-        // than any entry for `uk`.
-        strict_probe.pop();
-        if let Err(e) = self.inner.seek_for_prev(&strict_probe) {
+        if let Err(e) = self.inner.seek_for_prev(&probe) {
             self.error = Some(e);
         }
         self.direction = Direction::Reverse;
