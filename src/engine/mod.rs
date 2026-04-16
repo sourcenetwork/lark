@@ -80,6 +80,7 @@ pub(crate) struct EngineOptions {
     pub(crate) universal_compaction_options: crate::options::UniversalCompactionOptions,
     pub(crate) use_direct_io_for_compaction: bool,
     pub(crate) max_subcompactions: usize,
+    pub(crate) max_background_compactions: usize,
 }
 
 impl EngineOptions {
@@ -125,6 +126,7 @@ impl Default for EngineOptions {
             universal_compaction_options: crate::options::UniversalCompactionOptions::default(),
             use_direct_io_for_compaction: false,
             max_subcompactions: 1,
+            max_background_compactions: 1,
         }
     }
 }
@@ -141,13 +143,13 @@ pub(crate) struct LarkEngine {
     sst_dir: PathBuf,
     wal_dir: PathBuf,
     compaction: Mutex<CompactionScheduler>,
-    /// Engine-wide mutex that serializes every compaction pass —
-    /// background and foreground — so two compactions can't pick
-    /// overlapping input sets and double-delete files out from under
-    /// each other. Held around each `pick_and_run_compaction` call in
-    /// the background scheduler, and around the whole
-    /// [`LarkEngine::compact_range`] walk in the foreground path.
-    compaction_lock: Arc<Mutex<()>>,
+    /// Engine-wide RwLock that coordinates foreground and background
+    /// compaction. Background workers each hold a read lock so they
+    /// can run concurrently; foreground callers (`compact_range`,
+    /// `ingest_external_files`, `checkpoint_capture`) hold the write
+    /// lock to exclude all background activity for the duration of
+    /// their pass.
+    compaction_lock: Arc<RwLock<()>>,
     /// Tracks the sequence numbers of every live snapshot so compaction
     /// can drop versions that no snapshot and no current reader can
     /// see. A snapshot registers itself on creation and releases on
@@ -275,9 +277,10 @@ impl LarkEngine {
             universal_compaction_options: options.universal_compaction_options,
             use_direct_io_for_compaction: options.use_direct_io_for_compaction,
             max_subcompactions: options.max_subcompactions,
+            max_background_compactions: options.max_background_compactions,
         };
 
-        let compaction_lock = Arc::new(Mutex::new(()));
+        let compaction_lock = Arc::new(RwLock::new(()));
         let snapshot_registry = Arc::new(SnapshotRegistry::new());
         let stall_signal = Arc::new(StallSignal::new());
         let compaction = CompactionScheduler::start(
@@ -1402,9 +1405,10 @@ impl LarkEngine {
             }
         }
 
-        // 2. Serialize with background compaction for the duration of
-        //    the range walk.
-        let _compact_guard = self.compaction_lock.lock();
+        // 2. Exclude all background workers for the duration of the
+        //    range walk. Write lock blocks until every in-flight
+        //    background pass releases its read lock.
+        let _compact_guard = self.compaction_lock.write();
 
         // 3. Compute the snapshot-pinning GC horizon so compaction can
         //    drop versions that no live snapshot needs.
@@ -1431,6 +1435,7 @@ impl LarkEngine {
             universal_compaction_options: self.options.universal_compaction_options,
             use_direct_io_for_compaction: self.options.use_direct_io_for_compaction,
             max_subcompactions: self.options.max_subcompactions,
+            max_background_compactions: self.options.max_background_compactions,
         };
         // Under FIFO compaction there is no level push-down; a
         // synchronous compact_range just flushes the memtable and
@@ -1546,9 +1551,9 @@ impl LarkEngine {
             });
         }
 
-        // Serialize with background compaction for the duration of the
-        // ingest — same pattern as `compact_range`.
-        let _compact_guard = self.compaction_lock.lock();
+        // Exclude all background workers for the duration of the ingest
+        // — same pattern as `compact_range`.
+        let _compact_guard = self.compaction_lock.write();
 
         for source in &sources {
             self.ingest_one(source, ingest_opts)?;
@@ -1735,7 +1740,7 @@ impl LarkEngine {
             }
         }
 
-        let compaction_guard = self.compaction_lock.lock_arc();
+        let compaction_guard = self.compaction_lock.write_arc();
 
         let version;
         let manifest_path;
@@ -2113,7 +2118,7 @@ pub(crate) struct CheckpointSnapshot {
     pub(crate) manifest_len: u64,
     pub(crate) sst_dir: PathBuf,
     /// Compaction lock guard, scoped to the snapshot's lifetime.
-    _compaction_guard: parking_lot::ArcMutexGuard<parking_lot::RawMutex, ()>,
+    _compaction_guard: parking_lot::ArcRwLockWriteGuard<parking_lot::RawRwLock, ()>,
 }
 
 impl CheckpointSnapshot {
