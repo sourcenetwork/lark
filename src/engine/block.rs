@@ -64,6 +64,21 @@ impl Block {
             + self.restarts.capacity() * std::mem::size_of::<u32>()
     }
 
+    /// The entry region of the block (everything before the restart
+    /// array and the trailing `num_restarts` u32).
+    pub(crate) fn entry_data(&self) -> &[u8] {
+        let data_end = self.data.len() - 4 - self.restarts.len() * 4;
+        &self.data[..data_end]
+    }
+
+    pub(crate) fn restart_count(&self) -> usize {
+        self.restarts.len()
+    }
+
+    pub(crate) fn restart_offset(&self, idx: usize) -> usize {
+        self.restarts[idx] as usize
+    }
+
     /// Iterate all entries in this block in sorted order.
     pub(crate) fn iter(&self) -> BlockIterator<'_> {
         let data_end = self.data.len() - 4 - self.restarts.len() * 4;
@@ -142,12 +157,12 @@ impl<'a> Iterator for BlockIterator<'a> {
             return None;
         }
 
-        let (key, value) = decode_block_entry(self.data, self.pos, &self.current_key);
-        let entry_size = encoded_entry_size(self.data, self.pos);
-        self.pos += entry_size;
-        self.current_key = key.clone();
+        let (consumed, val_off, val_len) =
+            decode_entry_at(self.data, self.pos, &mut self.current_key);
+        self.pos += consumed;
+        let value = self.data[val_off..val_off + val_len].to_vec();
 
-        Some((key, value))
+        Some((self.current_key.clone(), value))
     }
 }
 
@@ -213,6 +228,32 @@ impl BlockBuilder {
     }
 }
 
+/// Decode one entry at `pos`. Reconstructs the key in-place into
+/// `prev_key` (truncate to shared prefix + extend with unshared).
+/// Returns `(bytes_consumed, value_offset_in_data, value_len)`.
+/// The value lives at `data[value_offset..value_offset+value_len]`.
+pub(crate) fn decode_entry_at(
+    data: &[u8],
+    pos: usize,
+    prev_key: &mut Vec<u8>,
+) -> (usize, usize, usize) {
+    let mut offset = pos;
+    let (shared, n) = decode_varint(&data[offset..]);
+    offset += n;
+    let (unshared, n) = decode_varint(&data[offset..]);
+    offset += n;
+    let (value_len, n) = decode_varint(&data[offset..]);
+    offset += n;
+    let shared = shared as usize;
+    let unshared = unshared as usize;
+    let value_len = value_len as usize;
+    prev_key.truncate(shared);
+    prev_key.extend_from_slice(&data[offset..offset + unshared]);
+    let value_offset = offset + unshared;
+    let consumed = value_offset + value_len - pos;
+    (consumed, value_offset, value_len)
+}
+
 fn decode_block_entry(data: &[u8], pos: usize, prev_key: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let mut offset = pos;
     let (shared, n) = decode_varint(&data[offset..]);
@@ -234,7 +275,7 @@ fn decode_block_entry(data: &[u8], pos: usize, prev_key: &[u8]) -> (Vec<u8>, Vec
     (key, value)
 }
 
-fn encoded_entry_size(data: &[u8], pos: usize) -> usize {
+pub(crate) fn encoded_entry_size(data: &[u8], pos: usize) -> usize {
     let mut offset = pos;
     let (_, n) = decode_varint(&data[offset..]); // shared
     offset += n;
@@ -254,7 +295,7 @@ fn encode_varint(buf: &mut Vec<u8>, mut value: u64) {
     buf.push(value as u8);
 }
 
-fn decode_varint(data: &[u8]) -> (u64, usize) {
+pub(crate) fn decode_varint(data: &[u8]) -> (u64, usize) {
     let mut result: u64 = 0;
     let mut shift = 0;
     for (i, &byte) in data.iter().enumerate() {

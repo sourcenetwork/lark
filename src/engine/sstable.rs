@@ -979,9 +979,26 @@ impl SsTableReader {
         }
     }
 
+    /// Load block `block_idx` through the cache. Used by the streaming
+    /// iterator for zero-copy entry decoding within a block.
+    pub(crate) fn load_block_by_idx(
+        &self,
+        block_idx: usize,
+        cache: &BlockCache,
+    ) -> io::Result<Arc<Block>> {
+        let handle = if self.partitioned {
+            let leaves = self.expand_all_leaves()?;
+            leaves[block_idx].handle
+        } else {
+            self.index[block_idx].handle
+        };
+        self.read_block(handle, cache)
+    }
+
     /// Materialize every entry in `block_idx` as a vector of `(internal_key,
-    /// value)` pairs through the block cache. Used by the streaming iterator
-    /// to drive forward through one block at a time.
+    /// value)` pairs through the block cache. Retained for compaction paths
+    /// that need fully materialized entry vectors.
+    #[allow(dead_code)]
     pub(crate) fn load_block_entries(
         &self,
         block_idx: usize,
