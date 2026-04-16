@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -24,26 +25,26 @@ pub(crate) const DEFAULT_LEVEL_BASE_BYTES: u64 = 256 * 1024 * 1024;
 /// Default target SSTable file size (64 MB).
 pub(crate) const DEFAULT_TARGET_FILE_SIZE: u64 = 64 * 1024 * 1024;
 
-/// Manages background compaction on a dedicated OS thread.
+/// Manages background compaction on one or more dedicated OS threads.
 pub(crate) struct CompactionScheduler {
     shutdown: Arc<AtomicBool>,
     trigger: Arc<(Mutex<bool>, Condvar)>,
-    handle: Option<thread::JoinHandle<()>>,
+    handles: Vec<thread::JoinHandle<()>>,
 }
 
 impl CompactionScheduler {
-    /// Start the background compaction thread.
+    /// Start one or more background compaction threads.
     ///
-    /// `compaction_lock` is the engine-wide mutex that serializes
-    /// background compactions with any foreground caller of
-    /// [`run_compact_range`] — acquiring it around every compaction pass
-    /// ensures both paths don't try to pick overlapping input sets or
-    /// double-delete the same file.
+    /// `compaction_lock` is the engine-wide RwLock that serializes
+    /// foreground callers (write lock) with background workers (read
+    /// lock). Multiple workers can run concurrently; the in-progress
+    /// set inside `compaction_loop` ensures they don't pick overlapping
+    /// input sets.
     ///
     /// `snapshot_registry` lets each compaction pass query the current
     /// pin seq so it can drop versions that no live snapshot needs.
     pub(crate) fn start(
-        compaction_lock: Arc<parking_lot::Mutex<()>>,
+        compaction_lock: Arc<parking_lot::RwLock<()>>,
         snapshot_registry: Arc<SnapshotRegistry>,
         versions: Arc<parking_lot::Mutex<VersionSet>>,
         sst_dir: Arc<Path>,
@@ -53,31 +54,48 @@ impl CompactionScheduler {
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let trigger = Arc::new((Mutex::new(false), Condvar::new()));
+        let in_progress: Arc<parking_lot::Mutex<HashSet<u64>>> =
+            Arc::new(parking_lot::Mutex::new(HashSet::new()));
 
-        let shutdown_clone = Arc::clone(&shutdown);
-        let trigger_clone = Arc::clone(&trigger);
+        let worker_count = opts.max_background_compactions.max(1);
+        let mut handles = Vec::with_capacity(worker_count);
 
-        let handle = thread::Builder::new()
-            .name("lark-compaction".into())
-            .spawn(move || {
-                compaction_loop(
-                    shutdown_clone,
-                    trigger_clone,
-                    compaction_lock,
-                    snapshot_registry,
-                    versions,
-                    sst_dir,
-                    cache,
-                    opts,
-                    stall_signal,
-                );
-            })
-            .expect("failed to spawn compaction thread");
+        for i in 0..worker_count {
+            let shutdown_clone = Arc::clone(&shutdown);
+            let trigger_clone = Arc::clone(&trigger);
+            let lock_clone = Arc::clone(&compaction_lock);
+            let registry_clone = Arc::clone(&snapshot_registry);
+            let versions_clone = Arc::clone(&versions);
+            let sst_dir_clone = Arc::clone(&sst_dir);
+            let cache_clone = Arc::clone(&cache);
+            let opts_clone = opts.clone();
+            let stall_clone = Arc::clone(&stall_signal);
+            let in_progress_clone = Arc::clone(&in_progress);
+
+            let handle = thread::Builder::new()
+                .name(format!("lark-compaction-{i}"))
+                .spawn(move || {
+                    compaction_loop(
+                        shutdown_clone,
+                        trigger_clone,
+                        lock_clone,
+                        registry_clone,
+                        versions_clone,
+                        sst_dir_clone,
+                        cache_clone,
+                        opts_clone,
+                        stall_clone,
+                        in_progress_clone,
+                    );
+                })
+                .expect("failed to spawn compaction thread");
+            handles.push(handle);
+        }
 
         Self {
             shutdown,
             trigger,
-            handle: Some(handle),
+            handles,
         }
     }
 
@@ -89,11 +107,11 @@ impl CompactionScheduler {
         cvar.notify_one();
     }
 
-    /// Shut down the compaction thread.
+    /// Shut down all compaction threads.
     pub(crate) fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Release);
         self.notify();
-        if let Some(handle) = self.handle.take() {
+        for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
     }
@@ -126,6 +144,7 @@ pub(crate) struct CompactionOptions {
     pub(crate) universal_compaction_options: crate::options::UniversalCompactionOptions,
     pub(crate) use_direct_io_for_compaction: bool,
     pub(crate) max_subcompactions: usize,
+    pub(crate) max_background_compactions: usize,
 }
 
 impl CompactionOptions {
@@ -161,6 +180,7 @@ impl Default for CompactionOptions {
             universal_compaction_options: crate::options::UniversalCompactionOptions::default(),
             use_direct_io_for_compaction: false,
             max_subcompactions: 1,
+            max_background_compactions: 1,
         }
     }
 }
@@ -169,13 +189,14 @@ impl Default for CompactionOptions {
 fn compaction_loop(
     shutdown: Arc<AtomicBool>,
     trigger: Arc<(Mutex<bool>, Condvar)>,
-    compaction_lock: Arc<parking_lot::Mutex<()>>,
+    compaction_lock: Arc<parking_lot::RwLock<()>>,
     snapshot_registry: Arc<SnapshotRegistry>,
     versions: Arc<parking_lot::Mutex<VersionSet>>,
     sst_dir: Arc<Path>,
     cache: Arc<BlockCache>,
     opts: CompactionOptions,
     stall_signal: Arc<crate::engine::StallSignal>,
+    in_progress: Arc<parking_lot::Mutex<HashSet<u64>>>,
 ) {
     loop {
         // Wait for trigger or periodic check
@@ -194,17 +215,25 @@ fn compaction_loop(
         }
 
         // Drive compactions until there's nothing to do. Each pass
-        // acquires `compaction_lock` so a foreground `compact_range`
-        // caller can interleave cleanly — foreground grabs the lock
-        // for the duration of its walk and we block until it's done.
+        // takes a read lock so multiple workers can run concurrently.
+        // Foreground callers (`compact_range`, `ingest_external_files`,
+        // `checkpoint_capture`) take the write lock, which blocks until
+        // all workers finish their current pass.
         loop {
             let did_work = {
-                let _guard = compaction_lock.lock();
+                let _guard = compaction_lock.read();
                 // Recompute the GC horizon on every pass: a snapshot
                 // may have dropped since the previous pass, unpinning
                 // more versions.
                 let pin_seq = snapshot_registry.oldest_live_seq();
-                match pick_and_run_compaction(&versions, &sst_dir, &cache, &opts, pin_seq) {
+                match pick_and_run_compaction(
+                    &versions,
+                    &sst_dir,
+                    &cache,
+                    &opts,
+                    pin_seq,
+                    &in_progress,
+                ) {
                     Ok(did_work) => did_work,
                     Err(e) => {
                         tracing::error!(error = %e, "Compaction failed");
@@ -245,13 +274,26 @@ fn pick_and_run_compaction(
     cache: &BlockCache,
     opts: &CompactionOptions,
     pin_seq: u64,
+    in_progress: &parking_lot::Mutex<HashSet<u64>>,
 ) -> std::io::Result<bool> {
     match opts.compaction_style {
         crate::options::CompactionStyle::Level => {
-            pick_and_run_level_compaction(versions, sst_dir, cache, opts, pin_seq)
+            pick_and_run_level_compaction(versions, sst_dir, cache, opts, pin_seq, in_progress)
         }
-        crate::options::CompactionStyle::Fifo => run_fifo_pass(versions, sst_dir, opts),
+        crate::options::CompactionStyle::Fifo => {
+            // Skip if any file is already being compacted — with a
+            // single L0 pool there's nothing safe to pick in parallel.
+            if !in_progress.lock().is_empty() {
+                return Ok(false);
+            }
+            run_fifo_pass(versions, sst_dir, opts)
+        }
         crate::options::CompactionStyle::Universal => {
+            // Same: universal merges all L0 files, so parallel picks
+            // would conflict. Skip until the in-progress set clears.
+            if !in_progress.lock().is_empty() {
+                return Ok(false);
+            }
             pick_and_run_universal(versions, sst_dir, cache, opts, pin_seq)
         }
     }
@@ -424,19 +466,20 @@ fn pick_and_run_level_compaction(
     cache: &BlockCache,
     opts: &CompactionOptions,
     pin_seq: u64,
+    in_progress: &parking_lot::Mutex<HashSet<u64>>,
 ) -> std::io::Result<bool> {
     let version = versions.lock().current();
 
     // Check L0 first
     if version.l0_count() >= opts.l0_compaction_trigger {
-        return compact_l0(versions, sst_dir, cache, opts, pin_seq);
+        return compact_l0(versions, sst_dir, cache, opts, pin_seq, in_progress);
     }
 
     // Check other levels
     for level in 1..MAX_LEVELS - 1 {
         let target = level_target_size(level, opts);
         if version.level_size(level) > target {
-            return compact_level(versions, sst_dir, cache, opts, level, pin_seq);
+            return compact_level(versions, sst_dir, cache, opts, level, pin_seq, in_progress);
         }
     }
 
@@ -539,8 +582,22 @@ fn compact_l0(
     cache: &BlockCache,
     opts: &CompactionOptions,
     pin_seq: u64,
+    in_progress: &parking_lot::Mutex<HashSet<u64>>,
 ) -> std::io::Result<bool> {
-    compact_level(versions, sst_dir, cache, opts, 0, pin_seq)
+    // If any L0 file is already being compacted by another worker,
+    // skip — L0 files may overlap so concurrent picks would produce
+    // conflicting output sets.
+    {
+        let ip = in_progress.lock();
+        let version = versions.lock().current();
+        if version.levels[0]
+            .iter()
+            .any(|f| ip.contains(&f.meta.file_id))
+        {
+            return Ok(false);
+        }
+    }
+    compact_level(versions, sst_dir, cache, opts, 0, pin_seq, in_progress)
 }
 
 /// Compact a level into the next level using the standard size-based
@@ -553,6 +610,7 @@ fn compact_level(
     opts: &CompactionOptions,
     level: usize,
     pin_seq: u64,
+    in_progress: &parking_lot::Mutex<HashSet<u64>>,
 ) -> std::io::Result<bool> {
     let target_level = level + 1;
     if target_level >= MAX_LEVELS {
@@ -566,20 +624,51 @@ fn compact_level(
         return Ok(false);
     }
 
-    // For L0, all files may overlap. For other levels, pick the first file.
+    // For L0, all files may overlap. For other levels, pick the first
+    // file that is not already being compacted by another worker.
     let (input_files, overlap_files) = if level == 0 {
         let l0_files = input_files;
         let (min_key, max_key) = key_range(&l0_files);
         let overlapping = find_overlapping(&version.levels[target_level], &min_key, &max_key);
         (l0_files, overlapping)
     } else {
-        let picked = vec![Arc::clone(&input_files[0])];
+        let ip = in_progress.lock();
+        let candidate = input_files
+            .iter()
+            .find(|f| !ip.contains(&f.meta.file_id))
+            .map(Arc::clone);
+        drop(ip);
+        let picked = match candidate {
+            Some(f) => vec![f],
+            None => return Ok(false),
+        };
         let (min_key, max_key) = key_range(&picked);
+        // Also skip if any overlap file is already in-progress.
         let overlapping = find_overlapping(&version.levels[target_level], &min_key, &max_key);
+        {
+            let ip = in_progress.lock();
+            if overlapping.iter().any(|f| ip.contains(&f.meta.file_id)) {
+                return Ok(false);
+            }
+        }
         (picked, overlapping)
     };
 
-    perform_compaction(
+    // Register all input and overlap file ids before releasing the
+    // version snapshot so concurrent workers see them immediately.
+    let all_ids: Vec<u64> = input_files
+        .iter()
+        .chain(overlap_files.iter())
+        .map(|f| f.meta.file_id)
+        .collect();
+    {
+        let mut ip = in_progress.lock();
+        for &id in &all_ids {
+            ip.insert(id);
+        }
+    }
+
+    let result = perform_compaction(
         versions,
         sst_dir,
         cache,
@@ -588,7 +677,18 @@ fn compact_level(
         input_files,
         overlap_files,
         pin_seq,
-    )?;
+    );
+
+    // Always deregister, even on error, so workers don't stall
+    // forever waiting for a slot that will never clear.
+    {
+        let mut ip = in_progress.lock();
+        for id in &all_ids {
+            ip.remove(id);
+        }
+    }
+
+    result?;
     Ok(true)
 }
 

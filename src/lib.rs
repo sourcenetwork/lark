@@ -5131,6 +5131,73 @@ mod tests {
     }
 
     #[test]
+    fn test_multi_worker_compaction_reads_are_correct() {
+        // With 4 background workers, heavy writes produce many L0
+        // files that trigger multiple concurrent L1+ compactions.
+        // Every key must still read back its latest value after
+        // the dust settles.
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            max_background_compactions: 4,
+            l0_compaction_trigger: 2,
+            target_file_size: 8 * 1024,
+            ..Options::default()
+        };
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), opts).unwrap();
+
+        let mut expected = std::collections::BTreeMap::new();
+        for i in 0..2048 {
+            let k = format!("k{i:06}");
+            let v = format!("v{i}");
+            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            expected.insert(k, v);
+        }
+        // Overwrite a window to exercise dedup across workers.
+        for i in 100..300 {
+            let k = format!("k{i:06}");
+            let v = format!("v{i}-new");
+            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            expected.insert(k, v);
+        }
+
+        // Give background workers time to process L0 files.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        db.compact_range(None, None).unwrap();
+
+        for (k, v) in &expected {
+            assert_eq!(
+                db.get(k.as_bytes()).unwrap(),
+                Some(v.as_bytes().to_vec()),
+                "key {k} must read back its latest value"
+            );
+        }
+    }
+
+    #[test]
+    fn test_multi_worker_single_thread_matches_default() {
+        // max_background_compactions=1 must behave identically to
+        // the default (which is also 1). Sanity check that the
+        // RwLock path doesn't break the single-worker case.
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            max_background_compactions: 1,
+            ..Options::default()
+        };
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), opts).unwrap();
+        for i in 0..500 {
+            let k = format!("k{i:04}");
+            db.put(k.as_bytes(), b"v").unwrap();
+        }
+        db.compact_range(None, None).unwrap();
+        for i in 0..500 {
+            let k = format!("k{i:04}");
+            assert_eq!(db.get(k.as_bytes()).unwrap(), Some(b"v".to_vec()));
+        }
+    }
+
+    #[test]
     fn test_subcompactions_produce_correct_reads() {
         // A compaction large enough that the planner wants to
         // split it — then read everything back and confirm the

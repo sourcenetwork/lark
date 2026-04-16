@@ -432,6 +432,17 @@ pub struct Options {
     /// Tunables for [`CompactionStyle::Universal`]. Ignored when
     /// the style is not Universal.
     pub universal_compaction_options: UniversalCompactionOptions,
+    /// Number of background threads available for compaction.
+    ///
+    /// When `> 1`, multiple non-overlapping compaction jobs can
+    /// run concurrently (e.g. L1→L2 at key range `[a,m)` on one
+    /// worker while L2→L3 at `[m,z)` runs on another). L0
+    /// compactions are exclusive — only one L0 job runs at a
+    /// time because L0 files can overlap arbitrarily.
+    ///
+    /// `1` (default) keeps compaction single-threaded and matches
+    /// pre-multi-worker behavior.
+    pub max_background_compactions: usize,
     /// Parallelism used to write a single compaction's output
     /// SSTables.
     ///
@@ -500,6 +511,7 @@ impl Default for Options {
             fifo_compaction_options: FifoCompactionOptions::default(),
             universal_compaction_options: UniversalCompactionOptions::default(),
             use_direct_io_for_compaction: false,
+            max_background_compactions: 1,
             max_subcompactions: 1,
         }
     }
@@ -567,6 +579,10 @@ impl std::fmt::Debug for Options {
                 "use_direct_io_for_compaction",
                 &self.use_direct_io_for_compaction,
             )
+            .field(
+                "max_background_compactions",
+                &self.max_background_compactions,
+            )
             .field("max_subcompactions", &self.max_subcompactions)
             .finish()
     }
@@ -602,6 +618,7 @@ impl Options {
             fifo_compaction_options: self.fifo_compaction_options,
             universal_compaction_options: self.universal_compaction_options,
             use_direct_io_for_compaction: self.use_direct_io_for_compaction,
+            max_background_compactions: self.max_background_compactions,
             max_subcompactions: self.max_subcompactions,
         }
     }
