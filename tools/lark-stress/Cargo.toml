@@ -1,0 +1,11 @@
+[package]
+name = "lark-stress"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+lark-kv = { path = "../.." }
+clap = { version = "4", features = ["derive"] }
+rand = "0.9"
+tempfile = "3.8"

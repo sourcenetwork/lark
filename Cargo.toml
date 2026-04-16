@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "tools/lark-bench"]
+members = [".", "tools/lark-bench", "tools/lark-stress"]
 
 [package]
 name = "lark-kv"
