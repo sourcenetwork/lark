@@ -477,6 +477,16 @@ pub struct Options {
     /// about foreground latency stability on Linux should turn
     /// it on.
     pub use_direct_io_for_compaction: bool,
+    /// Split the SSTable index into small leaf blocks on disk and keep
+    /// only a compact top-level index in memory. Reduces resident
+    /// memory when thousands of SSTables are open, at the cost of one
+    /// extra disk read per point lookup (amortized by the OS page
+    /// cache). Default: `false` (flat index loaded eagerly).
+    pub partitioned_index: bool,
+    /// Target size for each index leaf block when
+    /// [`Options::partitioned_index`] is enabled. Ignored when
+    /// partitioned indexing is off. Default: 4096.
+    pub metadata_block_size: usize,
 }
 
 impl Default for Options {
@@ -513,6 +523,8 @@ impl Default for Options {
             use_direct_io_for_compaction: false,
             max_background_compactions: 1,
             max_subcompactions: 1,
+            partitioned_index: false,
+            metadata_block_size: 4096,
         }
     }
 }
@@ -584,6 +596,8 @@ impl std::fmt::Debug for Options {
                 &self.max_background_compactions,
             )
             .field("max_subcompactions", &self.max_subcompactions)
+            .field("partitioned_index", &self.partitioned_index)
+            .field("metadata_block_size", &self.metadata_block_size)
             .finish()
     }
 }
@@ -620,6 +634,8 @@ impl Options {
             use_direct_io_for_compaction: self.use_direct_io_for_compaction,
             max_background_compactions: self.max_background_compactions,
             max_subcompactions: self.max_subcompactions,
+            partitioned_index: self.partitioned_index,
+            metadata_block_size: self.metadata_block_size,
         }
     }
 }

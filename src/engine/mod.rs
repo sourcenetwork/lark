@@ -81,6 +81,8 @@ pub(crate) struct EngineOptions {
     pub(crate) use_direct_io_for_compaction: bool,
     pub(crate) max_subcompactions: usize,
     pub(crate) max_background_compactions: usize,
+    pub(crate) partitioned_index: bool,
+    pub(crate) metadata_block_size: usize,
 }
 
 impl EngineOptions {
@@ -127,6 +129,8 @@ impl Default for EngineOptions {
             use_direct_io_for_compaction: false,
             max_subcompactions: 1,
             max_background_compactions: 1,
+            partitioned_index: false,
+            metadata_block_size: 4096,
         }
     }
 }
@@ -278,6 +282,8 @@ impl LarkEngine {
             use_direct_io_for_compaction: options.use_direct_io_for_compaction,
             max_subcompactions: options.max_subcompactions,
             max_background_compactions: options.max_background_compactions,
+            partitioned_index: options.partitioned_index,
+            metadata_block_size: options.metadata_block_size,
         };
 
         let compaction_lock = Arc::new(RwLock::new(()));
@@ -1255,6 +1261,8 @@ impl LarkEngine {
             self.options.bloom_bits_per_key,
             self.options.compression_for_level(0),
             self.options.prefix_extractor.clone(),
+            self.options.partitioned_index,
+            self.options.metadata_block_size,
         )?;
 
         // Walk the memtable in internal-key order and copy every version
@@ -1436,6 +1444,8 @@ impl LarkEngine {
             use_direct_io_for_compaction: self.options.use_direct_io_for_compaction,
             max_subcompactions: self.options.max_subcompactions,
             max_background_compactions: self.options.max_background_compactions,
+            partitioned_index: self.options.partitioned_index,
+            metadata_block_size: self.options.metadata_block_size,
         };
         // Under FIFO compaction there is no level push-down; a
         // synchronous compact_range just flushes the memtable and
@@ -1615,6 +1625,8 @@ impl LarkEngine {
             self.options.bloom_bits_per_key,
             self.options.compression_for_level(target_level),
             self.options.prefix_extractor.clone(),
+            self.options.partitioned_index,
+            self.options.metadata_block_size,
         )?;
 
         // Re-encode every point entry with the ingest seq.
