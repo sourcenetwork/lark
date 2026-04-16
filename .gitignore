@@ -28,3 +28,6 @@ crates/ffi/defra.h
 
 # Claude (user-specific)
 .claude/
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
