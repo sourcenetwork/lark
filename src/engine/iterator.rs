@@ -138,7 +138,7 @@ impl LevelIter {
             }
             Self::SsTable(it) => {
                 if !it.reader.may_have_prefix(prefix) {
-                    it.curr = None;
+                    it.valid = false;
                     return Ok(());
                 }
                 it.seek(target)
@@ -179,14 +179,30 @@ impl LevelIter {
     fn key(&self) -> Option<&[u8]> {
         match self {
             Self::Memtable(it) => it.curr.as_ref().map(|(k, _)| k.as_slice()),
-            Self::SsTable(it) => it.curr.as_ref().map(|(k, _)| k.as_slice()),
+            Self::SsTable(it) => {
+                if it.valid {
+                    it.block_entries
+                        .get(it.entry_pos)
+                        .map(|(k, _)| k.as_slice())
+                } else {
+                    None
+                }
+            }
         }
     }
 
     fn value(&self) -> Option<&[u8]> {
         match self {
             Self::Memtable(it) => it.curr.as_ref().map(|(_, v)| v.as_slice()),
-            Self::SsTable(it) => it.curr.as_ref().map(|(_, v)| v.as_slice()),
+            Self::SsTable(it) => {
+                if it.valid {
+                    it.block_entries
+                        .get(it.entry_pos)
+                        .map(|(_, v)| v.as_slice())
+                } else {
+                    None
+                }
+            }
         }
     }
 }
@@ -236,7 +252,10 @@ struct SsTableLevelIter {
     block_idx: usize,
     block_entries: Vec<(Vec<u8>, Vec<u8>)>,
     entry_pos: usize,
-    curr: Option<(Vec<u8>, Vec<u8>)>,
+    /// Whether `entry_pos` points at a valid entry in
+    /// `block_entries`. Replaces the old `curr: Option<...>`
+    /// clone that allocated on every step.
+    valid: bool,
 }
 
 impl SsTableLevelIter {
@@ -247,13 +266,13 @@ impl SsTableLevelIter {
             block_idx: 0,
             block_entries: Vec::new(),
             entry_pos: 0,
-            curr: None,
+            valid: false,
         }
     }
 
     fn seek_to_first(&mut self) -> io::Result<()> {
         if self.reader.num_blocks() == 0 {
-            self.curr = None;
+            self.valid = false;
             return Ok(());
         }
         self.block_idx = 0;
@@ -261,7 +280,7 @@ impl SsTableLevelIter {
             .reader
             .load_block_entries(self.block_idx, &self.cache)?;
         self.entry_pos = 0;
-        self.curr = self.block_entries.first().cloned();
+        self.valid = !self.block_entries.is_empty();
         Ok(())
     }
 
@@ -269,7 +288,7 @@ impl SsTableLevelIter {
         let block_idx = match self.reader.seek_block(target) {
             Some(i) => i,
             None => {
-                self.curr = None;
+                self.valid = false;
                 return Ok(());
             }
         };
@@ -291,7 +310,7 @@ impl SsTableLevelIter {
         if self.entry_pos >= self.block_entries.len() {
             self.block_idx += 1;
             if self.block_idx >= self.reader.num_blocks() {
-                self.curr = None;
+                self.valid = false;
                 return Ok(());
             }
             self.block_entries = self
@@ -299,7 +318,7 @@ impl SsTableLevelIter {
                 .load_block_entries(self.block_idx, &self.cache)?;
             self.entry_pos = 0;
         }
-        self.curr = self.block_entries.get(self.entry_pos).cloned();
+        self.valid = self.entry_pos < self.block_entries.len();
         Ok(())
     }
 
@@ -316,7 +335,7 @@ impl SsTableLevelIter {
         // **last** block (not block 0).
         let num_blocks = self.reader.num_blocks();
         if num_blocks == 0 {
-            self.curr = None;
+            self.valid = false;
             return Ok(());
         }
         let block_idx = self.reader.seek_block(target).unwrap_or(num_blocks - 1);
@@ -339,7 +358,7 @@ impl SsTableLevelIter {
         match best {
             Some(i) => {
                 self.entry_pos = i;
-                self.curr = self.block_entries.get(i).cloned();
+                self.valid = true;
             }
             None => {
                 // Every entry in this block is `> target`, which can
@@ -349,7 +368,7 @@ impl SsTableLevelIter {
                 // known to be `< target` (that's why `seek_block`
                 // skipped it).
                 if self.block_idx == 0 {
-                    self.curr = None;
+                    self.valid = false;
                     return Ok(());
                 }
                 self.block_idx -= 1;
@@ -357,7 +376,7 @@ impl SsTableLevelIter {
                     .reader
                     .load_block_entries(self.block_idx, &self.cache)?;
                 self.entry_pos = self.block_entries.len().saturating_sub(1);
-                self.curr = self.block_entries.last().cloned();
+                self.valid = !self.block_entries.is_empty();
             }
         }
         Ok(())
@@ -366,27 +385,27 @@ impl SsTableLevelIter {
     fn advance(&mut self) -> io::Result<()> {
         self.entry_pos += 1;
         if self.entry_pos < self.block_entries.len() {
-            self.curr = self.block_entries.get(self.entry_pos).cloned();
+            self.valid = self.entry_pos < self.block_entries.len();
             return Ok(());
         }
         // Move to the next block.
         self.block_idx += 1;
         if self.block_idx >= self.reader.num_blocks() {
-            self.curr = None;
+            self.valid = false;
             return Ok(());
         }
         self.block_entries = self
             .reader
             .load_block_entries(self.block_idx, &self.cache)?;
         self.entry_pos = 0;
-        self.curr = self.block_entries.first().cloned();
+        self.valid = !self.block_entries.is_empty();
         Ok(())
     }
 
     fn seek_to_last(&mut self) -> io::Result<()> {
         let n = self.reader.num_blocks();
         if n == 0 {
-            self.curr = None;
+            self.valid = false;
             return Ok(());
         }
         self.block_idx = n - 1;
@@ -394,26 +413,26 @@ impl SsTableLevelIter {
             .reader
             .load_block_entries(self.block_idx, &self.cache)?;
         if self.block_entries.is_empty() {
-            self.curr = None;
+            self.valid = false;
             return Ok(());
         }
         self.entry_pos = self.block_entries.len() - 1;
-        self.curr = self.block_entries.last().cloned();
+        self.valid = !self.block_entries.is_empty();
         Ok(())
     }
 
     fn advance_backward(&mut self) -> io::Result<()> {
-        if self.curr.is_none() {
+        if !self.valid {
             return Ok(());
         }
         if self.entry_pos > 0 {
             self.entry_pos -= 1;
-            self.curr = self.block_entries.get(self.entry_pos).cloned();
+            self.valid = self.entry_pos < self.block_entries.len();
             return Ok(());
         }
         // Move to the previous block.
         if self.block_idx == 0 {
-            self.curr = None;
+            self.valid = false;
             return Ok(());
         }
         self.block_idx -= 1;
@@ -421,11 +440,11 @@ impl SsTableLevelIter {
             .reader
             .load_block_entries(self.block_idx, &self.cache)?;
         if self.block_entries.is_empty() {
-            self.curr = None;
+            self.valid = false;
             return Ok(());
         }
         self.entry_pos = self.block_entries.len() - 1;
-        self.curr = self.block_entries.last().cloned();
+        self.valid = !self.block_entries.is_empty();
         Ok(())
     }
 }
