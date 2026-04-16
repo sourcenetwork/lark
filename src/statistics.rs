@@ -248,11 +248,7 @@ pub struct HistogramSnapshot {
 impl HistogramSnapshot {
     /// Arithmetic mean. Returns 0 when `count == 0`.
     pub fn average(&self) -> u64 {
-        if self.count == 0 {
-            0
-        } else {
-            self.sum / self.count
-        }
+        self.sum.checked_div(self.count).unwrap_or(0)
     }
 }
 
