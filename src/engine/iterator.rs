@@ -59,15 +59,17 @@ use std::io;
 use std::ops::Bound;
 use std::sync::Arc;
 
+use super::block::encoded_entry_size;
+use super::block::{decode_entry_at, Block, RESTART_INTERVAL};
 use super::block_cache::BlockCache;
 use super::internal_key::{
-    compare_internal_keys, decode_internal_key, lookup_key, INTERNAL_KEY_SUFFIX_LEN,
+    compare_internal_keys, decode_internal_key, lookup_key, user_key_of, INTERNAL_KEY_SUFFIX_LEN,
     VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE,
 };
 use super::manifest::Version;
 use super::memtable::MemTable;
 use super::range_tombstone::{max_covering_seq, RangeTombstone};
-use super::sstable::SsTableReader;
+use super::sstable::{LiveSst, SsTableReader};
 use crate::options::MergeOperator;
 use crate::options::PrefixExtractor;
 
@@ -93,6 +95,7 @@ fn above_all_versions(user_key: &[u8]) -> Vec<u8> {
 enum LevelIter {
     Memtable(MemtableLevelIter),
     SsTable(SsTableLevelIter),
+    LevelConcat(LevelConcatIter),
 }
 
 impl LevelIter {
@@ -103,6 +106,7 @@ impl LevelIter {
                 Ok(())
             }
             Self::SsTable(it) => it.seek_to_first(),
+            Self::LevelConcat(it) => it.seek_to_first(),
         }
     }
 
@@ -113,6 +117,7 @@ impl LevelIter {
                 Ok(())
             }
             Self::SsTable(it) => it.seek_to_last(),
+            Self::LevelConcat(it) => it.seek_to_last(),
         }
     }
 
@@ -123,6 +128,7 @@ impl LevelIter {
                 Ok(())
             }
             Self::SsTable(it) => it.seek(target),
+            Self::LevelConcat(it) => it.seek(target),
         }
     }
 
@@ -143,6 +149,7 @@ impl LevelIter {
                 }
                 it.seek(target)
             }
+            Self::LevelConcat(it) => it.seek(target),
         }
     }
 
@@ -153,6 +160,7 @@ impl LevelIter {
                 Ok(())
             }
             Self::SsTable(it) => it.seek_for_prev(target),
+            Self::LevelConcat(it) => it.seek_for_prev(target),
         }
     }
 
@@ -163,6 +171,7 @@ impl LevelIter {
                 Ok(())
             }
             Self::SsTable(it) => it.advance(),
+            Self::LevelConcat(it) => it.advance(),
         }
     }
 
@@ -173,6 +182,7 @@ impl LevelIter {
                 Ok(())
             }
             Self::SsTable(it) => it.advance_backward(),
+            Self::LevelConcat(it) => it.advance_backward(),
         }
     }
 
@@ -181,13 +191,12 @@ impl LevelIter {
             Self::Memtable(it) => it.curr.as_ref().map(|(k, _)| k.as_slice()),
             Self::SsTable(it) => {
                 if it.valid {
-                    it.block_entries
-                        .get(it.entry_pos)
-                        .map(|(k, _)| k.as_slice())
+                    Some(&it.cached_key[..])
                 } else {
                     None
                 }
             }
+            Self::LevelConcat(it) => it.key(),
         }
     }
 
@@ -196,13 +205,15 @@ impl LevelIter {
             Self::Memtable(it) => it.curr.as_ref().map(|(_, v)| v.as_slice()),
             Self::SsTable(it) => {
                 if it.valid {
-                    it.block_entries
-                        .get(it.entry_pos)
-                        .map(|(_, v)| v.as_slice())
+                    let data = it.block.as_ref().unwrap().entry_data();
+                    Some(
+                        &data[it.cached_value_offset..it.cached_value_offset + it.cached_value_len],
+                    )
                 } else {
                     None
                 }
             }
+            Self::LevelConcat(it) => it.value(),
         }
     }
 }
@@ -249,13 +260,19 @@ impl MemtableLevelIter {
 struct SsTableLevelIter {
     reader: Arc<SsTableReader>,
     cache: Arc<BlockCache>,
+    block: Option<Arc<Block>>,
     block_idx: usize,
-    block_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Byte offset of the current entry within `block.entry_data()`.
     entry_pos: usize,
-    /// Whether `entry_pos` points at a valid entry in
-    /// `block_entries`. Replaces the old `curr: Option<...>`
-    /// clone that allocated on every step.
+    /// Byte offset just past the current entry (start of the next).
+    next_entry_pos: usize,
+    cached_key: Vec<u8>,
+    cached_value_offset: usize,
+    cached_value_len: usize,
     valid: bool,
+    /// Lazily built on the first backward step; maps entry index to
+    /// byte offset in entry_data.
+    entry_offsets: Option<Vec<usize>>,
 }
 
 impl SsTableLevelIter {
@@ -263,11 +280,40 @@ impl SsTableLevelIter {
         Self {
             reader,
             cache,
+            block: None,
             block_idx: 0,
-            block_entries: Vec::new(),
             entry_pos: 0,
+            next_entry_pos: 0,
+            cached_key: Vec::new(),
+            cached_value_offset: 0,
+            cached_value_len: 0,
             valid: false,
+            entry_offsets: None,
         }
+    }
+
+    fn load_block(&mut self, idx: usize) -> io::Result<()> {
+        self.block_idx = idx;
+        self.block = Some(self.reader.load_block_by_idx(idx, &self.cache)?);
+        self.entry_pos = 0;
+        self.next_entry_pos = 0;
+        self.entry_offsets = None;
+        self.cached_key.clear();
+        Ok(())
+    }
+
+    fn decode_current(&mut self) {
+        let data = self.block.as_ref().unwrap().entry_data();
+        if self.entry_pos >= data.len() {
+            self.valid = false;
+            return;
+        }
+        let (consumed, val_off, val_len) =
+            decode_entry_at(data, self.entry_pos, &mut self.cached_key);
+        self.next_entry_pos = self.entry_pos + consumed;
+        self.cached_value_offset = val_off;
+        self.cached_value_len = val_len;
+        self.valid = true;
     }
 
     fn seek_to_first(&mut self) -> io::Result<()> {
@@ -275,12 +321,8 @@ impl SsTableLevelIter {
             self.valid = false;
             return Ok(());
         }
-        self.block_idx = 0;
-        self.block_entries = self
-            .reader
-            .load_block_entries(self.block_idx, &self.cache)?;
-        self.entry_pos = 0;
-        self.valid = !self.block_entries.is_empty();
+        self.load_block(0)?;
+        self.decode_current();
         Ok(())
     }
 
@@ -292,113 +334,90 @@ impl SsTableLevelIter {
                 return Ok(());
             }
         };
-        self.block_idx = block_idx;
-        self.block_entries = self
-            .reader
-            .load_block_entries(self.block_idx, &self.cache)?;
-        // Within the block, find the first entry >= target.
-        self.entry_pos = self
-            .block_entries
-            .iter()
-            .position(|(k, _)| k.as_slice() >= target)
-            .unwrap_or(self.block_entries.len());
-        // If the target falls past the end of this block, advance to the
-        // next block — the block the binary-search landed on has
-        // `last_key >= target` but its contents may all be < target if the
-        // last key exactly equals target. In practice seek_block returns
-        // the right block, but handle the edge defensively.
-        if self.entry_pos >= self.block_entries.len() {
-            self.block_idx += 1;
-            if self.block_idx >= self.reader.num_blocks() {
-                self.valid = false;
+        self.load_block(block_idx)?;
+        let data = self.block.as_ref().unwrap().entry_data();
+        self.entry_pos = 0;
+        self.cached_key.clear();
+        while self.entry_pos < data.len() {
+            let (consumed, val_off, val_len) =
+                decode_entry_at(data, self.entry_pos, &mut self.cached_key);
+            self.next_entry_pos = self.entry_pos + consumed;
+            self.cached_value_offset = val_off;
+            self.cached_value_len = val_len;
+            if compare_internal_keys(&self.cached_key, target).is_ge() {
+                self.valid = true;
                 return Ok(());
             }
-            self.block_entries = self
-                .reader
-                .load_block_entries(self.block_idx, &self.cache)?;
-            self.entry_pos = 0;
+            self.entry_pos = self.next_entry_pos;
         }
-        self.valid = self.entry_pos < self.block_entries.len();
+        // Fell off end of block — try next block.
+        self.block_idx += 1;
+        if self.block_idx >= self.reader.num_blocks() {
+            self.valid = false;
+            return Ok(());
+        }
+        self.load_block(self.block_idx)?;
+        self.decode_current();
         Ok(())
     }
 
     fn seek_for_prev(&mut self, target: &[u8]) -> io::Result<()> {
-        // Pick the block that could contain the largest entry `<= target`.
-        //
-        // `seek_block` returns the first block whose last key is `>= target`
-        // — that is the "containing" block, i.e. the earliest block that
-        // might hold `target` or the smallest key greater than `target`.
-        //
-        // If `seek_block` returns `None` every block's last key is `<
-        // target`, which means `target` is greater than every entry in
-        // the table. The correct answer is then the last entry of the
-        // **last** block (not block 0).
         let num_blocks = self.reader.num_blocks();
         if num_blocks == 0 {
             self.valid = false;
             return Ok(());
         }
         let block_idx = self.reader.seek_block(target).unwrap_or(num_blocks - 1);
-
-        self.block_idx = block_idx;
-        self.block_entries = self
-            .reader
-            .load_block_entries(self.block_idx, &self.cache)?;
-
-        // Within the block, find the largest entry `<= target` via linear
-        // walk. One block holds ~hundreds of entries, so this is cheap.
+        self.load_block(block_idx)?;
+        self.build_entry_offsets();
+        let offsets = self.entry_offsets.as_ref().unwrap();
+        let data = self.block.as_ref().unwrap().entry_data();
         let mut best: Option<usize> = None;
-        for (i, (k, _)) in self.block_entries.iter().enumerate() {
-            if k.as_slice() <= target {
+        let mut temp_key = Vec::new();
+        for (i, &off) in offsets.iter().enumerate() {
+            let (_consumed, _vo, _vl) = decode_entry_at(data, off, &mut temp_key);
+            if compare_internal_keys(&temp_key, target).is_le() {
                 best = Some(i);
             } else {
                 break;
             }
         }
         match best {
-            Some(i) => {
-                self.entry_pos = i;
+            Some(idx) => {
+                self.replay_key_to_index(idx);
                 self.valid = true;
             }
             None => {
-                // Every entry in this block is `> target`, which can
-                // happen when the containing block's first key already
-                // exceeds `target`. The answer, if one exists, is the
-                // last entry of the previous block — its last key is
-                // known to be `< target` (that's why `seek_block`
-                // skipped it).
                 if self.block_idx == 0 {
                     self.valid = false;
                     return Ok(());
                 }
                 self.block_idx -= 1;
-                self.block_entries = self
-                    .reader
-                    .load_block_entries(self.block_idx, &self.cache)?;
-                self.entry_pos = self.block_entries.len().saturating_sub(1);
-                self.valid = !self.block_entries.is_empty();
+                self.load_block(self.block_idx)?;
+                self.build_entry_offsets();
+                let last = self.entry_offsets.as_ref().unwrap().len() - 1;
+                self.replay_key_to_index(last);
+                self.valid = true;
             }
         }
         Ok(())
     }
 
     fn advance(&mut self) -> io::Result<()> {
-        self.entry_pos += 1;
-        if self.entry_pos < self.block_entries.len() {
-            self.valid = self.entry_pos < self.block_entries.len();
+        if !self.valid {
             return Ok(());
         }
-        // Move to the next block.
-        self.block_idx += 1;
-        if self.block_idx >= self.reader.num_blocks() {
-            self.valid = false;
-            return Ok(());
+        self.entry_pos = self.next_entry_pos;
+        let data = self.block.as_ref().unwrap().entry_data();
+        if self.entry_pos >= data.len() {
+            self.block_idx += 1;
+            if self.block_idx >= self.reader.num_blocks() {
+                self.valid = false;
+                return Ok(());
+            }
+            self.load_block(self.block_idx)?;
         }
-        self.block_entries = self
-            .reader
-            .load_block_entries(self.block_idx, &self.cache)?;
-        self.entry_pos = 0;
-        self.valid = !self.block_entries.is_empty();
+        self.decode_current();
         Ok(())
     }
 
@@ -408,16 +427,16 @@ impl SsTableLevelIter {
             self.valid = false;
             return Ok(());
         }
-        self.block_idx = n - 1;
-        self.block_entries = self
-            .reader
-            .load_block_entries(self.block_idx, &self.cache)?;
-        if self.block_entries.is_empty() {
+        self.load_block(n - 1)?;
+        self.build_entry_offsets();
+        let offsets = self.entry_offsets.as_ref().unwrap();
+        if offsets.is_empty() {
             self.valid = false;
             return Ok(());
         }
-        self.entry_pos = self.block_entries.len() - 1;
-        self.valid = !self.block_entries.is_empty();
+        let last = offsets.len() - 1;
+        self.replay_key_to_index(last);
+        self.valid = true;
         Ok(())
     }
 
@@ -425,27 +444,240 @@ impl SsTableLevelIter {
         if !self.valid {
             return Ok(());
         }
-        if self.entry_pos > 0 {
-            self.entry_pos -= 1;
-            self.valid = self.entry_pos < self.block_entries.len();
+        if self.entry_offsets.is_none() {
+            self.build_entry_offsets();
+        }
+        let offsets = self.entry_offsets.as_ref().unwrap();
+        let cur_idx = offsets
+            .iter()
+            .position(|&o| o == self.entry_pos)
+            .unwrap_or(0);
+        if cur_idx == 0 {
+            if self.block_idx == 0 {
+                self.valid = false;
+                return Ok(());
+            }
+            self.block_idx -= 1;
+            self.load_block(self.block_idx)?;
+            self.build_entry_offsets();
+            let offsets = self.entry_offsets.as_ref().unwrap();
+            if offsets.is_empty() {
+                self.valid = false;
+                return Ok(());
+            }
+            let last = offsets.len() - 1;
+            self.replay_key_to_index(last);
+            self.valid = true;
             return Ok(());
         }
-        // Move to the previous block.
-        if self.block_idx == 0 {
-            self.valid = false;
-            return Ok(());
-        }
-        self.block_idx -= 1;
-        self.block_entries = self
-            .reader
-            .load_block_entries(self.block_idx, &self.cache)?;
-        if self.block_entries.is_empty() {
-            self.valid = false;
-            return Ok(());
-        }
-        self.entry_pos = self.block_entries.len() - 1;
-        self.valid = !self.block_entries.is_empty();
+        self.replay_key_to_index(cur_idx - 1);
+        self.valid = true;
         Ok(())
+    }
+
+    fn build_entry_offsets(&mut self) {
+        let data = self.block.as_ref().unwrap().entry_data();
+        let mut offsets = Vec::new();
+        let mut pos = 0;
+        while pos < data.len() {
+            offsets.push(pos);
+            pos += encoded_entry_size(data, pos);
+        }
+        self.entry_offsets = Some(offsets);
+    }
+
+    /// Replay key reconstruction from the nearest restart point up to
+    /// `target_idx` in `entry_offsets`. After this call `cached_key`,
+    /// `entry_pos`, `next_entry_pos`, and cached value metadata are
+    /// all consistent with the entry at `target_idx`.
+    fn replay_key_to_index(&mut self, target_idx: usize) {
+        let restart_idx = target_idx / RESTART_INTERVAL;
+        let block = self.block.as_ref().unwrap();
+        let data = block.entry_data();
+        let start_offset = if restart_idx > 0 && restart_idx < block.restart_count() {
+            block.restart_offset(restart_idx)
+        } else {
+            0
+        };
+        self.cached_key.clear();
+        let offsets = self.entry_offsets.as_ref().unwrap();
+        let start_entry_idx = restart_idx * RESTART_INTERVAL;
+        let mut pos = start_offset;
+        for idx in start_entry_idx..=target_idx {
+            let (consumed, val_off, val_len) = decode_entry_at(data, pos, &mut self.cached_key);
+            if idx == target_idx {
+                self.entry_pos = pos;
+                self.next_entry_pos = pos + consumed;
+                self.cached_value_offset = val_off;
+                self.cached_value_len = val_len;
+            }
+            pos += consumed;
+        }
+        let _ = offsets; // used for the target_idx contract only
+    }
+}
+
+// ─── LevelConcatIter ───────────────────────────────────────────────────────
+
+/// Concatenation iterator for a sorted, non-overlapping level (L1+).
+/// Opens one SSTable at a time and walks through files in order.
+struct LevelConcatIter {
+    files: Vec<Arc<LiveSst>>,
+    cache: Arc<BlockCache>,
+    file_idx: usize,
+    current: Option<SsTableLevelIter>,
+}
+
+impl LevelConcatIter {
+    fn new(files: Vec<Arc<LiveSst>>, cache: Arc<BlockCache>) -> Self {
+        Self {
+            files,
+            cache,
+            file_idx: 0,
+            current: None,
+        }
+    }
+
+    fn open_current(&mut self) -> io::Result<()> {
+        if self.file_idx < self.files.len() {
+            self.current = Some(SsTableLevelIter::new(
+                Arc::clone(&self.files[self.file_idx].reader),
+                Arc::clone(&self.cache),
+            ));
+        } else {
+            self.current = None;
+        }
+        Ok(())
+    }
+
+    fn seek_to_first(&mut self) -> io::Result<()> {
+        if self.files.is_empty() {
+            self.current = None;
+            return Ok(());
+        }
+        self.file_idx = 0;
+        self.open_current()?;
+        self.current.as_mut().unwrap().seek_to_first()
+    }
+
+    fn seek_to_last(&mut self) -> io::Result<()> {
+        if self.files.is_empty() {
+            self.current = None;
+            return Ok(());
+        }
+        self.file_idx = self.files.len() - 1;
+        self.open_current()?;
+        self.current.as_mut().unwrap().seek_to_last()
+    }
+
+    fn seek(&mut self, target: &[u8]) -> io::Result<()> {
+        if self.files.is_empty() {
+            self.current = None;
+            return Ok(());
+        }
+        let uk = user_key_of(target);
+        let idx = self
+            .files
+            .partition_point(|f| f.meta.largest_key.as_slice() < uk);
+        if idx >= self.files.len() {
+            self.current = None;
+            return Ok(());
+        }
+        self.file_idx = idx;
+        self.open_current()?;
+        self.current.as_mut().unwrap().seek(target)?;
+        if !self.current.as_ref().unwrap().valid {
+            self.file_idx += 1;
+            if self.file_idx >= self.files.len() {
+                self.current = None;
+                return Ok(());
+            }
+            self.open_current()?;
+            self.current.as_mut().unwrap().seek_to_first()?;
+        }
+        Ok(())
+    }
+
+    fn seek_for_prev(&mut self, target: &[u8]) -> io::Result<()> {
+        if self.files.is_empty() {
+            self.current = None;
+            return Ok(());
+        }
+        let uk = user_key_of(target);
+        let idx = self
+            .files
+            .partition_point(|f| f.meta.largest_key.as_slice() < uk);
+        let idx = if idx >= self.files.len() {
+            self.files.len() - 1
+        } else {
+            idx
+        };
+        self.file_idx = idx;
+        self.open_current()?;
+        self.current.as_mut().unwrap().seek_for_prev(target)?;
+        if !self.current.as_ref().unwrap().valid {
+            if self.file_idx == 0 {
+                self.current = None;
+                return Ok(());
+            }
+            self.file_idx -= 1;
+            self.open_current()?;
+            self.current.as_mut().unwrap().seek_to_last()?;
+        }
+        Ok(())
+    }
+
+    fn advance(&mut self) -> io::Result<()> {
+        if let Some(ref mut it) = self.current {
+            it.advance()?;
+            if it.valid {
+                return Ok(());
+            }
+        }
+        self.file_idx += 1;
+        if self.file_idx >= self.files.len() {
+            self.current = None;
+            return Ok(());
+        }
+        self.open_current()?;
+        self.current.as_mut().unwrap().seek_to_first()
+    }
+
+    fn advance_backward(&mut self) -> io::Result<()> {
+        if let Some(ref mut it) = self.current {
+            it.advance_backward()?;
+            if it.valid {
+                return Ok(());
+            }
+        }
+        if self.file_idx == 0 {
+            self.current = None;
+            return Ok(());
+        }
+        self.file_idx -= 1;
+        self.open_current()?;
+        self.current.as_mut().unwrap().seek_to_last()
+    }
+
+    fn key(&self) -> Option<&[u8]> {
+        self.current.as_ref().and_then(|it| {
+            if it.valid {
+                Some(it.cached_key.as_slice())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn value(&self) -> Option<&[u8]> {
+        self.current.as_ref().and_then(|it| {
+            if it.valid {
+                let data = it.block.as_ref().unwrap().entry_data();
+                Some(&data[it.cached_value_offset..it.cached_value_offset + it.cached_value_len])
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -666,15 +898,22 @@ impl LarkIterator {
                 Arc::clone(&cache),
             )));
         }
-        // L1+: within a level file order doesn't matter (non-overlapping).
+        // L1+: non-overlapping files; use a single concatenation
+        // iterator per level instead of one LevelIter per file.
         for level in 1..version.levels.len() {
+            if version.levels[level].is_empty() {
+                continue;
+            }
             for file in &version.levels[level] {
                 range_tombstones.extend(file.reader.range_tombstones().iter().cloned());
-                levels.push(LevelIter::SsTable(SsTableLevelIter::new(
-                    Arc::clone(&file.reader),
-                    Arc::clone(&cache),
-                )));
             }
+            let mut sorted: Vec<Arc<LiveSst>> =
+                version.levels[level].iter().map(Arc::clone).collect();
+            sorted.sort_by(|a, b| a.meta.smallest_key.cmp(&b.meta.smallest_key));
+            levels.push(LevelIter::LevelConcat(LevelConcatIter::new(
+                sorted,
+                Arc::clone(&cache),
+            )));
         }
 
         Self {
