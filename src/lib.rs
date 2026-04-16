@@ -5198,6 +5198,137 @@ mod tests {
     }
 
     #[test]
+    fn test_partitioned_index_reads_are_correct() {
+        // Enable partitioned index with a tiny metadata_block_size
+        // so the test actually exercises the two-level path.
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            partitioned_index: true,
+            metadata_block_size: 128,
+            ..Options::default()
+        };
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), opts).unwrap();
+
+        for i in 0..500 {
+            let k = format!("k{i:04}");
+            let v = format!("v{i}");
+            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+        }
+        db.compact_range(None, None).unwrap();
+
+        for i in 0..500 {
+            let k = format!("k{i:04}");
+            let v = format!("v{i}");
+            assert_eq!(
+                db.get(k.as_bytes()).unwrap(),
+                Some(v.into_bytes()),
+                "key {k} must read back correctly with partitioned index"
+            );
+        }
+    }
+
+    #[test]
+    fn test_partitioned_index_scan_matches_flat() {
+        // Write the same data with and without partitioned index.
+        // Scans must produce identical results.
+        let write_and_scan = |partitioned: bool| -> Vec<(Vec<u8>, Vec<u8>)> {
+            let dir = TempDir::new().unwrap();
+            let opts = Options {
+                write_buffer_size: 4 * 1024,
+                partitioned_index: partitioned,
+                metadata_block_size: 128,
+                ..Options::default()
+            };
+            let db = Db::open(dir.path(), opts).unwrap();
+            for i in 0..200 {
+                let k = format!("k{i:04}");
+                let v = format!("v{i}");
+                db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            }
+            db.compact_range(None, None).unwrap();
+            db.scan(None, None).unwrap()
+        };
+        let flat = write_and_scan(false);
+        let partitioned = write_and_scan(true);
+        assert_eq!(flat, partitioned, "partitioned scan must match flat scan");
+    }
+
+    #[test]
+    fn test_partitioned_index_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            partitioned_index: true,
+            metadata_block_size: 128,
+            ..Options::default()
+        };
+        {
+            let db = Db::open(dir.path(), opts.clone()).unwrap();
+            for i in 0..200 {
+                let k = format!("k{i:04}");
+                db.put(k.as_bytes(), b"v").unwrap();
+            }
+            db.compact_range(None, None).unwrap();
+        }
+        // Reopen — the V2 SSTables must still be readable.
+        let db = Db::open(dir.path(), opts).unwrap();
+        for i in 0..200 {
+            let k = format!("k{i:04}");
+            assert_eq!(db.get(k.as_bytes()).unwrap(), Some(b"v".to_vec()));
+        }
+    }
+
+    #[test]
+    fn test_mixed_v1_v2_sstables_read_correctly() {
+        // Write some data with flat index (V1), then switch to
+        // partitioned (V2) and write more. Reads that span both
+        // file types must work correctly.
+        let dir = TempDir::new().unwrap();
+        {
+            let opts = Options {
+                write_buffer_size: 4 * 1024,
+                partitioned_index: false,
+                ..Options::default()
+            };
+            let db = Db::open(dir.path(), opts).unwrap();
+            for i in 0..100 {
+                let k = format!("k{i:04}");
+                db.put(k.as_bytes(), b"v1").unwrap();
+            }
+            db.compact_range(None, None).unwrap();
+        }
+        {
+            let opts = Options {
+                write_buffer_size: 4 * 1024,
+                partitioned_index: true,
+                metadata_block_size: 128,
+                ..Options::default()
+            };
+            let db = Db::open(dir.path(), opts).unwrap();
+            for i in 100..200 {
+                let k = format!("k{i:04}");
+                db.put(k.as_bytes(), b"v2").unwrap();
+            }
+            // Don't compact — leave V1 files at lower levels and
+            // V2 files in L0/L1.
+        }
+        let opts = Options {
+            partitioned_index: true,
+            ..Options::default()
+        };
+        let db = Db::open(dir.path(), opts).unwrap();
+        for i in 0..100 {
+            let k = format!("k{i:04}");
+            assert_eq!(db.get(k.as_bytes()).unwrap(), Some(b"v1".to_vec()));
+        }
+        for i in 100..200 {
+            let k = format!("k{i:04}");
+            assert_eq!(db.get(k.as_bytes()).unwrap(), Some(b"v2".to_vec()));
+        }
+    }
+
+    #[test]
     fn test_subcompactions_produce_correct_reads() {
         // A compaction large enough that the planner wants to
         // split it — then read everything back and confirm the

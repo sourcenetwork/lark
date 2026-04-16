@@ -33,9 +33,13 @@ use super::internal_key::{
 use super::range_tombstone::{max_covering_seq, RangeTombstone};
 use crate::options::{CompressionType, PrefixExtractor};
 
-/// SSTable magic number: "LARKSST\x01" (format version 2 — added the
-/// range-tombstone meta block at the bottom of the file).
-const MAGIC: u64 = 0x4C41524B_53535401;
+/// SSTable magic number: "LARKSST\x01" — flat-index format.
+const MAGIC_V1: u64 = 0x4C41524B_53535401;
+
+/// SSTable magic number: "LARKSST\x02" — partitioned-index format. The
+/// footer's `index_offset/index_size` point to a compact top-level index
+/// whose entries each reference a leaf sub-block on disk.
+const MAGIC_V2: u64 = 0x4C41524B_53535402;
 
 /// Footer size in bytes.
 const FOOTER_SIZE: usize = 64;
@@ -81,7 +85,7 @@ impl Footer {
 
     fn decode(buf: &[u8; FOOTER_SIZE]) -> io::Result<Self> {
         let magic = u64::from_le_bytes(buf[56..64].try_into().unwrap());
-        if magic != MAGIC {
+        if magic != MAGIC_V1 && magic != MAGIC_V2 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid SSTable magic number",
@@ -228,6 +232,12 @@ fn encode_index_block(entries: &[(Vec<u8>, BlockHandle)]) -> Vec<u8> {
     data
 }
 
+/// Compute the serialized byte size of an index block without allocating.
+fn encoded_index_block_size(entries: &[(Vec<u8>, BlockHandle)]) -> usize {
+    // 4 bytes for count, then per entry: 4 (key_len) + key + 8 (offset) + 8 (size)
+    4 + entries.iter().map(|(k, _)| 4 + k.len() + 16).sum::<usize>()
+}
+
 fn decode_index_block(data: &[u8]) -> io::Result<Vec<IndexEntry>> {
     if data.len() < 4 {
         return Ok(Vec::new());
@@ -286,6 +296,8 @@ pub(crate) struct SsTableWriter {
     largest_user_key: Option<Vec<u8>>,
     last_bloom_user_key: Vec<u8>,
     compression: CompressionType,
+    partitioned_index: bool,
+    metadata_block_size: usize,
 }
 
 impl SsTableWriter {
@@ -295,6 +307,8 @@ impl SsTableWriter {
         bloom_bits_per_key: usize,
         compression: CompressionType,
         prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
+        partitioned_index: bool,
+        metadata_block_size: usize,
     ) -> io::Result<Self> {
         let file = File::create(path)?;
         let prefix_bloom_builder = prefix_extractor
@@ -317,6 +331,8 @@ impl SsTableWriter {
             largest_user_key: None,
             last_bloom_user_key: Vec::new(),
             compression,
+            partitioned_index,
+            metadata_block_size,
         })
     }
 
@@ -427,10 +443,51 @@ impl SsTableWriter {
         let bloom_size = 8 + prefix_bloom_data.len() as u64 + user_bloom_data.len() as u64;
         self.current_offset += bloom_size;
 
-        let index_data = encode_index_block(&self.index_entries);
-        let index_offset = self.current_offset;
-        self.writer.write_all(&index_data)?;
-        self.current_offset += index_data.len() as u64;
+        let (index_offset, index_size, magic) = if self.partitioned_index {
+            // Partition the flat index entries into leaf sub-blocks whose
+            // serialized size stays within `metadata_block_size`, write
+            // each leaf as a raw encoded index block, and build a
+            // top-level index pointing to each leaf.
+            let mut top_level: Vec<(Vec<u8>, BlockHandle)> = Vec::new();
+            let mut chunk_start = 0usize;
+            while chunk_start < self.index_entries.len() {
+                let mut chunk_end = chunk_start + 1;
+                while chunk_end < self.index_entries.len() {
+                    let candidate = &self.index_entries[chunk_start..chunk_end + 1];
+                    let size = encoded_index_block_size(candidate);
+                    if size > self.metadata_block_size {
+                        break;
+                    }
+                    chunk_end += 1;
+                }
+                let chunk = &self.index_entries[chunk_start..chunk_end];
+                let leaf_data = encode_index_block(chunk);
+                let leaf_offset = self.current_offset;
+                self.writer.write_all(&leaf_data)?;
+                self.current_offset += leaf_data.len() as u64;
+
+                let last_key = chunk.last().unwrap().0.clone();
+                top_level.push((
+                    last_key,
+                    BlockHandle {
+                        offset: leaf_offset,
+                        size: leaf_data.len() as u64,
+                    },
+                ));
+                chunk_start = chunk_end;
+            }
+            let top_data = encode_index_block(&top_level);
+            let top_offset = self.current_offset;
+            self.writer.write_all(&top_data)?;
+            self.current_offset += top_data.len() as u64;
+            (top_offset, top_data.len() as u64, MAGIC_V2)
+        } else {
+            let index_data = encode_index_block(&self.index_entries);
+            let idx_offset = self.current_offset;
+            self.writer.write_all(&index_data)?;
+            self.current_offset += index_data.len() as u64;
+            (idx_offset, index_data.len() as u64, MAGIC_V1)
+        };
 
         let footer = Footer {
             range_tombstone_offset,
@@ -438,9 +495,9 @@ impl SsTableWriter {
             bloom_offset,
             bloom_size,
             index_offset,
-            index_size: index_data.len() as u64,
+            index_size,
             num_entries: self.num_entries,
-            magic: MAGIC,
+            magic,
         };
         self.writer.write_all(&footer.encode())?;
         self.writer.flush()?;
@@ -537,6 +594,11 @@ pub(crate) struct SsTableReader {
     /// returns `true` — the file might contain the prefix.
     prefix_bloom: Option<BloomFilter>,
     range_tombstones: Vec<RangeTombstone>,
+    /// `true` when the file was written with `MAGIC_V2` (partitioned
+    /// index). `self.index` then holds only the compact top-level
+    /// entries; each entry's `handle` points to a leaf sub-block that
+    /// must be read via [`SsTableReader::read_index_leaf`].
+    partitioned: bool,
 }
 
 impl SsTableReader {
@@ -595,6 +657,8 @@ impl SsTableReader {
             decode_range_tombstone_block(&rt_data)?
         };
 
+        let partitioned = footer.magic == MAGIC_V2;
+
         Ok(Self {
             file: Mutex::new(file),
             file_id,
@@ -602,7 +666,96 @@ impl SsTableReader {
             bloom,
             prefix_bloom,
             range_tombstones,
+            partitioned,
         })
+    }
+
+    /// Read and decode a leaf index sub-block from disk. Used when
+    /// `self.partitioned` is true; the `handle` comes from one of the
+    /// top-level index entries in `self.index`. No block cache is
+    /// consulted — the OS page cache keeps hot leaves warm.
+    fn read_index_leaf(&self, handle: BlockHandle) -> io::Result<Vec<IndexEntry>> {
+        let mut buf = vec![0u8; handle.size as usize];
+        {
+            let mut file = self.file.lock();
+            file.seek(SeekFrom::Start(handle.offset))?;
+            file.read_exact(&mut buf)?;
+        }
+        decode_index_block(&buf)
+    }
+
+    /// Expand the top-level index into a flat list of all data-block
+    /// index entries by reading every leaf. Used by paths that need to
+    /// enumerate all blocks (iteration, `approximate_size_in_range`).
+    fn expand_all_leaves(&self) -> io::Result<Vec<IndexEntry>> {
+        let mut all = Vec::new();
+        for entry in &self.index {
+            let leaf = self.read_index_leaf(entry.handle)?;
+            all.extend(leaf);
+        }
+        Ok(all)
+    }
+
+    /// Resolve a lookup key against the (possibly partitioned) index to
+    /// find the data-block entries starting from the block that may
+    /// contain `search_key`. Returns a flat vector of index entries
+    /// starting from the matching block through the end, so the caller
+    /// can walk forward.
+    fn resolve_index_for_lookup(
+        &self,
+        search_key: &[u8],
+    ) -> io::Result<Option<(Vec<IndexEntry>, usize)>> {
+        if !self.partitioned {
+            let idx = match self
+                .index
+                .binary_search_by(|e| compare_internal_keys(&e.key, search_key))
+            {
+                Ok(i) => i,
+                Err(i) => {
+                    if i >= self.index.len() {
+                        return Ok(None);
+                    }
+                    i
+                }
+            };
+            return Ok(Some((self.index.clone(), idx)));
+        }
+
+        // Partitioned: binary search top-level to find which leaf.
+        let top_idx = match self
+            .index
+            .binary_search_by(|e| compare_internal_keys(&e.key, search_key))
+        {
+            Ok(i) => i,
+            Err(i) => {
+                if i >= self.index.len() {
+                    return Ok(None);
+                }
+                i
+            }
+        };
+
+        // Read the leaf and all subsequent leaves so the caller can
+        // walk forward across leaf boundaries.
+        let mut all_entries = Vec::new();
+        let mut block_offset = 0usize;
+        for (li, top_entry) in self.index.iter().enumerate() {
+            let leaf = self.read_index_leaf(top_entry.handle)?;
+            if li == top_idx {
+                // Binary search within this leaf.
+                let inner_idx =
+                    match leaf.binary_search_by(|e| compare_internal_keys(&e.key, search_key)) {
+                        Ok(i) => i,
+                        Err(i) => i,
+                    };
+                block_offset = all_entries.len() + inner_idx;
+            }
+            all_entries.extend(leaf);
+        }
+        if block_offset >= all_entries.len() {
+            return Ok(None);
+        }
+        Ok(Some((all_entries, block_offset)))
     }
 
     /// Whether this SSTable *might* contain a user key whose prefix
@@ -653,24 +806,16 @@ impl SsTableReader {
         }
 
         let search_key = lookup_key(user_key, snapshot_seq);
-        let mut block_idx = match self
-            .index
-            .binary_search_by(|e| compare_internal_keys(&e.key, &search_key))
-        {
-            Ok(i) => i,
-            Err(i) => {
-                if i >= self.index.len() {
-                    return Ok(LookupResult::NotInTable);
-                }
-                i
-            }
+        let (resolved_index, mut block_idx) = match self.resolve_index_for_lookup(&search_key)? {
+            Some(pair) => pair,
+            None => return Ok(LookupResult::NotInTable),
         };
 
         // Walk forward past `Merge` entries — they are collapsed
         // separately by `collect_merge_chain` and shouldn't be
         // mistaken for a point terminator here.
         loop {
-            let entry = &self.index[block_idx];
+            let entry = &resolved_index[block_idx];
             let block = self.read_block(entry.handle, cache)?;
             for (ik, value) in block.iter() {
                 if compare_internal_keys(ik.as_slice(), search_key.as_slice()).is_lt() {
@@ -693,7 +838,7 @@ impl SsTableReader {
                 }
             }
             block_idx += 1;
-            if block_idx >= self.index.len() {
+            if block_idx >= resolved_index.len() {
                 return Ok(LookupResult::NotInTable);
             }
         }
@@ -716,21 +861,13 @@ impl SsTableReader {
         }
 
         let search_key = lookup_key(user_key, snapshot_seq);
-        let mut block_idx = match self
-            .index
-            .binary_search_by(|e| compare_internal_keys(&e.key, &search_key))
-        {
-            Ok(i) => i,
-            Err(i) => {
-                if i >= self.index.len() {
-                    return Ok(false);
-                }
-                i
-            }
+        let (resolved_index, mut block_idx) = match self.resolve_index_for_lookup(&search_key)? {
+            Some(pair) => pair,
+            None => return Ok(false),
         };
 
         loop {
-            let entry = &self.index[block_idx];
+            let entry = &resolved_index[block_idx];
             let block = self.read_block(entry.handle, cache)?;
             for (ik, value) in block.iter() {
                 if compare_internal_keys(ik.as_slice(), search_key.as_slice()).is_lt() {
@@ -746,7 +883,7 @@ impl SsTableReader {
                 }
             }
             block_idx += 1;
-            if block_idx >= self.index.len() {
+            if block_idx >= resolved_index.len() {
                 return Ok(false);
             }
         }
@@ -755,8 +892,13 @@ impl SsTableReader {
     /// Read every entry in internal-key order with no dedup or filtering.
     /// Used by compaction to merge tables without losing versions.
     pub(crate) fn iter_internal(&self, cache: &BlockCache) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let data_index = if self.partitioned {
+            self.expand_all_leaves()?
+        } else {
+            self.index.clone()
+        };
         let mut result = Vec::new();
-        for entry in &self.index {
+        for entry in &data_index {
             let block = self.read_block(entry.handle, cache)?;
             for (ik, value) in block.iter() {
                 result.push((ik, value));
@@ -776,40 +918,67 @@ impl SsTableReader {
         if self.index.is_empty() || start >= end {
             return 0;
         }
-        // Binary-search for the first block whose last internal
-        // key is `>= lookup_key(start, u64::MAX)`. That's the
-        // earliest block that might contain any key in the range.
+        let data_index = if self.partitioned {
+            match self.expand_all_leaves() {
+                Ok(v) => v,
+                Err(_) => return 0,
+            }
+        } else {
+            self.index.clone()
+        };
+        if data_index.is_empty() {
+            return 0;
+        }
         let lo_probe = lookup_key(start, u64::MAX);
         let hi_probe = lookup_key(end, u64::MAX);
-        let first = self
-            .index
-            .partition_point(|e| compare_internal_keys(&e.key, &lo_probe).is_lt());
-        let last = self
-            .index
-            .partition_point(|e| compare_internal_keys(&e.key, &hi_probe).is_lt());
-        // Blocks in `[first..=last]` may contain keys inside the
-        // range. We over-count by at most one block at each
-        // boundary, which is the accuracy bound the public API
-        // documents.
-        let end_idx = last.min(self.index.len() - 1);
+        let first =
+            data_index.partition_point(|e| compare_internal_keys(&e.key, &lo_probe).is_lt());
+        let last = data_index.partition_point(|e| compare_internal_keys(&e.key, &hi_probe).is_lt());
+        let end_idx = last.min(data_index.len() - 1);
         if first > end_idx {
             return 0;
         }
         let mut total: u64 = 0;
-        for entry in &self.index[first..=end_idx] {
+        for entry in &data_index[first..=end_idx] {
             total += entry.handle.size;
         }
         total
     }
 
-    /// Number of data blocks in this table.
+    /// Number of data blocks in this table. For partitioned-index
+    /// files, expands all leaf blocks to count data blocks.
     pub(crate) fn num_blocks(&self) -> usize {
-        self.index.len()
+        if !self.partitioned {
+            return self.index.len();
+        }
+        // Expand leaves to count data blocks. On error, fall back to
+        // the top-level count (conservative, but avoids panics in a
+        // method that returns usize).
+        match self.expand_all_leaves() {
+            Ok(v) => v.len(),
+            Err(_) => self.index.len(),
+        }
     }
 
     /// Find the first block whose last internal key is `>= target`. Used by
     /// the streaming iterator to seek to a position within this SSTable.
     pub(crate) fn seek_block(&self, target: &[u8]) -> Option<usize> {
+        if self.partitioned {
+            let data_index = match self.expand_all_leaves() {
+                Ok(v) => v,
+                Err(_) => return None,
+            };
+            return match data_index.binary_search_by(|e| compare_internal_keys(&e.key, target)) {
+                Ok(i) => Some(i),
+                Err(i) => {
+                    if i >= data_index.len() {
+                        None
+                    } else {
+                        Some(i)
+                    }
+                }
+            };
+        }
         match self
             .index
             .binary_search_by(|e| compare_internal_keys(&e.key, target))
@@ -833,7 +1002,12 @@ impl SsTableReader {
         block_idx: usize,
         cache: &BlockCache,
     ) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let handle = self.index[block_idx].handle;
+        let handle = if self.partitioned {
+            let data_index = self.expand_all_leaves()?;
+            data_index[block_idx].handle
+        } else {
+            self.index[block_idx].handle
+        };
         let block = self.read_block(handle, cache)?;
         Ok(block.iter().collect())
     }
@@ -933,7 +1107,8 @@ mod tests {
 
         {
             let mut writer =
-                SsTableWriter::new(&path, 4096, 10, CompressionType::Lz4, None).unwrap();
+                SsTableWriter::new(&path, 4096, 10, CompressionType::Lz4, None, false, 4096)
+                    .unwrap();
             // Add 100 distinct user keys at seq=1 in sorted order.
             for i in 0..100 {
                 let user_key = format!("key_{:04}", i);
@@ -975,7 +1150,8 @@ mod tests {
 
         {
             let mut writer =
-                SsTableWriter::new(&path, 4096, 10, CompressionType::None, None).unwrap();
+                SsTableWriter::new(&path, 4096, 10, CompressionType::None, None, false, 4096)
+                    .unwrap();
             // Must be written in internal-key order: newest seq first.
             writer.add(&tombstone(b"k", 5), b"").unwrap();
             writer.add(&ik(b"k", 3), b"v3").unwrap();
@@ -1016,7 +1192,8 @@ mod tests {
 
         {
             let mut writer =
-                SsTableWriter::new(&path, 4096, 10, CompressionType::None, None).unwrap();
+                SsTableWriter::new(&path, 4096, 10, CompressionType::None, None, false, 4096)
+                    .unwrap();
             writer.add(&ik(b"hello", 1), b"world").unwrap();
             writer.add(&ik(b"test", 1), b"data").unwrap();
             writer.finish().unwrap().unwrap();
@@ -1046,7 +1223,8 @@ mod tests {
 
         {
             let mut writer =
-                SsTableWriter::new(&path, 4096, 10, CompressionType::None, None).unwrap();
+                SsTableWriter::new(&path, 4096, 10, CompressionType::None, None, false, 4096)
+                    .unwrap();
             writer.add(&ik(b"a", 1), b"v_a").unwrap();
             writer.add(&ik(b"m", 2), b"v_m").unwrap();
             writer.add(&ik(b"z", 3), b"v_z").unwrap();
@@ -1075,7 +1253,8 @@ mod tests {
 
         {
             let mut writer =
-                SsTableWriter::new(&path, 4096, 10, CompressionType::None, None).unwrap();
+                SsTableWriter::new(&path, 4096, 10, CompressionType::None, None, false, 4096)
+                    .unwrap();
             writer.add_range_tombstone(b"aa", b"kk", 5);
             writer.add_range_tombstone(b"mm", b"zz", 7);
             let summary = writer.finish().unwrap().unwrap();
@@ -1104,6 +1283,8 @@ mod tests {
                 10,
                 CompressionType::None,
                 Some(extractor.clone()),
+                false,
+                4096,
             )
             .unwrap();
             for tenant in &["aaaa", "bbbb", "cccc"] {
@@ -1155,7 +1336,8 @@ mod tests {
 
         {
             let mut writer =
-                SsTableWriter::new(&path, 4096, 10, CompressionType::None, None).unwrap();
+                SsTableWriter::new(&path, 4096, 10, CompressionType::None, None, false, 4096)
+                    .unwrap();
             writer.add(&ik(b"aaaa:1", 1), b"v").unwrap();
             writer.add(&ik(b"bbbb:1", 1), b"v").unwrap();
             writer.finish().unwrap().unwrap();

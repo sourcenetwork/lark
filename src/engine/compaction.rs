@@ -145,6 +145,8 @@ pub(crate) struct CompactionOptions {
     pub(crate) use_direct_io_for_compaction: bool,
     pub(crate) max_subcompactions: usize,
     pub(crate) max_background_compactions: usize,
+    pub(crate) partitioned_index: bool,
+    pub(crate) metadata_block_size: usize,
 }
 
 impl CompactionOptions {
@@ -181,6 +183,8 @@ impl Default for CompactionOptions {
             use_direct_io_for_compaction: false,
             max_subcompactions: 1,
             max_background_compactions: 1,
+            partitioned_index: false,
+            metadata_block_size: 4096,
         }
     }
 }
@@ -1565,6 +1569,8 @@ fn write_chunk_outputs(
             opts.bloom_bits_per_key,
             opts.compression_for_level(target_level),
             opts.prefix_extractor.clone(),
+            opts.partitioned_index,
+            opts.metadata_block_size,
         )?;
 
         let mut estimated_size: u64 = 0;
