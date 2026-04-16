@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "tools/lark-bench"]
+
 [package]
 name = "lark-kv"
 version = "0.1.0"
