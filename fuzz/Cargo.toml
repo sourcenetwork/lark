@@ -1,0 +1,28 @@
+[package]
+name = "lark-kv-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tempfile = "3.8"
+
+[dependencies.lark-kv]
+path = ".."
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_api_ops"
+path = "fuzz_targets/fuzz_api_ops.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_writebatch"
+path = "fuzz_targets/fuzz_writebatch.rs"
+doc = false
