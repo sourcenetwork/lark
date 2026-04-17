@@ -1040,7 +1040,10 @@ impl LarkIterator {
         if self.direction == Direction::Reverse {
             self.flip_to_forward();
         }
-        self.curr_user = None;
+        // Do NOT set curr_user = None here — materialize_next_visible
+        // reuses the existing Vec buffers via clear() + extend_from_slice,
+        // avoiding heap allocations in steady state. It sets curr_user = None
+        // when the iterator is exhausted.
         self.materialize_next_visible();
     }
 
@@ -1079,6 +1082,28 @@ impl LarkIterator {
     /// and advance the inner iterator past every remaining entry in that
     /// user-key group. If no live user key remains, `curr_user` stays
     /// `None` and the iterator becomes invalid.
+    /// Consume all remaining entries with the same user key as
+    /// `self.curr_user`. Borrows `self.inner` and `self.curr_user`
+    /// in non-overlapping scopes so the borrow checker is satisfied.
+    fn consume_curr_user_key_forward(&mut self) {
+        loop {
+            let matches = {
+                let Some(ik) = self.inner.key() else {
+                    return;
+                };
+                let (uk, _, _) = decode_internal_key(ik);
+                uk == self.curr_user.as_ref().unwrap().0.as_slice()
+            };
+            if !matches {
+                return;
+            }
+            if let Err(e) = self.inner.advance() {
+                self.error = Some(e);
+                return;
+            }
+        }
+    }
+
     fn materialize_next_visible(&mut self) {
         loop {
             let Some(ik) = self.inner.key() else {
@@ -1087,9 +1112,6 @@ impl LarkIterator {
             };
             let (uk, seq, vt) = decode_internal_key(ik);
 
-            // Prefix-bounded scan: once we reach a user key at or past
-            // the upper bound we're done. Bound is exclusive — a key
-            // equal to `upper_bound` is already outside the prefix.
             if let Some(ub) = self.upper_bound.as_deref() {
                 if uk >= ub {
                     self.curr_user = None;
@@ -1098,9 +1120,6 @@ impl LarkIterator {
             }
 
             if seq > self.snapshot_seq {
-                // Invisible at this snapshot. Skip this single entry and
-                // keep looking — a later entry in the same user-key group
-                // may be visible, or we may cross into a new user key.
                 if let Err(e) = self.inner.advance() {
                     self.error = Some(e);
                     self.curr_user = None;
@@ -1109,39 +1128,80 @@ impl LarkIterator {
                 continue;
             }
 
-            // Newest visible entry for this user key. If a range
-            // tombstone with a strictly greater seq covers it, the
-            // whole user key is considered deleted — same effect as a
-            // point tombstone. Otherwise emit the value (or skip if
-            // it's itself a point tombstone; or collapse a merge
-            // chain via the configured merge operator).
-            let uk_owned = uk.to_vec();
-            let rt_seq = self.covering_rt_seq(&uk_owned);
+            let rt_seq = self.covering_rt_seq(uk);
             if rt_seq > seq {
-                self.consume_user_key_forward(&uk_owned);
+                // Range-tombstoned. Store key in curr_user so
+                // consume_curr_user_key_forward can reference it.
+                match &mut self.curr_user {
+                    Some((k, _)) => {
+                        k.clear();
+                        k.extend_from_slice(uk);
+                    }
+                    None => {
+                        self.curr_user = Some((uk.to_vec(), Vec::new()));
+                    }
+                }
+                self.consume_curr_user_key_forward();
                 continue;
             }
             match vt {
                 VALUE_TYPE_DELETION => {
-                    self.consume_user_key_forward(&uk_owned);
+                    match &mut self.curr_user {
+                        Some((k, _)) => {
+                            k.clear();
+                            k.extend_from_slice(uk);
+                        }
+                        None => {
+                            self.curr_user = Some((uk.to_vec(), Vec::new()));
+                        }
+                    }
+                    self.consume_curr_user_key_forward();
                     continue;
                 }
-                VALUE_TYPE_MERGE => match self.collapse_merge_chain_forward(&uk_owned, rt_seq) {
-                    Ok(Some(v)) => {
-                        self.curr_user = Some((uk_owned, v));
-                        return;
+                VALUE_TYPE_MERGE => {
+                    let uk_owned = uk.to_vec();
+                    match self.collapse_merge_chain_forward(&uk_owned, rt_seq) {
+                        Ok(Some(v)) => {
+                            match &mut self.curr_user {
+                                Some((k, vbuf)) => {
+                                    k.clear();
+                                    k.extend_from_slice(&uk_owned);
+                                    *vbuf = v;
+                                }
+                                None => {
+                                    self.curr_user = Some((uk_owned, v));
+                                }
+                            }
+                            return;
+                        }
+                        Ok(None) => continue,
+                        Err(e) => {
+                            self.error = Some(e);
+                            self.curr_user = None;
+                            return;
+                        }
                     }
-                    Ok(None) => continue,
-                    Err(e) => {
-                        self.error = Some(e);
-                        self.curr_user = None;
-                        return;
-                    }
-                },
+                }
                 _ => {
-                    let v = self.inner.value().map(|s| s.to_vec()).unwrap_or_default();
-                    self.curr_user = Some((uk_owned.clone(), v));
-                    self.consume_user_key_forward(&uk_owned);
+                    // Hot path: write key + value into curr_user,
+                    // reusing the existing Vec allocations so the
+                    // steady-state forward scan does zero mallocs.
+                    // Inline rather than a method call because `uk`
+                    // and `value` borrow from `self.inner` while
+                    // `self.curr_user` is a disjoint field.
+                    let value = self.inner.value().unwrap_or(&[]);
+                    match &mut self.curr_user {
+                        Some((k, v)) => {
+                            k.clear();
+                            k.extend_from_slice(uk);
+                            v.clear();
+                            v.extend_from_slice(value);
+                        }
+                        None => {
+                            self.curr_user = Some((uk.to_vec(), value.to_vec()));
+                        }
+                    }
+                    self.consume_curr_user_key_forward();
                     return;
                 }
             }
