@@ -311,11 +311,14 @@ impl Db {
             s.record(Histogram::BytesPerWrite, bytes);
         }
         perf_context::record_write_call();
-        let mut batch = BTreeMap::new();
-        batch.insert(prefix_key(DEFAULT_CF_ID, key), Some(value.to_vec()));
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
-            .apply_batch(batch, Vec::new(), Vec::new(), dm, disable_wal)
+            .apply_single_put(
+                prefix_key(DEFAULT_CF_ID, key),
+                value.to_vec(),
+                dm,
+                disable_wal,
+            )
             .map_err(Error::Io)
     }
 
@@ -5162,7 +5165,8 @@ mod tests {
         }
 
         // Give background workers time to process L0 files.
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Use a generous sleep so slow CI runners don't flake.
+        std::thread::sleep(std::time::Duration::from_millis(500));
         db.compact_range(None, None).unwrap();
 
         for (k, v) in &expected {

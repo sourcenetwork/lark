@@ -13,7 +13,7 @@ pub(crate) mod wal;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use parking_lot::{Condvar, Mutex, RwLock};
@@ -168,6 +168,14 @@ pub(crate) struct LarkEngine {
     /// and calls [`StallSignal::notify_all`] after each compaction
     /// pass so blocked writers can re-check their thresholds.
     stall_signal: Arc<StallSignal>,
+    /// Cached stall level: 0 = none, 1 = slowdown, 2 = stop.
+    /// Updated by `rotate_memtable` (after changing L0/memtable
+    /// counts) and by the compaction thread (after reducing them).
+    /// Writers check this atomic first — the full `stall_state()`
+    /// with its lock acquisitions is only called when the cached
+    /// level is nonzero, saving 2 lock round-trips per write in
+    /// the common no-stall case.
+    cached_stall_level: AtomicU8,
 }
 
 /// Lock + condvar pair shared between foreground writers (which
@@ -315,6 +323,7 @@ impl LarkEngine {
             options,
             write_lock: Mutex::new(()),
             stall_signal,
+            cached_stall_level: AtomicU8::new(0),
         });
 
         Ok(engine)
@@ -923,16 +932,38 @@ impl LarkEngine {
     /// active. Returns the number of microseconds the caller spent
     /// stalled, which is also published to the
     /// [`crate::statistics::Ticker::WriteStallMicros`] counter.
+    /// Refresh the cached stall level from the current L0 /
+    /// memtable / pending-bytes state. Called after any event that
+    /// changes those counters (memtable rotation, compaction pass).
+    pub(crate) fn refresh_stall_level(&self) {
+        let level = match self.stall_state() {
+            None => 0,
+            Some((_, false)) => 1,
+            Some((_, true)) => 2,
+        };
+        self.cached_stall_level.store(level, Ordering::Release);
+    }
+
     pub(crate) fn wait_for_write_capacity(&self, no_slowdown: bool) -> Result<u64, crate::Error> {
+        // Fast path: if the cached stall level is 0, skip the
+        // expensive stall_state() call that locks versions +
+        // frozen_memtables. This saves ~2 lock round-trips per
+        // write in the common no-stall scenario.
+        if self.cached_stall_level.load(Ordering::Acquire) == 0 {
+            return Ok(0);
+        }
+
         let start = std::time::Instant::now();
         let mut any_stall = false;
 
-        // Loop until no stop condition is active. Each iteration
-        // waits on `stall_signal.cv` which the compaction thread
-        // notifies after every pass.
         loop {
             match self.stall_state() {
-                None => break,
+                None => {
+                    // Stall cleared — update the cache so
+                    // subsequent writers take the fast path.
+                    self.cached_stall_level.store(0, Ordering::Release);
+                    break;
+                }
                 Some((reason, true)) => {
                     if no_slowdown {
                         return Err(crate::Error::Busy(reason));
@@ -999,6 +1030,57 @@ impl LarkEngine {
 
         let _write_guard = self.write_lock.lock();
         self.apply_batch_locked(point_ops, range_deletes, merges, durability, disable_wal)
+    }
+
+    /// Fast path for a single put — avoids BTreeMap construction,
+    /// WAL formatting, and memtable insertion overhead for the
+    /// most common write operation.
+    pub(crate) fn apply_single_put(
+        &self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        durability: DurabilityMode,
+        disable_wal: bool,
+    ) -> std::io::Result<()> {
+        let _write_guard = self.write_lock.lock();
+        let seq = self.latest_seq.fetch_add(1, Ordering::AcqRel) + 1;
+
+        if !disable_wal {
+            let _perf_wal =
+                crate::perf_context::PerfTimer::new(crate::perf_context::PerfTimerField::WriteWal);
+            let wal_start = std::time::Instant::now();
+            let mut wal = self.active_wal.lock();
+            wal.append_put(&key, &value, seq)?;
+            let wal_bytes = (key.len() + value.len() + 8) as u64;
+            match durability {
+                DurabilityMode::Immediate => wal.sync()?,
+                DurabilityMode::Eventual => wal.flush()?,
+            }
+            if let Some(s) = self.statistics() {
+                s.add(crate::statistics::Ticker::WalBytesWritten, wal_bytes);
+                if matches!(durability, DurabilityMode::Immediate) {
+                    s.add(crate::statistics::Ticker::WalSyncCount, 1);
+                }
+                s.record(
+                    crate::statistics::Histogram::WalWriteTime,
+                    wal_start.elapsed().as_micros() as u64,
+                );
+            }
+        }
+
+        {
+            let _perf_mt = crate::perf_context::PerfTimer::new(
+                crate::perf_context::PerfTimerField::WriteMemtable,
+            );
+            let memtable = self.active_memtable.read();
+            memtable.put(&key, &value, seq);
+        }
+
+        if self.active_memtable.read().approximate_size() >= self.options.write_buffer_size {
+            self.rotate_memtable()?;
+        }
+
+        Ok(())
     }
 
     /// Apply a batch assuming the caller already holds
@@ -1222,6 +1304,7 @@ impl LarkEngine {
 
         self.wal_id.store(new_wal_id, Ordering::Release);
         self.flush_frozen_memtable(old_wal)?;
+        self.refresh_stall_level();
 
         Ok(())
     }
