@@ -813,8 +813,21 @@ pub(crate) struct LarkIterator {
     /// iterator so the first move in the new direction lands on the
     /// correct neighbor of `curr_user`.
     direction: Direction,
-    /// Most recently produced `(user_key, value)` pair, if any.
-    curr_user: Option<(Vec<u8>, Vec<u8>)>,
+    /// True when the forward path has positioned the MergingIter on
+    /// a visible entry. key()/value() delegate through to the inner
+    /// iterator in this state.
+    valid_entry: bool,
+    /// Reusable buffer holding the user key of the current entry.
+    /// Used by consume_curr_user_key_forward and covering_rt_seq
+    /// during materialization. NOT used by key()/value().
+    curr_user_key: Vec<u8>,
+    /// Owned storage used only by the reverse iteration path
+    /// (materialize_prev_visible), which must accumulate multiple
+    /// entries before deciding which one to yield.
+    reverse_curr: Option<(Vec<u8>, Vec<u8>)>,
+    /// Owned storage for the rare merge-result case, where the
+    /// value is computed rather than borrowed from a block.
+    merge_result: Option<(Vec<u8>, Vec<u8>)>,
     /// Flat snapshot of every range tombstone the iterator must honor
     /// — the union of memtable RTs and SSTable RTs from every level
     /// reachable through the pinned `Version`. Captured once at
@@ -929,7 +942,10 @@ impl LarkIterator {
             inner: MergingIter::new(levels),
             snapshot_seq,
             direction: Direction::Forward,
-            curr_user: None,
+            valid_entry: false,
+            curr_user_key: Vec::new(),
+            reverse_curr: None,
+            merge_result: None,
             range_tombstones,
             _version: version,
             error: None,
@@ -951,7 +967,9 @@ impl LarkIterator {
 
     pub(crate) fn seek_to_first(&mut self) {
         self.error = None;
-        self.curr_user = None;
+        self.valid_entry = false;
+        self.merge_result = None;
+        self.reverse_curr = None;
         self.pending_consume = false;
         self.upper_bound = None;
         self.direction = Direction::Forward;
@@ -964,7 +982,9 @@ impl LarkIterator {
 
     pub(crate) fn seek_to_last(&mut self) {
         self.error = None;
-        self.curr_user = None;
+        self.valid_entry = false;
+        self.merge_result = None;
+        self.reverse_curr = None;
         self.pending_consume = false;
         self.upper_bound = None;
         self.direction = Direction::Reverse;
@@ -977,7 +997,9 @@ impl LarkIterator {
 
     pub(crate) fn seek(&mut self, target: &[u8]) {
         self.error = None;
-        self.curr_user = None;
+        self.valid_entry = false;
+        self.merge_result = None;
+        self.reverse_curr = None;
         self.pending_consume = false;
         self.upper_bound = None;
         self.direction = Direction::Forward;
@@ -994,7 +1016,9 @@ impl LarkIterator {
 
     pub(crate) fn seek_for_prev(&mut self, target: &[u8]) {
         self.error = None;
-        self.curr_user = None;
+        self.valid_entry = false;
+        self.merge_result = None;
+        self.reverse_curr = None;
         self.pending_consume = false;
         self.upper_bound = None;
         self.direction = Direction::Reverse;
@@ -1020,7 +1044,9 @@ impl LarkIterator {
     /// normally (safe superset).
     pub(crate) fn seek_prefix(&mut self, prefix: &[u8]) {
         self.error = None;
-        self.curr_user = None;
+        self.valid_entry = false;
+        self.merge_result = None;
+        self.reverse_curr = None;
         self.pending_consume = false;
         self.direction = Direction::Forward;
         self.upper_bound = prefix_upper_bound(prefix);
@@ -1049,17 +1075,13 @@ impl LarkIterator {
     }
 
     pub(crate) fn next(&mut self) {
-        if self.curr_user.is_none() || self.error.is_some() {
+        if !self.valid() {
             return;
         }
         if self.direction == Direction::Reverse {
             self.flip_to_forward();
         }
-        // If the previous materialize_next_visible deferred the
-        // consume, do it now — advance past all remaining versions
-        // of the user key we just yielded. This halves the number
-        // of advance+pick_smallest cycles per visible entry in a
-        // single-version sequential scan.
+        self.merge_result = None;
         if self.pending_consume {
             self.consume_curr_user_key_forward();
             self.pending_consume = false;
@@ -1068,32 +1090,59 @@ impl LarkIterator {
     }
 
     pub(crate) fn prev(&mut self) {
-        if self.curr_user.is_none() || self.error.is_some() {
+        if !self.valid() {
             return;
         }
-        // Consume any pending forward group before flipping
-        // direction, so the MergingIter positions are clean.
         if self.pending_consume {
             self.consume_curr_user_key_forward();
             self.pending_consume = false;
         }
+        self.merge_result = None;
         if self.direction == Direction::Forward {
             self.flip_to_reverse();
         }
-        self.curr_user = None;
+        self.reverse_curr = None;
         self.materialize_prev_visible();
     }
 
     pub(crate) fn valid(&self) -> bool {
-        self.curr_user.is_some() && self.error.is_none()
+        if self.error.is_some() {
+            return false;
+        }
+        match self.direction {
+            Direction::Forward => self.valid_entry || self.merge_result.is_some(),
+            Direction::Reverse => self.reverse_curr.is_some(),
+        }
     }
 
     pub(crate) fn key(&self) -> Option<&[u8]> {
-        self.curr_user.as_ref().map(|(k, _)| k.as_slice())
+        match self.direction {
+            Direction::Forward => {
+                if let Some((k, _)) = &self.merge_result {
+                    return Some(k.as_slice());
+                }
+                if !self.valid_entry {
+                    return None;
+                }
+                self.inner.key().map(user_key_of)
+            }
+            Direction::Reverse => self.reverse_curr.as_ref().map(|(k, _)| k.as_slice()),
+        }
     }
 
     pub(crate) fn value(&self) -> Option<&[u8]> {
-        self.curr_user.as_ref().map(|(_, v)| v.as_slice())
+        match self.direction {
+            Direction::Forward => {
+                if let Some((_, v)) = &self.merge_result {
+                    return Some(v.as_slice());
+                }
+                if !self.valid_entry {
+                    return None;
+                }
+                self.inner.value()
+            }
+            Direction::Reverse => self.reverse_curr.as_ref().map(|(_, v)| v.as_slice()),
+        }
     }
 
     pub(crate) fn status(&self) -> io::Result<()> {
@@ -1118,7 +1167,7 @@ impl LarkIterator {
                     return;
                 };
                 let (uk, _, _) = decode_internal_key(ik);
-                uk == self.curr_user.as_ref().unwrap().0.as_slice()
+                uk == self.curr_user_key.as_slice()
             };
             if !matches {
                 return;
@@ -1131,16 +1180,15 @@ impl LarkIterator {
     }
 
     fn materialize_next_visible(&mut self) {
+        self.valid_entry = false;
         loop {
             let Some(ik) = self.inner.key() else {
-                self.curr_user = None;
                 return;
             };
             let (uk, seq, vt) = decode_internal_key(ik);
 
             if let Some(ub) = self.upper_bound.as_deref() {
                 if uk >= ub {
-                    self.curr_user = None;
                     return;
                 }
             }
@@ -1148,7 +1196,6 @@ impl LarkIterator {
             if seq > self.snapshot_seq {
                 if let Err(e) = self.inner.advance() {
                     self.error = Some(e);
-                    self.curr_user = None;
                     return;
                 }
                 continue;
@@ -1156,31 +1203,15 @@ impl LarkIterator {
 
             let rt_seq = self.covering_rt_seq(uk);
             if rt_seq > seq {
-                // Range-tombstoned. Store key in curr_user so
-                // consume_curr_user_key_forward can reference it.
-                match &mut self.curr_user {
-                    Some((k, _)) => {
-                        k.clear();
-                        k.extend_from_slice(uk);
-                    }
-                    None => {
-                        self.curr_user = Some((uk.to_vec(), Vec::new()));
-                    }
-                }
+                self.curr_user_key.clear();
+                self.curr_user_key.extend_from_slice(uk);
                 self.consume_curr_user_key_forward();
                 continue;
             }
             match vt {
                 VALUE_TYPE_DELETION => {
-                    match &mut self.curr_user {
-                        Some((k, _)) => {
-                            k.clear();
-                            k.extend_from_slice(uk);
-                        }
-                        None => {
-                            self.curr_user = Some((uk.to_vec(), Vec::new()));
-                        }
-                    }
+                    self.curr_user_key.clear();
+                    self.curr_user_key.extend_from_slice(uk);
                     self.consume_curr_user_key_forward();
                     continue;
                 }
@@ -1188,51 +1219,26 @@ impl LarkIterator {
                     let uk_owned = uk.to_vec();
                     match self.collapse_merge_chain_forward(&uk_owned, rt_seq) {
                         Ok(Some(v)) => {
-                            match &mut self.curr_user {
-                                Some((k, vbuf)) => {
-                                    k.clear();
-                                    k.extend_from_slice(&uk_owned);
-                                    *vbuf = v;
-                                }
-                                None => {
-                                    self.curr_user = Some((uk_owned, v));
-                                }
-                            }
+                            self.curr_user_key.clear();
+                            self.curr_user_key.extend_from_slice(&uk_owned);
+                            self.merge_result = Some((uk_owned, v));
+                            self.pending_consume = false;
                             return;
                         }
                         Ok(None) => continue,
                         Err(e) => {
                             self.error = Some(e);
-                            self.curr_user = None;
                             return;
                         }
                     }
                 }
                 _ => {
-                    // Hot path: write key + value into curr_user,
-                    // reusing the existing Vec allocations so the
-                    // steady-state forward scan does zero mallocs.
-                    // Inline rather than a method call because `uk`
-                    // and `value` borrow from `self.inner` while
-                    // `self.curr_user` is a disjoint field.
-                    let value = self.inner.value().unwrap_or(&[]);
-                    match &mut self.curr_user {
-                        Some((k, v)) => {
-                            k.clear();
-                            k.extend_from_slice(uk);
-                            v.clear();
-                            v.extend_from_slice(value);
-                        }
-                        None => {
-                            self.curr_user = Some((uk.to_vec(), value.to_vec()));
-                        }
-                    }
-                    // Defer the consume to the next next() call.
-                    // The MergingIter is still positioned at this
-                    // entry (or the one right after it from the
-                    // advance that found it). The caller reads
-                    // key()/value() before calling next() again, so
-                    // the data in curr_user is stable until then.
+                    // Zero-copy hot path: record the user key for
+                    // consume/dedup logic and mark the entry valid.
+                    // key()/value() delegate to self.inner.
+                    self.curr_user_key.clear();
+                    self.curr_user_key.extend_from_slice(uk);
+                    self.valid_entry = true;
                     self.pending_consume = true;
                     return;
                 }
@@ -1358,19 +1364,12 @@ impl LarkIterator {
     fn materialize_prev_visible(&mut self) {
         loop {
             let Some(ik) = self.inner.key() else {
-                self.curr_user = None;
+                self.reverse_curr = None;
                 return;
             };
             let (uk, _, _) = decode_internal_key(ik);
             let group = uk.to_vec();
 
-            // Collect every visible entry in this group in walk
-            // order (ascending seq). After the walk we know the
-            // full group and can classify its winning outcome.
-            // Within a user-key group, entries with
-            // `seq > snapshot_seq` and entries hidden by a range
-            // tombstone are skipped. We retain merges so we can
-            // collapse them at the end via the configured operator.
             let rt_seq = self.covering_rt_seq(&group);
             let mut collected: Vec<(u64, u8, Vec<u8>)> = Vec::new();
 
@@ -1385,17 +1384,11 @@ impl LarkIterator {
                 }
                 if let Err(e) = self.inner.advance_backward() {
                     self.error = Some(e);
-                    self.curr_user = None;
+                    self.reverse_curr = None;
                     return;
                 }
             }
 
-            // `collected` is ascending by seq (oldest visible first,
-            // newest visible last). Find the newest terminator and
-            // fold any operands that sit on top of it.
-            //
-            // Walk backwards to locate the terminator seq; collect
-            // operands that are strictly newer than the terminator.
             if collected.is_empty() {
                 continue;
             }
@@ -1408,9 +1401,6 @@ impl LarkIterator {
                 }
             }
 
-            // Operands that apply are everything from `terminator_idx + 1`
-            // through the end. If there's no terminator, every entry
-            // is a merge operand and the base is None.
             let (base, operand_range_start) = match terminator_idx {
                 Some(i) => match collected[i].1 {
                     VALUE_TYPE_VALUE => (Some(collected[i].2.clone()), i + 1),
@@ -1422,27 +1412,22 @@ impl LarkIterator {
 
             let operand_slice = &collected[operand_range_start..];
             if operand_slice.is_empty() {
-                // Plain value or deletion — no merge fold required.
                 match terminator_idx {
                     Some(i) if collected[i].1 == VALUE_TYPE_VALUE => {
-                        self.curr_user = Some((group, base.unwrap()));
+                        self.reverse_curr = Some((group, base.unwrap()));
                         return;
                     }
-                    _ => continue, // deletion or nothing visible
+                    _ => continue,
                 }
             }
 
-            // Collapse the merge chain. We need a merge operator to
-            // materialize it — without one, treat the group as
-            // missing.
             let Some(merge_op) = self.merge_operator.clone() else {
                 continue;
             };
-            // `operand_slice` is already oldest-first.
             let operand_refs: Vec<&[u8]> = operand_slice.iter().map(|e| e.2.as_slice()).collect();
             match merge_op.full_merge(&group, base.as_deref(), &operand_refs) {
                 Some(v) => {
-                    self.curr_user = Some((group, v));
+                    self.reverse_curr = Some((group, v));
                     return;
                 }
                 None => {
@@ -1450,7 +1435,7 @@ impl LarkIterator {
                         io::ErrorKind::InvalidData,
                         format!("merge operator {} failed", merge_op.name()),
                     ));
-                    self.curr_user = None;
+                    self.reverse_curr = None;
                     return;
                 }
             }
@@ -1479,13 +1464,14 @@ impl LarkIterator {
     /// level forward to just past the last version of `curr_user` so the
     /// next forward step lands on the immediately following user key.
     fn flip_to_forward(&mut self) {
-        let Some((uk, _)) = &self.curr_user else {
+        let Some((uk, _)) = &self.reverse_curr else {
             return;
         };
         let probe = above_all_versions(uk);
         if let Err(e) = self.inner.seek(&probe) {
             self.error = Some(e);
         }
+        self.reverse_curr = None;
         self.direction = Direction::Forward;
     }
 
@@ -1494,21 +1480,22 @@ impl LarkIterator {
     /// before the smallest internal key of `curr_user` so the next
     /// reverse step lands on the immediately preceding user key.
     fn flip_to_reverse(&mut self) {
-        let Some((uk, _)) = &self.curr_user else {
-            return;
+        // In forward mode, the current user key is in curr_user_key
+        // (for normal entries) or merge_result (for merge results).
+        let uk: Vec<u8> = if let Some((k, _)) = &self.merge_result {
+            k.clone()
+        } else {
+            self.curr_user_key.clone()
         };
-        // `lookup_key(uk, u64::MAX)` is the smallest internal key for
-        // `uk` under `compare_internal_keys`: same user key, trailer
-        // `!MAX_SEQ || 0` = `[0,0,...,0]` which is the lowest possible
-        // trailer. `seek_for_prev` is inclusive (lands on the largest
-        // entry `<=` the probe). Since no real entry has seq=u64::MAX
-        // (the engine starts at 0 and counts up), nothing in the skip
-        // list will match the probe exactly, and `seek_for_prev` lands
-        // on the last entry of the user key immediately preceding `uk`.
-        let probe = lookup_key(uk, u64::MAX);
+        if uk.is_empty() {
+            return;
+        }
+        let probe = lookup_key(&uk, u64::MAX);
         if let Err(e) = self.inner.seek_for_prev(&probe) {
             self.error = Some(e);
         }
+        self.valid_entry = false;
+        self.merge_result = None;
         self.direction = Direction::Reverse;
     }
 }
