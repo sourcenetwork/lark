@@ -5165,7 +5165,8 @@ mod tests {
         }
 
         // Give background workers time to process L0 files.
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Use a generous sleep so slow CI runners don't flake.
+        std::thread::sleep(std::time::Duration::from_millis(500));
         db.compact_range(None, None).unwrap();
 
         for (k, v) in &expected {
