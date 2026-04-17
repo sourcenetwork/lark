@@ -311,11 +311,14 @@ impl Db {
             s.record(Histogram::BytesPerWrite, bytes);
         }
         perf_context::record_write_call();
-        let mut batch = BTreeMap::new();
-        batch.insert(prefix_key(DEFAULT_CF_ID, key), Some(value.to_vec()));
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
-            .apply_batch(batch, Vec::new(), Vec::new(), dm, disable_wal)
+            .apply_single_put(
+                prefix_key(DEFAULT_CF_ID, key),
+                value.to_vec(),
+                dm,
+                disable_wal,
+            )
             .map_err(Error::Io)
     }
 
