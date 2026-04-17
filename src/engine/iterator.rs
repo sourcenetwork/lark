@@ -846,6 +846,15 @@ pub(crate) struct LarkIterator {
     /// merge chains encountered during materialization into a
     /// single final value via [`MergeOperator::full_merge`].
     merge_operator: Option<Arc<dyn MergeOperator>>,
+    /// When `true`, the MergingIter is still positioned at the
+    /// entry we last yielded (or an older version of the same user
+    /// key). The next `next()` must consume the rest of that
+    /// user-key group before materializing a new visible entry.
+    /// This defers the `consume_curr_user_key_forward` work from
+    /// the end of one `next()` to the start of the following one,
+    /// halving the number of `advance() + pick_smallest()` cycles
+    /// per visible entry in a single-version sequential scan.
+    pending_consume: bool,
 }
 
 /// Compute the exclusive upper bound of all keys that start with
@@ -927,6 +936,7 @@ impl LarkIterator {
             upper_bound: None,
             prefix_extractor,
             merge_operator,
+            pending_consume: false,
         }
     }
 
@@ -942,6 +952,7 @@ impl LarkIterator {
     pub(crate) fn seek_to_first(&mut self) {
         self.error = None;
         self.curr_user = None;
+        self.pending_consume = false;
         self.upper_bound = None;
         self.direction = Direction::Forward;
         if let Err(e) = self.inner.seek_to_first() {
@@ -954,6 +965,7 @@ impl LarkIterator {
     pub(crate) fn seek_to_last(&mut self) {
         self.error = None;
         self.curr_user = None;
+        self.pending_consume = false;
         self.upper_bound = None;
         self.direction = Direction::Reverse;
         if let Err(e) = self.inner.seek_to_last() {
@@ -966,6 +978,7 @@ impl LarkIterator {
     pub(crate) fn seek(&mut self, target: &[u8]) {
         self.error = None;
         self.curr_user = None;
+        self.pending_consume = false;
         self.upper_bound = None;
         self.direction = Direction::Forward;
         // Smallest internal key for `target` at any seq: `target || !u64::MAX || 0`.
@@ -982,6 +995,7 @@ impl LarkIterator {
     pub(crate) fn seek_for_prev(&mut self, target: &[u8]) {
         self.error = None;
         self.curr_user = None;
+        self.pending_consume = false;
         self.upper_bound = None;
         self.direction = Direction::Reverse;
         // Reverse-seek to the largest internal key ≤ `target`. Probe with
@@ -1007,6 +1021,7 @@ impl LarkIterator {
     pub(crate) fn seek_prefix(&mut self, prefix: &[u8]) {
         self.error = None;
         self.curr_user = None;
+        self.pending_consume = false;
         self.direction = Direction::Forward;
         self.upper_bound = prefix_upper_bound(prefix);
 
@@ -1040,16 +1055,27 @@ impl LarkIterator {
         if self.direction == Direction::Reverse {
             self.flip_to_forward();
         }
-        // Do NOT set curr_user = None here — materialize_next_visible
-        // reuses the existing Vec buffers via clear() + extend_from_slice,
-        // avoiding heap allocations in steady state. It sets curr_user = None
-        // when the iterator is exhausted.
+        // If the previous materialize_next_visible deferred the
+        // consume, do it now — advance past all remaining versions
+        // of the user key we just yielded. This halves the number
+        // of advance+pick_smallest cycles per visible entry in a
+        // single-version sequential scan.
+        if self.pending_consume {
+            self.consume_curr_user_key_forward();
+            self.pending_consume = false;
+        }
         self.materialize_next_visible();
     }
 
     pub(crate) fn prev(&mut self) {
         if self.curr_user.is_none() || self.error.is_some() {
             return;
+        }
+        // Consume any pending forward group before flipping
+        // direction, so the MergingIter positions are clean.
+        if self.pending_consume {
+            self.consume_curr_user_key_forward();
+            self.pending_consume = false;
         }
         if self.direction == Direction::Forward {
             self.flip_to_reverse();
@@ -1201,7 +1227,13 @@ impl LarkIterator {
                             self.curr_user = Some((uk.to_vec(), value.to_vec()));
                         }
                     }
-                    self.consume_curr_user_key_forward();
+                    // Defer the consume to the next next() call.
+                    // The MergingIter is still positioned at this
+                    // entry (or the one right after it from the
+                    // advance that found it). The caller reads
+                    // key()/value() before calling next() again, so
+                    // the data in curr_user is stable until then.
+                    self.pending_consume = true;
                     return;
                 }
             }
