@@ -10,16 +10,9 @@
 use lark_kv::{CompactionStyle, CompressionType, Db, FifoCompactionOptions, Options, WriteBatch};
 use tempfile::TempDir;
 
-fn opts() -> Options {
-    Options {
-        write_buffer_size: 4 * 1024,
-        ..Options::default()
-    }
-}
+mod common;
 
-fn open(dir: &TempDir) -> Db {
-    Db::open(dir.path(), opts()).unwrap()
-}
+use common::{open, small_opts as opts};
 
 // ── basic CRUD ────────────────────────────────────────────────
 
