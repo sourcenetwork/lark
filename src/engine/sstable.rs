@@ -1351,4 +1351,432 @@ mod tests {
         assert!(reader.may_have_prefix(b"zzzz"));
         assert!(reader.may_have_prefix(b"anything"));
     }
+
+    // ── filename / misc helpers ─────────────────────────────────
+
+    #[test]
+    fn sst_filename_pads_six_digits() {
+        assert_eq!(sst_filename(0), "000000.sst");
+        assert_eq!(sst_filename(1), "000001.sst");
+        assert_eq!(sst_filename(999_999), "999999.sst");
+    }
+
+    // ── Footer encode/decode ────────────────────────────────────
+
+    #[test]
+    fn footer_round_trip_v1() {
+        let f = Footer {
+            range_tombstone_offset: 10,
+            range_tombstone_size: 20,
+            bloom_offset: 30,
+            bloom_size: 40,
+            index_offset: 70,
+            index_size: 80,
+            num_entries: 100,
+            magic: MAGIC_V1,
+        };
+        let buf = f.encode();
+        let got = Footer::decode(&buf).unwrap();
+        assert_eq!(got.range_tombstone_offset, 10);
+        assert_eq!(got.range_tombstone_size, 20);
+        assert_eq!(got.bloom_offset, 30);
+        assert_eq!(got.bloom_size, 40);
+        assert_eq!(got.index_offset, 70);
+        assert_eq!(got.index_size, 80);
+        assert_eq!(got.num_entries, 100);
+        assert_eq!(got.magic, MAGIC_V1);
+    }
+
+    #[test]
+    fn footer_round_trip_v2() {
+        let f = Footer {
+            range_tombstone_offset: 0,
+            range_tombstone_size: 0,
+            bloom_offset: 1,
+            bloom_size: 2,
+            index_offset: 3,
+            index_size: 4,
+            num_entries: 5,
+            magic: MAGIC_V2,
+        };
+        let got = Footer::decode(&f.encode()).unwrap();
+        assert_eq!(got.magic, MAGIC_V2);
+    }
+
+    #[test]
+    fn footer_decode_rejects_bad_magic() {
+        let mut buf = [0u8; FOOTER_SIZE];
+        // Leave magic at zero — any non-V1/V2 value should be rejected.
+        buf[56..64].copy_from_slice(&0xDEAD_BEEF_u64.to_le_bytes());
+        let err = Footer::decode(&buf).expect_err("should reject");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    // ── reader error paths ──────────────────────────────────────
+
+    #[test]
+    fn open_rejects_file_smaller_than_footer() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tiny.sst");
+        fs::write(&path, vec![0u8; 10]).unwrap();
+        let kind = match SsTableReader::open(&path, 1) {
+            Err(e) => e.kind(),
+            Ok(_) => panic!("expected InvalidData"),
+        };
+        assert_eq!(kind, io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn open_rejects_file_with_bogus_magic() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bogus.sst");
+        fs::write(&path, vec![0u8; FOOTER_SIZE]).unwrap();
+        let kind = match SsTableReader::open(&path, 1) {
+            Err(e) => e.kind(),
+            Ok(_) => panic!("expected InvalidData"),
+        };
+        assert_eq!(kind, io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn open_missing_file_returns_not_found() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("never.sst");
+        let kind = match SsTableReader::open(&path, 1) {
+            Err(e) => e.kind(),
+            Ok(_) => panic!("expected NotFound"),
+        };
+        assert_eq!(kind, io::ErrorKind::NotFound);
+    }
+
+    // ── writer empty / summary ──────────────────────────────────
+
+    #[test]
+    fn finish_on_empty_writer_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("empty.sst");
+        let writer =
+            SsTableWriter::new(&path, 4096, 10, CompressionType::None, None, false, 4096).unwrap();
+        assert!(writer.finish().unwrap().is_none());
+    }
+
+    #[test]
+    fn finish_with_only_range_tombstones_returns_summary() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rt_only_summary.sst");
+        let mut writer =
+            SsTableWriter::new(&path, 4096, 10, CompressionType::None, None, false, 4096).unwrap();
+        writer.add_range_tombstone(b"a", b"z", 7);
+        let summary = writer.finish().unwrap().expect("should produce summary");
+        assert_eq!(summary.num_entries, 0);
+        assert_eq!(summary.smallest_user_key, b"a");
+        assert_eq!(summary.largest_user_key, b"z");
+    }
+
+    #[test]
+    fn summary_records_first_and_last_user_keys() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bounds.sst");
+        let mut writer =
+            SsTableWriter::new(&path, 4096, 10, CompressionType::None, None, false, 4096).unwrap();
+        writer.add(&ik(b"alpha", 1), b"1").unwrap();
+        writer.add(&ik(b"bravo", 1), b"2").unwrap();
+        writer.add(&ik(b"delta", 1), b"3").unwrap();
+        let summary = writer.finish().unwrap().unwrap();
+        assert_eq!(summary.smallest_user_key, b"alpha");
+        assert_eq!(summary.largest_user_key, b"delta");
+        assert_eq!(summary.num_entries, 3);
+    }
+
+    // ── multi-block / index ─────────────────────────────────────
+
+    #[test]
+    fn multi_block_lookup_walks_index_correctly() {
+        // Tiny block size forces each entry into (almost) its own
+        // block, giving a tall index and exercising the binary-search
+        // path.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("multi.sst");
+        let cache = BlockCache::new(1024 * 1024);
+
+        {
+            let mut writer =
+                SsTableWriter::new(&path, 64, 10, CompressionType::None, None, false, 4096)
+                    .unwrap();
+            for i in 0..200 {
+                let k = format!("k_{:04}", i);
+                let v = format!("v_{}", i);
+                writer.add(&ik(k.as_bytes(), 1), v.as_bytes()).unwrap();
+            }
+            writer.finish().unwrap().unwrap();
+        }
+
+        let reader = SsTableReader::open(&path, 1).unwrap();
+        for i in 0..200 {
+            let k = format!("k_{:04}", i);
+            let expected = format!("v_{}", i);
+            assert_eq!(
+                reader.get(k.as_bytes(), u64::MAX, &cache).unwrap(),
+                LookupResult::Found {
+                    seq: 1,
+                    value: expected.into_bytes()
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn iter_internal_returns_every_entry_in_order() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("iter.sst");
+        let cache = BlockCache::new(1024 * 1024);
+        let mut writer =
+            SsTableWriter::new(&path, 64, 10, CompressionType::None, None, false, 4096).unwrap();
+        writer.add(&ik(b"a", 3), b"a3").unwrap();
+        writer.add(&ik(b"a", 1), b"a1").unwrap();
+        writer.add(&ik(b"b", 2), b"b2").unwrap();
+        writer.finish().unwrap().unwrap();
+
+        let reader = SsTableReader::open(&path, 1).unwrap();
+        let pairs = reader.iter_internal(&cache).unwrap();
+        assert_eq!(pairs.len(), 3);
+        // iter_internal preserves raw internal-key order — no dedup,
+        // no tombstone hiding.
+        let user_keys: Vec<&[u8]> = pairs.iter().map(|(k, _)| user_key_of(k)).collect();
+        assert_eq!(user_keys, vec![&b"a"[..], &b"a"[..], &b"b"[..]]);
+    }
+
+    // ── approximate size ───────────────────────────────────────
+
+    #[test]
+    fn approximate_size_empty_range_is_zero() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("approx.sst");
+        let mut writer =
+            SsTableWriter::new(&path, 4096, 10, CompressionType::None, None, false, 4096).unwrap();
+        writer.add(&ik(b"m", 1), b"v").unwrap();
+        writer.finish().unwrap().unwrap();
+
+        let reader = SsTableReader::open(&path, 1).unwrap();
+        // start >= end: guaranteed zero.
+        assert_eq!(reader.approximate_size_in_range(b"z", b"a"), 0);
+        assert_eq!(reader.approximate_size_in_range(b"m", b"m"), 0);
+    }
+
+    #[test]
+    fn approximate_size_grows_with_range_width() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("approx_grow.sst");
+        let mut writer =
+            SsTableWriter::new(&path, 128, 10, CompressionType::None, None, false, 4096).unwrap();
+        for i in 0..500 {
+            writer
+                .add(&ik(format!("k_{:04}", i).as_bytes(), 1), b"value")
+                .unwrap();
+        }
+        writer.finish().unwrap().unwrap();
+
+        let reader = SsTableReader::open(&path, 1).unwrap();
+        let narrow = reader.approximate_size_in_range(b"k_0000", b"k_0001");
+        let wide = reader.approximate_size_in_range(b"k_0000", b"k_0499");
+        assert!(
+            wide > narrow,
+            "wide ({wide}) should exceed narrow ({narrow})"
+        );
+    }
+
+    // ── compression variants ────────────────────────────────────
+
+    #[test]
+    fn lz4_compression_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("lz4.sst");
+        let cache = BlockCache::new(1024 * 1024);
+        {
+            let mut writer =
+                SsTableWriter::new(&path, 4096, 10, CompressionType::Lz4, None, false, 4096)
+                    .unwrap();
+            // Repetitive data compresses well — exercises a realistic path.
+            for i in 0..50 {
+                writer
+                    .add(
+                        &ik(format!("key_{:03}", i).as_bytes(), 1),
+                        b"AAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    )
+                    .unwrap();
+            }
+            writer.finish().unwrap().unwrap();
+        }
+        let reader = SsTableReader::open(&path, 1).unwrap();
+        assert_eq!(
+            reader.get(b"key_025", u64::MAX, &cache).unwrap(),
+            LookupResult::Found {
+                seq: 1,
+                value: b"AAAAAAAAAAAAAAAAAAAAAAAAAA".to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn snappy_compression_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("snappy.sst");
+        let cache = BlockCache::new(1024 * 1024);
+        {
+            let mut writer =
+                SsTableWriter::new(&path, 4096, 10, CompressionType::Snappy, None, false, 4096)
+                    .unwrap();
+            for i in 0..50 {
+                writer
+                    .add(
+                        &ik(format!("key_{:03}", i).as_bytes(), 1),
+                        b"BBBBBBBBBBBBBBBBBBBBBBBBBB",
+                    )
+                    .unwrap();
+            }
+            writer.finish().unwrap().unwrap();
+        }
+        let reader = SsTableReader::open(&path, 1).unwrap();
+        assert_eq!(
+            reader.get(b"key_007", u64::MAX, &cache).unwrap(),
+            LookupResult::Found {
+                seq: 1,
+                value: b"BBBBBBBBBBBBBBBBBBBBBBBBBB".to_vec()
+            }
+        );
+    }
+
+    // ── range tombstone encode/decode ──────────────────────────
+
+    #[test]
+    fn range_tombstone_block_round_trip() {
+        let input = vec![
+            RangeTombstone::new(b"a".to_vec(), b"c".to_vec(), 5),
+            RangeTombstone::new(b"f".to_vec(), b"k".to_vec(), 7),
+        ];
+        let bytes = encode_range_tombstone_block(&input);
+        let got = decode_range_tombstone_block(&bytes).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].start, b"a");
+        assert_eq!(got[0].end, b"c");
+        assert_eq!(got[0].seq, 5);
+        assert_eq!(got[1].seq, 7);
+    }
+
+    #[test]
+    fn range_tombstone_block_empty_input() {
+        assert!(decode_range_tombstone_block(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn range_tombstone_block_rejects_tiny_header() {
+        // 1–3 bytes is ambiguous: not empty, not enough for a count.
+        let kind = match decode_range_tombstone_block(&[0, 1]) {
+            Err(e) => e.kind(),
+            Ok(v) => panic!("expected error, got {} tombstones", v.len()),
+        };
+        assert_eq!(kind, io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn range_tombstone_block_truncated_mid_record_drops_tail() {
+        // Valid count = 2, but only the first record is complete. The
+        // decoder should early-return what it could parse rather than
+        // erroring out — matches the "drop torn tail" convention.
+        let mut bytes = vec![];
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        // First record: start "aa", end "bb", seq=1 → 4+2+4+2+8 = 20
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(b"aa");
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(b"bb");
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        // Second record: deliberately truncated after start_len
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.push(b'c'); // incomplete start
+
+        let got = decode_range_tombstone_block(&bytes).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].start, b"aa");
+    }
+
+    #[test]
+    fn reader_with_no_range_tombstones_reports_empty_list() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("no_rt.sst");
+        {
+            let mut writer =
+                SsTableWriter::new(&path, 4096, 10, CompressionType::None, None, false, 4096)
+                    .unwrap();
+            writer.add(&ik(b"k", 1), b"v").unwrap();
+            writer.finish().unwrap().unwrap();
+        }
+        let reader = SsTableReader::open(&path, 1).unwrap();
+        assert!(reader.range_tombstones().is_empty());
+        assert_eq!(reader.covering_range_tombstone_seq(b"k", u64::MAX), 0);
+    }
+
+    // ── bloom short-circuit ─────────────────────────────────────
+
+    #[test]
+    fn negative_lookup_on_many_keys_mostly_short_circuits() {
+        // Indirect test: with 10 bpk the bloom rejects >99% of absent
+        // keys without touching blocks. We can't directly observe
+        // block reads but can verify lookup returns NotInTable fast
+        // for all absent keys.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bloomy.sst");
+        let cache = BlockCache::new(1024 * 1024);
+        {
+            let mut writer =
+                SsTableWriter::new(&path, 4096, 10, CompressionType::None, None, false, 4096)
+                    .unwrap();
+            for i in 0..1000 {
+                writer
+                    .add(&ik(format!("hit_{:04}", i).as_bytes(), 1), b"v")
+                    .unwrap();
+            }
+            writer.finish().unwrap().unwrap();
+        }
+        let reader = SsTableReader::open(&path, 1).unwrap();
+        for i in 0..5000 {
+            let absent = format!("miss_{:05}", i);
+            assert_eq!(
+                reader.get(absent.as_bytes(), u64::MAX, &cache).unwrap(),
+                LookupResult::NotInTable
+            );
+        }
+    }
+
+    // ── partitioned index variant ──────────────────────────────
+
+    #[test]
+    fn partitioned_index_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("partitioned.sst");
+        let cache = BlockCache::new(1024 * 1024);
+        {
+            // Tiny metadata_block_size forces multiple index leaves.
+            let mut writer =
+                SsTableWriter::new(&path, 128, 10, CompressionType::None, None, true, 128).unwrap();
+            for i in 0..300 {
+                writer
+                    .add(&ik(format!("k_{:04}", i).as_bytes(), 1), b"value")
+                    .unwrap();
+            }
+            writer.finish().unwrap().unwrap();
+        }
+        let reader = SsTableReader::open(&path, 1).unwrap();
+        // Spot-check across the range.
+        for i in [0usize, 75, 150, 225, 299] {
+            let k = format!("k_{:04}", i);
+            assert_eq!(
+                reader.get(k.as_bytes(), u64::MAX, &cache).unwrap(),
+                LookupResult::Found {
+                    seq: 1,
+                    value: b"value".to_vec(),
+                }
+            );
+        }
+    }
 }
