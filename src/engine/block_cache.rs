@@ -458,4 +458,44 @@ mod tests {
         assert_eq!(cache.usage(), 0);
         assert!(cache.get(1, 0).is_none());
     }
+
+    #[test]
+    fn repeated_insert_at_same_key_does_not_double_count() {
+        let cache = BlockCache::with_config(64 * 1024, 0, false);
+        cache.insert(1, 0, dummy_block(1024));
+        let first_usage = cache.usage();
+        cache.insert(1, 0, dummy_block(1024));
+        cache.insert(1, 0, dummy_block(1024));
+        // Re-inserting the same key replaces rather than accumulating.
+        let final_usage = cache.usage();
+        assert_eq!(first_usage, final_usage);
+    }
+
+    #[test]
+    fn miss_on_absent_key_returns_none() {
+        let cache = BlockCache::with_config(64 * 1024, 0, false);
+        assert!(cache.get(99, 999).is_none());
+    }
+
+    #[test]
+    fn capacity_reflects_rounded_budget() {
+        // 100 KB / 64 shards would drop below MIN_SHARD_CAPACITY, so
+        // the constructor collapses to fewer shards. Capacity is the
+        // actual rounded budget after collapse, not the request.
+        let cache = BlockCache::with_config(100_000, 6, false);
+        assert!(cache.capacity() <= 100_000);
+        assert!(cache.capacity() > 0);
+    }
+
+    #[test]
+    fn evict_file_does_not_touch_other_files() {
+        let cache = BlockCache::with_config(64 * 1024 * 1024, 6, false);
+        cache.insert(7, 0, dummy_block(1024));
+        cache.insert(8, 0, dummy_block(1024));
+        let before = cache.usage();
+        cache.evict_file(99); // a file id that was never inserted
+        assert_eq!(cache.usage(), before);
+        assert!(cache.get(7, 0).is_some());
+        assert!(cache.get(8, 0).is_some());
+    }
 }
