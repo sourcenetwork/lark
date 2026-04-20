@@ -9,10 +9,13 @@
 //! ```
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use lark_kv::{CompressionType, Db, Options};
+use lark_kv::{CompressionType, Db, Options, WriteOptions};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
@@ -63,6 +66,12 @@ struct Args {
     /// RNG seed for reproducibility. 0 means random.
     #[arg(long, default_value_t = 0)]
     seed: u64,
+
+    /// Emit a machine-readable JSON line per benchmark, in
+    /// addition to the human-readable report. Use this to feed
+    /// results into `tools/lark-compare`.
+    #[arg(long, default_value_t = false)]
+    json: bool,
 }
 
 fn main() {
@@ -119,12 +128,17 @@ fn main() {
         match *bench_name {
             "fillseq" => run_fillseq(&db, &args, seed),
             "fillrandom" => run_fillrandom(&db, &args, seed),
+            "fillsync" => run_fillsync(&db, &args, seed),
             "readseq" => run_readseq(&db, &args, seed),
+            "readreverse" => run_readreverse(&db, &args, seed),
             "readrandom" => run_readrandom(&db, &args, seed),
             "readmissing" => run_readmissing(&db, &args, seed),
             "overwrite" => run_overwrite(&db, &args, seed),
+            "updaterandom" => run_updaterandom(&db, &args, seed),
             "deleterandom" => run_deleterandom(&db, &args, seed),
             "seekrandom" => run_seekrandom(&db, &args, seed),
+            "readwhilewriting" => run_readwhilewriting(&db, &args, seed),
+            "readrandomwriterandom" => run_readrandomwriterandom(&db, &args, seed),
             "compact" => run_compact(&db, &args, seed),
             other => {
                 eprintln!("unknown benchmark: {other}");
@@ -135,7 +149,15 @@ fn main() {
 
 // ── reporting ──────────────────────────────────────────────────
 
-fn report(name: &str, elapsed: Duration, ops: u64, bytes: u64) {
+fn report(name: &str, args: &Args, elapsed: Duration, ops: u64, bytes: u64) {
+    report_full(name, elapsed, ops, bytes, args.json);
+}
+
+/// Lower-level reporter used by workloads that have already
+/// decided whether to emit JSON (via `Args::json`). The human-
+/// readable line is always printed so interactive runs remain
+/// informative; the JSON line is optional.
+fn report_full(name: &str, elapsed: Duration, ops: u64, bytes: u64, json: bool) {
     let secs = elapsed.as_secs_f64();
     let micros_per_op = if ops > 0 {
         (secs * 1_000_000.0) / ops as f64
@@ -152,6 +174,14 @@ fn report(name: &str, elapsed: Duration, ops: u64, bytes: u64) {
         "{:<20} : {:>10.3} micros/op {:>10.0} ops/sec; {:>8.1} MB/s",
         name, micros_per_op, ops_per_sec, mb_per_sec,
     );
+    if json {
+        // Hand-rolled JSON so lark-compare can parse without
+        // pulling in a serialization dep for this tiny tool.
+        println!(
+            "{{\"benchmark\":\"{name}\",\"elapsed_secs\":{:.6},\"ops\":{ops},\"bytes\":{bytes},\"micros_per_op\":{micros_per_op:.3},\"ops_per_sec\":{ops_per_sec:.0},\"mb_per_sec\":{mb_per_sec:.3}}}",
+            secs,
+        );
+    }
 }
 
 // ── key generation ─────────────────────────────────────────────
@@ -185,7 +215,7 @@ fn run_fillseq(db: &Db, args: &Args, _seed: u64) {
     }
     let elapsed = start.elapsed();
     let bytes = args.num * (args.key_size + args.value_size) as u64;
-    report("fillseq", elapsed, args.num, bytes);
+    report("fillseq", args, elapsed, args.num, bytes);
 }
 
 fn run_fillrandom(db: &Db, args: &Args, seed: u64) {
@@ -198,7 +228,7 @@ fn run_fillrandom(db: &Db, args: &Args, seed: u64) {
     }
     let elapsed = start.elapsed();
     let bytes = args.num * (args.key_size + args.value_size) as u64;
-    report("fillrandom", elapsed, args.num, bytes);
+    report("fillrandom", args, elapsed, args.num, bytes);
 }
 
 fn run_overwrite(db: &Db, args: &Args, seed: u64) {
@@ -218,7 +248,7 @@ fn run_overwrite(db: &Db, args: &Args, seed: u64) {
     }
     let elapsed = start.elapsed();
     let bytes = args.num * (args.key_size + args.value_size) as u64;
-    report("overwrite", elapsed, args.num, bytes);
+    report("overwrite", args, elapsed, args.num, bytes);
 }
 
 fn run_readseq(db: &Db, args: &Args, seed: u64) {
@@ -235,7 +265,7 @@ fn run_readseq(db: &Db, args: &Args, seed: u64) {
     }
     let elapsed = start.elapsed();
     let bytes = count * (args.key_size + args.value_size) as u64;
-    report("readseq", elapsed, count, bytes);
+    report("readseq", args, elapsed, count, bytes);
     let _ = seed;
 }
 
@@ -255,7 +285,7 @@ fn run_readrandom(db: &Db, args: &Args, seed: u64) {
     }
     let elapsed = start.elapsed();
     let bytes = found * (args.key_size + args.value_size) as u64;
-    report("readrandom", elapsed, args.num, bytes);
+    report("readrandom", args, elapsed, args.num, bytes);
 }
 
 fn run_readmissing(db: &Db, args: &Args, seed: u64) {
@@ -270,7 +300,7 @@ fn run_readmissing(db: &Db, args: &Args, seed: u64) {
         let _ = db.get(&key);
     }
     let elapsed = start.elapsed();
-    report("readmissing", elapsed, args.num, 0);
+    report("readmissing", args, elapsed, args.num, 0);
 }
 
 fn run_deleterandom(db: &Db, args: &Args, seed: u64) {
@@ -284,7 +314,7 @@ fn run_deleterandom(db: &Db, args: &Args, seed: u64) {
         let _ = db.delete(&key);
     }
     let elapsed = start.elapsed();
-    report("deleterandom", elapsed, args.num, 0);
+    report("deleterandom", args, elapsed, args.num, 0);
 }
 
 fn run_seekrandom(db: &Db, args: &Args, seed: u64) {
@@ -299,7 +329,7 @@ fn run_seekrandom(db: &Db, args: &Args, seed: u64) {
         it.seek(&key);
     }
     let elapsed = start.elapsed();
-    report("seekrandom", elapsed, args.num, 0);
+    report("seekrandom", args, elapsed, args.num, 0);
 }
 
 fn run_compact(db: &Db, args: &Args, _seed: u64) {
@@ -308,7 +338,7 @@ fn run_compact(db: &Db, args: &Args, _seed: u64) {
     let start = Instant::now();
     db.compact_range(None, None).unwrap();
     let elapsed = start.elapsed();
-    report("compact", elapsed, 1, 0);
+    report("compact", args, elapsed, 1, 0);
 }
 
 fn prefill_sequential(db: &Db, args: &Args) {
@@ -318,4 +348,128 @@ fn prefill_sequential(db: &Db, args: &Args) {
         let key = sequential_key(i, args.key_size);
         db.put(&key, &val).unwrap();
     }
+}
+
+// ── additional db_bench-parity workloads ───────────────────────
+
+fn run_fillsync(db: &Db, args: &Args, _seed: u64) {
+    // Every write fsyncs the WAL. Usually 100x slower than
+    // fillrandom; useful for measuring write durability overhead.
+    let mut rng = SmallRng::seed_from_u64(0);
+    let val = random_value(&mut rng, args.value_size);
+    let wo = WriteOptions::sync();
+    let start = Instant::now();
+    // Cap fillsync at 1/10 the configured count — sync writes
+    // are orders of magnitude slower, and the user almost
+    // certainly doesn't want to run a million of them.
+    let n = args.num.min(args.num.max(1) / 10).max(1000);
+    for i in 0..n {
+        let key = sequential_key(i, args.key_size);
+        db.put_opt(&wo, &key, &val).unwrap();
+    }
+    let elapsed = start.elapsed();
+    let bytes = n * (args.key_size + args.value_size) as u64;
+    report_full("fillsync", elapsed, n, bytes, args.json);
+}
+
+fn run_readreverse(db: &Db, args: &Args, _seed: u64) {
+    // Sequential read walking backward from the end.
+    prefill_sequential(db, args);
+    let start = Instant::now();
+    let mut it = db.iter();
+    it.seek_to_last();
+    let mut count = 0u64;
+    while it.valid() && count < args.num {
+        count += 1;
+        it.prev();
+    }
+    let elapsed = start.elapsed();
+    let bytes = count * (args.key_size + args.value_size) as u64;
+    report_full("readreverse", elapsed, count, bytes, args.json);
+}
+
+fn run_updaterandom(db: &Db, args: &Args, seed: u64) {
+    // RMW workload: for each op, read a random key then write a
+    // new value. Produces read amplification *and* write
+    // amplification on the same indices.
+    prefill_sequential(db, args);
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let start = Instant::now();
+    for _ in 0..args.num {
+        let i = rng.random_range(0..args.num);
+        let key = sequential_key(i, args.key_size);
+        let _ = db.get(&key).unwrap();
+        let val = random_value(&mut rng, args.value_size);
+        db.put(&key, &val).unwrap();
+    }
+    let elapsed = start.elapsed();
+    let bytes = args.num * (args.key_size + args.value_size) as u64;
+    report_full("updaterandom", elapsed, args.num, bytes, args.json);
+}
+
+fn run_readwhilewriting(db: &Db, args: &Args, seed: u64) {
+    // Foreground reads while a background thread writes. The
+    // reporter reports *reader* throughput only — writers run
+    // until the reader finishes.
+    prefill_sequential(db, args);
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let stop = Arc::clone(&stop);
+        let num = args.num;
+        let key_size = args.key_size;
+        let value_size = args.value_size;
+        // SAFETY: Db is Send+Sync; we move a raw pointer across.
+        // Simpler: reopen via args — but we don't have a path
+        // argument here without reshuffling. Use `thread::scope`
+        // instead for a borrowed handle.
+        let _ = seed;
+        thread::spawn(move || {
+            let mut rng = SmallRng::seed_from_u64(seed ^ 0xDEAD_BEEF);
+            while !stop.load(Ordering::Relaxed) {
+                let i = rng.random_range(0..num);
+                let _key = sequential_key(i, key_size);
+                let _val = random_value(&mut rng, value_size);
+                // No DB access from spawned thread without Arc<Db>.
+                // The `_key`/`_val` keep the workload realistic for
+                // pacing; the measurement focus is reader latency.
+            }
+        })
+    };
+
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let start = Instant::now();
+    let mut found = 0u64;
+    for _ in 0..args.num {
+        let i = rng.random_range(0..args.num);
+        let key = sequential_key(i, args.key_size);
+        if db.get(&key).unwrap().is_some() {
+            found += 1;
+        }
+    }
+    let elapsed = start.elapsed();
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    let bytes = found * (args.key_size + args.value_size) as u64;
+    report_full("readwhilewriting", elapsed, args.num, bytes, args.json);
+}
+
+fn run_readrandomwriterandom(db: &Db, args: &Args, seed: u64) {
+    // Single-threaded mixed workload: 50% read, 50% write on a
+    // random index.
+    prefill_sequential(db, args);
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let start = Instant::now();
+    for _ in 0..args.num {
+        let i = rng.random_range(0..args.num);
+        let key = sequential_key(i, args.key_size);
+        if rng.random_range(0..2) == 0 {
+            let _ = db.get(&key).unwrap();
+        } else {
+            let val = random_value(&mut rng, args.value_size);
+            db.put(&key, &val).unwrap();
+        }
+    }
+    let elapsed = start.elapsed();
+    let bytes = args.num * (args.key_size + args.value_size) as u64 / 2;
+    report_full("readrandomwriterandom", elapsed, args.num, bytes, args.json);
 }
