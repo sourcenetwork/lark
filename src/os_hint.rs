@@ -54,3 +54,24 @@ pub(crate) fn drop_page_cache_by_path(path: &std::path::Path) {
         drop_page_cache(&file);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn drop_page_cache_on_real_file_does_not_panic() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("hint.bin");
+        std::fs::write(&path, vec![0u8; 4096]).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        drop_page_cache(&file);
+    }
+
+    #[test]
+    fn drop_page_cache_by_path_silently_ignores_missing_file() {
+        let dir = TempDir::new().unwrap();
+        drop_page_cache_by_path(&dir.path().join("never_existed"));
+    }
+}

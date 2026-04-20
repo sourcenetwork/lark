@@ -241,3 +241,149 @@ where
         f(l.as_ref());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Listener that counts every callback it receives. Used to
+    /// verify that `dispatch` reaches every registered listener
+    /// and that the default no-op implementations don't panic.
+    #[derive(Default)]
+    struct CountingListener {
+        flushes: AtomicUsize,
+        compactions: AtomicUsize,
+        files_created: AtomicUsize,
+        files_deleted: AtomicUsize,
+        ingests: AtomicUsize,
+        bg_errors: AtomicUsize,
+        wal_fulls: AtomicUsize,
+    }
+
+    impl EventListener for CountingListener {
+        fn on_flush_completed(&self, _: &FlushJobInfo) {
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+        }
+        fn on_compaction_completed(&self, _: &CompactionJobInfo) {
+            self.compactions.fetch_add(1, Ordering::Relaxed);
+        }
+        fn on_table_file_created(&self, _: &TableFileCreationInfo) {
+            self.files_created.fetch_add(1, Ordering::Relaxed);
+        }
+        fn on_table_file_deleted(&self, _: &TableFileDeletionInfo) {
+            self.files_deleted.fetch_add(1, Ordering::Relaxed);
+        }
+        fn on_external_file_ingested(&self, _: &ExternalFileIngestionInfo) {
+            self.ingests.fetch_add(1, Ordering::Relaxed);
+        }
+        fn on_background_error(&self, _: BackgroundErrorReason, _: &Error) {
+            self.bg_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        fn on_wal_full(&self, _: &WalFullInfo) {
+            self.wal_fulls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn sample_flush() -> FlushJobInfo {
+        FlushJobInfo {
+            file_id: 1,
+            file_path: PathBuf::from("/tmp/x.sst"),
+            file_size: 1024,
+            num_entries: 10,
+            smallest_key: b"a".to_vec(),
+            largest_key: b"z".to_vec(),
+            duration: Duration::from_millis(5),
+        }
+    }
+
+    fn sample_compaction() -> CompactionJobInfo {
+        CompactionJobInfo {
+            input_level: 0,
+            output_level: 1,
+            input_files_input_level: vec![1, 2],
+            input_files_output_level: vec![3],
+            output_files: vec![4],
+            duration: Duration::from_millis(20),
+        }
+    }
+
+    #[test]
+    fn default_trait_impls_are_noop() {
+        struct NoOp;
+        impl EventListener for NoOp {}
+        let n = NoOp;
+        n.on_flush_completed(&sample_flush());
+        n.on_compaction_begin(&sample_compaction());
+        n.on_compaction_completed(&sample_compaction());
+        n.on_wal_full(&WalFullInfo { wal_id: 1, size: 0 });
+        // No panic reaching here is the assertion.
+    }
+
+    #[test]
+    fn dispatch_visits_every_listener() {
+        let a = Arc::new(CountingListener::default());
+        let b = Arc::new(CountingListener::default());
+        let listeners: Vec<Arc<dyn EventListener>> = vec![
+            a.clone() as Arc<dyn EventListener>,
+            b.clone() as Arc<dyn EventListener>,
+        ];
+
+        let info = sample_flush();
+        dispatch(&listeners, |l| l.on_flush_completed(&info));
+        assert_eq!(a.flushes.load(Ordering::Relaxed), 1);
+        assert_eq!(b.flushes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn dispatch_on_empty_list_is_noop() {
+        let empty: Vec<Arc<dyn EventListener>> = Vec::new();
+        dispatch(&empty, |_| panic!("should not be called"));
+    }
+
+    #[test]
+    fn table_file_creation_reason_variants_are_equal_only_to_themselves() {
+        assert_eq!(
+            TableFileCreationReason::Flush,
+            TableFileCreationReason::Flush
+        );
+        assert_ne!(
+            TableFileCreationReason::Flush,
+            TableFileCreationReason::Compaction
+        );
+        assert_ne!(
+            TableFileCreationReason::Compaction,
+            TableFileCreationReason::Recovery
+        );
+    }
+
+    #[test]
+    fn background_error_reason_copy_and_eq() {
+        let r = BackgroundErrorReason::Flush;
+        let copy = r; // Copy
+        assert_eq!(r, copy);
+        assert_ne!(r, BackgroundErrorReason::Compaction);
+    }
+
+    #[test]
+    fn info_structs_are_cloneable_and_debug_formattable() {
+        // Sanity check that every public info struct carries
+        // Clone + Debug so telemetry callers can snapshot them.
+        let f = sample_flush();
+        let _ = format!("{f:?}");
+        let _ = f.clone();
+        let c = sample_compaction();
+        let _ = format!("{c:?}");
+        let _ = c.clone();
+        let ext = ExternalFileIngestionInfo {
+            external_file_path: PathBuf::from("/x"),
+            internal_file_id: 1,
+            level: 0,
+            num_entries: 1,
+            file_size: 2,
+        };
+        let _ = format!("{ext:?}");
+        let _ = ext.clone();
+    }
+}

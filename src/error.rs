@@ -20,3 +20,32 @@ pub enum Error {
     #[error("merge operator failed for key {0:?}")]
     MergeFailed(Vec<u8>),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn io_error_converts_via_from() {
+        let ioe = std::io::Error::new(std::io::ErrorKind::NotFound, "nope");
+        let e: Error = ioe.into();
+        assert!(matches!(e, Error::Io(_)));
+    }
+
+    #[test]
+    fn busy_display_contains_reason() {
+        let e = Error::Busy("too many L0 files");
+        let msg = format!("{e}");
+        assert!(msg.contains("too many L0 files"));
+        assert!(msg.contains("busy"));
+    }
+
+    #[test]
+    fn merge_failed_display_contains_key_bytes() {
+        let e = Error::MergeFailed(b"k".to_vec());
+        let msg = format!("{e}");
+        assert!(msg.contains("merge"));
+        // Debug-printed key bytes show up as `[107]`.
+        assert!(msg.contains("107"));
+    }
+}
