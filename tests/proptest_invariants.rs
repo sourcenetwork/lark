@@ -15,19 +15,15 @@
 
 use std::collections::BTreeMap;
 
-use lark_kv::{Db, Options, WriteBatch};
+use lark_kv::WriteBatch;
 use proptest::prelude::*;
 use tempfile::TempDir;
 
-// ── helpers ────────────────────────────────────────────────────
+mod common;
 
-fn open(dir: &TempDir) -> Db {
-    let opts = Options {
-        write_buffer_size: 4 * 1024,
-        ..Options::default()
-    };
-    Db::open(dir.path(), opts).unwrap()
-}
+use common::open;
+
+// ── helpers ────────────────────────────────────────────────────
 
 /// Strategy that generates a key as 1–32 random bytes.
 fn key_strategy() -> impl Strategy<Value = Vec<u8>> {
@@ -229,5 +225,126 @@ proptest! {
             let got = db.get(k).unwrap();
             prop_assert_eq!(got.as_ref(), Some(v));
         }
+    }
+
+    /// The iterator yields the same (key, value) sequence as
+    /// `scan(None, None)`. This catches any divergence between the
+    /// two read paths — they share the merge layer internally, but
+    /// any caching/prefetching difference could desync them.
+    #[test]
+    fn iter_matches_scan(
+        entries in prop::collection::vec(
+            (key_strategy(), value_strategy()),
+            1..=100,
+        ),
+    ) {
+        let dir = TempDir::new().unwrap();
+        let db = open(&dir);
+        for (k, v) in &entries {
+            db.put(k, v).unwrap();
+        }
+        let scanned = db.scan(None, None).unwrap();
+        let mut iter_pairs = Vec::new();
+        let mut it = db.iter();
+        it.seek_to_first();
+        while it.valid() {
+            iter_pairs.push((it.key().unwrap().to_vec(), it.value().unwrap().to_vec()));
+            it.next();
+        }
+        prop_assert_eq!(iter_pairs, scanned);
+    }
+
+    /// Reopening a clean-closed database yields exactly the same
+    /// scan output. This is the "ReopenIdempotent" invariant —
+    /// nothing about serialization should be lossy.
+    #[test]
+    fn reopen_preserves_scan_output(
+        entries in prop::collection::vec(
+            (key_strategy(), value_strategy()),
+            1..=100,
+        ),
+    ) {
+        let dir = TempDir::new().unwrap();
+        let before = {
+            let db = open(&dir);
+            for (k, v) in &entries {
+                db.put(k, v).unwrap();
+            }
+            db.scan(None, None).unwrap()
+        };
+        let db = open(&dir);
+        let after = db.scan(None, None).unwrap();
+        prop_assert_eq!(before, after);
+    }
+
+    /// Deleted keys stay deleted across reopen — tombstones cannot
+    /// resurrect values from older memtables or SSTables. This is
+    /// a foundational LSM invariant; any regression here is
+    /// immediately obvious to users as "my delete didn't stick".
+    #[test]
+    fn no_resurrection_across_reopen(
+        entries in prop::collection::vec(
+            (key_strategy(), value_strategy()),
+            1..=80,
+        ),
+        delete_picks in prop::collection::vec(0..80usize, 0..=20),
+    ) {
+        let dir = TempDir::new().unwrap();
+        let deleted_keys: Vec<Vec<u8>> = {
+            let db = open(&dir);
+            let mut recorded: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+            for (k, v) in &entries {
+                db.put(k, v).unwrap();
+                recorded.insert(k.clone(), v.clone());
+            }
+            let keys: Vec<Vec<u8>> = recorded.keys().cloned().collect();
+            let mut deleted = Vec::new();
+            for idx in &delete_picks {
+                if keys.is_empty() { break; }
+                let k = &keys[idx % keys.len()];
+                db.delete(k).unwrap();
+                deleted.push(k.clone());
+            }
+            db.compact_range(None, None).unwrap();
+            deleted
+        };
+        let db = open(&dir);
+        for k in &deleted_keys {
+            prop_assert!(
+                db.get(k).unwrap().is_none(),
+                "key {:?} resurrected across reopen",
+                k
+            );
+        }
+    }
+
+    /// Range scans return exactly the BTreeMap slice for the given
+    /// bounds. Verifies lark's `scan(start, end)` honours the
+    /// `[start, end)` half-open convention.
+    #[test]
+    fn range_scan_matches_btree_slice(
+        entries in prop::collection::vec(
+            (key_strategy(), value_strategy()),
+            1..=80,
+        ),
+        bounds in (key_strategy(), key_strategy()),
+    ) {
+        let dir = TempDir::new().unwrap();
+        let db = open(&dir);
+        let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        for (k, v) in &entries {
+            db.put(k, v).unwrap();
+            expected.insert(k.clone(), v.clone());
+        }
+        let (mut lo, mut hi) = bounds;
+        if lo > hi {
+            std::mem::swap(&mut lo, &mut hi);
+        }
+        let got = db.scan(Some(&lo), Some(&hi)).unwrap();
+        let want: Vec<(Vec<u8>, Vec<u8>)> = expected
+            .range(lo.clone()..hi.clone())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        prop_assert_eq!(got, want);
     }
 }
