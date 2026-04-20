@@ -131,4 +131,126 @@ mod tests {
             false_positives
         );
     }
+
+    #[test]
+    fn empty_builder_produces_filter_that_accepts_everything() {
+        // An empty filter has no bit array to probe; the `may_contain`
+        // fast-path returns true so every lookup is treated as
+        // "possibly present". Callers rely on this to make an
+        // empty-filter SSTable fall back to block search.
+        let bloom = BloomFilterBuilder::new(10).build();
+        assert!(bloom.may_contain(b"anything"));
+        assert!(bloom.may_contain(b""));
+    }
+
+    #[test]
+    fn no_false_negatives_on_large_keyset() {
+        let mut b = BloomFilterBuilder::new(10);
+        let keys: Vec<Vec<u8>> = (0..10_000)
+            .map(|i| format!("key_{}", i).into_bytes())
+            .collect();
+        for k in &keys {
+            b.add_key(k);
+        }
+        let bloom = b.build();
+        for k in &keys {
+            assert!(bloom.may_contain(k), "false negative on {:?}", k);
+        }
+    }
+
+    #[test]
+    fn false_positive_rate_drops_with_more_bits_per_key() {
+        // Build two filters on the same 1000-key input, one at 4 bpk
+        // and one at 16 bpk, and assert the denser filter has the
+        // lower observed false-positive rate on a 10k probe set.
+        let mut sparse_b = BloomFilterBuilder::new(4);
+        let mut dense_b = BloomFilterBuilder::new(16);
+        for i in 0..1000 {
+            let k = format!("in_{}", i);
+            sparse_b.add_key(k.as_bytes());
+            dense_b.add_key(k.as_bytes());
+        }
+        let sparse = sparse_b.build();
+        let dense = dense_b.build();
+        let mut sparse_fp = 0usize;
+        let mut dense_fp = 0usize;
+        for i in 0..10_000 {
+            let k = format!("out_{}", i);
+            if sparse.may_contain(k.as_bytes()) {
+                sparse_fp += 1;
+            }
+            if dense.may_contain(k.as_bytes()) {
+                dense_fp += 1;
+            }
+        }
+        assert!(
+            dense_fp < sparse_fp,
+            "dense FP ({dense_fp}) should be less than sparse FP ({sparse_fp})",
+        );
+    }
+
+    #[test]
+    fn round_trip_encode_decode_preserves_membership() {
+        let mut b = BloomFilterBuilder::new(10);
+        let keys: Vec<&[u8]> = b"abcdefghij".iter().map(std::slice::from_ref).collect();
+        for k in &keys {
+            b.add_key(k);
+        }
+        let original = b.build();
+        let bytes = encode_bloom_block(&original);
+        let restored = decode_bloom_block(&bytes);
+        for k in &keys {
+            assert!(restored.may_contain(k));
+        }
+    }
+
+    #[test]
+    fn decode_bloom_block_handles_short_input() {
+        // Fewer than 4 bytes means no num_hashes prefix — the decoder
+        // falls back to a zero-sized filter whose `may_contain` short-
+        // circuits on the empty bit array.
+        let bloom = decode_bloom_block(&[0, 1]);
+        assert!(bloom.may_contain(b"anything"));
+    }
+
+    #[test]
+    fn num_hashes_clamped_to_30_for_large_bpk() {
+        let mut b = BloomFilterBuilder::new(1000);
+        b.add_key(b"only");
+        let bloom = b.build();
+        let bytes = encode_bloom_block(&bloom);
+        let num_hashes = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        assert_eq!(num_hashes, 30);
+    }
+
+    #[test]
+    fn num_hashes_is_at_least_one_for_zero_bpk() {
+        let mut b = BloomFilterBuilder::new(0);
+        b.add_key(b"only");
+        let bloom = b.build();
+        let bytes = encode_bloom_block(&bloom);
+        let num_hashes = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        assert_eq!(num_hashes, 1);
+    }
+
+    #[test]
+    fn single_key_filter_matches_itself() {
+        let mut b = BloomFilterBuilder::new(8);
+        b.add_key(b"solo");
+        let bloom = b.build();
+        assert!(bloom.may_contain(b"solo"));
+    }
+
+    #[test]
+    fn minimum_bit_array_is_at_least_eight_bytes() {
+        // With 1 key × 10 bpk = 10 bits requested, the builder rounds
+        // up to the 64-bit (8-byte) minimum to give the hash functions
+        // room to spread. Verify via the encoded block size.
+        let mut b = BloomFilterBuilder::new(10);
+        b.add_key(b"one");
+        let bloom = b.build();
+        let bytes = encode_bloom_block(&bloom);
+        // 4 bytes for num_hashes + at least 8 bytes of bits.
+        assert!(bytes.len() >= 4 + 8, "filter too small: {}", bytes.len());
+    }
 }
