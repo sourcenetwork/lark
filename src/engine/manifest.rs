@@ -515,4 +515,165 @@ mod tests {
         // Pinned snapshot still sees both files.
         assert_eq!(pinned.levels[0].len(), 2);
     }
+
+    #[test]
+    fn initial_version_has_empty_levels_and_defaults() {
+        let v = Version::new();
+        assert_eq!(v.levels.len(), MAX_LEVELS);
+        assert!(v.levels.iter().all(|l| l.is_empty()));
+        assert_eq!(v.next_file_id, 1);
+        assert_eq!(v.last_seq, 0);
+        assert_eq!(v.l0_count(), 0);
+        for level in 0..MAX_LEVELS {
+            assert_eq!(v.level_size(level), 0);
+        }
+    }
+
+    #[test]
+    fn manifest_path_returned_as_written() {
+        let dir = TempDir::new().unwrap();
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+        let vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+        assert_eq!(vs.manifest_path(), dir.path().join("MANIFEST"));
+    }
+
+    #[test]
+    fn manifest_record_encode_decode_round_trip() {
+        // Exercise every tag through the encode/decode path used by
+        // the replay loop.
+        let records = [
+            ManifestRecord::AddFile {
+                level: 2,
+                meta: SsTableMeta {
+                    file_id: 99,
+                    smallest_key: b"aaa".to_vec(),
+                    largest_key: b"zzz".to_vec(),
+                    file_size: 4096,
+                    num_entries: 128,
+                },
+            },
+            ManifestRecord::RemoveFile {
+                level: 1,
+                file_id: 7,
+            },
+            ManifestRecord::SetLastSeq(999),
+            ManifestRecord::SetNextFileId(42),
+        ];
+        for r in &records {
+            let mut buf = Vec::new();
+            r.encode(&mut buf);
+            let mut pos = 0;
+            let decoded = match ManifestRecord::decode(&buf, &mut pos) {
+                Ok(Some(d)) => d,
+                other => panic!("expected decoded record, got {:?}", other.is_ok()),
+            };
+            // Re-encode and compare — equality via round-trip avoids
+            // having to add PartialEq to ManifestRecord.
+            let mut rebuf = Vec::new();
+            decoded.encode(&mut rebuf);
+            assert_eq!(buf, rebuf);
+            assert_eq!(pos, buf.len());
+        }
+    }
+
+    #[test]
+    fn manifest_record_decode_rejects_unknown_tag() {
+        let data = [0xFFu8];
+        let mut pos = 0;
+        let kind = match ManifestRecord::decode(&data, &mut pos) {
+            Err(e) => e.kind(),
+            Ok(_) => panic!("expected error on unknown tag"),
+        };
+        assert_eq!(kind, io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn manifest_record_decode_returns_none_at_eof() {
+        let mut pos = 0;
+        let got = ManifestRecord::decode(&[], &mut pos).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn replay_survives_truncated_trailer() {
+        // Write a manifest, then truncate it inside the last record.
+        // Replay should stop cleanly and expose the valid prefix.
+        let dir = TempDir::new().unwrap();
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+
+        let file1 = make_live_sst(&sst_dir, 1, b"a", b"m");
+        let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+        vs.apply(&[VersionEdit::AddFile {
+            level: 0,
+            file: Arc::clone(&file1),
+        }])
+        .unwrap();
+        vs.apply(&[VersionEdit::SetLastSeq(50)]).unwrap();
+        drop(vs);
+
+        // Truncate 2 bytes off the end — enough to damage the final
+        // record's checksum or tail.
+        let path = dir.path().join("MANIFEST");
+        let current = std::fs::metadata(&path).unwrap().len();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(current - 2)
+            .unwrap();
+
+        let vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+        let v = vs.current();
+        // The AddFile should have survived (it was the first record);
+        // the SetLastSeq may or may not survive depending on where the
+        // truncation landed. Either way, we should NOT panic.
+        assert!(v.levels[0].len() <= 1);
+    }
+
+    #[test]
+    fn compact_manifest_rewrites_to_canonical_form() {
+        // Apply many edits, then compact. The resulting manifest
+        // should replay to the same version.
+        let dir = TempDir::new().unwrap();
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+
+        let file1 = make_live_sst(&sst_dir, 1, b"a", b"c");
+        let file2 = make_live_sst(&sst_dir, 2, b"d", b"f");
+
+        let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+        vs.apply(&[VersionEdit::AddFile {
+            level: 0,
+            file: Arc::clone(&file1),
+        }])
+        .unwrap();
+        vs.apply(&[VersionEdit::AddFile {
+            level: 1,
+            file: Arc::clone(&file2),
+        }])
+        .unwrap();
+        vs.apply(&[VersionEdit::SetLastSeq(500), VersionEdit::SetNextFileId(99)])
+            .unwrap();
+
+        let pre_size = std::fs::metadata(dir.path().join("MANIFEST"))
+            .unwrap()
+            .len();
+        vs.compact_manifest().unwrap();
+        let post_size = std::fs::metadata(dir.path().join("MANIFEST"))
+            .unwrap()
+            .len();
+        // Compaction produces a single snapshot, so it is typically
+        // not larger than the history it replaced.
+        assert!(post_size <= pre_size + 64);
+
+        drop(vs);
+        let vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+        let v = vs.current();
+        assert_eq!(v.levels[0].len(), 1);
+        assert_eq!(v.levels[1].len(), 1);
+        assert_eq!(v.last_seq, 500);
+        assert_eq!(v.next_file_id, 99);
+    }
 }

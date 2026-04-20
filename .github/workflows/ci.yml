@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # Nightly at 07:00 UTC — drives the long-running stress/soak jobs.
+    - cron: '0 7 * * *'
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -88,3 +92,33 @@ jobs:
             cat coverage-summary.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Soft-warn when line coverage drops below 90%
+        run: |
+          # Pulls the percentage off the TOTAL row of `cargo llvm-cov`'s
+          # summary table. The line-coverage column is the 10th field
+          # (Filename, Regions, Missed, Cover, Functions, Missed, Cover,
+          # Lines, Missed, Cover). Soft gate — emits an annotation but
+          # never fails the job.
+          total=$(awk '/^TOTAL/ {gsub("%", "", $10); print $10}' coverage-summary.txt)
+          if [ -z "$total" ]; then
+            echo "::warning::could not parse line-coverage percentage from coverage-summary.txt"
+            exit 0
+          fi
+          awk -v t="$total" 'BEGIN { exit !(t+0 < 90) }' \
+            && echo "::warning::line coverage $total% is below the 90% soft floor" \
+            || echo "line coverage $total% ≥ 90% ✓"
+
+  # Long-running stress, soak, and fault-injection tests. Gated behind
+  # `#[ignore]` in the main crate so `cargo test` stays fast for PRs;
+  # this job unlocks them via `--ignored`. Runs on the nightly schedule,
+  # manual dispatch, or direct pushes to `main` — never on PRs.
+  nightly-stress:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run ignored tests (stress / soak / concurrency)
+        run: cargo test --workspace --release -- --ignored --nocapture

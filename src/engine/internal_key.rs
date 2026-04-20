@@ -159,4 +159,72 @@ mod tests {
         assert!(seq_5 >= probe);
         assert!(seq_3 >= probe);
     }
+
+    #[test]
+    fn user_key_of_strips_suffix() {
+        let ik = encode_internal_key(b"hello", 42, VALUE_TYPE_VALUE);
+        assert_eq!(user_key_of(&ik), b"hello");
+    }
+
+    #[test]
+    fn compare_correctly_orders_prefix_keys() {
+        // Naive byte comparison would interleave these incorrectly
+        // because `ab`'s `!seq` trailer collides with `abc`'s literal
+        // `c` byte. The custom comparator fixes this: `ab` < `abc`
+        // regardless of seq.
+        let ab_high = encode_internal_key(b"ab", u64::MAX, VALUE_TYPE_VALUE);
+        let ab_low = encode_internal_key(b"ab", 0, VALUE_TYPE_VALUE);
+        let abc_high = encode_internal_key(b"abc", u64::MAX, VALUE_TYPE_VALUE);
+
+        assert!(compare_internal_keys(&ab_high, &abc_high).is_lt());
+        assert!(compare_internal_keys(&ab_low, &abc_high).is_lt());
+        assert!(compare_internal_keys(&abc_high, &ab_high).is_gt());
+    }
+
+    #[test]
+    fn compare_falls_back_to_raw_for_short_keys() {
+        // Keys shorter than the 9-byte internal-key suffix can't be
+        // decoded as internal keys. The comparator short-circuits to
+        // raw byte compare so it can still be used on test-crafted
+        // blocks that contain raw user keys.
+        let a = b"ab";
+        let b = b"ac";
+        assert!(compare_internal_keys(a, b).is_lt());
+        assert!(compare_internal_keys(b, a).is_gt());
+        assert!(compare_internal_keys(a, a).is_eq());
+    }
+
+    #[test]
+    fn internal_key_ord_trait_delegates_to_comparator() {
+        let mut keys = [
+            InternalKey(encode_internal_key(b"b", 1, VALUE_TYPE_VALUE)),
+            InternalKey(encode_internal_key(b"a", 5, VALUE_TYPE_VALUE)),
+            InternalKey(encode_internal_key(b"a", 1, VALUE_TYPE_VALUE)),
+            InternalKey(encode_internal_key(b"c", 1, VALUE_TYPE_VALUE)),
+        ];
+        keys.sort();
+        let user_keys: Vec<&[u8]> = keys.iter().map(|k| user_key_of(&k.0)).collect();
+        assert_eq!(user_keys, vec![&b"a"[..], &b"a"[..], &b"b"[..], &b"c"[..]]);
+    }
+
+    #[test]
+    fn every_value_type_round_trips() {
+        for vt in [VALUE_TYPE_VALUE, VALUE_TYPE_DELETION, VALUE_TYPE_MERGE] {
+            let ik = encode_internal_key(b"k", 3, vt);
+            let (_, _, decoded_vt) = decode_internal_key(&ik);
+            assert_eq!(decoded_vt, vt);
+        }
+    }
+
+    #[test]
+    fn lookup_key_at_u64_max_sorts_after_any_stored_seq() {
+        // snapshot_seq = u64::MAX means "most recent possible read".
+        // The resulting lookup key must be <= every encoded
+        // entry for the same user key.
+        let probe = lookup_key(b"k", u64::MAX);
+        let seq_1 = encode_internal_key(b"k", 1, VALUE_TYPE_VALUE);
+        let seq_huge = encode_internal_key(b"k", u64::MAX - 1, VALUE_TYPE_VALUE);
+        assert!(compare_internal_keys(&probe, &seq_1).is_le());
+        assert!(compare_internal_keys(&probe, &seq_huge).is_le());
+    }
 }

@@ -162,4 +162,50 @@ mod tests {
         r.release(42);
         assert_eq!(r.oldest_live_seq(), u64::MAX);
     }
+
+    #[test]
+    fn live_count_tracks_refcount_total_not_distinct_seqs() {
+        let r = SnapshotRegistry::new();
+        r.register(5);
+        r.register(5);
+        r.register(9);
+        assert_eq!(r.live_count(), 3);
+        assert_eq!(r.pin_count(), 2);
+        r.release(5);
+        assert_eq!(r.live_count(), 2);
+    }
+
+    #[test]
+    fn oldest_snapshot_time_is_none_when_empty_and_some_when_pinned() {
+        let r = SnapshotRegistry::new();
+        assert!(r.oldest_snapshot_time_unix().is_none());
+        r.register(7);
+        assert!(r.oldest_snapshot_time_unix().is_some());
+        r.release(7);
+        assert!(r.oldest_snapshot_time_unix().is_none());
+    }
+
+    #[test]
+    fn concurrent_register_release_stays_consistent() {
+        use std::sync::Arc;
+        use std::thread;
+        let r = Arc::new(SnapshotRegistry::new());
+        let mut handles = Vec::new();
+        for worker in 0..4u64 {
+            let r = Arc::clone(&r);
+            handles.push(thread::spawn(move || {
+                for i in 0..200u64 {
+                    let seq = worker * 200 + i + 1;
+                    r.register(seq);
+                    r.release(seq);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(r.pin_count(), 0);
+        assert_eq!(r.live_count(), 0);
+        assert_eq!(r.oldest_live_seq(), u64::MAX);
+    }
 }

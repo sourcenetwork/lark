@@ -312,6 +312,16 @@ pub(crate) fn decode_varint(data: &[u8]) -> (u64, usize) {
 mod tests {
     use super::*;
 
+    fn build_block(pairs: &[(&[u8], &[u8])]) -> Block {
+        let mut builder = BlockBuilder::new(4);
+        for (k, v) in pairs {
+            builder.add(k, v);
+        }
+        Block::decode(builder.finish()).unwrap()
+    }
+
+    // ── varint encoding ──────────────────────────────────────────
+
     #[test]
     fn test_varint_roundtrip() {
         let test_values = [0u64, 1, 127, 128, 16383, 16384, u64::MAX];
@@ -323,13 +333,33 @@ mod tests {
         }
     }
 
-    fn build_block(pairs: &[(&[u8], &[u8])]) -> Block {
-        let mut builder = BlockBuilder::new(4);
-        for (k, v) in pairs {
-            builder.add(k, v);
+    #[test]
+    fn varint_zero_and_127_fit_in_one_byte() {
+        for v in [0u64, 42, 127] {
+            let mut buf = Vec::new();
+            encode_varint(&mut buf, v);
+            assert_eq!(buf.len(), 1, "value {v} should encode to 1 byte");
+            assert_eq!(decode_varint(&buf), (v, 1));
         }
-        Block::decode(builder.finish()).unwrap()
     }
+
+    #[test]
+    fn varint_128_crosses_into_two_bytes() {
+        let mut buf = Vec::new();
+        encode_varint(&mut buf, 128);
+        assert_eq!(buf, vec![0x80, 0x01]);
+        assert_eq!(decode_varint(&buf), (128, 2));
+    }
+
+    #[test]
+    fn varint_u64_max_fits_in_ten_bytes() {
+        let mut buf = Vec::new();
+        encode_varint(&mut buf, u64::MAX);
+        assert_eq!(buf.len(), 10);
+        assert_eq!(decode_varint(&buf), (u64::MAX, 10));
+    }
+
+    // ── block encode/decode ─────────────────────────────────────
 
     #[test]
     fn test_block_seek_ge() {
@@ -352,5 +382,157 @@ mod tests {
             Some((b"banana".to_vec(), b"yellow".to_vec()))
         );
         assert_eq!(block.seek_ge(b"cherry"), None);
+    }
+
+    #[test]
+    fn empty_block_iterates_nothing() {
+        let builder = BlockBuilder::new(16);
+        let block = Block::decode(builder.finish()).unwrap();
+        assert_eq!(block.iter().count(), 0);
+    }
+
+    #[test]
+    fn single_entry_block_round_trips() {
+        let block = build_block(&[(b"only", b"one")]);
+        let entries: Vec<_> = block.iter().collect();
+        assert_eq!(entries, vec![(b"only".to_vec(), b"one".to_vec())]);
+    }
+
+    #[test]
+    fn iter_preserves_insert_order() {
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..20)
+            .map(|i| {
+                (
+                    format!("key_{:04}", i).into_bytes(),
+                    format!("val_{}", i).into_bytes(),
+                )
+            })
+            .collect();
+        let mut b = BlockBuilder::new(4);
+        for (k, v) in &pairs {
+            b.add(k, v);
+        }
+        let block = Block::decode(b.finish()).unwrap();
+        let got: Vec<_> = block.iter().collect();
+        assert_eq!(got, pairs);
+    }
+
+    #[test]
+    fn prefix_compression_round_trips_shared_prefix_keys() {
+        let block = build_block(&[(b"zebra_a", b"1"), (b"zebra_b", b"2"), (b"zebra_c", b"3")]);
+        let got: Vec<_> = block.iter().collect();
+        assert_eq!(
+            got,
+            vec![
+                (b"zebra_a".to_vec(), b"1".to_vec()),
+                (b"zebra_b".to_vec(), b"2".to_vec()),
+                (b"zebra_c".to_vec(), b"3".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn restart_points_occur_every_interval_entries() {
+        let n = 32usize;
+        let mut b = BlockBuilder::new(8);
+        for i in 0..n {
+            let key = format!("k_{:04}", i);
+            b.add(key.as_bytes(), b"v");
+        }
+        let block = Block::decode(b.finish()).unwrap();
+        // Entry 0 is always a restart; then 8, 16, 24 → 4 total.
+        assert_eq!(block.restart_count(), 4);
+        assert_eq!(block.restart_offset(0), 0);
+    }
+
+    #[test]
+    fn decode_rejects_buffer_smaller_than_footer() {
+        assert!(Block::decode(vec![]).is_err());
+        assert!(Block::decode(vec![0u8; 3]).is_err());
+    }
+
+    // ── seek_ge edge cases ──────────────────────────────────────
+
+    #[test]
+    fn seek_ge_before_first_key_returns_first() {
+        let block = build_block(&[(b"b", b"2"), (b"c", b"3")]);
+        // Empty target sorts before every key — the ordering function
+        // short-circuits on suffix-length so any user key > "" wins.
+        assert_eq!(block.seek_ge(b""), Some((b"b".to_vec(), b"2".to_vec())));
+    }
+
+    #[test]
+    fn seek_ge_matches_every_key_after_binary_search() {
+        // 100 sorted keys with restart interval 4 exercises the
+        // binary-search path over ~25 restart points.
+        let keys: Vec<Vec<u8>> = (0..100)
+            .map(|i| format!("key_{:05}", i).into_bytes())
+            .collect();
+        let mut b = BlockBuilder::new(4);
+        for k in &keys {
+            b.add(k, b"v");
+        }
+        let block = Block::decode(b.finish()).unwrap();
+
+        for k in &keys {
+            assert_eq!(block.seek_ge(k), Some((k.clone(), b"v".to_vec())));
+        }
+    }
+
+    // ── cache accounting / builder internals ───────────────────
+
+    #[test]
+    fn charge_scales_with_data_bytes() {
+        let small = build_block(&[(b"k", b"v")]);
+        let big_pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..500)
+            .map(|i| (format!("key_{:04}", i).into_bytes(), vec![0u8; 128]))
+            .collect();
+        let mut b = BlockBuilder::new(16);
+        for (k, v) in &big_pairs {
+            b.add(k, v);
+        }
+        let big = Block::decode(b.finish()).unwrap();
+        assert!(big.charge() > small.charge() * 100);
+    }
+
+    #[test]
+    fn builder_is_empty_flag_reflects_entry_count() {
+        let mut b = BlockBuilder::new(16);
+        assert!(b.is_empty());
+        b.add(b"k", b"v");
+        assert!(!b.is_empty());
+    }
+
+    #[test]
+    fn builder_estimated_size_grows_monotonically() {
+        let mut b = BlockBuilder::new(16);
+        let s0 = b.estimated_size();
+        b.add(b"a", b"1");
+        let s1 = b.estimated_size();
+        b.add(b"b", b"2");
+        let s2 = b.estimated_size();
+        assert!(s1 >= s0);
+        assert!(s2 >= s1);
+    }
+
+    #[test]
+    fn entry_data_length_matches_iter_consumption() {
+        let pairs: Vec<(&[u8], &[u8])> = vec![(b"abc", b"1"), (b"abcd", b"22"), (b"xyz", b"333")];
+        let mut b = BlockBuilder::new(16);
+        for (k, v) in &pairs {
+            b.add(k, v);
+        }
+        let block = Block::decode(b.finish()).unwrap();
+        let data_len = block.entry_data().len();
+
+        let mut consumed = 0usize;
+        let mut pos = 0usize;
+        let data = block.entry_data();
+        while pos < data_len {
+            let size = encoded_entry_size(data, pos);
+            pos += size;
+            consumed += size;
+        }
+        assert_eq!(consumed, data_len);
     }
 }

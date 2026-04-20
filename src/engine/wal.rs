@@ -355,6 +355,51 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    // ── helpers ──────────────────────────────────────────────────
+
+    fn new_wal(dir: &TempDir) -> (Wal, PathBuf) {
+        let path = dir.path().join("test.wal");
+        let wal = Wal::create(&path).unwrap();
+        (wal, path)
+    }
+
+    fn flip_byte(path: &Path, offset: usize) {
+        let mut bytes = fs::read(path).unwrap();
+        bytes[offset] ^= 0xFF;
+        fs::write(path, &bytes).unwrap();
+    }
+
+    /// Build the *data* payload (everything between record-type and
+    /// checksum) for a put record, matching [`Wal::append_put`].
+    fn put_data(key: &[u8], value: &[u8], seq: u64) -> Vec<u8> {
+        let mut d = Vec::with_capacity(4 + key.len() + 4 + value.len() + 8);
+        d.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        d.extend_from_slice(key);
+        d.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        d.extend_from_slice(value);
+        d.extend_from_slice(&seq.to_le_bytes());
+        d
+    }
+
+    /// Append a raw record to an already-opened file. Used to craft
+    /// corruption scenarios the public API can't express — unknown
+    /// record types, bad-length headers, etc.
+    fn append_raw_record(
+        f: &mut impl Write,
+        record_type: u8,
+        data: &[u8],
+        checksum_override: Option<u32>,
+    ) {
+        let len = data.len() as u32;
+        let checksum = checksum_override.unwrap_or_else(|| xxhash_rust::xxh3::xxh3_64(data) as u32);
+        f.write_all(&len.to_le_bytes()).unwrap();
+        f.write_all(&[record_type]).unwrap();
+        f.write_all(data).unwrap();
+        f.write_all(&checksum.to_le_bytes()).unwrap();
+    }
+
+    // ── existing sanity tests ───────────────────────────────────
+
     #[test]
     fn test_wal_write_and_replay() {
         let dir = TempDir::new().unwrap();
@@ -393,5 +438,444 @@ mod tests {
     fn test_wal_filename() {
         assert_eq!(wal_filename(1), "wal_000001.log");
         assert_eq!(wal_filename(42), "wal_000042.log");
+    }
+
+    // ── round-trip coverage for every record type ──────────────
+
+    #[test]
+    fn put_record_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        wal.append_put(b"k", b"v", 7).unwrap();
+        wal.flush().unwrap();
+        drop(wal);
+
+        let entries = Wal::replay(&path).unwrap();
+        match entries.as_slice() {
+            [WalEntry::Put { key, value, seq: 7 }] => {
+                assert_eq!(key, b"k");
+                assert_eq!(value, b"v");
+            }
+            _ => panic!("expected a single put at seq=7, got {}", entries.len()),
+        }
+    }
+
+    #[test]
+    fn delete_record_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        wal.append_delete(b"gone", 11).unwrap();
+        wal.flush().unwrap();
+        drop(wal);
+
+        let entries = Wal::replay(&path).unwrap();
+        match entries.as_slice() {
+            [WalEntry::Delete { key, seq: 11 }] => assert_eq!(key, b"gone"),
+            _ => panic!("expected a single delete"),
+        }
+    }
+
+    #[test]
+    fn delete_range_record_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        wal.append_delete_range(b"aaa", b"zzz", 5).unwrap();
+        wal.flush().unwrap();
+        drop(wal);
+
+        let entries = Wal::replay(&path).unwrap();
+        match entries.as_slice() {
+            [WalEntry::DeleteRange { start, end, seq: 5 }] => {
+                assert_eq!(start, b"aaa");
+                assert_eq!(end, b"zzz");
+            }
+            _ => panic!("expected a single delete_range"),
+        }
+    }
+
+    #[test]
+    fn merge_record_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        wal.append_merge(b"counter", b"+3", 99).unwrap();
+        wal.flush().unwrap();
+        drop(wal);
+
+        let entries = Wal::replay(&path).unwrap();
+        match entries.as_slice() {
+            [WalEntry::Merge {
+                key,
+                operand,
+                seq: 99,
+            }] => {
+                assert_eq!(key, b"counter");
+                assert_eq!(operand, b"+3");
+            }
+            _ => panic!("expected a single merge"),
+        }
+    }
+
+    #[test]
+    fn all_record_types_replay_in_order() {
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        wal.append_put(b"p", b"1", 1).unwrap();
+        wal.append_delete(b"d", 2).unwrap();
+        wal.append_delete_range(b"ra", b"rb", 3).unwrap();
+        wal.append_merge(b"m", b"op", 4).unwrap();
+        wal.flush().unwrap();
+        drop(wal);
+
+        let entries = Wal::replay(&path).unwrap();
+        assert_eq!(entries.len(), 4);
+        assert!(matches!(entries[0], WalEntry::Put { seq: 1, .. }));
+        assert!(matches!(entries[1], WalEntry::Delete { seq: 2, .. }));
+        assert!(matches!(entries[2], WalEntry::DeleteRange { seq: 3, .. }));
+        assert!(matches!(entries[3], WalEntry::Merge { seq: 4, .. }));
+    }
+
+    // ── edge cases ───────────────────────────────────────────────
+
+    #[test]
+    fn replay_empty_file_returns_no_entries() {
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        wal.flush().unwrap();
+        drop(wal);
+
+        assert!(Wal::replay(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn round_trip_empty_key_and_value() {
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        wal.append_put(b"", b"", 0).unwrap();
+        wal.flush().unwrap();
+        drop(wal);
+
+        match Wal::replay(&path).unwrap().as_slice() {
+            [WalEntry::Put { key, value, seq: 0 }] => {
+                assert!(key.is_empty());
+                assert!(value.is_empty());
+            }
+            other => panic!("expected empty-key/value put, got {} entries", other.len()),
+        }
+    }
+
+    #[test]
+    fn round_trip_large_value() {
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        // 1 MiB value — larger than BufWriter's default 8 KiB buffer,
+        // forcing multiple writes to the underlying file.
+        let big = vec![0xAB; 1 << 20];
+        wal.append_put(b"k", &big, 1).unwrap();
+        wal.flush().unwrap();
+        drop(wal);
+
+        match Wal::replay(&path).unwrap().as_slice() {
+            [WalEntry::Put { key, value, seq: 1 }] => {
+                assert_eq!(key, b"k");
+                assert_eq!(value.len(), 1 << 20);
+                assert!(value.iter().all(|&b| b == 0xAB));
+            }
+            _ => panic!("expected single large put"),
+        }
+    }
+
+    #[test]
+    fn round_trip_boundary_seq_numbers() {
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        wal.append_put(b"a", b"1", 0).unwrap();
+        wal.append_put(b"b", b"2", u64::MAX).unwrap();
+        wal.flush().unwrap();
+        drop(wal);
+
+        let entries = Wal::replay(&path).unwrap();
+        assert_eq!(entries.len(), 2);
+        let seqs: Vec<u64> = entries
+            .iter()
+            .map(|e| match e {
+                WalEntry::Put { seq, .. } => *seq,
+                _ => panic!("expected put"),
+            })
+            .collect();
+        assert_eq!(seqs, vec![0, u64::MAX]);
+    }
+
+    #[test]
+    fn replay_many_records() {
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        for i in 0..1000u64 {
+            wal.append_put(format!("k{:06}", i).as_bytes(), b"v", i)
+                .unwrap();
+        }
+        wal.flush().unwrap();
+        drop(wal);
+
+        let entries = Wal::replay(&path).unwrap();
+        assert_eq!(entries.len(), 1000);
+        for (i, entry) in entries.iter().enumerate() {
+            match entry {
+                WalEntry::Put { key, seq, .. } => {
+                    assert_eq!(key, format!("k{:06}", i).as_bytes());
+                    assert_eq!(*seq, i as u64);
+                }
+                _ => panic!("expected put at index {}", i),
+            }
+        }
+    }
+
+    // ── durability ───────────────────────────────────────────────
+
+    #[test]
+    fn sync_persists_records_across_drop() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.wal");
+        {
+            let mut wal = Wal::create(&path).unwrap();
+            wal.append_put(b"k", b"v", 1).unwrap();
+            wal.sync().unwrap();
+        }
+        let entries = Wal::replay(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn create_truncates_prior_contents() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.wal");
+
+        {
+            let mut wal = Wal::create(&path).unwrap();
+            wal.append_put(b"old", b"v", 1).unwrap();
+            wal.flush().unwrap();
+        }
+        {
+            let mut wal = Wal::create(&path).unwrap();
+            wal.append_put(b"new", b"v", 2).unwrap();
+            wal.flush().unwrap();
+        }
+
+        match Wal::replay(&path).unwrap().as_slice() {
+            [WalEntry::Put { key, seq: 2, .. }] => assert_eq!(key, b"new"),
+            other => panic!("old contents leaked: got {} entries", other.len()),
+        }
+    }
+
+    #[test]
+    fn remove_deletes_underlying_file() {
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        wal.append_put(b"k", b"v", 1).unwrap();
+        wal.flush().unwrap();
+        drop(wal);
+
+        assert!(path.exists());
+        Wal::remove(&path).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn path_returns_creation_path() {
+        let dir = TempDir::new().unwrap();
+        let (wal, path) = new_wal(&dir);
+        assert_eq!(wal.path(), path);
+    }
+
+    // ── corruption / torn tail ──────────────────────────────────
+
+    #[test]
+    fn replay_stops_cleanly_on_trailing_checksum_flip() {
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        wal.append_put(b"good", b"v", 1).unwrap();
+        wal.append_put(b"torn", b"v", 2).unwrap();
+        wal.flush().unwrap();
+        drop(wal);
+
+        // Last byte of the file is the high byte of the trailing
+        // record's checksum — flipping it simulates a corruption that
+        // should be indistinguishable from a torn crash-tail.
+        let len = fs::metadata(&path).unwrap().len() as usize;
+        flip_byte(&path, len - 1);
+
+        let entries = Wal::replay(&path).unwrap();
+        assert_eq!(entries.len(), 1, "torn record should not survive");
+        match &entries[0] {
+            WalEntry::Put { key, seq: 1, .. } => assert_eq!(key, b"good"),
+            _ => panic!("first record must be intact"),
+        }
+    }
+
+    #[test]
+    fn replay_stops_cleanly_on_trailing_data_byte_flip() {
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        wal.append_put(b"good", b"v", 1).unwrap();
+        wal.append_put(b"torn", b"v", 2).unwrap();
+        wal.flush().unwrap();
+        drop(wal);
+
+        // Flip a byte deep inside the second record's data (6 bytes
+        // before EOF puts us squarely inside the seq-number field).
+        let len = fs::metadata(&path).unwrap().len() as usize;
+        flip_byte(&path, len - 6);
+
+        let entries = Wal::replay(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn replay_stops_cleanly_on_truncated_trailing_header() {
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        wal.append_put(b"good", b"v", 1).unwrap();
+        wal.flush().unwrap();
+        drop(wal);
+
+        // Simulate a crash in the middle of writing the next record's
+        // 5-byte header by appending 2 stray bytes.
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(&[0xFF, 0xFF]);
+        fs::write(&path, &bytes).unwrap();
+
+        let entries = Wal::replay(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn replay_errors_when_length_header_exceeds_file() {
+        // Hand-craft a single record whose header claims 1000 bytes
+        // of data but the file actually contains none. Replay should
+        // surface an IO error rather than loop or silently truncate.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad.wal");
+        let mut f = File::create(&path).unwrap();
+        f.write_all(&1000u32.to_le_bytes()).unwrap(); // len
+        f.write_all(&[RECORD_PUT]).unwrap(); // type
+        f.sync_all().unwrap();
+
+        let kind = match Wal::replay(&path) {
+            Err(e) => e.kind(),
+            Ok(v) => panic!("expected error, got {} entries", v.len()),
+        };
+        assert_eq!(kind, io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn replay_skips_unknown_record_type() {
+        // File layout: [unknown-type record with valid CRC] + [valid put].
+        // Replay must warn-and-skip the unknown record, not abort, so
+        // the trailing valid record is still observable.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("mixed.wal");
+        let mut f = File::create(&path).unwrap();
+        let unknown_payload = b"opaque bytes".to_vec();
+        append_raw_record(&mut f, 0xEF, &unknown_payload, None);
+        let pd = put_data(b"after", b"ok", 42);
+        append_raw_record(&mut f, RECORD_PUT, &pd, None);
+        f.sync_all().unwrap();
+
+        let entries = Wal::replay(&path).unwrap();
+        match entries.as_slice() {
+            [WalEntry::Put { key, seq: 42, .. }] => assert_eq!(key, b"after"),
+            _ => panic!(
+                "expected single post-unknown put, got {} entries",
+                entries.len()
+            ),
+        }
+    }
+
+    #[test]
+    fn replay_of_nonexistent_path_errors() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("never_created.wal");
+        let kind = match Wal::replay(&path) {
+            Err(e) => e.kind(),
+            Ok(v) => panic!("expected error, got {} entries", v.len()),
+        };
+        assert_eq!(kind, io::ErrorKind::NotFound);
+    }
+
+    // ── parser error paths (exercised directly) ─────────────────
+
+    #[test]
+    fn parse_put_rejects_short_data() {
+        assert!(parse_put_record(&[0u8; 15]).is_err());
+    }
+
+    #[test]
+    fn parse_put_rejects_key_len_overflow() {
+        // key_len says 100 but only 2 more bytes follow.
+        let mut data = Vec::new();
+        data.extend_from_slice(&100u32.to_le_bytes());
+        data.extend_from_slice(&[0u8; 2]);
+        // pad to meet the initial 16-byte short-data bar
+        data.resize(16, 0);
+        assert!(parse_put_record(&data).is_err());
+    }
+
+    #[test]
+    fn parse_delete_rejects_short_data() {
+        assert!(parse_delete_record(&[0u8; 11]).is_err());
+    }
+
+    #[test]
+    fn parse_delete_rejects_key_len_overflow() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&100u32.to_le_bytes());
+        data.resize(12, 0);
+        assert!(parse_delete_record(&data).is_err());
+    }
+
+    #[test]
+    fn parse_delete_range_rejects_short_data() {
+        assert!(parse_delete_range_record(&[0u8; 15]).is_err());
+    }
+
+    #[test]
+    fn parse_delete_range_rejects_start_len_overflow() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&100u32.to_le_bytes());
+        data.resize(16, 0);
+        assert!(parse_delete_range_record(&data).is_err());
+    }
+
+    #[test]
+    fn parse_delete_range_rejects_end_len_overflow() {
+        // valid start of len 1, then end_len=100 with no trailing bytes.
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.push(b'k');
+        data.extend_from_slice(&100u32.to_le_bytes());
+        data.resize(16, 0);
+        assert!(parse_delete_range_record(&data).is_err());
+    }
+
+    #[test]
+    fn parse_merge_rejects_short_data() {
+        assert!(parse_merge_record(&[0u8; 15]).is_err());
+    }
+
+    #[test]
+    fn parse_merge_rejects_key_len_overflow() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&100u32.to_le_bytes());
+        data.resize(16, 0);
+        assert!(parse_merge_record(&data).is_err());
+    }
+
+    #[test]
+    fn parse_merge_rejects_operand_len_overflow() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.push(b'k');
+        data.extend_from_slice(&100u32.to_le_bytes());
+        data.resize(16, 0);
+        assert!(parse_merge_record(&data).is_err());
     }
 }

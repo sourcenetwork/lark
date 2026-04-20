@@ -84,4 +84,29 @@ mod tests {
         // No coverage.
         assert_eq!(max_covering_seq(&tombstones, b"0", 100), 0);
     }
+
+    #[test]
+    fn max_covering_seq_empty_list_returns_zero() {
+        assert_eq!(max_covering_seq(&[], b"k", u64::MAX), 0);
+    }
+
+    #[test]
+    fn empty_range_covers_nothing() {
+        // A degenerate `[x, x)` range has no keys in it.
+        let rt = RangeTombstone::new(b"m".to_vec(), b"m".to_vec(), 1);
+        assert!(!rt.covers(b"m"));
+        assert!(!rt.covers(b"n"));
+        assert!(!rt.covers(b"l"));
+    }
+
+    #[test]
+    fn snapshot_below_all_tombstone_seqs_sees_no_coverage() {
+        let rts = vec![
+            RangeTombstone::new(b"a".to_vec(), b"z".to_vec(), 10),
+            RangeTombstone::new(b"a".to_vec(), b"z".to_vec(), 20),
+        ];
+        assert_eq!(max_covering_seq(&rts, b"m", 5), 0);
+        assert_eq!(max_covering_seq(&rts, b"m", 9), 0);
+        assert_eq!(max_covering_seq(&rts, b"m", 10), 10);
+    }
 }

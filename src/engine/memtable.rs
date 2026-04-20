@@ -296,4 +296,127 @@ mod tests {
         let rts = mt.clone_range_tombstones();
         assert_eq!(rts.len(), 2);
     }
+
+    #[test]
+    fn empty_memtable_reports_empty_and_zero_size() {
+        let mt = MemTable::new();
+        assert!(mt.is_empty());
+        assert_eq!(mt.approximate_size(), 0);
+        assert_eq!(mt.get(b"k", u64::MAX), None);
+        assert!(mt.iter_internal().is_empty());
+    }
+
+    #[test]
+    fn approximate_size_grows_monotonically() {
+        let mt = MemTable::new();
+        let s0 = mt.approximate_size();
+        mt.put(b"k", b"v", 1);
+        let s1 = mt.approximate_size();
+        mt.put(b"k2", b"vv", 2);
+        let s2 = mt.approximate_size();
+        mt.delete(b"k3", 3);
+        let s3 = mt.approximate_size();
+        mt.delete_range(b"a", b"z", 4);
+        let s4 = mt.approximate_size();
+        assert!(s1 > s0 && s2 > s1 && s3 > s2 && s4 > s3);
+    }
+
+    #[test]
+    fn merge_and_get_returns_operand_as_value() {
+        // `get` returns the newest entry regardless of value_type; merge
+        // operands appear as `Some(bytes)` just like values. The merge
+        // resolution itself happens one level up.
+        let mt = MemTable::new();
+        mt.merge(b"k", b"op1", 1);
+        let (seq, val) = mt.get(b"k", 1).expect("should find operand");
+        assert_eq!(seq, 1);
+        assert_eq!(val, Some(b"op1".to_vec()));
+    }
+
+    #[test]
+    fn collect_merge_chain_walks_until_terminator() {
+        let mt = MemTable::new();
+        mt.put(b"k", b"base", 1);
+        mt.merge(b"k", b"a", 2);
+        mt.merge(b"k", b"b", 3);
+
+        let mut chain = Vec::new();
+        let reached_term = mt.collect_merge_chain(b"k", 3, &mut chain);
+        assert!(reached_term);
+        // Newest seq first: b, a, base (terminator).
+        assert_eq!(chain.len(), 3);
+        assert_eq!(chain[0].0, 3);
+        assert_eq!(chain[2].0, 1);
+        assert_eq!(chain[2].1, VALUE_TYPE_VALUE);
+    }
+
+    #[test]
+    fn collect_merge_chain_stops_at_tombstone() {
+        let mt = MemTable::new();
+        mt.delete(b"k", 1);
+        mt.merge(b"k", b"a", 2);
+
+        let mut chain = Vec::new();
+        let reached_term = mt.collect_merge_chain(b"k", 2, &mut chain);
+        assert!(reached_term);
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[1].1, VALUE_TYPE_DELETION);
+    }
+
+    #[test]
+    fn collect_merge_chain_returns_false_when_only_merges_visible() {
+        let mt = MemTable::new();
+        mt.merge(b"k", b"a", 1);
+        mt.merge(b"k", b"b", 2);
+        let mut chain = Vec::new();
+        let terminated = mt.collect_merge_chain(b"k", 2, &mut chain);
+        assert!(!terminated, "pure-merge chain must return false");
+        assert_eq!(chain.len(), 2);
+    }
+
+    #[test]
+    fn approximate_stats_for_range_counts_every_version() {
+        let mt = MemTable::new();
+        mt.put(b"a", b"1", 1);
+        mt.put(b"a", b"2", 2);
+        mt.put(b"b", b"x", 3);
+        mt.put(b"z", b"outside", 4);
+
+        let (count, _size) = mt.approximate_stats_for_range(b"a", b"c");
+        assert_eq!(count, 3, "two versions of 'a' + one 'b'");
+
+        let (count_empty, _) = mt.approximate_stats_for_range(b"x", b"a");
+        assert_eq!(count_empty, 0, "reversed range yields zero");
+    }
+
+    #[test]
+    fn first_and_last_entry_bracket_the_memtable() {
+        let mt = MemTable::new();
+        mt.put(b"b", b"1", 1);
+        mt.put(b"m", b"2", 2);
+        mt.put(b"y", b"3", 3);
+
+        let first = mt
+            .first_entry_from(std::ops::Bound::Unbounded)
+            .expect("has first");
+        let last = mt
+            .last_entry_before(std::ops::Bound::Unbounded)
+            .expect("has last");
+        assert_eq!(user_key_of_v(&first.0), b"b");
+        assert_eq!(user_key_of_v(&last.0), b"y");
+
+        // Bounded from above "k" — first >= k is "m".
+        let m_first = mt
+            .first_entry_from(std::ops::Bound::Included(&encode_internal_key(
+                b"k",
+                u64::MAX,
+                VALUE_TYPE_VALUE,
+            )))
+            .expect("has entry");
+        assert_eq!(user_key_of_v(&m_first.0), b"m");
+    }
+
+    fn user_key_of_v(ik: &[u8]) -> &[u8] {
+        &ik[..ik.len() - 9]
+    }
 }

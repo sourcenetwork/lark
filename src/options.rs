@@ -653,4 +653,96 @@ mod tests {
         assert_eq!(ex.extract(b""), None);
         assert_eq!(ex.name(), "FixedLengthPrefix");
     }
+
+    #[test]
+    fn fixed_length_prefix_zero_accepts_any_key() {
+        let ex = FixedLengthPrefix(0);
+        assert_eq!(ex.extract(b"anything"), Some(&b""[..]));
+        assert_eq!(ex.extract(b""), Some(&b""[..]));
+    }
+
+    #[test]
+    fn compaction_decision_equality_and_clone() {
+        assert_eq!(CompactionDecision::Keep, CompactionDecision::Keep);
+        assert_ne!(CompactionDecision::Keep, CompactionDecision::Remove);
+        let c = CompactionDecision::Change(b"new".to_vec());
+        assert_eq!(c.clone(), c);
+        assert_ne!(c, CompactionDecision::Change(b"other".to_vec()));
+    }
+
+    #[test]
+    fn write_options_defaults_are_all_false() {
+        let wo = WriteOptions::new();
+        assert!(!wo.sync);
+        assert!(!wo.disable_wal);
+        assert!(!wo.low_pri);
+        assert!(!wo.no_slowdown);
+        assert_eq!(wo, WriteOptions::default());
+    }
+
+    #[test]
+    fn write_options_sync_constructor_sets_only_sync() {
+        let wo = WriteOptions::sync();
+        assert!(wo.sync);
+        assert!(!wo.disable_wal);
+    }
+
+    #[test]
+    fn write_options_disable_wal_constructor_sets_only_disable_wal() {
+        let wo = WriteOptions::disable_wal();
+        assert!(wo.disable_wal);
+        assert!(!wo.sync);
+    }
+
+    #[test]
+    fn compaction_style_default_is_level() {
+        assert_eq!(CompactionStyle::default(), CompactionStyle::Level);
+    }
+
+    #[test]
+    fn fifo_compaction_options_default_is_one_gib() {
+        let f = FifoCompactionOptions::default();
+        assert_eq!(f.max_table_files_size, 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn options_to_engine_options_preserves_every_field() {
+        // Defaults must survive the translation unchanged — any
+        // divergence here is almost always a copy-paste bug.
+        let opts = Options::default();
+        let eo = opts.to_engine_options();
+        assert_eq!(eo.write_buffer_size, opts.write_buffer_size);
+        assert_eq!(eo.block_size, opts.block_size);
+        assert_eq!(eo.block_cache_size, opts.block_cache_size);
+        assert_eq!(eo.bloom_bits_per_key, opts.bloom_bits_per_key);
+        assert_eq!(eo.l0_compaction_trigger, opts.l0_compaction_trigger);
+        assert_eq!(eo.level_base_bytes, opts.level_base_bytes);
+        assert_eq!(eo.level_size_multiplier, opts.level_size_multiplier);
+        assert_eq!(eo.target_file_size, opts.target_file_size);
+        assert_eq!(eo.compaction_style, opts.compaction_style);
+        assert_eq!(
+            eo.max_background_compactions,
+            opts.max_background_compactions
+        );
+        assert_eq!(eo.partitioned_index, opts.partitioned_index);
+    }
+
+    /// Custom `PrefixExtractor` that returns everything before the
+    /// first `:` — proves the trait is user-implementable.
+    #[test]
+    fn custom_prefix_extractor_can_be_plugged_in() {
+        struct UntilColon;
+        impl PrefixExtractor for UntilColon {
+            fn extract<'a>(&self, key: &'a [u8]) -> Option<&'a [u8]> {
+                key.iter().position(|&b| b == b':').map(|i| &key[..i])
+            }
+            fn name(&self) -> &'static str {
+                "UntilColon"
+            }
+        }
+        let ex: Arc<dyn PrefixExtractor> = Arc::new(UntilColon);
+        assert_eq!(ex.extract(b"tenant:key"), Some(&b"tenant"[..]));
+        assert_eq!(ex.extract(b"nocolon"), None);
+        assert_eq!(ex.name(), "UntilColon");
+    }
 }
