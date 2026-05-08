@@ -220,42 +220,27 @@ impl LarkEngine {
 
         for wal_path in &wal_files {
             tracing::info!(path = %wal_path.display(), "Replaying WAL");
-            match Wal::replay(wal_path) {
-                Ok(entries) => {
-                    for entry in entries {
-                        match entry {
-                            WalEntry::Put { key, value, seq } => {
-                                memtable.put(&key, &value, seq);
-                                latest_seq = latest_seq.max(seq);
-                            }
-                            WalEntry::Delete { key, seq } => {
-                                memtable.delete(&key, seq);
-                                latest_seq = latest_seq.max(seq);
-                            }
-                            WalEntry::DeleteRange { start, end, seq } => {
-                                memtable.delete_range(&start, &end, seq);
-                                latest_seq = latest_seq.max(seq);
-                            }
-                            WalEntry::Merge { key, operand, seq } => {
-                                memtable.merge(&key, &operand, seq);
-                                latest_seq = latest_seq.max(seq);
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(path = %wal_path.display(), error = %e, "Failed to replay WAL");
-                }
+            let entries = Wal::replay(wal_path)?;
+            for entry in entries {
+                latest_seq = latest_seq.max(apply_replayed_wal_entry(&memtable, entry));
             }
         }
 
-        for wal_path in &wal_files {
-            let _ = std::fs::remove_file(wal_path);
-        }
-
-        let wal_id = version.next_file_id;
+        let wal_id = next_wal_id(version.next_file_id, &wal_files);
         let wal_path = wal_dir.join(wal_filename(wal_id));
-        let wal = Wal::create(&wal_path)?;
+        let mut wal = Wal::create(&wal_path)?;
+
+        rewrite_recovered_memtable_to_wal(&memtable, &mut wal)?;
+
+        for replayed_wal_path in &wal_files {
+            if replayed_wal_path != &wal_path {
+                match Wal::remove(replayed_wal_path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
 
         version_set.apply(&[VersionEdit::SetNextFileId(wal_id + 1)])?;
 
@@ -2241,4 +2226,69 @@ fn list_wal_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
         }
     }
     Ok(files)
+}
+
+fn wal_file_id(path: &Path) -> Option<u64> {
+    let stem = path.file_stem()?.to_str()?;
+    stem.strip_prefix("wal_")?.parse().ok()
+}
+
+fn next_wal_id(manifest_next_file_id: u64, wal_files: &[PathBuf]) -> u64 {
+    wal_files
+        .iter()
+        .filter_map(|path| wal_file_id(path))
+        .map(|id| id.saturating_add(1))
+        .fold(manifest_next_file_id, u64::max)
+}
+
+fn apply_replayed_wal_entry(memtable: &MemTable, entry: WalEntry) -> u64 {
+    match entry {
+        WalEntry::Put { key, value, seq } => {
+            memtable.put(&key, &value, seq);
+            seq
+        }
+        WalEntry::Delete { key, seq } => {
+            memtable.delete(&key, seq);
+            seq
+        }
+        WalEntry::DeleteRange { start, end, seq } => {
+            memtable.delete_range(&start, &end, seq);
+            seq
+        }
+        WalEntry::Merge { key, operand, seq } => {
+            memtable.merge(&key, &operand, seq);
+            seq
+        }
+    }
+}
+
+fn rewrite_recovered_memtable_to_wal(memtable: &MemTable, wal: &mut Wal) -> std::io::Result<()> {
+    let mut wrote_record = false;
+
+    for (internal_key, value) in memtable.iter_internal() {
+        let (user_key, seq, value_type) = internal_key::decode_internal_key(&internal_key);
+        match value_type {
+            internal_key::VALUE_TYPE_VALUE => wal.append_put(user_key, &value, seq)?,
+            internal_key::VALUE_TYPE_DELETION => wal.append_delete(user_key, seq)?,
+            internal_key::VALUE_TYPE_MERGE => wal.append_merge(user_key, &value, seq)?,
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unknown value type {other} in recovered memtable"),
+                ));
+            }
+        }
+        wrote_record = true;
+    }
+
+    for tombstone in memtable.clone_range_tombstones() {
+        wal.append_delete_range(&tombstone.start, &tombstone.end, tombstone.seq)?;
+        wrote_record = true;
+    }
+
+    if wrote_record {
+        wal.sync()?;
+    }
+
+    Ok(())
 }

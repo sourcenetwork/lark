@@ -1581,6 +1581,35 @@ mod tests {
         assert_eq!(db.get(b"c").unwrap(), Some(b"3".to_vec()));
     }
 
+    #[test]
+    fn test_recovered_wal_survives_second_crash_before_flush() {
+        let dir = TempDir::new().unwrap();
+
+        {
+            let db = Db::open(dir.path(), Options::default()).unwrap();
+            db.put(b"a", b"1").unwrap();
+            db.put(b"b", b"2").unwrap();
+            db.put(b"d", b"4").unwrap();
+            db.delete(b"a").unwrap();
+            db.delete_range(b"d", b"f").unwrap();
+            // Drop without close so the first reopen must recover from WAL.
+        }
+
+        {
+            let db = Db::open(dir.path(), Options::default()).unwrap();
+            assert_eq!(db.get(b"a").unwrap(), None);
+            assert_eq!(db.get(b"b").unwrap(), Some(b"2".to_vec()));
+            assert_eq!(db.get(b"d").unwrap(), None);
+            // Drop again before the recovered memtable can flush. The
+            // recovered state must have been rewritten to the active WAL.
+        }
+
+        let db = Db::open(dir.path(), Options::default()).unwrap();
+        assert_eq!(db.get(b"a").unwrap(), None);
+        assert_eq!(db.get(b"b").unwrap(), Some(b"2".to_vec()));
+        assert_eq!(db.get(b"d").unwrap(), None);
+    }
+
     // ─── Streaming iterator tests ────────────────────────────────────────
 
     fn collect_iter(db: &Db) -> Vec<(Vec<u8>, Vec<u8>)> {
