@@ -1470,6 +1470,14 @@ mod tests {
         }
     }
 
+    fn force_flush_with_prefix(db: &Db, prefix: &str) {
+        let payload = vec![0u8; 512];
+        for i in 0..32 {
+            let key = format!("{prefix}_{i:04}");
+            db.put(key.as_bytes(), &payload).unwrap();
+        }
+    }
+
     #[test]
     fn test_basic_crud() {
         let (db, _dir) = open_tmp();
@@ -2278,6 +2286,24 @@ mod tests {
             };
             assert_eq!(db.get(k.as_bytes()).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn test_compaction_range_tombstone_bounds_cover_point_keys_in_other_files() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        db.put(b"b", b"old").unwrap();
+        force_flush_with_prefix(&db, "__old_flush");
+        db.compact_range(None, None).unwrap();
+
+        db.delete_range(b"a", b"z").unwrap();
+        db.put(b"m", b"new").unwrap();
+        force_flush_with_prefix(&db, "zz_new_flush");
+        db.compact_range(None, None).unwrap();
+
+        assert_eq!(db.get(b"b").unwrap(), None);
+        assert_eq!(db.get(b"m").unwrap(), Some(b"new".to_vec()));
     }
 
     // ─── MultiGet tests ─────────────────────────────────────────────────
