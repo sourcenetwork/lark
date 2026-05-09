@@ -2,6 +2,7 @@ pub(crate) mod block;
 pub(crate) mod block_cache;
 pub(crate) mod bloom;
 pub(crate) mod compaction;
+pub(crate) mod durability;
 pub(crate) mod internal_key;
 pub(crate) mod iterator;
 pub(crate) mod manifest;
@@ -1305,14 +1306,12 @@ impl LarkEngine {
     }
 
     fn rotate_memtable(&self) -> std::io::Result<()> {
-        let old_memtable = {
+        {
             let mut active = self.active_memtable.write();
             let old = Arc::clone(&active);
+            self.frozen_memtables.write().push(Arc::clone(&old));
             *active = Arc::new(MemTable::new());
-            old
-        };
-
-        self.frozen_memtables.write().push(old_memtable);
+        }
 
         let new_wal_id = {
             let mut versions = self.versions.lock();

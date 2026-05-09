@@ -1,6 +1,8 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+
+use super::durability;
 
 /// Record types in the WAL.
 const RECORD_PUT: u8 = 0x01;
@@ -215,7 +217,7 @@ impl Wal {
 
     /// Delete a WAL file.
     pub(crate) fn remove(path: &Path) -> io::Result<()> {
-        fs::remove_file(path)
+        durability::remove_file_and_sync_parent(path)
     }
 }
 
@@ -526,6 +528,7 @@ fn parse_batch_record(data: &[u8]) -> io::Result<Vec<WalEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::TempDir;
 
     // ── helpers ──────────────────────────────────────────────────
