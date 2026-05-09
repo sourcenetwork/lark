@@ -507,28 +507,25 @@ impl SsTableWriter {
         self.writer.get_ref().sync_all()?;
         durability::sync_parent_dir(&self.path)?;
 
-        // Derive the file's declared user-key range. Prefer point
-        // entries; fall back to the union of range-tombstone bounds
-        // when the file has tombstones but no points.
-        let (smallest_user_key, largest_user_key) =
-            match (self.smallest_user_key.take(), self.largest_user_key.take()) {
-                (Some(s), Some(l)) => (s, l),
-                _ => {
-                    let mut iter = self.range_tombstones.iter();
-                    let first = iter.next().expect("checked non-empty above").clone();
-                    let mut smallest = first.start.clone();
-                    let mut largest = first.end.clone();
-                    for rt in iter {
-                        if rt.start < smallest {
-                            smallest = rt.start.clone();
-                        }
-                        if rt.end > largest {
-                            largest = rt.end.clone();
-                        }
-                    }
-                    (smallest, largest)
-                }
-            };
+        let mut smallest_user_key = self.smallest_user_key.take();
+        let mut largest_user_key = self.largest_user_key.take();
+        for rt in &self.range_tombstones {
+            if smallest_user_key
+                .as_ref()
+                .is_none_or(|smallest| rt.start.as_slice() < smallest.as_slice())
+            {
+                smallest_user_key = Some(rt.start.clone());
+            }
+            if largest_user_key
+                .as_ref()
+                .is_none_or(|largest| rt.end.as_slice() > largest.as_slice())
+            {
+                largest_user_key = Some(rt.end.clone());
+            }
+        }
+
+        let smallest_user_key = smallest_user_key.expect("checked non-empty above");
+        let largest_user_key = largest_user_key.expect("checked non-empty above");
 
         Ok(Some(SsTableWriteSummary {
             smallest_user_key,
@@ -1491,6 +1488,24 @@ mod tests {
         assert_eq!(summary.smallest_user_key, b"alpha");
         assert_eq!(summary.largest_user_key, b"delta");
         assert_eq!(summary.num_entries, 3);
+    }
+
+    #[test]
+    fn summary_includes_range_tombstone_bounds_with_point_entries() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("mixed_rt_bounds.sst");
+        let mut writer =
+            SsTableWriter::new(&path, 4096, 10, CompressionType::None, None, false, 4096).unwrap();
+        writer.add(&ik(b"m", 1), b"1").unwrap();
+        writer.add(&ik(b"n", 1), b"2").unwrap();
+        writer.add_range_tombstone(b"a", b"c", 7);
+        writer.add_range_tombstone(b"x", b"z", 8);
+
+        let summary = writer.finish().unwrap().unwrap();
+
+        assert_eq!(summary.smallest_user_key, b"a");
+        assert_eq!(summary.largest_user_key, b"z");
+        assert_eq!(summary.num_entries, 2);
     }
 
     // ── multi-block / index ─────────────────────────────────────
