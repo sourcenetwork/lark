@@ -10,9 +10,9 @@ const RECORD_MERGE: u8 = 0x04;
 
 /// A write-ahead log for crash recovery.
 ///
-/// Records are CRC-protected and append-only. Each memtable gets its own
-/// WAL file. On crash recovery, WAL files are replayed to reconstruct
-/// memtable state.
+/// Records are checksum-protected and append-only. Each memtable gets
+/// its own WAL file. On crash recovery, WAL files are replayed to
+/// reconstruct memtable state.
 pub(crate) struct Wal {
     writer: BufWriter<File>,
     path: PathBuf,
@@ -143,34 +143,30 @@ impl Wal {
         let mut reader = BufReader::new(file);
         let mut entries = Vec::new();
 
-        loop {
-            // Read record header: length (4 bytes) + type (1 byte)
-            let mut header = [0u8; 5];
-            match reader.read_exact(&mut header) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
-            }
-
+        // Read record headers: length (4 bytes) + type (1 byte).
+        while let Some(header) = read_wal_header(&mut reader)? {
             let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
             let record_type = header[4];
 
             // Read data
             let mut data = vec![0u8; len];
-            reader.read_exact(&mut data)?;
+            read_exact_or_truncated(&mut reader, &mut data, "truncated WAL record data")?;
 
             // Read and verify checksum
             let mut checksum_bytes = [0u8; 4];
-            reader.read_exact(&mut checksum_bytes)?;
+            read_exact_or_truncated(
+                &mut reader,
+                &mut checksum_bytes,
+                "truncated WAL record checksum",
+            )?;
             let stored_checksum = u32::from_le_bytes(checksum_bytes);
             let computed_checksum = xxhash_rust::xxh3::xxh3_64(&data) as u32;
 
             if stored_checksum != computed_checksum {
-                tracing::warn!(
-                    path = %path.display(),
-                    "WAL checksum mismatch - truncated record at end of file, stopping replay"
-                );
-                break;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("WAL checksum mismatch in {}", path.display()),
+                ));
             }
 
             match record_type {
@@ -191,7 +187,10 @@ impl Wal {
                     entries.push(entry);
                 }
                 _ => {
-                    tracing::warn!(record_type, "Unknown WAL record type, skipping");
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unknown WAL record type {record_type}"),
+                    ));
                 }
             }
         }
@@ -208,6 +207,42 @@ impl Wal {
 /// Format a WAL filename from a numeric ID.
 pub(crate) fn wal_filename(id: u64) -> String {
     format!("wal_{:06}.log", id)
+}
+
+fn read_wal_header(reader: &mut impl Read) -> io::Result<Option<[u8; 5]>> {
+    let mut header = [0u8; 5];
+    let mut read = 0;
+
+    while read < header.len() {
+        match reader.read(&mut header[read..]) {
+            Ok(0) if read == 0 => return Ok(None),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated WAL record header",
+                ));
+            }
+            Ok(n) => read += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(Some(header))
+}
+
+fn read_exact_or_truncated(
+    reader: &mut impl Read,
+    buf: &mut [u8],
+    message: &'static str,
+) -> io::Result<()> {
+    reader.read_exact(buf).map_err(|e| {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            io::Error::new(io::ErrorKind::UnexpectedEof, message)
+        } else {
+            e
+        }
+    })
 }
 
 fn parse_put_record(data: &[u8]) -> io::Result<WalEntry> {
@@ -689,7 +724,7 @@ mod tests {
     // ── corruption / torn tail ──────────────────────────────────
 
     #[test]
-    fn replay_stops_cleanly_on_trailing_checksum_flip() {
+    fn replay_errors_on_trailing_checksum_flip() {
         let dir = TempDir::new().unwrap();
         let (mut wal, path) = new_wal(&dir);
         wal.append_put(b"good", b"v", 1).unwrap();
@@ -698,21 +733,20 @@ mod tests {
         drop(wal);
 
         // Last byte of the file is the high byte of the trailing
-        // record's checksum — flipping it simulates a corruption that
-        // should be indistinguishable from a torn crash-tail.
+        // record's checksum. Replay must fail closed rather than
+        // silently keeping only the prefix.
         let len = fs::metadata(&path).unwrap().len() as usize;
         flip_byte(&path, len - 1);
 
-        let entries = Wal::replay(&path).unwrap();
-        assert_eq!(entries.len(), 1, "torn record should not survive");
-        match &entries[0] {
-            WalEntry::Put { key, seq: 1, .. } => assert_eq!(key, b"good"),
-            _ => panic!("first record must be intact"),
-        }
+        let kind = match Wal::replay(&path) {
+            Err(e) => e.kind(),
+            Ok(v) => panic!("expected checksum error, got {} entries", v.len()),
+        };
+        assert_eq!(kind, io::ErrorKind::InvalidData);
     }
 
     #[test]
-    fn replay_stops_cleanly_on_trailing_data_byte_flip() {
+    fn replay_errors_on_trailing_data_byte_flip() {
         let dir = TempDir::new().unwrap();
         let (mut wal, path) = new_wal(&dir);
         wal.append_put(b"good", b"v", 1).unwrap();
@@ -725,12 +759,15 @@ mod tests {
         let len = fs::metadata(&path).unwrap().len() as usize;
         flip_byte(&path, len - 6);
 
-        let entries = Wal::replay(&path).unwrap();
-        assert_eq!(entries.len(), 1);
+        let kind = match Wal::replay(&path) {
+            Err(e) => e.kind(),
+            Ok(v) => panic!("expected checksum error, got {} entries", v.len()),
+        };
+        assert_eq!(kind, io::ErrorKind::InvalidData);
     }
 
     #[test]
-    fn replay_stops_cleanly_on_truncated_trailing_header() {
+    fn replay_errors_on_truncated_trailing_header() {
         let dir = TempDir::new().unwrap();
         let (mut wal, path) = new_wal(&dir);
         wal.append_put(b"good", b"v", 1).unwrap();
@@ -743,8 +780,11 @@ mod tests {
         bytes.extend_from_slice(&[0xFF, 0xFF]);
         fs::write(&path, &bytes).unwrap();
 
-        let entries = Wal::replay(&path).unwrap();
-        assert_eq!(entries.len(), 1);
+        let kind = match Wal::replay(&path) {
+            Err(e) => e.kind(),
+            Ok(v) => panic!("expected truncated header error, got {} entries", v.len()),
+        };
+        assert_eq!(kind, io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
@@ -767,10 +807,9 @@ mod tests {
     }
 
     #[test]
-    fn replay_skips_unknown_record_type() {
-        // File layout: [unknown-type record with valid CRC] + [valid put].
-        // Replay must warn-and-skip the unknown record, not abort, so
-        // the trailing valid record is still observable.
+    fn replay_errors_on_unknown_record_type() {
+        // Unknown record types with valid checksums still indicate a
+        // WAL format this reader cannot safely interpret.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("mixed.wal");
         let mut f = File::create(&path).unwrap();
@@ -780,14 +819,11 @@ mod tests {
         append_raw_record(&mut f, RECORD_PUT, &pd, None);
         f.sync_all().unwrap();
 
-        let entries = Wal::replay(&path).unwrap();
-        match entries.as_slice() {
-            [WalEntry::Put { key, seq: 42, .. }] => assert_eq!(key, b"after"),
-            _ => panic!(
-                "expected single post-unknown put, got {} entries",
-                entries.len()
-            ),
-        }
+        let kind = match Wal::replay(&path) {
+            Err(e) => e.kind(),
+            Ok(v) => panic!("expected unknown-type error, got {} entries", v.len()),
+        };
+        assert_eq!(kind, io::ErrorKind::InvalidData);
     }
 
     #[test]

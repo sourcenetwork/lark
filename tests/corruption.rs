@@ -9,9 +9,10 @@
 //! of earlier, uncorrupted data.
 
 use std::fs::{self, OpenOptions};
+use std::io;
 use std::path::{Path, PathBuf};
 
-use lark_kv::Db;
+use lark_kv::{Db, Error};
 use tempfile::TempDir;
 
 mod common;
@@ -57,16 +58,21 @@ fn first_wal(db_dir: &Path) -> PathBuf {
     entries.into_iter().next().unwrap().path()
 }
 
+fn assert_open_fails_with_kind(dir: &TempDir, expected: io::ErrorKind) {
+    match Db::open(dir.path(), Default::default()) {
+        Err(Error::Io(e)) => assert_eq!(e.kind(), expected),
+        Err(e) => panic!("expected I/O error, got {e:?}"),
+        Ok(_) => panic!("expected DB open to fail"),
+    }
+}
+
 // ── WAL tail corruption ─────────────────────────────────────────
 
 #[test]
-fn torn_wal_tail_checksum_flip_recovers_first_record() {
-    // corruption_test.cc::Recovery — flipping a byte in the *last*
-    // record's checksum must leave earlier records readable. (A
-    // truncation inside the last record's data body also produces a
-    // recoverable state in lark's current implementation, but we
-    // specifically exercise the checksum-flip path here because
-    // it's unambiguously the "torn tail" shape.)
+fn torn_wal_tail_checksum_flip_fails_open_and_keeps_wal() {
+    // A checksum mismatch means replay cannot prove which committed
+    // records are safe. Open must fail closed and leave the WAL for
+    // repair/inspection rather than silently keeping only a prefix.
     let dir = TempDir::new().unwrap();
     {
         let db = open(&dir);
@@ -75,22 +81,22 @@ fn torn_wal_tail_checksum_flip_recovers_first_record() {
     }
 
     let wal = first_wal(dir.path());
+    let wal_count = count_wal_files(dir.path());
     let size = fs::metadata(&wal).unwrap().len() as usize;
     // Flip the last byte of the file — always part of the trailing
     // record's 4-byte checksum.
     flip_byte(&wal, size - 1);
 
-    let db = open(&dir);
-    // The first record completed before the mangled tail.
-    assert_eq!(db.get(b"good_1").unwrap(), Some(b"1".to_vec()));
+    assert_open_fails_with_kind(&dir, io::ErrorKind::InvalidData);
+    assert!(wal.exists());
+    assert_eq!(count_wal_files(dir.path()), wal_count);
 }
 
 #[test]
-fn wal_truncated_at_arbitrary_offset_does_not_panic() {
+fn wal_truncated_at_arbitrary_offset_fails_open_and_keeps_wal() {
     // Robustness check: truncate the WAL at every byte offset from
-    // one past the first record up to the end. The engine must
-    // either open cleanly (with partial data) or return Err — never
-    // panic, never report corrupted memory.
+    // one past the first record up to the end. The engine must fail
+    // closed and keep the WAL rather than silently prefix-replay.
     let dir = TempDir::new().unwrap();
     {
         let db = open(&dir);
@@ -98,6 +104,7 @@ fn wal_truncated_at_arbitrary_offset_does_not_panic() {
         db.put(b"b", b"2").unwrap();
     }
     let wal = first_wal(dir.path());
+    let wal_count = count_wal_files(dir.path());
     let full = fs::read(&wal).unwrap();
     for trim in [1u64, 3, 5, 9, 11, 15, 20] {
         if (full.len() as u64) <= trim {
@@ -105,15 +112,16 @@ fn wal_truncated_at_arbitrary_offset_does_not_panic() {
         }
         fs::write(&wal, &full).unwrap();
         truncate(&wal, full.len() as u64 - trim);
-        // `Db::open` returning Err is acceptable for this torn shape.
-        let _ = Db::open(dir.path(), Default::default());
+        assert_open_fails_with_kind(&dir, io::ErrorKind::UnexpectedEof);
+        assert!(wal.exists());
+        assert_eq!(count_wal_files(dir.path()), wal_count);
     }
 }
 
 #[test]
-fn wal_checksum_flip_in_final_record_is_clean_stop() {
-    // corruption_test.cc variant — flipping a checksum byte in the
-    // last record produces the same outcome as a truncation.
+fn wal_checksum_flip_in_final_record_fails_open() {
+    // Flipping a checksum byte in the last record is still a
+    // corruption signal. Do not convert it into a clean stop.
     let dir = TempDir::new().unwrap();
     {
         let db = open(&dir);
@@ -125,9 +133,8 @@ fn wal_checksum_flip_in_final_record_is_clean_stop() {
     // Flip the very last byte (high byte of the trailing checksum).
     flip_byte(&wal, size - 1);
 
-    let db = open(&dir);
-    // "first" was written before the corrupted tail record.
-    assert_eq!(db.get(b"first").unwrap(), Some(b"v1".to_vec()));
+    assert_open_fails_with_kind(&dir, io::ErrorKind::InvalidData);
+    assert!(wal.exists());
 }
 
 // ── manifest corruption ─────────────────────────────────────────
