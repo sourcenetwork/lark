@@ -18,7 +18,7 @@
 
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -26,6 +26,7 @@ use parking_lot::Mutex;
 use super::block::{Block, BlockBuilder, BlockHandle, RESTART_INTERVAL};
 use super::block_cache::BlockCache;
 use super::bloom::{decode_bloom_block, encode_bloom_block, BloomFilter, BloomFilterBuilder};
+use super::durability;
 use super::internal_key::{
     compare_internal_keys, decode_internal_key, lookup_key, user_key_of, VALUE_TYPE_DELETION,
     VALUE_TYPE_MERGE,
@@ -281,6 +282,7 @@ fn decode_index_block(data: &[u8]) -> io::Result<Vec<IndexEntry>> {
 /// versions of a user key appear before older ones).
 pub(crate) struct SsTableWriter {
     writer: BufWriter<File>,
+    path: PathBuf,
     block_builder: BlockBuilder,
     index_entries: Vec<(Vec<u8>, BlockHandle)>,
     bloom_builder: BloomFilterBuilder,
@@ -316,6 +318,7 @@ impl SsTableWriter {
             .map(|_| BloomFilterBuilder::new(bloom_bits_per_key));
         Ok(Self {
             writer: BufWriter::new(file),
+            path: path.to_path_buf(),
             block_builder: BlockBuilder::new(RESTART_INTERVAL),
             index_entries: Vec::new(),
             bloom_builder: BloomFilterBuilder::new(bloom_bits_per_key),
@@ -501,6 +504,8 @@ impl SsTableWriter {
         };
         self.writer.write_all(&footer.encode())?;
         self.writer.flush()?;
+        self.writer.get_ref().sync_all()?;
+        durability::sync_parent_dir(&self.path)?;
 
         // Derive the file's declared user-key range. Prefer point
         // entries; fall back to the union of range-tombstone bounds

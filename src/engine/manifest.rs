@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use super::durability;
 use super::sstable::{sst_filename, LiveSst, SsTableMeta, SsTableReader};
 
 /// Maximum number of levels in the LSM tree.
@@ -85,6 +86,13 @@ impl VersionEdit {
             VersionEdit::SetLastSeq(seq) => ManifestRecord::SetLastSeq(*seq),
             VersionEdit::SetNextFileId(id) => ManifestRecord::SetNextFileId(*id),
         }
+    }
+
+    fn requires_manifest_sync(&self) -> bool {
+        // File-id reservations do not make new data reachable on
+        // their own. They are flushed here and become durable with
+        // the next synced AddFile/RemoveFile/SetLastSeq edit.
+        !matches!(self, VersionEdit::SetNextFileId(_))
     }
 }
 
@@ -219,6 +227,8 @@ impl VersionSet {
         } else {
             let version = Version::new();
             let file = File::create(&manifest_path)?;
+            file.sync_all()?;
+            durability::sync_parent_dir(&manifest_path)?;
             (version, BufWriter::new(file))
         };
 
@@ -263,9 +273,13 @@ impl VersionSet {
 
         let records: Vec<ManifestRecord> = edits.iter().map(VersionEdit::to_record).collect();
         let encoded = Self::encode_records(&records);
+        let requires_sync = edits.iter().any(VersionEdit::requires_manifest_sync);
         if let Some(writer) = &mut self.manifest_writer {
             writer.write_all(&encoded)?;
             writer.flush()?;
+            if requires_sync {
+                writer.get_ref().sync_all()?;
+            }
         }
 
         *self.current.write() = Arc::new(version);
@@ -300,6 +314,7 @@ impl VersionSet {
             file.sync_all()?;
         }
         fs::rename(&tmp_path, &self.manifest_path)?;
+        durability::sync_parent_dir(&self.manifest_path)?;
 
         let file = OpenOptions::new().append(true).open(&self.manifest_path)?;
         self.manifest_writer = Some(BufWriter::new(file));
