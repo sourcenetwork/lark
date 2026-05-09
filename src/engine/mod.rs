@@ -1099,28 +1099,71 @@ impl LarkEngine {
             let wal_start = std::time::Instant::now();
             let mut wal = self.active_wal.lock();
             let mut wal_bytes: u64 = 0;
-            for (i, (key, value)) in point_ops.iter().enumerate() {
-                let seq = base_seq + i as u64;
-                match value {
-                    Some(v) => {
-                        wal.append_put(key, v, seq)?;
-                        wal_bytes += (key.len() + v.len() + 8) as u64;
-                    }
-                    None => {
-                        wal.append_delete(key, seq)?;
-                        wal_bytes += (key.len() + 8) as u64;
+            if total_ops == 1 {
+                for (i, (key, value)) in point_ops.iter().enumerate() {
+                    let seq = base_seq + i as u64;
+                    match value {
+                        Some(v) => {
+                            wal.append_put(key, v, seq)?;
+                            wal_bytes += (key.len() + v.len() + 8) as u64;
+                        }
+                        None => {
+                            wal.append_delete(key, seq)?;
+                            wal_bytes += (key.len() + 8) as u64;
+                        }
                     }
                 }
-            }
-            for (j, (start, end)) in range_deletes.iter().enumerate() {
-                let seq = range_delete_base + j as u64;
-                wal.append_delete_range(start, end, seq)?;
-                wal_bytes += (start.len() + end.len() + 8) as u64;
-            }
-            for (k, (key, operand)) in merges.iter().enumerate() {
-                let seq = merge_base + k as u64;
-                wal.append_merge(key, operand, seq)?;
-                wal_bytes += (key.len() + operand.len() + 8) as u64;
+                for (j, (start, end)) in range_deletes.iter().enumerate() {
+                    let seq = range_delete_base + j as u64;
+                    wal.append_delete_range(start, end, seq)?;
+                    wal_bytes += (start.len() + end.len() + 8) as u64;
+                }
+                for (k, (key, operand)) in merges.iter().enumerate() {
+                    let seq = merge_base + k as u64;
+                    wal.append_merge(key, operand, seq)?;
+                    wal_bytes += (key.len() + operand.len() + 8) as u64;
+                }
+            } else {
+                let mut wal_entries = Vec::with_capacity(total_ops);
+                for (i, (key, value)) in point_ops.iter().enumerate() {
+                    let seq = base_seq + i as u64;
+                    match value {
+                        Some(v) => {
+                            wal_entries.push(WalEntry::Put {
+                                key: key.clone(),
+                                value: v.clone(),
+                                seq,
+                            });
+                            wal_bytes += (key.len() + v.len() + 8) as u64;
+                        }
+                        None => {
+                            wal_entries.push(WalEntry::Delete {
+                                key: key.clone(),
+                                seq,
+                            });
+                            wal_bytes += (key.len() + 8) as u64;
+                        }
+                    }
+                }
+                for (j, (start, end)) in range_deletes.iter().enumerate() {
+                    let seq = range_delete_base + j as u64;
+                    wal_entries.push(WalEntry::DeleteRange {
+                        start: start.clone(),
+                        end: end.clone(),
+                        seq,
+                    });
+                    wal_bytes += (start.len() + end.len() + 8) as u64;
+                }
+                for (k, (key, operand)) in merges.iter().enumerate() {
+                    let seq = merge_base + k as u64;
+                    wal_entries.push(WalEntry::Merge {
+                        key: key.clone(),
+                        operand: operand.clone(),
+                        seq,
+                    });
+                    wal_bytes += (key.len() + operand.len() + 8) as u64;
+                }
+                wal.append_batch(&wal_entries)?;
             }
             match durability {
                 DurabilityMode::Immediate => wal.sync()?,
