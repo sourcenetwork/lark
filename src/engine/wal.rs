@@ -7,6 +7,7 @@ const RECORD_PUT: u8 = 0x01;
 const RECORD_DELETE: u8 = 0x02;
 const RECORD_DELETE_RANGE: u8 = 0x03;
 const RECORD_MERGE: u8 = 0x04;
+const RECORD_BATCH: u8 = 0x05;
 
 /// A write-ahead log for crash recovery.
 ///
@@ -19,6 +20,7 @@ pub(crate) struct Wal {
 }
 
 /// A replayed WAL entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WalEntry {
     Put {
         key: Vec<u8>,
@@ -60,11 +62,7 @@ impl Wal {
         let data_len = 4 + key.len() + 4 + value.len() + 8;
         let mut data = Vec::with_capacity(data_len);
 
-        data.extend_from_slice(&(key.len() as u32).to_le_bytes());
-        data.extend_from_slice(key);
-        data.extend_from_slice(&(value.len() as u32).to_le_bytes());
-        data.extend_from_slice(value);
-        data.extend_from_slice(&seq.to_le_bytes());
+        encode_put_payload(&mut data, key, value, seq);
 
         self.write_record(RECORD_PUT, &data)
     }
@@ -73,9 +71,7 @@ impl Wal {
     pub(crate) fn append_delete(&mut self, key: &[u8], seq: u64) -> io::Result<()> {
         let mut data = Vec::with_capacity(4 + key.len() + 8);
 
-        data.extend_from_slice(&(key.len() as u32).to_le_bytes());
-        data.extend_from_slice(key);
-        data.extend_from_slice(&seq.to_le_bytes());
+        encode_delete_payload(&mut data, key, seq);
 
         self.write_record(RECORD_DELETE, &data)
     }
@@ -84,11 +80,7 @@ impl Wal {
     /// existing value/merge chain for `key`.
     pub(crate) fn append_merge(&mut self, key: &[u8], operand: &[u8], seq: u64) -> io::Result<()> {
         let mut data = Vec::with_capacity(4 + key.len() + 4 + operand.len() + 8);
-        data.extend_from_slice(&(key.len() as u32).to_le_bytes());
-        data.extend_from_slice(key);
-        data.extend_from_slice(&(operand.len() as u32).to_le_bytes());
-        data.extend_from_slice(operand);
-        data.extend_from_slice(&seq.to_le_bytes());
+        encode_merge_payload(&mut data, key, operand, seq);
         self.write_record(RECORD_MERGE, &data)
     }
 
@@ -100,13 +92,32 @@ impl Wal {
         seq: u64,
     ) -> io::Result<()> {
         let mut data = Vec::with_capacity(4 + start.len() + 4 + end.len() + 8);
-        data.extend_from_slice(&(start.len() as u32).to_le_bytes());
-        data.extend_from_slice(start);
-        data.extend_from_slice(&(end.len() as u32).to_le_bytes());
-        data.extend_from_slice(end);
-        data.extend_from_slice(&seq.to_le_bytes());
+        encode_delete_range_payload(&mut data, start, end, seq);
 
         self.write_record(RECORD_DELETE_RANGE, &data)
+    }
+
+    /// Append a batch record containing multiple logical WAL entries.
+    ///
+    /// The batch is one top-level WAL record with one checksum. Replay
+    /// expands it only after the whole payload parses successfully, so
+    /// a torn or malformed batch cannot recover as a committed prefix.
+    pub(crate) fn append_batch(&mut self, entries: &[WalEntry]) -> io::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+
+        for entry in entries {
+            let (record_type, payload) = encode_batch_entry(entry);
+            data.push(record_type);
+            data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            data.extend_from_slice(&payload);
+        }
+
+        self.write_record(RECORD_BATCH, &data)
     }
 
     /// Flush and fsync the WAL to disk.
@@ -186,6 +197,10 @@ impl Wal {
                     let entry = parse_merge_record(&data)?;
                     entries.push(entry);
                 }
+                RECORD_BATCH => {
+                    let batch = parse_batch_record(&data)?;
+                    entries.extend(batch);
+                }
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -207,6 +222,61 @@ impl Wal {
 /// Format a WAL filename from a numeric ID.
 pub(crate) fn wal_filename(id: u64) -> String {
     format!("wal_{:06}.log", id)
+}
+
+fn encode_put_payload(out: &mut Vec<u8>, key: &[u8], value: &[u8], seq: u64) {
+    out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    out.extend_from_slice(key);
+    out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    out.extend_from_slice(value);
+    out.extend_from_slice(&seq.to_le_bytes());
+}
+
+fn encode_delete_payload(out: &mut Vec<u8>, key: &[u8], seq: u64) {
+    out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    out.extend_from_slice(key);
+    out.extend_from_slice(&seq.to_le_bytes());
+}
+
+fn encode_delete_range_payload(out: &mut Vec<u8>, start: &[u8], end: &[u8], seq: u64) {
+    out.extend_from_slice(&(start.len() as u32).to_le_bytes());
+    out.extend_from_slice(start);
+    out.extend_from_slice(&(end.len() as u32).to_le_bytes());
+    out.extend_from_slice(end);
+    out.extend_from_slice(&seq.to_le_bytes());
+}
+
+fn encode_merge_payload(out: &mut Vec<u8>, key: &[u8], operand: &[u8], seq: u64) {
+    out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    out.extend_from_slice(key);
+    out.extend_from_slice(&(operand.len() as u32).to_le_bytes());
+    out.extend_from_slice(operand);
+    out.extend_from_slice(&seq.to_le_bytes());
+}
+
+fn encode_batch_entry(entry: &WalEntry) -> (u8, Vec<u8>) {
+    match entry {
+        WalEntry::Put { key, value, seq } => {
+            let mut payload = Vec::with_capacity(4 + key.len() + 4 + value.len() + 8);
+            encode_put_payload(&mut payload, key, value, *seq);
+            (RECORD_PUT, payload)
+        }
+        WalEntry::Delete { key, seq } => {
+            let mut payload = Vec::with_capacity(4 + key.len() + 8);
+            encode_delete_payload(&mut payload, key, *seq);
+            (RECORD_DELETE, payload)
+        }
+        WalEntry::DeleteRange { start, end, seq } => {
+            let mut payload = Vec::with_capacity(4 + start.len() + 4 + end.len() + 8);
+            encode_delete_range_payload(&mut payload, start, end, *seq);
+            (RECORD_DELETE_RANGE, payload)
+        }
+        WalEntry::Merge { key, operand, seq } => {
+            let mut payload = Vec::with_capacity(4 + key.len() + 4 + operand.len() + 8);
+            encode_merge_payload(&mut payload, key, operand, *seq);
+            (RECORD_MERGE, payload)
+        }
+    }
 }
 
 fn read_wal_header(reader: &mut impl Read) -> io::Result<Option<[u8; 5]>> {
@@ -383,6 +453,74 @@ fn parse_merge_record(data: &[u8]) -> io::Result<WalEntry> {
     let seq = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
 
     Ok(WalEntry::Merge { key, operand, seq })
+}
+
+fn parse_batch_record(data: &[u8]) -> io::Result<Vec<WalEntry>> {
+    if data.len() < 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "batch record too short",
+        ));
+    }
+
+    let mut pos = 0;
+    let count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+
+    let mut entries = Vec::new();
+    for _ in 0..count {
+        if pos + 5 > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "batch entry header overflow",
+            ));
+        }
+
+        let record_type = data[pos];
+        pos += 1;
+
+        let payload_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+
+        if payload_len > data.len().saturating_sub(pos) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "batch entry payload overflow",
+            ));
+        }
+
+        let payload = &data[pos..pos + payload_len];
+        pos += payload_len;
+
+        let entry = match record_type {
+            RECORD_PUT => parse_put_record(payload)?,
+            RECORD_DELETE => parse_delete_record(payload)?,
+            RECORD_DELETE_RANGE => parse_delete_range_record(payload)?,
+            RECORD_MERGE => parse_merge_record(payload)?,
+            RECORD_BATCH => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "nested batch records are not supported",
+                ));
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unknown WAL batch entry type {record_type}"),
+                ));
+            }
+        };
+        entries.push(entry);
+    }
+
+    if pos != data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "batch record has trailing bytes",
+        ));
+    }
+
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -567,6 +705,49 @@ mod tests {
         assert!(matches!(entries[1], WalEntry::Delete { seq: 2, .. }));
         assert!(matches!(entries[2], WalEntry::DeleteRange { seq: 3, .. }));
         assert!(matches!(entries[3], WalEntry::Merge { seq: 4, .. }));
+    }
+
+    #[test]
+    fn batch_record_replays_all_entries_in_order() {
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        let expected = vec![
+            WalEntry::Put {
+                key: b"p".to_vec(),
+                value: b"1".to_vec(),
+                seq: 1,
+            },
+            WalEntry::Delete {
+                key: b"d".to_vec(),
+                seq: 2,
+            },
+            WalEntry::DeleteRange {
+                start: b"ra".to_vec(),
+                end: b"rb".to_vec(),
+                seq: 3,
+            },
+            WalEntry::Merge {
+                key: b"m".to_vec(),
+                operand: b"op".to_vec(),
+                seq: 4,
+            },
+        ];
+        wal.append_batch(&expected).unwrap();
+        wal.flush().unwrap();
+        drop(wal);
+
+        assert_eq!(Wal::replay(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn empty_batch_append_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        wal.append_batch(&[]).unwrap();
+        wal.flush().unwrap();
+        drop(wal);
+
+        assert!(Wal::replay(&path).unwrap().is_empty());
     }
 
     // ── edge cases ───────────────────────────────────────────────
@@ -822,6 +1003,49 @@ mod tests {
         let kind = match Wal::replay(&path) {
             Err(e) => e.kind(),
             Ok(v) => panic!("expected unknown-type error, got {} entries", v.len()),
+        };
+        assert_eq!(kind, io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn replay_rejects_malformed_batch_entry_payload() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad_batch.wal");
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes()); // one batch entry
+        data.push(RECORD_PUT);
+        data.extend_from_slice(&100u32.to_le_bytes()); // impossible payload length
+        data.extend_from_slice(&[0xAA, 0xBB]);
+
+        let mut f = File::create(&path).unwrap();
+        append_raw_record(&mut f, RECORD_BATCH, &data, None);
+        f.sync_all().unwrap();
+
+        let kind = match Wal::replay(&path) {
+            Err(e) => e.kind(),
+            Ok(v) => panic!("expected malformed-batch error, got {} entries", v.len()),
+        };
+        assert_eq!(kind, io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn replay_rejects_batch_trailing_bytes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("trailing_batch.wal");
+        let mut data = Vec::new();
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.push(0xFF);
+
+        let mut f = File::create(&path).unwrap();
+        append_raw_record(&mut f, RECORD_BATCH, &data, None);
+        f.sync_all().unwrap();
+
+        let kind = match Wal::replay(&path) {
+            Err(e) => e.kind(),
+            Ok(v) => panic!(
+                "expected batch trailing-byte error, got {} entries",
+                v.len()
+            ),
         };
         assert_eq!(kind, io::ErrorKind::InvalidData);
     }

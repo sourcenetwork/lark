@@ -1433,12 +1433,23 @@ impl WriteBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn open_tmp() -> (Db, TempDir) {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), Options::default()).unwrap();
         (db, dir)
+    }
+
+    fn first_wal_path(dir: &TempDir) -> PathBuf {
+        let mut entries: Vec<_> = std::fs::read_dir(dir.path().join("wal"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("log"))
+            .collect();
+        entries.sort_by_key(|entry| entry.path());
+        entries.into_iter().next().unwrap().path()
     }
 
     /// Options that force flushes early so tests can exercise the SSTable path.
@@ -1488,6 +1499,20 @@ mod tests {
         assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
         assert_eq!(db.get(b"b").unwrap(), Some(b"2".to_vec()));
         assert_eq!(db.get(b"c").unwrap(), Some(b"3".to_vec()));
+    }
+
+    #[test]
+    fn test_write_batch_uses_single_wal_batch_record() {
+        let (db, dir) = open_tmp();
+
+        let mut batch = WriteBatch::new();
+        batch.put(b"a", b"1");
+        batch.put(b"b", b"2");
+        db.write(batch).unwrap();
+
+        let wal = std::fs::read(first_wal_path(&dir)).unwrap();
+        assert!(wal.len() >= 5);
+        assert_eq!(wal[4], 0x05, "multi-op WriteBatch must use RECORD_BATCH");
     }
 
     #[test]
