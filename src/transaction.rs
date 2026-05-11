@@ -266,6 +266,7 @@ pub struct Transaction<'db> {
     lock_manager: Option<Arc<LockManager>>,
     lock_timeout: Duration,
     resolved: bool,
+    resources_released: bool,
     _phantom: std::marker::PhantomData<&'db ()>,
 }
 
@@ -302,6 +303,7 @@ impl<'db> Transaction<'db> {
             lock_manager,
             lock_timeout,
             resolved: false,
+            resources_released: false,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -520,6 +522,10 @@ impl<'db> Transaction<'db> {
     }
 
     fn release_resources(&mut self) {
+        if self.resources_released {
+            return;
+        }
+        self.resources_released = true;
         if let Some(lm) = self.lock_manager.as_ref() {
             if let TxMode::Pessimistic { tx_id } = self.mode {
                 for key in self.held_locks.drain(..) {
@@ -656,6 +662,20 @@ mod tests {
         tx.put(b"k", b"never").unwrap();
         tx.rollback();
         assert_eq!(db.db().get(b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn optimistic_rollback_releases_shared_snapshot_pin_once() {
+        let (db, _dir) = opt_db();
+        let tx1 = db.begin_transaction();
+        let tx2 = db.begin_transaction();
+        assert_eq!(db.db().get_int_property("lark.num-snapshots"), Some(2));
+
+        tx1.rollback();
+        assert_eq!(db.db().get_int_property("lark.num-snapshots"), Some(1));
+
+        drop(tx2);
+        assert_eq!(db.db().get_int_property("lark.num-snapshots"), Some(0));
     }
 
     #[test]
@@ -838,6 +858,20 @@ mod tests {
         tx2.put(b"k", b"v2").unwrap();
         tx2.commit().unwrap();
         assert_eq!(db.db().get(b"k").unwrap(), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn pessimistic_rollback_releases_shared_snapshot_pin_once() {
+        let (db, _dir) = pes_db();
+        let tx1 = db.begin_transaction();
+        let tx2 = db.begin_transaction();
+        assert_eq!(db.db().get_int_property("lark.num-snapshots"), Some(2));
+
+        tx1.rollback();
+        assert_eq!(db.db().get_int_property("lark.num-snapshots"), Some(1));
+
+        drop(tx2);
+        assert_eq!(db.db().get_int_property("lark.num-snapshots"), Some(0));
     }
 
     #[test]
