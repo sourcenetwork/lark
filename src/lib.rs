@@ -571,18 +571,30 @@ impl Db {
         self.engine.drop_all().map_err(Error::Io)
     }
 
-    /// Synchronously compact every SSTable overlapping the user-key
-    /// range `[start, end)` down to the bottommost non-empty level.
+    /// Synchronously compact every SSTable overlapping the default
+    /// column-family user-key range `[start, end)` down to the
+    /// bottommost non-empty level.
     ///
     /// Passing `None` for either bound means "unbounded" on that side,
-    /// so `compact_range(None, None)` compacts the entire database.
+    /// so `compact_range(None, None)` compacts the entire default
+    /// column family.
     ///
     /// Active memtable contents that fall in the range are flushed to
     /// L0 first. The call blocks until the requested compaction work
     /// is finished and is serialized with the background compaction
     /// scheduler so the two paths can't fight over the same inputs.
     pub fn compact_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
-        self.engine.compact_range(start, end).map_err(Error::Io)
+        let lower = match start {
+            Some(s) => prefix_key(DEFAULT_CF_ID, s),
+            None => cf_lower_bound(DEFAULT_CF_ID),
+        };
+        let upper = match end {
+            Some(e) => prefix_key(DEFAULT_CF_ID, e),
+            None => cf_upper_bound(DEFAULT_CF_ID),
+        };
+        self.engine
+            .compact_range(Some(&lower), Some(&upper))
+            .map_err(Error::Io)
     }
 
     /// Return the string value of a named property, or `None` if
@@ -2196,6 +2208,32 @@ mod tests {
                 Some(b"z".to_vec())
             );
         }
+    }
+
+    #[test]
+    fn test_compact_range_bounded_compacts_default_cf_files() {
+        let dir = TempDir::new().unwrap();
+        let opts = Options {
+            write_buffer_size: 4 * 1024,
+            l0_compaction_trigger: 1_000,
+            ..Options::default()
+        };
+        let db = Db::open(dir.path(), opts).unwrap();
+        let payload = vec![0u8; 512];
+
+        for i in 0..32 {
+            db.put(format!("m{i:04}").as_bytes(), &payload).unwrap();
+        }
+        force_flush_with_prefix(&db, "m_flush");
+
+        let l0_before = level_file_count(&db, 0);
+        assert!(l0_before > 0);
+
+        db.compact_range(Some(b"m"), Some(b"n")).unwrap();
+
+        assert_eq!(level_file_count(&db, 0), 0);
+        assert!(total_file_count(&db) > 0);
+        assert_eq!(db.get(b"m0000").unwrap(), Some(payload));
     }
 
     #[test]
