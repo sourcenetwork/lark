@@ -137,6 +137,7 @@ impl ManifestRecord {
         match tag {
             TAG_ADD_FILE => {
                 let level = read_u32(data, pos)? as usize;
+                validate_level_index(level)?;
                 let file_id = read_u64(data, pos)?;
                 let smallest_key = read_bytes(data, pos)?;
                 let largest_key = read_bytes(data, pos)?;
@@ -156,6 +157,7 @@ impl ManifestRecord {
             }
             TAG_REMOVE_FILE => {
                 let level = read_u32(data, pos)? as usize;
+                validate_level_index(level)?;
                 let file_id = read_u64(data, pos)?;
                 Ok(Some(ManifestRecord::RemoveFile { level, file_id }))
             }
@@ -201,6 +203,17 @@ fn read_bytes(data: &[u8], pos: &mut usize) -> io::Result<Vec<u8>> {
     let bytes = data[*pos..*pos + len].to_vec();
     *pos += len;
     Ok(bytes)
+}
+
+fn validate_level_index(level: usize) -> io::Result<()> {
+    if level < MAX_LEVELS {
+        return Ok(());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("manifest level {level} out of range 0..{MAX_LEVELS}"),
+    ))
 }
 
 /// Manages the current version and persists version edits to a manifest log.
@@ -261,6 +274,15 @@ impl VersionSet {
     /// Apply a batch of edits atomically: update the in-memory version
     /// and persist the serialized records to the manifest log.
     pub(crate) fn apply(&mut self, edits: &[VersionEdit]) -> io::Result<()> {
+        for edit in edits {
+            match edit {
+                VersionEdit::AddFile { level, .. } | VersionEdit::RemoveFile { level, .. } => {
+                    validate_level_index(*level)?;
+                }
+                VersionEdit::SetLastSeq(_) | VersionEdit::SetNextFileId(_) => {}
+            }
+        }
+
         let mut version = (*self.current()).clone();
 
         for edit in edits {
@@ -479,6 +501,16 @@ mod tests {
         second_start + 4 + second_len
     }
 
+    fn test_meta(file_id: u64) -> SsTableMeta {
+        SsTableMeta {
+            file_id,
+            smallest_key: b"a".to_vec(),
+            largest_key: b"z".to_vec(),
+            file_size: 128,
+            num_entries: 2,
+        }
+    }
+
     #[test]
     fn test_apply_and_replay_roundtrip() {
         let dir = TempDir::new().unwrap();
@@ -629,10 +661,87 @@ mod tests {
     }
 
     #[test]
+    fn manifest_record_decode_rejects_invalid_level_indexes() {
+        let records = [
+            ManifestRecord::AddFile {
+                level: MAX_LEVELS,
+                meta: test_meta(1),
+            },
+            ManifestRecord::RemoveFile {
+                level: MAX_LEVELS,
+                file_id: 1,
+            },
+        ];
+
+        for record in records {
+            let mut data = Vec::new();
+            record.encode(&mut data);
+            let mut pos = 0;
+            let kind = match ManifestRecord::decode(&data, &mut pos) {
+                Err(e) => e.kind(),
+                Ok(_) => panic!("expected invalid level error"),
+            };
+            assert_eq!(kind, io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
     fn manifest_record_decode_returns_none_at_eof() {
         let mut pos = 0;
         let got = ManifestRecord::decode(&[], &mut pos).unwrap();
         assert!(got.is_none());
+    }
+
+    #[test]
+    fn apply_rejects_invalid_level_indexes() {
+        let dir = TempDir::new().unwrap();
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+
+        let file = make_live_sst(&sst_dir, 1, b"a", b"z");
+        let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+
+        let kind = match vs.apply(&[VersionEdit::AddFile {
+            level: MAX_LEVELS,
+            file,
+        }]) {
+            Err(e) => e.kind(),
+            Ok(_) => panic!("expected invalid level error"),
+        };
+        assert_eq!(kind, io::ErrorKind::InvalidData);
+        assert_eq!(vs.current().levels.iter().map(Vec::len).sum::<usize>(), 0);
+
+        let kind = match vs.apply(&[VersionEdit::RemoveFile {
+            level: MAX_LEVELS,
+            file_id: 1,
+        }]) {
+            Err(e) => e.kind(),
+            Ok(_) => panic!("expected invalid level error"),
+        };
+        assert_eq!(kind, io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn open_rejects_manifest_with_invalid_level_index() {
+        let dir = TempDir::new().unwrap();
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+
+        let records = [ManifestRecord::AddFile {
+            level: MAX_LEVELS,
+            meta: test_meta(1),
+        }];
+        std::fs::write(
+            dir.path().join("MANIFEST"),
+            VersionSet::encode_records(&records),
+        )
+        .unwrap();
+
+        let kind = match VersionSet::open(dir.path(), &sst_dir) {
+            Err(e) => e.kind(),
+            Ok(_) => panic!("expected invalid level error"),
+        };
+        assert_eq!(kind, io::ErrorKind::InvalidData);
     }
 
     #[test]
