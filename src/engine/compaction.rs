@@ -885,16 +885,12 @@ fn perform_compaction_to(
         }
     }
 
-    // Drop point entries that a range tombstone from the merged input
-    // set shadows — i.e. any `(user_key, seq)` where some RT covering
-    // `user_key` has `rt_seq > seq`. This shrinks the live set before
-    // the snapshot-pin GC so we don't rewrite bytes that no reader can
-    // ever see. We still keep range tombstones themselves in the output
-    // SSTable (see below), since a future compaction with lower levels
-    // may still need them to shadow older point entries.
+    // Drop point entries shadowed by range tombstones that are visible
+    // at the oldest live snapshot. Tombstones newer than `pin_seq`
+    // cannot prove an older point is invisible to every snapshot yet.
     all_entries.retain(|(ik, _v)| {
         let (uk, seq, _vt) = decode_internal_key(ik);
-        let rt_seq = max_covering_seq(&merged_range_tombstones, uk, u64::MAX);
+        let rt_seq = max_covering_seq(&merged_range_tombstones, uk, pin_seq);
         rt_seq <= seq
     });
 

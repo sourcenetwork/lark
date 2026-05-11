@@ -2036,6 +2036,21 @@ mod tests {
     }
 
     #[test]
+    fn test_range_tombstone_pruning_preserves_snapshot_visible_value() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        db.put(b"k", b"old").unwrap();
+        let snap = db.snapshot();
+        db.delete_range(b"a", b"z").unwrap();
+
+        db.compact_range(None, None).unwrap();
+
+        assert_eq!(snap.get(b"k").unwrap(), Some(b"old".to_vec()));
+        assert_eq!(db.get(b"k").unwrap(), None);
+    }
+
+    #[test]
     fn test_gc_across_many_user_keys() {
         // Stress the multi-group path: many distinct user keys each
         // with several versions. No snapshot is live so each key
