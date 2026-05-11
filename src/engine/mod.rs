@@ -25,7 +25,7 @@ use manifest::{VersionEdit, VersionSet};
 use memtable::MemTable;
 use snapshot_registry::SnapshotRegistry;
 
-use crate::event_listener;
+use crate::{event_listener, WriteBatchOp};
 use sstable::{sst_filename, LiveSst, LookupResult, SsTableMeta, SsTableReader, SsTableWriter};
 use wal::{wal_filename, Wal, WalEntry};
 
@@ -48,6 +48,78 @@ pub(crate) enum CommitOutcome {
         observed_seq: u64,
         latest_seq: u64,
     },
+}
+
+fn grouped_batch_ops(
+    point_ops: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
+    merges: Vec<(Vec<u8>, Vec<u8>)>,
+) -> Vec<WriteBatchOp> {
+    let mut ops = Vec::with_capacity(point_ops.len() + range_deletes.len() + merges.len());
+    for (key, value) in point_ops {
+        match value {
+            Some(value) => ops.push(WriteBatchOp::Put { key, value }),
+            None => ops.push(WriteBatchOp::Delete { key }),
+        }
+    }
+    for (start, end) in range_deletes {
+        ops.push(WriteBatchOp::DeleteRange { start, end });
+    }
+    for (key, operand) in merges {
+        ops.push(WriteBatchOp::Merge { key, operand });
+    }
+    ops
+}
+
+fn batch_op_wal_bytes(op: &WriteBatchOp) -> u64 {
+    match op {
+        WriteBatchOp::Put { key, value } => (key.len() + value.len() + 8) as u64,
+        WriteBatchOp::Delete { key } => (key.len() + 8) as u64,
+        WriteBatchOp::DeleteRange { start, end } => (start.len() + end.len() + 8) as u64,
+        WriteBatchOp::Merge { key, operand } => (key.len() + operand.len() + 8) as u64,
+    }
+}
+
+fn append_single_wal_op(wal: &mut Wal, op: &WriteBatchOp, seq: u64) -> std::io::Result<()> {
+    match op {
+        WriteBatchOp::Put { key, value } => wal.append_put(key, value, seq),
+        WriteBatchOp::Delete { key } => wal.append_delete(key, seq),
+        WriteBatchOp::DeleteRange { start, end } => wal.append_delete_range(start, end, seq),
+        WriteBatchOp::Merge { key, operand } => wal.append_merge(key, operand, seq),
+    }
+}
+
+fn wal_entry_for_batch_op(op: &WriteBatchOp, seq: u64) -> WalEntry {
+    match op {
+        WriteBatchOp::Put { key, value } => WalEntry::Put {
+            key: key.clone(),
+            value: value.clone(),
+            seq,
+        },
+        WriteBatchOp::Delete { key } => WalEntry::Delete {
+            key: key.clone(),
+            seq,
+        },
+        WriteBatchOp::DeleteRange { start, end } => WalEntry::DeleteRange {
+            start: start.clone(),
+            end: end.clone(),
+            seq,
+        },
+        WriteBatchOp::Merge { key, operand } => WalEntry::Merge {
+            key: key.clone(),
+            operand: operand.clone(),
+            seq,
+        },
+    }
+}
+
+fn apply_batch_op_to_memtable(memtable: &MemTable, op: &WriteBatchOp, seq: u64) {
+    match op {
+        WriteBatchOp::Put { key, value } => memtable.put(key, value, seq),
+        WriteBatchOp::Delete { key } => memtable.delete(key, seq),
+        WriteBatchOp::DeleteRange { start, end } => memtable.delete_range(start, end, seq),
+        WriteBatchOp::Merge { key, operand } => memtable.merge(key, operand, seq),
+    }
 }
 
 /// Configuration for the Lark engine.
@@ -985,18 +1057,12 @@ impl LarkEngine {
         Ok(micros)
     }
 
-    /// Apply a batch of point writes, range deletes, and merge
-    /// operands atomically.
+    /// Apply an ordered batch of writes atomically.
     ///
-    /// `point_ops` carries put/delete operations keyed by user key;
-    /// `range_deletes` is a list of `(start, end)` half-open
-    /// intervals; `merges` is a list of `(key, operand)` pairs that
-    /// each layer a merge operand on top of whatever base value the
-    /// key currently has.
-    ///
-    /// All operations in a single call are assigned consecutive
-    /// sequence numbers in this order: point ops, then range
-    /// deletes, then merges.
+    /// Operations are assigned consecutive sequence numbers in the
+    /// same order the caller recorded them. That order matters when
+    /// a batch mixes range tombstones with puts/deletes/merges for
+    /// keys inside the range.
     ///
     /// `durability` controls WAL fsync semantics (`Immediate` = fsync
     /// per call, `Eventual` = buffered flush). `disable_wal` skips
@@ -1004,18 +1070,30 @@ impl LarkEngine {
     /// before the next memtable flush loses the write.
     pub(crate) fn apply_batch(
         &self,
+        ops: Vec<WriteBatchOp>,
+        durability: DurabilityMode,
+        disable_wal: bool,
+    ) -> std::io::Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+
+        let _write_guard = self.write_lock.lock();
+        self.apply_batch_locked(ops, durability, disable_wal)
+    }
+
+    /// Apply grouped writes from older internal callers that do not
+    /// preserve a single operation log.
+    pub(crate) fn apply_grouped_batch(
+        &self,
         point_ops: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
         merges: Vec<(Vec<u8>, Vec<u8>)>,
         durability: DurabilityMode,
         disable_wal: bool,
     ) -> std::io::Result<()> {
-        if point_ops.is_empty() && range_deletes.is_empty() && merges.is_empty() {
-            return Ok(());
-        }
-
-        let _write_guard = self.write_lock.lock();
-        self.apply_batch_locked(point_ops, range_deletes, merges, durability, disable_wal)
+        let ops = grouped_batch_ops(point_ops, range_deletes, merges);
+        self.apply_batch(ops, durability, disable_wal)
     }
 
     /// Fast path for a single put — avoids BTreeMap construction,
@@ -1076,94 +1154,37 @@ impl LarkEngine {
     /// write lock the whole time.
     fn apply_batch_locked(
         &self,
-        point_ops: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
-        range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
-        merges: Vec<(Vec<u8>, Vec<u8>)>,
+        ops: Vec<WriteBatchOp>,
         durability: DurabilityMode,
         disable_wal: bool,
     ) -> std::io::Result<()> {
-        if point_ops.is_empty() && range_deletes.is_empty() && merges.is_empty() {
+        if ops.is_empty() {
             return Ok(());
         }
 
-        let total_ops = point_ops.len() + range_deletes.len() + merges.len();
+        let total_ops = ops.len();
         let base_seq = self
             .latest_seq
             .fetch_add(total_ops as u64, Ordering::AcqRel)
             + 1;
-        let range_delete_base = base_seq + point_ops.len() as u64;
-        let merge_base = range_delete_base + range_deletes.len() as u64;
 
         if !disable_wal {
             let _perf_wal =
                 crate::perf_context::PerfTimer::new(crate::perf_context::PerfTimerField::WriteWal);
             let wal_start = std::time::Instant::now();
             let mut wal = self.active_wal.lock();
-            let mut wal_bytes: u64 = 0;
+            let wal_bytes: u64 = ops.iter().map(batch_op_wal_bytes).sum();
             if total_ops == 1 {
-                for (i, (key, value)) in point_ops.iter().enumerate() {
-                    let seq = base_seq + i as u64;
-                    match value {
-                        Some(v) => {
-                            wal.append_put(key, v, seq)?;
-                            wal_bytes += (key.len() + v.len() + 8) as u64;
-                        }
-                        None => {
-                            wal.append_delete(key, seq)?;
-                            wal_bytes += (key.len() + 8) as u64;
-                        }
-                    }
-                }
-                for (j, (start, end)) in range_deletes.iter().enumerate() {
-                    let seq = range_delete_base + j as u64;
-                    wal.append_delete_range(start, end, seq)?;
-                    wal_bytes += (start.len() + end.len() + 8) as u64;
-                }
-                for (k, (key, operand)) in merges.iter().enumerate() {
-                    let seq = merge_base + k as u64;
-                    wal.append_merge(key, operand, seq)?;
-                    wal_bytes += (key.len() + operand.len() + 8) as u64;
-                }
+                append_single_wal_op(&mut wal, &ops[0], base_seq)?;
             } else {
-                let mut wal_entries = Vec::with_capacity(total_ops);
-                for (i, (key, value)) in point_ops.iter().enumerate() {
-                    let seq = base_seq + i as u64;
-                    match value {
-                        Some(v) => {
-                            wal_entries.push(WalEntry::Put {
-                                key: key.clone(),
-                                value: v.clone(),
-                                seq,
-                            });
-                            wal_bytes += (key.len() + v.len() + 8) as u64;
-                        }
-                        None => {
-                            wal_entries.push(WalEntry::Delete {
-                                key: key.clone(),
-                                seq,
-                            });
-                            wal_bytes += (key.len() + 8) as u64;
-                        }
-                    }
-                }
-                for (j, (start, end)) in range_deletes.iter().enumerate() {
-                    let seq = range_delete_base + j as u64;
-                    wal_entries.push(WalEntry::DeleteRange {
-                        start: start.clone(),
-                        end: end.clone(),
-                        seq,
-                    });
-                    wal_bytes += (start.len() + end.len() + 8) as u64;
-                }
-                for (k, (key, operand)) in merges.iter().enumerate() {
-                    let seq = merge_base + k as u64;
-                    wal_entries.push(WalEntry::Merge {
-                        key: key.clone(),
-                        operand: operand.clone(),
-                        seq,
-                    });
-                    wal_bytes += (key.len() + operand.len() + 8) as u64;
-                }
+                let wal_entries: Vec<WalEntry> = ops
+                    .iter()
+                    .enumerate()
+                    .map(|(i, op)| {
+                        let seq = base_seq + i as u64;
+                        wal_entry_for_batch_op(op, seq)
+                    })
+                    .collect();
                 wal.append_batch(&wal_entries)?;
             }
             match durability {
@@ -1187,20 +1208,9 @@ impl LarkEngine {
                 crate::perf_context::PerfTimerField::WriteMemtable,
             );
             let memtable = self.active_memtable.read();
-            for (i, (key, value)) in point_ops.iter().enumerate() {
+            for (i, op) in ops.iter().enumerate() {
                 let seq = base_seq + i as u64;
-                match value {
-                    Some(v) => memtable.put(key, v, seq),
-                    None => memtable.delete(key, seq),
-                }
-            }
-            for (j, (start, end)) in range_deletes.iter().enumerate() {
-                let seq = range_delete_base + j as u64;
-                memtable.delete_range(start, end, seq);
-            }
-            for (k, (key, operand)) in merges.iter().enumerate() {
-                let seq = merge_base + k as u64;
-                memtable.merge(key, operand, seq);
+                apply_batch_op_to_memtable(&memtable, op, seq);
             }
         }
 
@@ -1252,7 +1262,8 @@ impl LarkEngine {
             }
         }
 
-        self.apply_batch_locked(point_ops, range_deletes, merges, durability, false)?;
+        let ops = grouped_batch_ops(point_ops, range_deletes, merges);
+        self.apply_batch_locked(ops, durability, false)?;
         Ok(CommitOutcome::Ok)
     }
 

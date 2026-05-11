@@ -492,7 +492,7 @@ impl<'db> Transaction<'db> {
             TxMode::Pessimistic { .. } => {
                 // Locks already guarantee no conflict; just apply.
                 self.engine
-                    .apply_batch(writes, range_deletes, merges, self.durability, false)
+                    .apply_grouped_batch(writes, range_deletes, merges, self.durability, false)
                     .map_err(TransactionError::Io)
             }
         }
