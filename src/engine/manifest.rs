@@ -210,6 +210,11 @@ pub(crate) struct VersionSet {
     manifest_writer: Option<BufWriter<File>>,
 }
 
+struct ManifestReplay {
+    version: Version,
+    valid_len: usize,
+}
+
 impl VersionSet {
     /// Create or recover a VersionSet from the given directory. During
     /// recovery every SSTable referenced by the manifest is opened
@@ -220,10 +225,14 @@ impl VersionSet {
 
         let (version, writer) = if manifest_path.exists() {
             let data = fs::read(&manifest_path)?;
-            let version = Self::replay_manifest(&data, sst_dir)?;
+            let replay = Self::replay_manifest(&data, sst_dir)?;
 
             let file = OpenOptions::new().append(true).open(&manifest_path)?;
-            (version, BufWriter::new(file))
+            if replay.valid_len < data.len() {
+                file.set_len(replay.valid_len as u64)?;
+                file.sync_all()?;
+            }
+            (replay.version, BufWriter::new(file))
         } else {
             let version = Version::new();
             let file = File::create(&manifest_path)?;
@@ -338,7 +347,7 @@ impl VersionSet {
         buf
     }
 
-    fn replay_manifest(data: &[u8], sst_dir: &Path) -> io::Result<Version> {
+    fn replay_manifest(data: &[u8], sst_dir: &Path) -> io::Result<ManifestReplay> {
         // Two-pass replay. The first pass walks every record and tracks
         // the *logical* state of each level — which file ids are live —
         // without touching the filesystem. Only after replay completes
@@ -354,8 +363,14 @@ impl VersionSet {
         let mut last_seq: u64 = 0;
         let mut next_file_id: u64 = 1;
         let mut offset = 0;
+        let mut valid_len = 0;
 
-        while offset + 4 <= data.len() {
+        while offset < data.len() {
+            if offset + 4 > data.len() {
+                tracing::warn!("Truncated manifest record header, stopping replay");
+                break;
+            }
+
             let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
 
@@ -393,6 +408,7 @@ impl VersionSet {
                     }
                 }
             }
+            valid_len = offset;
         }
 
         // Second pass: open readers for the survivors.
@@ -409,7 +425,7 @@ impl VersionSet {
             }
         }
 
-        Ok(version)
+        Ok(ManifestReplay { version, valid_len })
     }
 }
 
@@ -452,6 +468,15 @@ mod tests {
             },
             reader,
         )
+    }
+
+    fn second_record_checksum_offset(path: &Path) -> usize {
+        let data = std::fs::read(path).unwrap();
+        let first_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        let second_start = 4 + first_len + 4;
+        let second_len =
+            u32::from_le_bytes(data[second_start..second_start + 4].try_into().unwrap()) as usize;
+        second_start + 4 + second_len
     }
 
     #[test]
@@ -645,6 +670,65 @@ mod tests {
         // the SetLastSeq may or may not survive depending on where the
         // truncation landed. Either way, we should NOT panic.
         assert!(v.levels[0].len() <= 1);
+    }
+
+    #[test]
+    fn open_truncates_truncated_manifest_tail_before_append() {
+        let dir = TempDir::new().unwrap();
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+
+        {
+            let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+            vs.apply(&[VersionEdit::SetLastSeq(7)]).unwrap();
+            vs.apply(&[VersionEdit::SetLastSeq(11)]).unwrap();
+        }
+
+        let path = dir.path().join("MANIFEST");
+        let current = std::fs::metadata(&path).unwrap().len();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(current - 2)
+            .unwrap();
+
+        {
+            let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+            assert_eq!(vs.current().last_seq, 7);
+            vs.apply(&[VersionEdit::SetLastSeq(99)]).unwrap();
+        }
+
+        let vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+        assert_eq!(vs.current().last_seq, 99);
+    }
+
+    #[test]
+    fn open_truncates_corrupt_manifest_tail_before_append() {
+        let dir = TempDir::new().unwrap();
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+
+        {
+            let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+            vs.apply(&[VersionEdit::SetLastSeq(7)]).unwrap();
+            vs.apply(&[VersionEdit::SetLastSeq(11)]).unwrap();
+        }
+
+        let path = dir.path().join("MANIFEST");
+        let checksum_offset = second_record_checksum_offset(&path);
+        let mut data = std::fs::read(&path).unwrap();
+        data[checksum_offset] ^= 0xFF;
+        std::fs::write(&path, data).unwrap();
+
+        {
+            let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+            assert_eq!(vs.current().last_seq, 7);
+            vs.apply(&[VersionEdit::SetLastSeq(99)]).unwrap();
+        }
+
+        let vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+        assert_eq!(vs.current().last_seq, 99);
     }
 
     #[test]
