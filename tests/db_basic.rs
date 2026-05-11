@@ -399,14 +399,13 @@ fn write_batch_degenerate_range_delete_is_ignored() {
 #[test]
 fn write_batch_put_delete_on_same_key_keeps_last_op() {
     // write_batch_test.cc::Multiple (seen-last-wins variant) — the
-    // ops map deduplicates by key, so put-then-delete on the same
-    // key leaves only the delete.
+    // operation log keeps both entries, and applying the batch in
+    // caller order leaves the final delete visible.
     let mut b = WriteBatch::new();
     b.put(b"k", b"v");
     b.delete(b"k");
-    assert_eq!(b.len(), 1);
-    // The surviving entry is the delete — we can't inspect it
-    // directly, but applying the batch and reading should yield None.
+    assert_eq!(b.len(), 2);
+    // Applying the batch and reading should yield the final op.
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
     db.put(b"k", b"prior").unwrap();

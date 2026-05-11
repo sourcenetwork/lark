@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::options::{CompactionDecision, CompactionFilter};
-use crate::{Db, Error, Options, Result, WriteBatch};
+use crate::{Db, Error, Options, Result, WriteBatch, WriteBatchOp};
 
 /// Byte width of the trailing timestamp suffix.
 const TS_LEN: usize = 4;
@@ -129,17 +129,21 @@ impl DbWithTtl {
         // Source batch keys are already CF-prefixed by the public
         // `put`/`delete`/... methods. Pass them through via raw
         // inserts so we don't double-prefix.
-        for (key, value) in batch.ops_iter() {
-            match value {
-                Some(v) => stamped_batch.insert_raw_put(key.to_vec(), stamp(v, ts)),
-                None => stamped_batch.insert_raw_delete(key.to_vec()),
+        for op in batch.ops_iter() {
+            match op {
+                WriteBatchOp::Put { key, value } => {
+                    stamped_batch.insert_raw_put(key.clone(), stamp(value, ts));
+                }
+                WriteBatchOp::Delete { key } => {
+                    stamped_batch.insert_raw_delete(key.clone());
+                }
+                WriteBatchOp::DeleteRange { start, end } => {
+                    stamped_batch.insert_raw_range_delete(start.clone(), end.clone());
+                }
+                WriteBatchOp::Merge { key, operand } => {
+                    stamped_batch.insert_raw_merge(key.clone(), operand.clone());
+                }
             }
-        }
-        for (start, end) in batch.range_deletes_iter() {
-            stamped_batch.insert_raw_range_delete(start.to_vec(), end.to_vec());
-        }
-        for (key, operand) in batch.merges_iter() {
-            stamped_batch.insert_raw_merge(key.to_vec(), operand.to_vec());
         }
         self.inner.write(stamped_batch)
     }
@@ -271,25 +275,12 @@ impl CompactionFilter for TtlCompactionFilter {
 
 // Internal accessors on `WriteBatch` used by `DbWithTtl::write`.
 //
-// `WriteBatch` stores point ops in a `BTreeMap` and range deletes in a
-// `Vec`. `DbWithTtl::write` needs to rebuild a parallel batch with
-// stamped values, so we expose read-only iterators instead of moving
-// the fields to the public API.
+// `DbWithTtl::write` needs to rebuild a parallel batch with stamped
+// values, so expose a read-only ordered iterator instead of moving
+// the storage field to the public API.
 impl WriteBatch {
-    pub(crate) fn ops_iter(&self) -> impl Iterator<Item = (&[u8], Option<&[u8]>)> {
-        self.ops.iter().map(|(k, v)| (k.as_slice(), v.as_deref()))
-    }
-
-    pub(crate) fn range_deletes_iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
-        self.range_deletes
-            .iter()
-            .map(|(s, e)| (s.as_slice(), e.as_slice()))
-    }
-
-    pub(crate) fn merges_iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
-        self.merges
-            .iter()
-            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+    pub(crate) fn ops_iter(&self) -> impl Iterator<Item = &WriteBatchOp> {
+        self.ops.iter()
     }
 }
 

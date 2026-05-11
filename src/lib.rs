@@ -339,7 +339,7 @@ impl Db {
         batch.insert(prefix_key(DEFAULT_CF_ID, key), None);
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
-            .apply_batch(batch, Vec::new(), Vec::new(), dm, disable_wal)
+            .apply_grouped_batch(batch, Vec::new(), Vec::new(), dm, disable_wal)
             .map_err(Error::Io)
     }
 
@@ -362,7 +362,7 @@ impl Db {
         }
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
-            .apply_batch(
+            .apply_grouped_batch(
                 BTreeMap::new(),
                 Vec::new(),
                 vec![(prefix_key(DEFAULT_CF_ID, key), operand.to_vec())],
@@ -398,7 +398,7 @@ impl Db {
         }
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
-            .apply_batch(
+            .apply_grouped_batch(
                 BTreeMap::new(),
                 vec![(
                     prefix_key(DEFAULT_CF_ID, start),
@@ -431,37 +431,36 @@ impl Db {
             let mut bytes: u64 = 0;
             let mut puts: u64 = 0;
             let mut deletes: u64 = 0;
-            for (k, v) in &batch.ops {
-                match v {
-                    Some(val) => {
+            let mut range_deletes: u64 = 0;
+            let mut merges: u64 = 0;
+            for op in &batch.ops {
+                match op {
+                    WriteBatchOp::Put { key, value } => {
                         puts += 1;
-                        bytes += (k.len() + val.len()) as u64;
+                        bytes += (key.len() + value.len()) as u64;
                     }
-                    None => {
+                    WriteBatchOp::Delete { key } => {
                         deletes += 1;
-                        bytes += k.len() as u64;
+                        bytes += key.len() as u64;
+                    }
+                    WriteBatchOp::DeleteRange { .. } => {
+                        range_deletes += 1;
+                    }
+                    WriteBatchOp::Merge { .. } => {
+                        merges += 1;
                     }
                 }
             }
             s.add(Ticker::KeysWritten, puts);
             s.add(Ticker::KeysDeleted, deletes);
             s.add(Ticker::BytesWritten, bytes);
-            s.add(
-                Ticker::RangeDeletesWritten,
-                batch.range_deletes.len() as u64,
-            );
-            s.add(Ticker::MergesWritten, batch.merges.len() as u64);
+            s.add(Ticker::RangeDeletesWritten, range_deletes);
+            s.add(Ticker::MergesWritten, merges);
             s.record(Histogram::BytesPerWrite, bytes);
         }
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
-            .apply_batch(
-                batch.ops,
-                batch.range_deletes,
-                batch.merges,
-                dm,
-                disable_wal,
-            )
+            .apply_batch(batch.ops, dm, disable_wal)
             .map_err(Error::Io)
     }
 
@@ -884,7 +883,7 @@ impl Db {
         );
         batch.insert(meta::next_id_key(), Some(next_id.to_be_bytes().to_vec()));
         self.engine
-            .apply_batch(batch, Vec::new(), Vec::new(), self.durability, false)
+            .apply_grouped_batch(batch, Vec::new(), Vec::new(), self.durability, false)
             .map_err(Error::Io)?;
         Ok(handle)
     }
@@ -919,7 +918,7 @@ impl Db {
         point_ops.insert(meta::name_key(cf.name()), None);
         let range_deletes = vec![(lo, hi)];
         self.engine
-            .apply_batch(point_ops, range_deletes, Vec::new(), self.durability, false)
+            .apply_grouped_batch(point_ops, range_deletes, Vec::new(), self.durability, false)
             .map_err(Error::Io)?;
         self.cfs.remove(cf.name());
         Ok(())
@@ -948,7 +947,7 @@ impl Db {
         let mut batch = BTreeMap::new();
         batch.insert(prefix_key(cf.id(), key), Some(value.to_vec()));
         self.engine
-            .apply_batch(batch, Vec::new(), Vec::new(), self.durability, false)
+            .apply_grouped_batch(batch, Vec::new(), Vec::new(), self.durability, false)
             .map_err(Error::Io)
     }
 
@@ -957,7 +956,7 @@ impl Db {
         let mut batch = BTreeMap::new();
         batch.insert(prefix_key(cf.id(), key), None);
         self.engine
-            .apply_batch(batch, Vec::new(), Vec::new(), self.durability, false)
+            .apply_grouped_batch(batch, Vec::new(), Vec::new(), self.durability, false)
             .map_err(Error::Io)
     }
 
@@ -967,7 +966,7 @@ impl Db {
             return Ok(());
         }
         self.engine
-            .apply_batch(
+            .apply_grouped_batch(
                 BTreeMap::new(),
                 vec![(prefix_key(cf.id(), start), prefix_key(cf.id(), end))],
                 Vec::new(),
@@ -981,7 +980,7 @@ impl Db {
     /// Requires [`Options::merge_operator`] to be set.
     pub fn merge_cf(&self, cf: &ColumnFamilyHandle, key: &[u8], operand: &[u8]) -> Result<()> {
         self.engine
-            .apply_batch(
+            .apply_grouped_batch(
                 BTreeMap::new(),
                 Vec::new(),
                 vec![(prefix_key(cf.id(), key), operand.to_vec())],
@@ -1313,12 +1312,23 @@ fn collect_range(
     Ok(out)
 }
 
+/// One ordered operation in a [`WriteBatch`].
+#[derive(Debug)]
+pub(crate) enum WriteBatchOp {
+    /// Write a value for `key`.
+    Put { key: Vec<u8>, value: Vec<u8> },
+    /// Delete the point value for `key`.
+    Delete { key: Vec<u8> },
+    /// Delete every key in `[start, end)`.
+    DeleteRange { start: Vec<u8>, end: Vec<u8> },
+    /// Add one merge operand for `key`.
+    Merge { key: Vec<u8>, operand: Vec<u8> },
+}
+
 /// A batch of write operations to apply atomically.
 #[derive(Debug, Default)]
 pub struct WriteBatch {
-    ops: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
-    range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
-    merges: Vec<(Vec<u8>, Vec<u8>)>,
+    ops: Vec<WriteBatchOp>,
 }
 
 impl WriteBatch {
@@ -1329,30 +1339,34 @@ impl WriteBatch {
 
     /// Add a put operation to the batch (default column family).
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
-        self.ops
-            .insert(prefix_key(DEFAULT_CF_ID, key), Some(value.to_vec()));
+        self.ops.push(WriteBatchOp::Put {
+            key: prefix_key(DEFAULT_CF_ID, key),
+            value: value.to_vec(),
+        });
     }
 
     /// Add a delete operation to the batch (default column family).
     pub fn delete(&mut self, key: &[u8]) {
-        self.ops.insert(prefix_key(DEFAULT_CF_ID, key), None);
+        self.ops.push(WriteBatchOp::Delete {
+            key: prefix_key(DEFAULT_CF_ID, key),
+        });
     }
 
     /// Delete every key in the half-open range `[start, end)` in
     /// the default column family.
     ///
-    /// When the batch is applied, the range delete is recorded with
-    /// the same transactional seq as the other batch operations, so
-    /// concurrent readers see an all-or-nothing effect. Calls with
+    /// When the batch is applied, the range delete is ordered with
+    /// the other batch operations, so later puts inside the range
+    /// remain live while earlier puts are shadowed. Calls with
     /// `start >= end` are ignored.
     pub fn delete_range(&mut self, start: &[u8], end: &[u8]) {
         if start >= end {
             return;
         }
-        self.range_deletes.push((
-            prefix_key(DEFAULT_CF_ID, start),
-            prefix_key(DEFAULT_CF_ID, end),
-        ));
+        self.ops.push(WriteBatchOp::DeleteRange {
+            start: prefix_key(DEFAULT_CF_ID, start),
+            end: prefix_key(DEFAULT_CF_ID, end),
+        });
     }
 
     /// Add a merge operand for `key` in the default column family.
@@ -1362,19 +1376,25 @@ impl WriteBatch {
     /// Multiple merges on the same key in a single batch are
     /// allowed and applied in insertion order.
     pub fn merge(&mut self, key: &[u8], operand: &[u8]) {
-        self.merges
-            .push((prefix_key(DEFAULT_CF_ID, key), operand.to_vec()));
+        self.ops.push(WriteBatchOp::Merge {
+            key: prefix_key(DEFAULT_CF_ID, key),
+            operand: operand.to_vec(),
+        });
     }
 
     /// Add a put scoped to column family `cf`.
     pub fn put_cf(&mut self, cf: &ColumnFamilyHandle, key: &[u8], value: &[u8]) {
-        self.ops
-            .insert(prefix_key(cf.id(), key), Some(value.to_vec()));
+        self.ops.push(WriteBatchOp::Put {
+            key: prefix_key(cf.id(), key),
+            value: value.to_vec(),
+        });
     }
 
     /// Add a delete scoped to column family `cf`.
     pub fn delete_cf(&mut self, cf: &ColumnFamilyHandle, key: &[u8]) {
-        self.ops.insert(prefix_key(cf.id(), key), None);
+        self.ops.push(WriteBatchOp::Delete {
+            key: prefix_key(cf.id(), key),
+        });
     }
 
     /// Add a range delete scoped to column family `cf`.
@@ -1382,26 +1402,33 @@ impl WriteBatch {
         if start >= end {
             return;
         }
-        self.range_deletes
-            .push((prefix_key(cf.id(), start), prefix_key(cf.id(), end)));
+        self.ops.push(WriteBatchOp::DeleteRange {
+            start: prefix_key(cf.id(), start),
+            end: prefix_key(cf.id(), end),
+        });
     }
 
     /// Add a merge operand scoped to column family `cf`.
     pub fn merge_cf(&mut self, cf: &ColumnFamilyHandle, key: &[u8], operand: &[u8]) {
-        self.merges
-            .push((prefix_key(cf.id(), key), operand.to_vec()));
+        self.ops.push(WriteBatchOp::Merge {
+            key: prefix_key(cf.id(), key),
+            operand: operand.to_vec(),
+        });
     }
 
     /// Insert an already-prefixed put (internal use by wrappers
     /// like `DbWithTtl` that iterate a source batch's raw entries
     /// and rebuild a new batch without re-applying the CF prefix).
     pub(crate) fn insert_raw_put(&mut self, prefixed_key: Vec<u8>, value: Vec<u8>) {
-        self.ops.insert(prefixed_key, Some(value));
+        self.ops.push(WriteBatchOp::Put {
+            key: prefixed_key,
+            value,
+        });
     }
 
     /// Insert an already-prefixed delete.
     pub(crate) fn insert_raw_delete(&mut self, prefixed_key: Vec<u8>) {
-        self.ops.insert(prefixed_key, None);
+        self.ops.push(WriteBatchOp::Delete { key: prefixed_key });
     }
 
     /// Insert an already-prefixed range delete.
@@ -1410,35 +1437,51 @@ impl WriteBatch {
         prefixed_start: Vec<u8>,
         prefixed_end: Vec<u8>,
     ) {
-        self.range_deletes.push((prefixed_start, prefixed_end));
+        self.ops.push(WriteBatchOp::DeleteRange {
+            start: prefixed_start,
+            end: prefixed_end,
+        });
     }
 
     /// Insert an already-prefixed merge operand.
     pub(crate) fn insert_raw_merge(&mut self, prefixed_key: Vec<u8>, operand: Vec<u8>) {
-        self.merges.push((prefixed_key, operand));
+        self.ops.push(WriteBatchOp::Merge {
+            key: prefixed_key,
+            operand,
+        });
     }
 
-    /// Number of point operations in the batch. Range deletes and
+    /// Number of point operations in the batch. Repeated operations
+    /// on the same key are counted separately. Range deletes and
     /// merges are counted separately via
     /// [`WriteBatch::range_delete_count`] and
     /// [`WriteBatch::merge_count`].
     pub fn len(&self) -> usize {
-        self.ops.len()
+        self.ops
+            .iter()
+            .filter(|op| matches!(op, WriteBatchOp::Put { .. } | WriteBatchOp::Delete { .. }))
+            .count()
     }
 
     /// Number of range-delete operations in the batch.
     pub fn range_delete_count(&self) -> usize {
-        self.range_deletes.len()
+        self.ops
+            .iter()
+            .filter(|op| matches!(op, WriteBatchOp::DeleteRange { .. }))
+            .count()
     }
 
     /// Number of merge operations in the batch.
     pub fn merge_count(&self) -> usize {
-        self.merges.len()
+        self.ops
+            .iter()
+            .filter(|op| matches!(op, WriteBatchOp::Merge { .. }))
+            .count()
     }
 
     /// Whether the batch contains no operations of any kind.
     pub fn is_empty(&self) -> bool {
-        self.ops.is_empty() && self.range_deletes.is_empty() && self.merges.is_empty()
+        self.ops.is_empty()
     }
 }
 
@@ -3095,6 +3138,50 @@ mod tests {
         assert_eq!(db.get(b"e").unwrap(), Some(b"e".to_vec()));
         assert_eq!(db.get(b"x").unwrap(), Some(b"x".to_vec()));
         assert_eq!(db.get(b"y").unwrap(), Some(b"y".to_vec()));
+    }
+
+    #[test]
+    fn test_write_batch_delete_range_then_put_inside_range_keeps_put() {
+        let (db, _dir) = open_tmp();
+        db.put(b"k", b"old").unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.delete_range(b"a", b"z");
+        batch.put(b"k", b"new");
+        db.write(batch).unwrap();
+
+        assert_eq!(db.get(b"k").unwrap(), Some(b"new".to_vec()));
+    }
+
+    #[test]
+    fn test_write_batch_put_then_delete_range_inside_range_deletes_put() {
+        let (db, _dir) = open_tmp();
+
+        let mut batch = WriteBatch::new();
+        batch.put(b"k", b"new");
+        batch.delete_range(b"a", b"z");
+        db.write(batch).unwrap();
+
+        assert_eq!(db.get(b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn test_write_batch_order_survives_wal_replay() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Db::open(dir.path(), Options::default()).unwrap();
+            db.put(b"k", b"old").unwrap();
+
+            let mut batch = WriteBatch::new();
+            batch.delete_range(b"a", b"z");
+            batch.put(b"k", b"new");
+            db.write(batch).unwrap();
+            // Drop without an explicit close so reopen must recover
+            // the ordered batch from the WAL.
+        }
+
+        let db = Db::open(dir.path(), Options::default()).unwrap();
+        assert_eq!(db.get(b"k").unwrap(), Some(b"new".to_vec()));
     }
 
     #[test]
