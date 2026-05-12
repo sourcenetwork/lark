@@ -348,19 +348,13 @@ impl BlockCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::block::{BlockBuilder, RESTART_INTERVAL};
 
     fn dummy_block(size: usize) -> Arc<Block> {
-        // Minimal encoded block: a single restart at offset 0 +
-        // the 4-byte restart count footer, padded with zeros to
-        // reach approximately `size` bytes. The decoder only
-        // checks trailing format, not content.
-        let mut data = vec![0u8; size.max(8)];
-        let restart_count: u32 = 1;
-        let data_len = data.len();
-        // restarts: single u32 at position data_len - 8
-        data[data_len - 8..data_len - 4].copy_from_slice(&0u32.to_le_bytes());
-        data[data_len - 4..].copy_from_slice(&restart_count.to_le_bytes());
-        Arc::new(Block::decode(data).expect("decode"))
+        let mut builder = BlockBuilder::new(RESTART_INTERVAL);
+        let value = vec![0u8; size];
+        builder.add(b"k", &value);
+        Arc::new(Block::decode(builder.finish()).expect("decode"))
     }
 
     #[test]

@@ -118,40 +118,27 @@ fn encode_range_tombstone_block(tombstones: &[RangeTombstone]) -> Vec<u8> {
     buf
 }
 
-fn decode_range_tombstone_block(data: &[u8]) -> io::Result<Vec<RangeTombstone>> {
+pub(crate) fn decode_range_tombstone_block(data: &[u8]) -> io::Result<Vec<RangeTombstone>> {
     if data.is_empty() {
         return Ok(Vec::new());
     }
     if data.len() < 4 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "range tombstone block too short",
-        ));
+        return Err(invalid_data("range tombstone block too short"));
     }
     let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-    let mut out = Vec::with_capacity(count);
+    let max_records_by_size = (data.len() - 4) / 16;
+    let mut out = Vec::with_capacity(count.min(max_records_by_size));
     let mut pos = 4;
     for _ in 0..count {
-        if pos + 4 > data.len() {
-            break;
-        }
-        let start_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
-        if pos + start_len + 4 > data.len() {
-            break;
-        }
-        let start = data[pos..pos + start_len].to_vec();
-        pos += start_len;
-        let end_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
-        if pos + end_len + 8 > data.len() {
-            break;
-        }
-        let end = data[pos..pos + end_len].to_vec();
-        pos += end_len;
-        let seq = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-        pos += 8;
+        let start_len = read_u32(data, &mut pos, "range tombstone start length")? as usize;
+        let start = read_bytes(data, &mut pos, start_len, "range tombstone start")?;
+        let end_len = read_u32(data, &mut pos, "range tombstone end length")? as usize;
+        let end = read_bytes(data, &mut pos, end_len, "range tombstone end")?;
+        let seq = read_u64(data, &mut pos, "range tombstone seq")?;
         out.push(RangeTombstone::new(start, end, seq));
+    }
+    if pos != data.len() {
+        return Err(invalid_data("range tombstone block has trailing bytes"));
     }
     Ok(out)
 }
@@ -241,38 +228,145 @@ fn encoded_index_block_size(entries: &[(Vec<u8>, BlockHandle)]) -> usize {
 
 fn decode_index_block(data: &[u8]) -> io::Result<Vec<IndexEntry>> {
     if data.len() < 4 {
-        return Ok(Vec::new());
+        return Err(invalid_data("index block too short"));
     }
 
     let num_entries = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-    let mut entries = Vec::with_capacity(num_entries);
+    let max_entries_by_size = (data.len() - 4) / 20;
+    let mut entries = Vec::with_capacity(num_entries.min(max_entries_by_size));
     let mut pos = 4;
 
     for _ in 0..num_entries {
-        if pos + 4 > data.len() {
-            break;
-        }
-        let key_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
-
-        if pos + key_len + 16 > data.len() {
-            break;
-        }
-        let key = data[pos..pos + key_len].to_vec();
-        pos += key_len;
-
-        let offset = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-        pos += 8;
-        let size = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-        pos += 8;
+        let key_len = read_u32(data, &mut pos, "index key length")? as usize;
+        let key = read_bytes(data, &mut pos, key_len, "index key")?;
+        let offset = read_u64(data, &mut pos, "index block offset")?;
+        let size = read_u64(data, &mut pos, "index block size")?;
 
         entries.push(IndexEntry {
             key,
             handle: BlockHandle { offset, size },
         });
     }
+    if pos != data.len() {
+        return Err(invalid_data("index block has trailing bytes"));
+    }
 
     Ok(entries)
+}
+
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+fn read_u32(data: &[u8], pos: &mut usize, field: &'static str) -> io::Result<u32> {
+    let end = pos
+        .checked_add(4)
+        .ok_or_else(|| invalid_data(format!("{field} offset overflows")))?;
+    if end > data.len() {
+        return Err(invalid_data(format!("{field} is truncated")));
+    }
+    let value = u32::from_le_bytes(data[*pos..end].try_into().unwrap());
+    *pos = end;
+    Ok(value)
+}
+
+fn read_u64(data: &[u8], pos: &mut usize, field: &'static str) -> io::Result<u64> {
+    let end = pos
+        .checked_add(8)
+        .ok_or_else(|| invalid_data(format!("{field} offset overflows")))?;
+    if end > data.len() {
+        return Err(invalid_data(format!("{field} is truncated")));
+    }
+    let value = u64::from_le_bytes(data[*pos..end].try_into().unwrap());
+    *pos = end;
+    Ok(value)
+}
+
+fn read_bytes(
+    data: &[u8],
+    pos: &mut usize,
+    len: usize,
+    field: &'static str,
+) -> io::Result<Vec<u8>> {
+    let end = pos
+        .checked_add(len)
+        .ok_or_else(|| invalid_data(format!("{field} length overflows")))?;
+    if end > data.len() {
+        return Err(invalid_data(format!("{field} is truncated")));
+    }
+    let bytes = data[*pos..end].to_vec();
+    *pos = end;
+    Ok(bytes)
+}
+
+fn validate_footer_regions(footer: &Footer, file_size: u64) -> io::Result<()> {
+    if footer.bloom_size < 8 {
+        return Err(invalid_data("bloom region too short"));
+    }
+    if footer.index_size < 4 {
+        return Err(invalid_data("index block too short"));
+    }
+    validate_file_region(
+        footer.bloom_offset,
+        footer.bloom_size,
+        file_size,
+        "bloom region",
+    )?;
+    validate_file_region(
+        footer.index_offset,
+        footer.index_size,
+        file_size,
+        "index block",
+    )?;
+    if footer.range_tombstone_size > 0 {
+        if footer.range_tombstone_size < 4 {
+            return Err(invalid_data("range tombstone block too short"));
+        }
+        validate_file_region(
+            footer.range_tombstone_offset,
+            footer.range_tombstone_size,
+            file_size,
+            "range tombstone block",
+        )?;
+    }
+    Ok(())
+}
+
+fn read_file_region(
+    file: &mut File,
+    offset: u64,
+    size: u64,
+    file_size: u64,
+    name: &'static str,
+) -> io::Result<Vec<u8>> {
+    validate_file_region(offset, size, file_size, name)?;
+    let len = usize::try_from(size)
+        .map_err(|_| invalid_data(format!("{name} is too large to address")))?;
+    let mut buf = vec![0u8; len];
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+fn validate_file_region(
+    offset: u64,
+    size: u64,
+    file_size: u64,
+    name: &'static str,
+) -> io::Result<()> {
+    let data_end = file_size
+        .checked_sub(FOOTER_SIZE as u64)
+        .ok_or_else(|| invalid_data("SSTable file too small"))?;
+    let end = offset
+        .checked_add(size)
+        .ok_or_else(|| invalid_data(format!("{name} range overflows")))?;
+    if end > data_end {
+        return Err(invalid_data(format!("{name} extends past SSTable data")));
+    }
+    if usize::try_from(size).is_err() {
+        return Err(invalid_data(format!("{name} is too large to address")));
+    }
+    Ok(())
 }
 
 // ─── Writer ─────────────────────────────────────────────────────────────────
@@ -587,6 +681,7 @@ impl SsTableWriter {
 /// keeps the bytes alive via file-descriptor refcounting).
 pub(crate) struct SsTableReader {
     file: Mutex<File>,
+    file_size: u64,
     pub(crate) file_id: u64,
     index: Vec<IndexEntry>,
     bloom: BloomFilter,
@@ -620,42 +715,61 @@ impl SsTableReader {
         let mut footer_buf = [0u8; FOOTER_SIZE];
         file.read_exact(&mut footer_buf)?;
         let footer = Footer::decode(&footer_buf)?;
+        validate_footer_regions(&footer, file_size)?;
 
-        file.seek(SeekFrom::Start(footer.bloom_offset))?;
-        let mut bloom_data = vec![0u8; footer.bloom_size as usize];
-        file.read_exact(&mut bloom_data)?;
+        let bloom_data = read_file_region(
+            &mut file,
+            footer.bloom_offset,
+            footer.bloom_size,
+            file_size,
+            "bloom region",
+        )?;
         // Peel [prefix_bloom_len: u64 LE][prefix_bytes][user_bytes].
         if bloom_data.len() < 8 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            return Err(invalid_data(
                 "bloom region too short for prefix-bloom length header",
             ));
         }
-        let prefix_len = u64::from_le_bytes(bloom_data[0..8].try_into().unwrap()) as usize;
-        if 8 + prefix_len > bloom_data.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "prefix bloom length exceeds bloom region",
-            ));
+        let prefix_len = usize::try_from(u64::from_le_bytes(bloom_data[0..8].try_into().unwrap()))
+            .map_err(|_| invalid_data("prefix bloom length is too large to address"))?;
+        let user_bloom_offset = 8usize
+            .checked_add(prefix_len)
+            .ok_or_else(|| invalid_data("prefix bloom length overflows"))?;
+        if user_bloom_offset > bloom_data.len() {
+            return Err(invalid_data("prefix bloom length exceeds bloom region"));
+        }
+        if prefix_len > 0 && prefix_len < 4 {
+            return Err(invalid_data("prefix bloom block too short"));
+        }
+        if bloom_data.len() - user_bloom_offset < 4 {
+            return Err(invalid_data("user bloom block too short"));
         }
         let prefix_bloom = if prefix_len == 0 {
             None
         } else {
             Some(decode_bloom_block(&bloom_data[8..8 + prefix_len]))
         };
-        let bloom = decode_bloom_block(&bloom_data[8 + prefix_len..]);
+        let bloom = decode_bloom_block(&bloom_data[user_bloom_offset..]);
 
-        file.seek(SeekFrom::Start(footer.index_offset))?;
-        let mut index_data = vec![0u8; footer.index_size as usize];
-        file.read_exact(&mut index_data)?;
+        let index_data = read_file_region(
+            &mut file,
+            footer.index_offset,
+            footer.index_size,
+            file_size,
+            "index block",
+        )?;
         let index = decode_index_block(&index_data)?;
 
         let range_tombstones = if footer.range_tombstone_size == 0 {
             Vec::new()
         } else {
-            file.seek(SeekFrom::Start(footer.range_tombstone_offset))?;
-            let mut rt_data = vec![0u8; footer.range_tombstone_size as usize];
-            file.read_exact(&mut rt_data)?;
+            let rt_data = read_file_region(
+                &mut file,
+                footer.range_tombstone_offset,
+                footer.range_tombstone_size,
+                file_size,
+                "range tombstone block",
+            )?;
             decode_range_tombstone_block(&rt_data)?
         };
 
@@ -663,6 +777,7 @@ impl SsTableReader {
 
         Ok(Self {
             file: Mutex::new(file),
+            file_size,
             file_id,
             index,
             bloom,
@@ -677,12 +792,14 @@ impl SsTableReader {
     /// top-level index entries in `self.index`. No block cache is
     /// consulted — the OS page cache keeps hot leaves warm.
     fn read_index_leaf(&self, handle: BlockHandle) -> io::Result<Vec<IndexEntry>> {
-        let mut buf = vec![0u8; handle.size as usize];
-        {
-            let mut file = self.file.lock();
-            file.seek(SeekFrom::Start(handle.offset))?;
-            file.read_exact(&mut buf)?;
-        }
+        let mut file = self.file.lock();
+        let buf = read_file_region(
+            &mut file,
+            handle.offset,
+            handle.size,
+            self.file_size,
+            "partitioned index leaf",
+        )?;
         decode_index_block(&buf)
     }
 
@@ -990,9 +1107,15 @@ impl SsTableReader {
     ) -> io::Result<Arc<Block>> {
         let handle = if self.partitioned {
             let leaves = self.expand_all_leaves()?;
-            leaves[block_idx].handle
+            leaves
+                .get(block_idx)
+                .ok_or_else(|| invalid_data("partitioned block index out of bounds"))?
+                .handle
         } else {
-            self.index[block_idx].handle
+            self.index
+                .get(block_idx)
+                .ok_or_else(|| invalid_data("block index out of bounds"))?
+                .handle
         };
         self.read_block(handle, cache)
     }
@@ -1008,9 +1131,15 @@ impl SsTableReader {
     ) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let handle = if self.partitioned {
             let data_index = self.expand_all_leaves()?;
-            data_index[block_idx].handle
+            data_index
+                .get(block_idx)
+                .ok_or_else(|| invalid_data("partitioned block index out of bounds"))?
+                .handle
         } else {
-            self.index[block_idx].handle
+            self.index
+                .get(block_idx)
+                .ok_or_else(|| invalid_data("block index out of bounds"))?
+                .handle
         };
         let block = self.read_block(handle, cache)?;
         Ok(block.iter().collect())
@@ -1021,12 +1150,18 @@ impl SsTableReader {
             return Ok(block);
         }
 
-        let mut block_data = vec![0u8; handle.size as usize];
-        {
-            let mut file = self.file.lock();
-            file.seek(SeekFrom::Start(handle.offset))?;
-            file.read_exact(&mut block_data)?;
+        if handle.size < 5 {
+            return Err(invalid_data("block frame too short"));
         }
+        let mut file = self.file.lock();
+        let block_data = read_file_region(
+            &mut file,
+            handle.offset,
+            handle.size,
+            self.file_size,
+            "data block",
+        )?;
+        drop(file);
 
         // Frame: [compression_type: u8][payload][checksum: u32]
         let compression_type = block_data[0];
@@ -1062,6 +1197,9 @@ impl SsTableReader {
                     .map_err(|e| {
                         io::Error::new(io::ErrorKind::InvalidData, format!("snappy decode: {e}"))
                     })?;
+                if n != raw_len {
+                    return Err(invalid_data("snappy decoded length mismatch"));
+                }
                 out.truncate(n);
                 out
             }
@@ -1414,6 +1552,13 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
+    fn expect_reader_open_err(path: &Path) -> io::Error {
+        match SsTableReader::open(path, 1) {
+            Err(e) => e,
+            Ok(_) => panic!("expected invalid SSTable"),
+        }
+    }
+
     // ── reader error paths ──────────────────────────────────────
 
     #[test]
@@ -1441,6 +1586,26 @@ mod tests {
     }
 
     #[test]
+    fn open_rejects_footer_region_past_file_data() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad-region.sst");
+        let footer = Footer {
+            range_tombstone_offset: 0,
+            range_tombstone_size: 0,
+            bloom_offset: 0,
+            bloom_size: 8,
+            index_offset: 8,
+            index_size: 4,
+            num_entries: 0,
+            magic: MAGIC_V1,
+        };
+        fs::write(&path, footer.encode()).unwrap();
+
+        let err = expect_reader_open_err(&path);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn open_missing_file_returns_not_found() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("never.sst");
@@ -1449,6 +1614,31 @@ mod tests {
             Ok(_) => panic!("expected NotFound"),
         };
         assert_eq!(kind, io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn read_block_rejects_short_frame() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("short-block.bin");
+        fs::write(&path, [0u8; 4]).unwrap();
+        let file = File::open(&path).unwrap();
+        let reader = SsTableReader {
+            file: Mutex::new(file),
+            file_size: FOOTER_SIZE as u64 + 4,
+            file_id: 1,
+            index: Vec::new(),
+            bloom: BloomFilter::new(Vec::new(), 0),
+            prefix_bloom: None,
+            range_tombstones: Vec::new(),
+            partitioned: false,
+        };
+        let cache = BlockCache::new(1024);
+
+        let err = match reader.read_block(BlockHandle { offset: 0, size: 4 }, &cache) {
+            Err(e) => e,
+            Ok(_) => panic!("expected invalid block frame"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     // ── writer empty / summary ──────────────────────────────────
@@ -1699,10 +1889,10 @@ mod tests {
     }
 
     #[test]
-    fn range_tombstone_block_truncated_mid_record_drops_tail() {
+    fn range_tombstone_block_rejects_truncated_mid_record() {
         // Valid count = 2, but only the first record is complete. The
-        // decoder should early-return what it could parse rather than
-        // erroring out — matches the "drop torn tail" convention.
+        // decoder must reject the block rather than silently keeping
+        // a prefix of the range-tombstone metadata.
         let mut bytes = vec![];
         bytes.extend_from_slice(&2u32.to_le_bytes());
         // First record: start "aa", end "bb", seq=1 → 4+2+4+2+8 = 20
@@ -1715,9 +1905,46 @@ mod tests {
         bytes.extend_from_slice(&2u32.to_le_bytes());
         bytes.push(b'c'); // incomplete start
 
-        let got = decode_range_tombstone_block(&bytes).unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].start, b"aa");
+        let err = decode_range_tombstone_block(&bytes).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn range_tombstone_block_rejects_trailing_bytes() {
+        let mut bytes =
+            encode_range_tombstone_block(&[RangeTombstone::new(b"a".to_vec(), b"b".to_vec(), 1)]);
+        bytes.push(0xAA);
+
+        let err = decode_range_tombstone_block(&bytes).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    // ── index block decode ─────────────────────────────────────
+
+    #[test]
+    fn index_block_rejects_tiny_header() {
+        let err = decode_index_block(&[1, 2]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn index_block_rejects_truncated_entry() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(b"ab");
+
+        let err = decode_index_block(&bytes).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn index_block_rejects_trailing_bytes() {
+        let mut bytes = encode_index_block(&[]);
+        bytes.push(0xAA);
+
+        let err = decode_index_block(&bytes).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

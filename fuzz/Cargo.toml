@@ -13,6 +13,7 @@ tempfile = "3.8"
 
 [dependencies.lark-kv]
 path = ".."
+features = ["fuzzing"]
 
 [workspace]
 members = ["."]
@@ -25,4 +26,29 @@ doc = false
 [[bin]]
 name = "fuzz_writebatch"
 path = "fuzz_targets/fuzz_writebatch.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_block_decoder"
+path = "fuzz_targets/fuzz_block_decoder.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_range_tombstone_decoder"
+path = "fuzz_targets/fuzz_range_tombstone_decoder.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_wal_decoder"
+path = "fuzz_targets/fuzz_wal_decoder.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_manifest_decoder"
+path = "fuzz_targets/fuzz_manifest_decoder.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_sst_decoder"
+path = "fuzz_targets/fuzz_sst_decoder.rs"
 doc = false

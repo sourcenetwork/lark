@@ -14,6 +14,9 @@ readme = "README.md"
 keywords = ["database", "key-value", "lsm-tree", "storage", "embedded"]
 categories = ["database-implementations"]
 
+[features]
+fuzzing = []
+
 [dependencies]
 crossbeam-skiplist = "0.1"
 lz4_flex = "0.11"
