@@ -2,6 +2,7 @@ pub(crate) mod block;
 pub(crate) mod block_cache;
 pub(crate) mod bloom;
 pub(crate) mod compaction;
+mod db_lock;
 pub(crate) mod durability;
 pub(crate) mod internal_key;
 pub(crate) mod iterator;
@@ -21,6 +22,7 @@ use parking_lot::{Condvar, Mutex, RwLock};
 
 use block_cache::BlockCache;
 use compaction::{CompactionOptions, CompactionScheduler};
+use db_lock::DbDirectoryLock;
 use manifest::{VersionEdit, VersionSet};
 use memtable::MemTable;
 use snapshot_registry::SnapshotRegistry;
@@ -249,6 +251,7 @@ pub(crate) struct LarkEngine {
     /// level is nonzero, saving 2 lock round-trips per write in
     /// the common no-stall case.
     cached_stall_level: AtomicU8,
+    _db_lock: DbDirectoryLock,
 }
 
 /// Lock + condvar pair shared between foreground writers (which
@@ -276,6 +279,7 @@ impl StallSignal {
 impl LarkEngine {
     /// Open or create the database at the given path.
     pub(crate) fn open(db_dir: &Path, options: EngineOptions) -> std::io::Result<Arc<Self>> {
+        let db_lock = DbDirectoryLock::acquire_exclusive(db_dir)?;
         let sst_dir = db_dir.join("sst");
         let wal_dir = db_dir.join("wal");
 
@@ -382,6 +386,7 @@ impl LarkEngine {
             write_lock: Mutex::new(()),
             stall_signal,
             cached_stall_level: AtomicU8::new(0),
+            _db_lock: db_lock,
         });
 
         Ok(engine)

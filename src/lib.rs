@@ -1507,6 +1507,27 @@ mod tests {
         entries.into_iter().next().unwrap().path()
     }
 
+    #[test]
+    fn test_db_open_rejects_second_writer_on_same_directory() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), Options::default()).unwrap();
+
+        let err = Db::open(dir.path(), Options::default()).unwrap_err();
+        match err {
+            Error::Io(io) => {
+                assert_eq!(io.kind(), std::io::ErrorKind::AlreadyExists);
+                assert!(io.to_string().contains("already locked"));
+            }
+            other => panic!("expected lock I/O error, got {other:?}"),
+        }
+
+        db.put(b"k", b"v").unwrap();
+        drop(db);
+
+        let reopened = Db::open(dir.path(), Options::default()).unwrap();
+        assert_eq!(reopened.get(b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
     /// Options that force flushes early so tests can exercise the SSTable path.
     fn tiny_flush_opts() -> Options {
         Options {
