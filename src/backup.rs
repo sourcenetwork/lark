@@ -2,10 +2,12 @@
 //!
 //! [`BackupEngine`] keeps a directory of backups that deduplicate
 //! SSTable files across generations. Files are keyed in a `shared/`
-//! subdirectory by their `xxh3_128` content hash, and each backup's
-//! manifest lists the `(level, file_id, hash, meta)` tuples that
+//! subdirectory by an xxh3-based content id, and each backup's
+//! manifest lists the `(level, file_id, content id, meta)` tuples that
 //! reconstruct its version. Backing up an unchanged database a
 //! second time adds only the per-backup manifest, not the data.
+//! The content id and manifest checksum are fast accidental-corruption
+//! guards, not adversarial tamper protection.
 //!
 //! On-disk layout:
 //!
@@ -25,11 +27,11 @@
 //! captured version.
 
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::engine::CheckpointSnapshot;
+use crate::engine::{checksum, CheckpointSnapshot};
 use crate::{Db, Error, Result};
 
 /// Opaque identifier for a single backup generation. Monotonically
@@ -297,16 +299,7 @@ impl BackupEngine {
 
 fn hash_file(path: &Path) -> io::Result<u128> {
     let mut f = File::open(path)?;
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut all = Vec::new();
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        all.extend_from_slice(&buf[..n]);
-    }
-    Ok(xxhash_rust::xxh3::xxh3_128(&all))
+    checksum::backup_shared_file(&mut f)
 }
 
 fn copy_file_atomic(src: &Path, dst: &Path) -> io::Result<()> {
@@ -359,7 +352,7 @@ fn encode_manifest(m: &BackupManifest) -> Vec<u8> {
         body.extend_from_slice(&(f.largest_key.len() as u32).to_le_bytes());
         body.extend_from_slice(&f.largest_key);
     }
-    let checksum = xxhash_rust::xxh3::xxh3_64(&body);
+    let checksum = checksum::backup_manifest(&body);
     let mut out = Vec::with_capacity(body.len() + 8);
     out.extend_from_slice(&body);
     out.extend_from_slice(&checksum.to_le_bytes());
@@ -373,7 +366,9 @@ fn decode_manifest(data: &[u8]) -> io::Result<BackupManifest> {
     let body_len = data.len() - 8;
     let body = &data[..body_len];
     let stored_cksum = u64::from_le_bytes(data[body_len..].try_into().unwrap());
-    if xxhash_rust::xxh3::xxh3_64(body) != stored_cksum {
+    if checksum::backup_manifest(body) != stored_cksum
+        && checksum::legacy_payload_u64(body) != stored_cksum
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "backup manifest checksum mismatch",
@@ -467,7 +462,7 @@ fn read_var_bytes(data: &[u8], p: &mut usize) -> io::Result<Vec<u8>> {
 /// Mirrors the record layout produced by
 /// `VersionSet::encode_records` / `ManifestRecord::encode` in
 /// [`crate::engine::manifest`]. Each record is `[len u32][body][cksum u32]`
-/// with an xxh3-64 truncated checksum over the body.
+/// with the same accidental-corruption checksum used by the engine manifest.
 fn encode_engine_manifest(m: &BackupManifest) -> Vec<u8> {
     const TAG_ADD_FILE: u8 = 1;
     const TAG_LAST_SEQ: u8 = 3;
@@ -503,7 +498,7 @@ fn encode_engine_manifest(m: &BackupManifest) -> Vec<u8> {
     let mut out = Vec::new();
     for record_buf in &records {
         let len = record_buf.len() as u32;
-        let checksum = xxhash_rust::xxh3::xxh3_64(record_buf) as u32;
+        let checksum = checksum::manifest_record(len, record_buf);
         out.extend_from_slice(&len.to_le_bytes());
         out.extend_from_slice(record_buf);
         out.extend_from_slice(&checksum.to_le_bytes());

@@ -2,7 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use super::durability;
+use super::{checksum, durability};
 
 /// Record types in the WAL.
 const RECORD_PUT: u8 = 0x01;
@@ -13,9 +13,9 @@ const RECORD_BATCH: u8 = 0x05;
 
 /// A write-ahead log for crash recovery.
 ///
-/// Records are checksum-protected and append-only. Each memtable gets
-/// its own WAL file. On crash recovery, WAL files are replayed to
-/// reconstruct memtable state.
+/// Records are append-only and carry fast non-cryptographic checksums for
+/// torn-write and bit-rot detection. On crash recovery, WAL files are
+/// replayed to reconstruct memtable state.
 pub(crate) struct Wal {
     writer: BufWriter<File>,
     path: PathBuf,
@@ -140,7 +140,7 @@ impl Wal {
 
     fn write_record(&mut self, record_type: u8, data: &[u8]) -> io::Result<()> {
         let len = data.len() as u32;
-        let checksum = xxhash_rust::xxh3::xxh3_64(data) as u32;
+        let checksum = checksum::wal_record(len, record_type, data);
 
         self.writer.write_all(&len.to_le_bytes())?;
         self.writer.write_all(&[record_type])?;
@@ -173,9 +173,11 @@ impl Wal {
                 "truncated WAL record checksum",
             )?;
             let stored_checksum = u32::from_le_bytes(checksum_bytes);
-            let computed_checksum = xxhash_rust::xxh3::xxh3_64(&data) as u32;
+            let computed_checksum = checksum::wal_record(len as u32, record_type, &data);
 
-            if stored_checksum != computed_checksum {
+            if stored_checksum != computed_checksum
+                && stored_checksum != checksum::legacy_payload_u32(&data)
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("WAL checksum mismatch in {}", path.display()),
@@ -567,7 +569,8 @@ mod tests {
         checksum_override: Option<u32>,
     ) {
         let len = data.len() as u32;
-        let checksum = checksum_override.unwrap_or_else(|| xxhash_rust::xxh3::xxh3_64(data) as u32);
+        let checksum =
+            checksum_override.unwrap_or_else(|| checksum::wal_record(len, record_type, data));
         f.write_all(&len.to_le_bytes()).unwrap();
         f.write_all(&[record_type]).unwrap();
         f.write_all(data).unwrap();
@@ -948,6 +951,56 @@ mod tests {
             Ok(v) => panic!("expected checksum error, got {} entries", v.len()),
         };
         assert_eq!(kind, io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn record_checksum_covers_header_fields() {
+        let data = put_data(b"k", b"v", 1);
+        let len = data.len() as u32;
+        let baseline = checksum::wal_record(len, RECORD_PUT, &data);
+        assert_ne!(baseline, checksum::wal_record(len + 1, RECORD_PUT, &data));
+        assert_ne!(baseline, checksum::wal_record(len, RECORD_DELETE, &data));
+    }
+
+    #[test]
+    fn replay_errors_on_record_type_header_flip() {
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        wal.append_put(b"k", b"v", 1).unwrap();
+        wal.flush().unwrap();
+        drop(wal);
+
+        flip_byte(&path, 4);
+
+        let kind = match Wal::replay(&path) {
+            Err(e) => e.kind(),
+            Ok(v) => panic!("expected checksum error, got {} entries", v.len()),
+        };
+        assert_eq!(kind, io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn replay_accepts_legacy_payload_only_checksum() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy.wal");
+        let data = put_data(b"k", b"v", 1);
+        let mut f = File::create(&path).unwrap();
+        append_raw_record(
+            &mut f,
+            RECORD_PUT,
+            &data,
+            Some(checksum::legacy_payload_u32(&data)),
+        );
+        f.sync_all().unwrap();
+
+        assert_eq!(
+            Wal::replay(&path).unwrap(),
+            vec![WalEntry::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                seq: 1
+            }]
+        );
     }
 
     #[test]
