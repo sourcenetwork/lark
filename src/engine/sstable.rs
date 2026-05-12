@@ -26,6 +26,7 @@ use parking_lot::Mutex;
 use super::block::{Block, BlockBuilder, BlockHandle, RESTART_INTERVAL};
 use super::block_cache::BlockCache;
 use super::bloom::{decode_bloom_block, encode_bloom_block, BloomFilter, BloomFilterBuilder};
+use super::checksum;
 use super::durability;
 use super::internal_key::{
     compare_internal_keys, decode_internal_key, lookup_key, user_key_of, VALUE_TYPE_DELETION,
@@ -653,7 +654,7 @@ impl SsTableWriter {
             }
         };
 
-        let checksum = xxhash_rust::xxh3::xxh3_64(&payload) as u32;
+        let checksum = checksum::sst_block(codec_byte, &payload);
         self.writer.write_all(&[codec_byte])?;
         self.writer.write_all(&payload)?;
         self.writer.write_all(&checksum.to_le_bytes())?;
@@ -1163,14 +1164,17 @@ impl SsTableReader {
         )?;
         drop(file);
 
-        // Frame: [compression_type: u8][payload][checksum: u32]
+        // Frame: [compression_type: u8][payload][checksum: u32].
+        // The checksum is an accidental-corruption guard, not a MAC.
         let compression_type = block_data[0];
         let checksum_offset = block_data.len() - 4;
         let stored_checksum = u32::from_le_bytes(block_data[checksum_offset..].try_into().unwrap());
         let compressed_data = &block_data[1..checksum_offset];
 
-        let computed_checksum = xxhash_rust::xxh3::xxh3_64(compressed_data) as u32;
-        if stored_checksum != computed_checksum {
+        let computed_checksum = checksum::sst_block(compression_type, compressed_data);
+        if stored_checksum != computed_checksum
+            && stored_checksum != checksum::legacy_payload_u32(compressed_data)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "block checksum mismatch",
@@ -1637,6 +1641,38 @@ mod tests {
         let err = match reader.read_block(BlockHandle { offset: 0, size: 4 }, &cache) {
             Err(e) => e,
             Ok(_) => panic!("expected invalid block frame"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn block_checksum_covers_compression_type() {
+        let payload = b"payload";
+        let baseline = checksum::sst_block(COMPRESSION_NONE, payload);
+        assert_ne!(baseline, checksum::sst_block(COMPRESSION_LZ4, payload));
+    }
+
+    #[test]
+    fn read_block_rejects_compression_header_flip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("header-flip.sst");
+        {
+            let mut writer =
+                SsTableWriter::new(&path, 4096, 10, CompressionType::None, None, false, 4096)
+                    .unwrap();
+            writer.add(&ik(b"k", 1), b"v").unwrap();
+            writer.finish().unwrap().unwrap();
+        }
+
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[0] = COMPRESSION_LZ4;
+        fs::write(&path, bytes).unwrap();
+
+        let reader = SsTableReader::open(&path, 1).unwrap();
+        let cache = BlockCache::new(1024);
+        let err = match reader.get(b"k", u64::MAX, &cache) {
+            Err(e) => e,
+            Ok(v) => panic!("expected checksum error, got {v:?}"),
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }

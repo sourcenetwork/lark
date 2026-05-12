@@ -1,6 +1,7 @@
 pub(crate) mod block;
 pub(crate) mod block_cache;
 pub(crate) mod bloom;
+pub(crate) mod checksum;
 pub(crate) mod compaction;
 mod db_lock;
 pub(crate) mod durability;

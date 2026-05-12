@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use super::durability;
 use super::sstable::{sst_filename, LiveSst, SsTableMeta, SsTableReader};
+use super::{checksum, durability};
 
 /// Maximum number of levels in the LSM tree.
 pub(crate) const MAX_LEVELS: usize = 7;
@@ -360,7 +360,7 @@ impl VersionSet {
             record.encode(&mut record_buf);
 
             let len = record_buf.len() as u32;
-            let checksum = xxhash_rust::xxh3::xxh3_64(&record_buf) as u32;
+            let checksum = checksum::manifest_record(len, &record_buf);
 
             buf.extend_from_slice(&len.to_le_bytes());
             buf.extend_from_slice(&record_buf);
@@ -407,8 +407,10 @@ impl VersionSet {
             let stored_checksum = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
             offset += 4;
 
-            let computed_checksum = xxhash_rust::xxh3::xxh3_64(record_data) as u32;
-            if stored_checksum != computed_checksum {
+            let computed_checksum = checksum::manifest_record(len as u32, record_data);
+            if stored_checksum != computed_checksum
+                && stored_checksum != checksum::legacy_payload_u32(record_data)
+            {
                 tracing::warn!("Manifest checksum mismatch, stopping replay");
                 break;
             }
@@ -509,6 +511,31 @@ mod tests {
             file_size: 128,
             num_entries: 2,
         }
+    }
+
+    #[test]
+    fn manifest_checksum_covers_length_header() {
+        let mut record = Vec::new();
+        ManifestRecord::SetLastSeq(7).encode(&mut record);
+        let len = record.len() as u32;
+        let baseline = checksum::manifest_record(len, &record);
+        assert_ne!(baseline, checksum::manifest_record(len + 1, &record));
+    }
+
+    #[test]
+    fn replay_manifest_accepts_legacy_payload_only_checksum() {
+        let dir = TempDir::new().unwrap();
+        let mut record = Vec::new();
+        ManifestRecord::SetLastSeq(7).encode(&mut record);
+        let len = record.len() as u32;
+        let mut data = Vec::new();
+        data.extend_from_slice(&len.to_le_bytes());
+        data.extend_from_slice(&record);
+        data.extend_from_slice(&checksum::legacy_payload_u32(&record).to_le_bytes());
+
+        let replay = VersionSet::replay_manifest(&data, dir.path()).unwrap();
+        assert_eq!(replay.version.last_seq, 7);
+        assert_eq!(replay.valid_len, data.len());
     }
 
     #[test]
