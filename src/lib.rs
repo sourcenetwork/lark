@@ -94,6 +94,38 @@ use std::sync::Arc;
 
 use engine::LarkEngine;
 
+fn invalid_cf_handle_error(cf: &ColumnFamilyHandle) -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "column family handle '{}' with id {} is not live",
+            cf.name(),
+            cf.id()
+        ),
+    ))
+}
+
+fn invalid_cf_id_io_error(cf_id: u32) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("column family id {cf_id} is not live"),
+    )
+}
+
+fn prefixed_cf_id(prefixed_key: &[u8]) -> std::io::Result<u32> {
+    let bytes: [u8; 4] = prefixed_key
+        .get(..4)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "prefixed key is shorter than the column-family id",
+            )
+        })?
+        .try_into()
+        .unwrap();
+    Ok(u32::from_be_bytes(bytes))
+}
+
 /// Minimal snapshot of the currently-configured options, returned
 /// by `Db::get_property("lark.options")`. Deliberately small —
 /// lark doesn't retain the full `Options` past `Db::open`, and
@@ -423,6 +455,7 @@ impl Db {
         if batch.is_empty() {
             return Ok(());
         }
+        self.validate_batch_cf_liveness(&batch)?;
         self.wait_for_write_capacity(opts)?;
         perf_context::record_write_call();
         let stats = self.stats();
@@ -504,6 +537,47 @@ impl Db {
         Ok(())
     }
 
+    fn validate_cf_handle(&self, cf: &ColumnFamilyHandle) -> Result<()> {
+        if self.cfs.is_live_handle(cf) {
+            Ok(())
+        } else {
+            Err(invalid_cf_handle_error(cf))
+        }
+    }
+
+    fn is_live_cf_handle(&self, cf: &ColumnFamilyHandle) -> bool {
+        self.cfs.is_live_handle(cf)
+    }
+
+    fn validate_prefixed_cf_io(&self, prefixed_key: &[u8]) -> std::io::Result<()> {
+        let cf_id = prefixed_cf_id(prefixed_key)?;
+        if self.cfs.contains_id(cf_id) {
+            Ok(())
+        } else {
+            Err(invalid_cf_id_io_error(cf_id))
+        }
+    }
+
+    fn validate_prefixed_cf(&self, prefixed_key: &[u8]) -> Result<()> {
+        self.validate_prefixed_cf_io(prefixed_key)
+            .map_err(Error::Io)
+    }
+
+    fn validate_batch_cf_liveness(&self, batch: &WriteBatch) -> Result<()> {
+        for op in &batch.ops {
+            match op {
+                WriteBatchOp::Put { key, .. }
+                | WriteBatchOp::Delete { key }
+                | WriteBatchOp::Merge { key, .. } => self.validate_prefixed_cf(key)?,
+                WriteBatchOp::DeleteRange { start, end } => {
+                    self.validate_prefixed_cf(start)?;
+                    self.validate_prefixed_cf(end)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Create a point-in-time snapshot for consistent reads.
     ///
     /// Snapshots also pin the compaction GC horizon: as long as at
@@ -516,6 +590,7 @@ impl Db {
         self.engine.register_snapshot(seq);
         Snapshot {
             engine: Arc::clone(&self.engine),
+            cfs: Arc::clone(&self.cfs),
             seq,
         }
     }
@@ -750,6 +825,9 @@ impl Db {
         cf: &ColumnFamilyHandle,
         ranges: &[Range<'_>],
     ) -> Vec<u64> {
+        if !self.is_live_cf_handle(cf) {
+            return vec![0; ranges.len()];
+        }
         ranges
             .iter()
             .map(|r| self.approximate_size_in_range(cf, r))
@@ -778,6 +856,9 @@ impl Db {
         cf: &ColumnFamilyHandle,
         range: Range<'_>,
     ) -> MemTableStats {
+        if !self.is_live_cf_handle(cf) {
+            return MemTableStats::default();
+        }
         self.memtable_stats_in(cf, &range)
     }
 
@@ -808,7 +889,9 @@ impl Db {
         opts: IngestOptions,
     ) -> Result<()> {
         self.engine
-            .ingest_external_files(files, &opts)
+            .ingest_external_files(files, &opts, |user_key| {
+                self.validate_prefixed_cf_io(user_key)
+            })
             .map_err(Error::Io)
     }
 
@@ -909,6 +992,7 @@ impl Db {
                 "cannot drop the reserved metadata column family",
             )));
         }
+        self.validate_cf_handle(&cf)?;
         let lo = cf_lower_bound(cf.id());
         let hi = cf_upper_bound(cf.id());
         // Apply the data range-delete and the metadata entry
@@ -927,6 +1011,7 @@ impl Db {
     /// Read `key` from column family `cf`. Same semantics as
     /// [`Db::get`] but scoped to the CF's keyspace.
     pub fn get_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.validate_cf_handle(cf)?;
         self.get_raw(&prefix_key(cf.id(), key))
     }
 
@@ -936,6 +1021,7 @@ impl Db {
         cf: &ColumnFamilyHandle,
         keys: &[&[u8]],
     ) -> Result<Vec<Option<Vec<u8>>>> {
+        self.validate_cf_handle(cf)?;
         let owned: Vec<Vec<u8>> = keys.iter().map(|k| prefix_key(cf.id(), k)).collect();
         let refs: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
         let seq = self.engine.snapshot_seq();
@@ -944,6 +1030,7 @@ impl Db {
 
     /// Write `key → value` in column family `cf`.
     pub fn put_cf(&self, cf: &ColumnFamilyHandle, key: &[u8], value: &[u8]) -> Result<()> {
+        self.validate_cf_handle(cf)?;
         let mut batch = BTreeMap::new();
         batch.insert(prefix_key(cf.id(), key), Some(value.to_vec()));
         self.engine
@@ -953,6 +1040,7 @@ impl Db {
 
     /// Delete `key` in column family `cf`.
     pub fn delete_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<()> {
+        self.validate_cf_handle(cf)?;
         let mut batch = BTreeMap::new();
         batch.insert(prefix_key(cf.id(), key), None);
         self.engine
@@ -962,6 +1050,7 @@ impl Db {
 
     /// Delete every key in `[start, end)` in column family `cf`.
     pub fn delete_range_cf(&self, cf: &ColumnFamilyHandle, start: &[u8], end: &[u8]) -> Result<()> {
+        self.validate_cf_handle(cf)?;
         if start >= end {
             return Ok(());
         }
@@ -979,6 +1068,7 @@ impl Db {
     /// Layer a merge operand on top of `key` in column family `cf`.
     /// Requires [`Options::merge_operator`] to be set.
     pub fn merge_cf(&self, cf: &ColumnFamilyHandle, key: &[u8], operand: &[u8]) -> Result<()> {
+        self.validate_cf_handle(cf)?;
         self.engine
             .apply_grouped_batch(
                 BTreeMap::new(),
@@ -999,6 +1089,7 @@ impl Db {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.validate_cf_handle(cf)?;
         let lo = match start {
             Some(s) => prefix_key(cf.id(), s),
             None => cf_lower_bound(cf.id()),
@@ -1015,10 +1106,11 @@ impl Db {
     /// Streaming iterator bounded to column family `cf`. The
     /// returned keys have the CF prefix stripped.
     pub fn iter_cf<'a>(&'a self, cf: &ColumnFamilyHandle) -> CfIter<'a> {
-        CfIter {
-            inner: self.raw_iter(),
-            cf_id: cf.id(),
-            upper_bound: cf_upper_bound(cf.id()),
+        let inner = self.raw_iter();
+        if self.is_live_cf_handle(cf) {
+            CfIter::new(inner, cf.id())
+        } else {
+            CfIter::invalid(inner)
         }
     }
 
@@ -1034,7 +1126,12 @@ impl Db {
     /// Create a forward-only [`TailingIter`] scoped to column
     /// family `cf`.
     pub fn iter_tailing_cf(&self, cf: &ColumnFamilyHandle) -> TailingIter {
-        tailing::new_for_cf(Arc::clone(&self.engine), cf)
+        let engine = Arc::clone(&self.engine);
+        if self.is_live_cf_handle(cf) {
+            tailing::new_for_cf(engine, cf)
+        } else {
+            tailing::new_empty(engine)
+        }
     }
 
     pub(crate) fn engine(&self) -> &LarkEngine {
@@ -1063,11 +1160,33 @@ pub struct CfIter<'a> {
     inner: Iter<'a>,
     cf_id: u32,
     upper_bound: Vec<u8>,
+    valid_cf: bool,
 }
 
 impl<'a> CfIter<'a> {
+    fn new(inner: Iter<'a>, cf_id: u32) -> Self {
+        Self {
+            inner,
+            cf_id,
+            upper_bound: cf_upper_bound(cf_id),
+            valid_cf: true,
+        }
+    }
+
+    fn invalid(inner: Iter<'a>) -> Self {
+        Self {
+            inner,
+            cf_id: DEFAULT_CF_ID,
+            upper_bound: cf_upper_bound(DEFAULT_CF_ID),
+            valid_cf: false,
+        }
+    }
+
     /// Position the cursor at the first key in the CF.
     pub fn seek_to_first(&mut self) {
+        if !self.valid_cf {
+            return;
+        }
         let lo = self.cf_id.to_be_bytes();
         self.inner.seek(&lo);
     }
@@ -1075,6 +1194,9 @@ impl<'a> CfIter<'a> {
     /// Position the cursor at the last key in the CF (or before
     /// the CF's upper bound if the CF is empty).
     pub fn seek_to_last(&mut self) {
+        if !self.valid_cf {
+            return;
+        }
         // `seek_for_prev(upper_bound - 1)` is the trick: seek to
         // the largest key strictly less than `upper_bound`.
         let mut probe = self.upper_bound.clone();
@@ -1096,11 +1218,17 @@ impl<'a> CfIter<'a> {
 
     /// Position the cursor at the first key `>= target` in the CF.
     pub fn seek(&mut self, target: &[u8]) {
+        if !self.valid_cf {
+            return;
+        }
         self.inner.seek(&prefix_key(self.cf_id, target));
     }
 
     /// Position the cursor at the last key `<= target` in the CF.
     pub fn seek_for_prev(&mut self, target: &[u8]) {
+        if !self.valid_cf {
+            return;
+        }
         self.inner.seek_for_prev(&prefix_key(self.cf_id, target));
     }
 
@@ -1109,24 +1237,36 @@ impl<'a> CfIter<'a> {
     /// that prefix. Delegates to the underlying [`Iter::seek_prefix`],
     /// with `prefix` first re-scoped to include the CF prefix.
     pub fn seek_prefix(&mut self, prefix: &[u8]) {
+        if !self.valid_cf {
+            return;
+        }
         self.inner.seek_prefix(&prefix_key(self.cf_id, prefix));
     }
 
     /// Advance the cursor forward. Invalidates the iterator if
     /// the next key crosses the CF's upper bound.
     pub fn next(&mut self) {
+        if !self.valid_cf {
+            return;
+        }
         self.inner.next();
     }
 
     /// Move the cursor backward. Invalidates the iterator if
     /// the previous key crosses the CF's lower bound.
     pub fn prev(&mut self) {
+        if !self.valid_cf {
+            return;
+        }
         self.inner.prev();
     }
 
     /// Whether the cursor is positioned on a visible key within
     /// the CF.
     pub fn valid(&self) -> bool {
+        if !self.valid_cf {
+            return false;
+        }
         let Some(k) = self.inner.key() else {
             return false;
         };
@@ -1164,6 +1304,7 @@ impl<'a> CfIter<'a> {
 /// A point-in-time snapshot for consistent reads.
 pub struct Snapshot {
     engine: Arc<LarkEngine>,
+    cfs: Arc<CfRegistry>,
     seq: u64,
 }
 
@@ -1187,6 +1328,18 @@ impl std::fmt::Debug for Snapshot {
 }
 
 impl Snapshot {
+    fn validate_cf_handle(&self, cf: &ColumnFamilyHandle) -> Result<()> {
+        if self.cfs.is_live_handle(cf) {
+            Ok(())
+        } else {
+            Err(invalid_cf_handle_error(cf))
+        }
+    }
+
+    fn is_live_cf_handle(&self, cf: &ColumnFamilyHandle) -> bool {
+        self.cfs.is_live_handle(cf)
+    }
+
     /// Get the value for a key at this snapshot (default CF).
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.engine
@@ -1222,16 +1375,16 @@ impl Snapshot {
     /// Create a streaming iterator anchored at this snapshot
     /// (default CF). Keys returned have the CF prefix stripped.
     pub fn iter(&self) -> CfIter<'_> {
-        CfIter {
-            inner: Iter::from_internal(self.engine.new_iter(self.seq))
+        CfIter::new(
+            Iter::from_internal(self.engine.new_iter(self.seq))
                 .with_stats(self.engine.statistics_arc()),
-            cf_id: DEFAULT_CF_ID,
-            upper_bound: cf_upper_bound(DEFAULT_CF_ID),
-        }
+            DEFAULT_CF_ID,
+        )
     }
 
     /// CF-scoped get at this snapshot.
     pub fn get_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.validate_cf_handle(cf)?;
         self.engine
             .get(&prefix_key(cf.id(), key), self.seq)
             .map_err(Error::Io)
@@ -1243,6 +1396,7 @@ impl Snapshot {
         cf: &ColumnFamilyHandle,
         keys: &[&[u8]],
     ) -> Result<Vec<Option<Vec<u8>>>> {
+        self.validate_cf_handle(cf)?;
         let owned: Vec<Vec<u8>> = keys.iter().map(|k| prefix_key(cf.id(), k)).collect();
         let refs: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
         self.engine.multi_get(&refs, self.seq).map_err(Error::Io)
@@ -1256,6 +1410,7 @@ impl Snapshot {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.validate_cf_handle(cf)?;
         let lo = match start {
             Some(s) => prefix_key(cf.id(), s),
             None => cf_lower_bound(cf.id()),
@@ -1270,11 +1425,12 @@ impl Snapshot {
 
     /// CF-scoped streaming iterator at this snapshot.
     pub fn iter_cf<'a>(&'a self, cf: &ColumnFamilyHandle) -> CfIter<'a> {
-        CfIter {
-            inner: Iter::from_internal(self.engine.new_iter(self.seq))
-                .with_stats(self.engine.statistics_arc()),
-            cf_id: cf.id(),
-            upper_bound: cf_upper_bound(cf.id()),
+        let inner = Iter::from_internal(self.engine.new_iter(self.seq))
+            .with_stats(self.engine.statistics_arc());
+        if self.is_live_cf_handle(cf) {
+            CfIter::new(inner, cf.id())
+        } else {
+            CfIter::invalid(inner)
         }
     }
 }
@@ -4245,6 +4401,102 @@ mod tests {
         // Re-creating with the same name yields a fresh, empty CF.
         let cf2 = db.create_column_family("tmp").unwrap();
         assert_eq!(db.get_cf(&cf2, b"a").unwrap(), None);
+    }
+
+    #[test]
+    fn test_cf_stale_handle_is_rejected_after_drop() {
+        let (db, _dir) = open_tmp();
+        let cf = db.create_column_family("tmp").unwrap();
+        db.put_cf(&cf, b"k", b"v").unwrap();
+        db.drop_column_family(cf.clone()).unwrap();
+
+        assert!(db.get_cf(&cf, b"k").is_err());
+        assert!(db.multi_get_cf(&cf, &[b"k"]).is_err());
+        assert!(db.put_cf(&cf, b"k", b"ghost").is_err());
+        assert!(db.delete_cf(&cf, b"k").is_err());
+        assert!(db.delete_range_cf(&cf, b"a", b"z").is_err());
+        assert!(db.merge_cf(&cf, b"k", b"operand").is_err());
+        assert!(db.scan_cf(&cf, None, None).is_err());
+        assert_eq!(
+            db.get_approximate_sizes_cf(&cf, &[Range::new(b"a", b"z")]),
+            vec![0]
+        );
+        assert_eq!(
+            db.get_approximate_memtable_stats_cf(&cf, Range::new(b"a", b"z")),
+            MemTableStats::default()
+        );
+
+        let mut iter = db.iter_cf(&cf);
+        iter.seek_to_first();
+        assert!(!iter.valid());
+
+        let mut tail = db.iter_tailing_cf(&cf);
+        tail.seek_to_first();
+        assert!(!tail.valid());
+    }
+
+    #[test]
+    fn test_cf_stale_handle_cannot_write_into_recreated_cf_name() {
+        let (db, _dir) = open_tmp();
+        let stale = db.create_column_family("tmp").unwrap();
+        db.put_cf(&stale, b"k", b"old").unwrap();
+        db.drop_column_family(stale.clone()).unwrap();
+
+        let live = db.create_column_family("tmp").unwrap();
+        assert_ne!(stale, live);
+        assert!(db.put_cf(&stale, b"k", b"ghost").is_err());
+        db.put_cf(&live, b"k", b"new").unwrap();
+
+        assert!(db.get_cf(&stale, b"k").is_err());
+        assert_eq!(db.get_cf(&live, b"k").unwrap(), Some(b"new".to_vec()));
+    }
+
+    #[test]
+    fn test_cf_write_batch_rejects_stale_handle_ops() {
+        let (db, _dir) = open_tmp();
+        let stale = db.create_column_family("tmp").unwrap();
+        db.drop_column_family(stale.clone()).unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.put_cf(&stale, b"k", b"ghost");
+        assert!(db.write(batch).is_err());
+
+        let live = db.create_column_family("tmp").unwrap();
+        assert_eq!(db.get_cf(&live, b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn test_cf_ingest_rejects_stale_handle_entries() {
+        let (db, dir) = open_tmp();
+        let stale = db.create_column_family("tmp").unwrap();
+        db.drop_column_family(stale.clone()).unwrap();
+
+        let path = dir.path().join("stale-cf.sst");
+        let mut writer = SstFileWriter::create(&path, &Options::default()).unwrap();
+        writer.put_cf(&stale, b"k", b"ghost").unwrap();
+        writer.finish().unwrap();
+
+        assert!(db
+            .ingest_external_files(&[path], IngestOptions::default())
+            .is_err());
+        let live = db.create_column_family("tmp").unwrap();
+        assert_eq!(db.get_cf(&live, b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn test_cf_snapshot_rejects_stale_handle_after_drop() {
+        let (db, _dir) = open_tmp();
+        let cf = db.create_column_family("tmp").unwrap();
+        db.put_cf(&cf, b"k", b"v").unwrap();
+        let snap = db.snapshot();
+        db.drop_column_family(cf.clone()).unwrap();
+
+        assert!(snap.get_cf(&cf, b"k").is_err());
+        assert!(snap.multi_get_cf(&cf, &[b"k"]).is_err());
+        assert!(snap.scan_cf(&cf, None, None).is_err());
+        let mut iter = snap.iter_cf(&cf);
+        iter.seek_to_first();
+        assert!(!iter.valid());
     }
 
     #[test]
