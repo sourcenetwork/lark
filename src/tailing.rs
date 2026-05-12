@@ -72,6 +72,7 @@ pub struct TailingIter {
     /// `valid` can compare without re-deriving the bound on every
     /// step.
     cf_upper: Vec<u8>,
+    valid_cf: bool,
     /// Statistics sink captured at construction so seek/next
     /// instrumentation borrows only this field, not the whole
     /// `&self` (which would conflict with the mutable borrows in
@@ -89,8 +90,15 @@ impl TailingIter {
             last_returned: None,
             cf_id,
             cf_upper: cf_upper_bound(cf_id),
+            valid_cf: true,
             stats,
         }
+    }
+
+    pub(crate) fn empty(engine: Arc<LarkEngine>) -> Self {
+        let mut iter = Self::new(engine, DEFAULT_CF_ID);
+        iter.valid_cf = false;
+        iter
     }
 
     fn tick_seek(&self) {
@@ -110,6 +118,9 @@ impl TailingIter {
     /// "last returned" bookkeeping so a subsequent refresh uses
     /// the new position as its floor.
     pub fn seek(&mut self, target: &[u8]) {
+        if !self.valid_cf {
+            return;
+        }
         self.tick_seek();
         {
             let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterSeek);
@@ -121,6 +132,9 @@ impl TailingIter {
 
     /// Position the cursor at the first key in this CF.
     pub fn seek_to_first(&mut self) {
+        if !self.valid_cf {
+            return;
+        }
         self.tick_seek();
         {
             let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterSeek);
@@ -136,6 +150,9 @@ impl TailingIter {
     /// available, the iterator becomes invalid; callers can poll
     /// by calling [`Self::refresh`] again later.
     pub fn next(&mut self) {
+        if !self.valid_cf {
+            return;
+        }
         // Scope the timing handle so its borrow on `self.stats`
         // ends before we call the `&mut self` helpers below.
         {
@@ -167,6 +184,9 @@ impl TailingIter {
     /// data without waiting for the current view to be fully
     /// exhausted.
     pub fn refresh(&mut self) {
+        if !self.valid_cf {
+            return;
+        }
         self.refresh_and_reseek();
         self.record_current();
     }
@@ -207,6 +227,9 @@ impl TailingIter {
     }
 
     fn within_cf(&self) -> bool {
+        if !self.valid_cf {
+            return false;
+        }
         match self.inner.key() {
             Some(k) => k >= self.cf_id.to_be_bytes().as_slice() && k < self.cf_upper.as_slice(),
             None => false,
@@ -254,4 +277,9 @@ pub(crate) fn new_default(engine: Arc<LarkEngine>) -> TailingIter {
 /// Helper called from `Db::iter_tailing_cf`.
 pub(crate) fn new_for_cf(engine: Arc<LarkEngine>, cf: &ColumnFamilyHandle) -> TailingIter {
     TailingIter::new(engine, cf.id())
+}
+
+/// Helper called when a stale CF handle is used with `Db::iter_tailing_cf`.
+pub(crate) fn new_empty(engine: Arc<LarkEngine>) -> TailingIter {
+    TailingIter::empty(engine)
 }

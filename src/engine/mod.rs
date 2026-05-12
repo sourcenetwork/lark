@@ -1623,11 +1623,15 @@ impl LarkEngine {
     /// set the call is rejected while any snapshot is pinned (ingest
     /// would otherwise inject a new seq that older snapshots cannot
     /// consistently observe).
-    pub(crate) fn ingest_external_files(
+    pub(crate) fn ingest_external_files<F>(
         &self,
         files: &[PathBuf],
         ingest_opts: &crate::sst_file_writer::IngestOptions,
-    ) -> std::io::Result<()> {
+        mut validate_user_key: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnMut(&[u8]) -> std::io::Result<()>,
+    {
         use crate::engine::internal_key::decode_internal_key;
 
         if files.is_empty() {
@@ -1651,6 +1655,38 @@ impl LarkEngine {
             })?;
             let entries = reader.iter_internal(&self.cache)?;
             let rts = reader.range_tombstones();
+            for (ik, _) in &entries {
+                let (user_key, _, _) = decode_internal_key(ik);
+                validate_user_key(user_key).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "ingest: source file {} contains a key outside live column families: {e}",
+                            path.display()
+                        ),
+                    )
+                })?;
+            }
+            for rt in rts {
+                validate_user_key(&rt.start).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "ingest: source file {} contains a range tombstone start outside live column families: {e}",
+                            path.display()
+                        ),
+                    )
+                })?;
+                validate_user_key(&rt.end).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "ingest: source file {} contains a range tombstone end outside live column families: {e}",
+                            path.display()
+                        ),
+                    )
+                })?;
+            }
             let (smallest, largest) =
                 if let (Some(first), Some(last)) = (entries.first(), entries.last()) {
                     let (uk_lo, _, _) = decode_internal_key(&first.0);

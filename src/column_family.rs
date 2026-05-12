@@ -82,9 +82,8 @@ pub(crate) const DEFAULT_CF_ID: u32 = 1;
 pub const DEFAULT_CF_NAME: &str = "default";
 
 /// A handle to a column family. Cheap to clone; carries only the
-/// CF's name and numeric id. Handles to dropped CFs are inert —
-/// calls that use them will see no data and writes land in a
-/// tombstoned range, but the Db won't panic.
+/// CF's name and numeric id. Handles become invalid after their CF
+/// is dropped; result-returning CF operations reject stale handles.
 #[derive(Debug, Clone)]
 pub struct ColumnFamilyHandle {
     pub(crate) name: Arc<String>,
@@ -222,6 +221,22 @@ impl CfRegistry {
             name: Arc::new(name.to_string()),
             id,
         })
+    }
+
+    pub(crate) fn contains_id(&self, id: u32) -> bool {
+        self.inner.lock().by_id.contains_key(&id)
+    }
+
+    pub(crate) fn is_live_handle(&self, cf: &ColumnFamilyHandle) -> bool {
+        let inner = self.inner.lock();
+        inner
+            .by_name
+            .get(cf.name())
+            .is_some_and(|&id| id == cf.id())
+            && inner
+                .by_id
+                .get(&cf.id())
+                .is_some_and(|name| name == cf.name())
     }
 
     /// Allocate a fresh CF id for `name`. The caller is responsible
