@@ -28,6 +28,7 @@ pub(crate) struct BlockHandle {
 pub(crate) struct Block {
     data: Vec<u8>,
     restarts: Vec<u32>,
+    entries_end: usize,
 }
 
 impl Block {
@@ -40,17 +41,32 @@ impl Block {
         }
 
         let num_restarts = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap()) as usize;
-        let restarts_offset = data.len() - 4 - num_restarts * 4;
+        if num_restarts == 0 {
+            return Err(invalid_data("block has no restart points"));
+        }
+        let restart_bytes = num_restarts
+            .checked_mul(4)
+            .ok_or_else(|| invalid_data("block restart array size overflows"))?;
+        let entries_end = data
+            .len()
+            .checked_sub(4)
+            .and_then(|len| len.checked_sub(restart_bytes))
+            .ok_or_else(|| invalid_data("block restart array exceeds block length"))?;
 
         let mut restarts = Vec::with_capacity(num_restarts);
         for i in 0..num_restarts {
-            let offset = restarts_offset + i * 4;
+            let offset = entries_end + i * 4;
             restarts.push(u32::from_le_bytes(
                 data[offset..offset + 4].try_into().unwrap(),
             ));
         }
+        validate_restarts_and_entries(&data[..entries_end], &restarts)?;
 
-        Ok(Self { data, restarts })
+        Ok(Self {
+            data,
+            restarts,
+            entries_end,
+        })
     }
 
     /// Approximate heap bytes held by this block. Used by the
@@ -67,8 +83,7 @@ impl Block {
     /// The entry region of the block (everything before the restart
     /// array and the trailing `num_restarts` u32).
     pub(crate) fn entry_data(&self) -> &[u8] {
-        let data_end = self.data.len() - 4 - self.restarts.len() * 4;
-        &self.data[..data_end]
+        &self.data[..self.entries_end]
     }
 
     pub(crate) fn restart_count(&self) -> usize {
@@ -81,9 +96,8 @@ impl Block {
 
     /// Iterate all entries in this block in sorted order.
     pub(crate) fn iter(&self) -> BlockIterator<'_> {
-        let data_end = self.data.len() - 4 - self.restarts.len() * 4;
         BlockIterator {
-            data: &self.data[..data_end],
+            data: self.entry_data(),
             pos: 0,
             current_key: Vec::new(),
         }
@@ -100,14 +114,14 @@ impl Block {
     /// to skip past `Merge` entries.
     #[allow(dead_code)]
     pub(crate) fn seek_ge(&self, target: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
-        let data_end = self.data.len() - 4 - self.restarts.len() * 4;
         let start = self.restart_start_for(target);
 
         let mut pos = start;
         let mut current_key = Vec::new();
-        while pos < data_end {
-            let (key, value) = decode_block_entry(&self.data[..data_end], pos, &current_key);
-            let entry_size = encoded_entry_size(&self.data[..data_end], pos);
+        let data = self.entry_data();
+        while pos < data.len() {
+            let (key, value) = decode_block_entry(data, pos, &current_key);
+            let entry_size = encoded_entry_size(data, pos);
             pos += entry_size;
             current_key = key;
 
@@ -122,13 +136,13 @@ impl Block {
     /// Binary-search restart points for the first entry whose key could be
     /// `>= target`; returns the byte offset to start the linear walk from.
     fn restart_start_for(&self, target: &[u8]) -> usize {
-        let data_end = self.data.len() - 4 - self.restarts.len() * 4;
+        let data = self.entry_data();
         let mut left = 0;
         let mut right = self.restarts.len();
         while left < right {
             let mid = left + (right - left) / 2;
             let restart_pos = self.restarts[mid] as usize;
-            let (key, _) = decode_block_entry(&self.data[..data_end], restart_pos, &[]);
+            let (key, _) = decode_block_entry(data, restart_pos, &[]);
             if compare_internal_keys(&key, target).is_lt() {
                 left = mid + 1;
             } else {
@@ -237,54 +251,23 @@ pub(crate) fn decode_entry_at(
     pos: usize,
     prev_key: &mut Vec<u8>,
 ) -> (usize, usize, usize) {
-    let mut offset = pos;
-    let (shared, n) = decode_varint(&data[offset..]);
-    offset += n;
-    let (unshared, n) = decode_varint(&data[offset..]);
-    offset += n;
-    let (value_len, n) = decode_varint(&data[offset..]);
-    offset += n;
-    let shared = shared as usize;
-    let unshared = unshared as usize;
-    let value_len = value_len as usize;
-    prev_key.truncate(shared);
-    prev_key.extend_from_slice(&data[offset..offset + unshared]);
-    let value_offset = offset + unshared;
-    let consumed = value_offset + value_len - pos;
-    (consumed, value_offset, value_len)
+    let decoded =
+        decode_block_entry_checked(data, pos, prev_key).expect("block entry validated at decode");
+    *prev_key = decoded.key;
+    (decoded.consumed, decoded.value_offset, decoded.value_len)
 }
 
 fn decode_block_entry(data: &[u8], pos: usize, prev_key: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let mut offset = pos;
-    let (shared, n) = decode_varint(&data[offset..]);
-    offset += n;
-    let (unshared, n) = decode_varint(&data[offset..]);
-    offset += n;
-    let (value_len, n) = decode_varint(&data[offset..]);
-    offset += n;
-
-    let shared = shared as usize;
-    let unshared = unshared as usize;
-    let value_len = value_len as usize;
-
-    let mut key = Vec::with_capacity(shared + unshared);
-    key.extend_from_slice(&prev_key[..shared]);
-    key.extend_from_slice(&data[offset..offset + unshared]);
-    let value = data[offset + unshared..offset + unshared + value_len].to_vec();
-
-    (key, value)
+    let decoded =
+        decode_block_entry_checked(data, pos, prev_key).expect("block entry validated at decode");
+    let value = data[decoded.value_offset..decoded.value_offset + decoded.value_len].to_vec();
+    (decoded.key, value)
 }
 
 pub(crate) fn encoded_entry_size(data: &[u8], pos: usize) -> usize {
-    let mut offset = pos;
-    let (_, n) = decode_varint(&data[offset..]); // shared
-    offset += n;
-    let (unshared, n) = decode_varint(&data[offset..]);
-    offset += n;
-    let (value_len, n) = decode_varint(&data[offset..]);
-    offset += n;
-
-    offset - pos + unshared as usize + value_len as usize
+    decode_entry_header(data, pos)
+        .expect("block entry validated at decode")
+        .consumed
 }
 
 fn encode_varint(buf: &mut Vec<u8>, mut value: u64) {
@@ -295,17 +278,162 @@ fn encode_varint(buf: &mut Vec<u8>, mut value: u64) {
     buf.push(value as u8);
 }
 
+#[cfg(test)]
 pub(crate) fn decode_varint(data: &[u8]) -> (u64, usize) {
     let mut result: u64 = 0;
-    let mut shift = 0;
-    for (i, &byte) in data.iter().enumerate() {
+    for (i, &byte) in data.iter().take(10).enumerate() {
+        let shift = i * 7;
         result |= ((byte & 0x7F) as u64) << shift;
         if byte & 0x80 == 0 {
             return (result, i + 1);
         }
-        shift += 7;
     }
-    (result, data.len())
+    (result, data.len().min(10))
+}
+
+fn invalid_data(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+struct DecodedEntry {
+    key: Vec<u8>,
+    consumed: usize,
+    value_offset: usize,
+    value_len: usize,
+}
+
+struct EntryHeader {
+    shared: usize,
+    unshared: usize,
+    value_len: usize,
+    key_offset: usize,
+    consumed: usize,
+}
+
+fn validate_restarts_and_entries(data: &[u8], restarts: &[u32]) -> io::Result<()> {
+    let mut entry_offsets = Vec::new();
+    let mut pos = 0usize;
+    let mut prev_key = Vec::new();
+    while pos < data.len() {
+        entry_offsets.push(pos);
+        let entry = decode_block_entry_checked(data, pos, &prev_key)?;
+        pos += entry.consumed;
+        prev_key = entry.key;
+    }
+
+    if restarts.first().copied() != Some(0) {
+        return Err(invalid_data("block first restart offset must be zero"));
+    }
+
+    let mut previous_restart = 0usize;
+    for (idx, &restart) in restarts.iter().enumerate() {
+        let restart = restart as usize;
+        if idx > 0 && restart <= previous_restart {
+            return Err(invalid_data(
+                "block restart offsets are not strictly increasing",
+            ));
+        }
+        previous_restart = restart;
+
+        if data.is_empty() {
+            if restart != 0 {
+                return Err(invalid_data("empty block restart offset must be zero"));
+            }
+            continue;
+        }
+        if entry_offsets.binary_search(&restart).is_err() {
+            return Err(invalid_data(
+                "block restart offset is not an entry boundary",
+            ));
+        }
+        if decode_entry_header(data, restart)?.shared != 0 {
+            return Err(invalid_data(
+                "block restart entry must not share a key prefix",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn decode_block_entry_checked(
+    data: &[u8],
+    pos: usize,
+    prev_key: &[u8],
+) -> io::Result<DecodedEntry> {
+    let header = decode_entry_header(data, pos)?;
+    if header.shared > prev_key.len() {
+        return Err(invalid_data(
+            "block entry shared prefix exceeds previous key",
+        ));
+    }
+
+    let key_len = header
+        .shared
+        .checked_add(header.unshared)
+        .ok_or_else(|| invalid_data("block entry key length overflows"))?;
+    let mut key = Vec::with_capacity(key_len);
+    key.extend_from_slice(&prev_key[..header.shared]);
+    key.extend_from_slice(&data[header.key_offset..header.key_offset + header.unshared]);
+    let value_offset = header.key_offset + header.unshared;
+
+    Ok(DecodedEntry {
+        key,
+        consumed: header.consumed,
+        value_offset,
+        value_len: header.value_len,
+    })
+}
+
+fn decode_entry_header(data: &[u8], pos: usize) -> io::Result<EntryHeader> {
+    if pos >= data.len() {
+        return Err(invalid_data("block entry offset is outside entry data"));
+    }
+
+    let mut offset = pos;
+    let shared = read_varint(data, &mut offset)?;
+    let unshared = read_varint(data, &mut offset)?;
+    let value_len = read_varint(data, &mut offset)?;
+
+    let key_end = offset
+        .checked_add(unshared)
+        .ok_or_else(|| invalid_data("block entry key length overflows"))?;
+    if key_end > data.len() {
+        return Err(invalid_data("block entry key extends past block"));
+    }
+    let value_end = key_end
+        .checked_add(value_len)
+        .ok_or_else(|| invalid_data("block entry value length overflows"))?;
+    if value_end > data.len() {
+        return Err(invalid_data("block entry value extends past block"));
+    }
+
+    Ok(EntryHeader {
+        shared,
+        unshared,
+        value_len,
+        key_offset: offset,
+        consumed: value_end - pos,
+    })
+}
+
+fn read_varint(data: &[u8], offset: &mut usize) -> io::Result<usize> {
+    let mut result: u64 = 0;
+    for i in 0..10 {
+        let Some(&byte) = data.get(*offset) else {
+            return Err(invalid_data("unterminated block entry varint"));
+        };
+        *offset += 1;
+        if i == 9 && byte > 1 {
+            return Err(invalid_data("block entry varint overflows u64"));
+        }
+        result |= ((byte & 0x7F) as u64) << (i * 7);
+        if byte & 0x80 == 0 {
+            return usize::try_from(result)
+                .map_err(|_| invalid_data("block entry varint overflows usize"));
+        }
+    }
+    Err(invalid_data("unterminated block entry varint"))
 }
 
 #[cfg(test)]
@@ -318,6 +446,13 @@ mod tests {
             builder.add(k, v);
         }
         Block::decode(builder.finish()).unwrap()
+    }
+
+    fn expect_block_decode_err(data: Vec<u8>) -> io::Error {
+        match Block::decode(data) {
+            Err(e) => e,
+            Ok(_) => panic!("expected invalid block"),
+        }
     }
 
     // ── varint encoding ──────────────────────────────────────────
@@ -357,6 +492,12 @@ mod tests {
         encode_varint(&mut buf, u64::MAX);
         assert_eq!(buf.len(), 10);
         assert_eq!(decode_varint(&buf), (u64::MAX, 10));
+    }
+
+    #[test]
+    fn decode_varint_does_not_panic_on_long_unterminated_input() {
+        let buf = vec![0x80; 32];
+        assert_eq!(decode_varint(&buf).1, 10);
     }
 
     // ── block encode/decode ─────────────────────────────────────
@@ -449,6 +590,78 @@ mod tests {
     fn decode_rejects_buffer_smaller_than_footer() {
         assert!(Block::decode(vec![]).is_err());
         assert!(Block::decode(vec![0u8; 3]).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_restart_array_that_exceeds_block() {
+        let mut data = vec![0u8; 4];
+        data.extend_from_slice(&2u32.to_le_bytes());
+        let err = expect_block_decode_err(data);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decode_rejects_restart_offset_outside_entry_data() {
+        let mut builder = BlockBuilder::new(16);
+        builder.add(b"k", b"v");
+        let mut data = builder.finish();
+        let restart_offset = data.len() - 8;
+        data[restart_offset] = 0xFF;
+        let err = expect_block_decode_err(data);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decode_rejects_first_restart_offset_that_is_not_zero() {
+        let mut data = Vec::new();
+        encode_varint(&mut data, 0);
+        encode_varint(&mut data, 1);
+        encode_varint(&mut data, 0);
+        data.push(b'a');
+        let second_offset = data.len() as u32;
+        encode_varint(&mut data, 0);
+        encode_varint(&mut data, 1);
+        encode_varint(&mut data, 0);
+        data.push(b'b');
+        data.extend_from_slice(&second_offset.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+
+        let err = expect_block_decode_err(data);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decode_rejects_truncated_entry_payload() {
+        let mut data = Vec::new();
+        encode_varint(&mut data, 0);
+        encode_varint(&mut data, 2);
+        encode_varint(&mut data, 1);
+        data.push(b'a');
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+
+        let err = expect_block_decode_err(data);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decode_rejects_shared_prefix_at_restart() {
+        let mut data = Vec::new();
+        encode_varint(&mut data, 0);
+        encode_varint(&mut data, 1);
+        encode_varint(&mut data, 0);
+        data.push(b'a');
+        let second_offset = data.len() as u32;
+        encode_varint(&mut data, 1);
+        encode_varint(&mut data, 1);
+        encode_varint(&mut data, 0);
+        data.push(b'b');
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&second_offset.to_le_bytes());
+        data.extend_from_slice(&2u32.to_le_bytes());
+
+        let err = expect_block_decode_err(data);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     // ── seek_ge edge cases ──────────────────────────────────────

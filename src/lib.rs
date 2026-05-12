@@ -84,6 +84,77 @@ pub use transaction::{
 };
 pub use ttl::{strip_timestamp, DbWithTtl, TtlCompactionFilter};
 
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    //! Fuzz-only entry points for private on-disk decoders.
+    //!
+    //! These helpers intentionally swallow decoder results: fuzz targets
+    //! care that arbitrary bytes never panic or trigger undefined behavior.
+
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    /// Decode arbitrary bytes as an SSTable data block.
+    pub fn decode_block(data: &[u8]) {
+        let _ = crate::engine::block::Block::decode(data.to_vec());
+    }
+
+    /// Decode arbitrary bytes as an SSTable range-tombstone block.
+    pub fn decode_range_tombstones(data: &[u8]) {
+        let _ = crate::engine::sstable::decode_range_tombstone_block(data);
+    }
+
+    /// Replay arbitrary bytes as a WAL file.
+    pub fn replay_wal(data: &[u8]) {
+        with_temp_file("wal", "log", data, |path| {
+            let _ = crate::engine::wal::Wal::replay(path);
+        });
+    }
+
+    /// Open arbitrary bytes as a complete SSTable file.
+    pub fn open_sst(data: &[u8]) {
+        with_temp_file("sst", "sst", data, |path| {
+            let _ = crate::engine::sstable::SsTableReader::open(path, 0);
+        });
+    }
+
+    /// Replay arbitrary bytes as a MANIFEST file.
+    pub fn replay_manifest(data: &[u8]) {
+        with_temp_dir("manifest", |db_dir| {
+            let sst_dir = db_dir.join("sst");
+            let manifest_path = db_dir.join("MANIFEST");
+            if fs::create_dir_all(&sst_dir).is_ok() && fs::write(&manifest_path, data).is_ok() {
+                let _ = crate::engine::manifest::VersionSet::open(db_dir, &sst_dir);
+            }
+        });
+    }
+
+    fn with_temp_file(label: &str, extension: &str, data: &[u8], f: impl FnOnce(&Path)) {
+        let path = temp_path(label).with_extension(extension);
+        if fs::write(&path, data).is_ok() {
+            f(&path);
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    fn with_temp_dir(label: &str, f: impl FnOnce(&Path)) {
+        let path = temp_path(label);
+        if fs::create_dir_all(&path).is_ok() {
+            f(&path);
+        }
+        let _ = fs::remove_dir_all(path);
+    }
+
+    fn temp_path(label: &str) -> PathBuf {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("lark-kv-fuzz-{label}-{}-{id}", std::process::id()))
+    }
+}
+
 use column_family::{
     cf_lower_bound, cf_upper_bound, meta, prefix_key, CfRegistry, DEFAULT_CF_ID, META_CF_ID,
 };
