@@ -33,6 +33,8 @@
 //!
 //! - Range-scan conflict tracking (only point writes / `get_for_update`
 //!   participate in conflict detection).
+//! - Transactional range deletes. [`Transaction::delete_range`] rejects
+//!   non-empty ranges until range conflict tracking or range locks land.
 //! - Wait-for graph deadlock detection (the pessimistic flavor ships
 //!   with timeout-based detection only).
 //! - Column-family-aware transactions (depends on CFs landing).
@@ -89,6 +91,10 @@ pub enum TransactionError {
     /// The caller tried to use a savepoint that was never set.
     #[error("no savepoint to roll back to")]
     NoSavepoint,
+    /// Transactional range deletes are disabled until they can
+    /// participate in conflict detection or range locking.
+    #[error("transactional range deletes are not supported")]
+    UnsupportedRangeDelete,
 }
 
 /// Convenience alias for results returned by transaction methods.
@@ -356,24 +362,21 @@ impl<'db> Transaction<'db> {
         Ok(())
     }
 
-    /// Buffer a range delete. Range deletes do **not** participate
-    /// in optimistic conflict detection in this initial impl: a
-    /// concurrent writer inserting a new key into the range between
-    /// the tx's snapshot and commit will silently lose its write.
-    /// For correctness-critical workloads prefer explicit
-    /// `get_for_update` + per-key deletes over `delete_range`.
+    /// Attempt to delete every key in `[start, end)`.
+    ///
+    /// Non-empty transactional range deletes are rejected until
+    /// they can participate in optimistic conflict detection or
+    /// pessimistic range locking. For correctness-critical
+    /// workloads, delete known keys individually with
+    /// [`Transaction::delete`] and use [`Transaction::get_for_update`]
+    /// when a read must also participate in conflict detection.
+    ///
+    /// Calls with `start >= end` are treated as no-ops.
     pub fn delete_range(&mut self, start: &[u8], end: &[u8]) -> TxResult<()> {
         if start >= end {
             return Ok(());
         }
-        // No lock acquisition for range deletes — the pessimistic
-        // lock manager is keyed per user-key, which doesn't match
-        // range semantics. A later iteration can add range locks.
-        self.range_deletes.push((
-            prefix_key(DEFAULT_CF_ID, start),
-            prefix_key(DEFAULT_CF_ID, end),
-        ));
-        Ok(())
+        Err(TransactionError::UnsupportedRangeDelete)
     }
 
     /// Buffer a merge operand. Merges are conflict-checked at the
@@ -774,6 +777,18 @@ mod tests {
         assert_eq!(db.db().get(b"k").unwrap(), None);
     }
 
+    #[test]
+    fn optimistic_range_delete_is_rejected() {
+        let (db, _dir) = opt_db();
+        let mut tx = db.begin_transaction();
+
+        assert!(matches!(
+            tx.delete_range(b"a", b"z"),
+            Err(TransactionError::UnsupportedRangeDelete)
+        ));
+        assert!(tx.delete_range(b"z", b"a").is_ok());
+    }
+
     // ── Pessimistic flavor ──────────────────────────────────────────────
 
     #[test]
@@ -783,6 +798,18 @@ mod tests {
         tx.put(b"k", b"v").unwrap();
         tx.commit().unwrap();
         assert_eq!(db.db().get(b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn pessimistic_range_delete_is_rejected() {
+        let (db, _dir) = pes_db();
+        let mut tx = db.begin_transaction();
+
+        assert!(matches!(
+            tx.delete_range(b"a", b"z"),
+            Err(TransactionError::UnsupportedRangeDelete)
+        ));
+        assert!(tx.delete_range(b"z", b"a").is_ok());
     }
 
     #[test]
