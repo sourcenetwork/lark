@@ -6137,10 +6137,10 @@ mod tests {
     }
 
     #[test]
-    fn test_subcompactions_produce_correct_reads() {
-        // A compaction large enough that the planner wants to
-        // split it — then read everything back and confirm the
-        // output is byte-identical to the single-threaded path.
+    fn test_streaming_compaction_produces_correct_reads() {
+        // A compaction large enough to span multiple output files;
+        // read everything back and confirm the streaming path keeps
+        // the latest version for every user key.
         let opts = Options {
             write_buffer_size: 4 * 1024,
             max_subcompactions: 4,
@@ -6156,8 +6156,7 @@ mod tests {
         for (k, v) in &expected {
             db.put(k.as_bytes(), v.as_bytes()).unwrap();
         }
-        // Overwrite a window to exercise dedup inside a
-        // subcompaction chunk.
+        // Overwrite a window to exercise dedup across input files.
         for i in 100..200 {
             let k = format!("k{i:06}");
             let v = format!("v{i}-new");
@@ -6182,10 +6181,10 @@ mod tests {
     }
 
     #[test]
-    fn test_subcompactions_one_matches_single_threaded() {
-        // max_subcompactions = 1 must preserve the exact
-        // single-threaded behavior. This test exists so a future
-        // refactor that silently bumps the floor is caught.
+    fn test_streaming_compaction_handles_single_worker_option() {
+        // max_subcompactions is accepted for API compatibility, but
+        // the streaming compaction path writes from the compaction
+        // worker thread.
         let opts = Options {
             write_buffer_size: 4 * 1024,
             max_subcompactions: 1,
@@ -6206,12 +6205,10 @@ mod tests {
     }
 
     #[test]
-    fn test_subcompactions_below_threshold_fall_back_to_single_worker() {
-        // With only ~32 user-key groups and
-        // max_subcompactions = 8, the planner should collapse to
-        // a single worker because each chunk would be too small
-        // to be worth spawning a thread. Correctness is the
-        // only visible effect, so we just assert the reads work.
+    fn test_streaming_compaction_accepts_subcompaction_option() {
+        // The compatibility knob should not change correctness even
+        // though output writing is now part of the bounded-memory
+        // streaming path.
         let opts = Options {
             write_buffer_size: 4 * 1024,
             max_subcompactions: 8,
