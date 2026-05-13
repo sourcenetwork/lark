@@ -31,7 +31,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::engine::{checksum, CheckpointSnapshot};
+use crate::engine::{checksum, durability, CheckpointSnapshot};
 use crate::{Db, Error, Result};
 
 /// Opaque identifier for a single backup generation. Monotonically
@@ -99,6 +99,10 @@ impl BackupEngine {
         let shared_dir = root.join("shared");
         fs::create_dir_all(&meta_dir).map_err(Error::Io)?;
         fs::create_dir_all(&shared_dir).map_err(Error::Io)?;
+        durability::sync_parent_dir(&root).map_err(Error::Io)?;
+        durability::sync_dir(&root).map_err(Error::Io)?;
+        durability::sync_dir(&meta_dir).map_err(Error::Io)?;
+        durability::sync_dir(&shared_dir).map_err(Error::Io)?;
         Ok(Self {
             root,
             meta_dir,
@@ -137,9 +141,8 @@ impl BackupEngine {
                     let hash = hash_file(&src).map_err(Error::Io)?;
                     let shared_name = shared_filename(hash);
                     let shared_path = self.shared_dir.join(&shared_name);
-                    if !shared_path.exists() {
-                        copy_file_atomic(&src, &shared_path).map_err(Error::Io)?;
-                    }
+                    ensure_shared_file(&src, &shared_path, hash, file.meta.file_size)
+                        .map_err(Error::Io)?;
                     files.push(BackupFileEntry {
                         level: level_idx as u32,
                         file_id: file.meta.file_id,
@@ -211,9 +214,14 @@ impl BackupEngine {
         let target_wal = target_dir.join("wal");
         fs::create_dir_all(&target_sst).map_err(Error::Io)?;
         fs::create_dir_all(&target_wal).map_err(Error::Io)?;
+        durability::sync_parent_dir(target_dir).map_err(Error::Io)?;
+        durability::sync_dir(target_dir).map_err(Error::Io)?;
+        durability::sync_dir(&target_sst).map_err(Error::Io)?;
+        durability::sync_dir(&target_wal).map_err(Error::Io)?;
 
         for f in &manifest.files {
             let src = self.shared_dir.join(shared_filename(f.hash));
+            verify_shared_file(&src, f.hash, f.file_size).map_err(Error::Io)?;
             let dst = target_sst.join(CheckpointSnapshot::sst_filename(f.file_id));
             copy_file_atomic(&src, &dst).map_err(Error::Io)?;
         }
@@ -232,7 +240,7 @@ impl BackupEngine {
             return Ok(());
         }
         let manifest = self.read_manifest(backup_id)?;
-        fs::remove_file(&path).map_err(Error::Io)?;
+        durability::remove_file_and_sync_parent(&path).map_err(Error::Io)?;
         self.gc_shared(&manifest)?;
         Ok(())
     }
@@ -271,7 +279,11 @@ impl BackupEngine {
         for f in &removed.files {
             if !still_referenced.contains(&f.hash) {
                 let p = self.shared_dir.join(shared_filename(f.hash));
-                let _ = fs::remove_file(&p);
+                match durability::remove_file_and_sync_parent(&p) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(Error::Io(e)),
+                }
             }
         }
         Ok(())
@@ -302,10 +314,62 @@ fn hash_file(path: &Path) -> io::Result<u128> {
     checksum::backup_shared_file(&mut f)
 }
 
+fn ensure_shared_file(
+    src: &Path,
+    dst: &Path,
+    expected_hash: u128,
+    expected_size: u64,
+) -> io::Result<()> {
+    match verify_shared_file(dst, expected_hash, expected_size) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+            if dst.is_dir() {
+                return Err(e);
+            }
+        }
+        Err(e) => return Err(e),
+    }
+
+    copy_file_atomic(src, dst)?;
+    verify_shared_file(dst, expected_hash, expected_size)
+}
+
+fn verify_shared_file(path: &Path, expected_hash: u128, expected_size: u64) -> io::Result<()> {
+    let meta = fs::metadata(path)?;
+    if !meta.is_file() {
+        return Err(invalid_data(format!(
+            "backup shared object {} is not a regular file",
+            path.display()
+        )));
+    }
+    if meta.len() != expected_size {
+        return Err(invalid_data(format!(
+            "backup shared object {} has size {}, expected {expected_size}",
+            path.display(),
+            meta.len()
+        )));
+    }
+    let actual_hash = hash_file(path)?;
+    if actual_hash != expected_hash {
+        return Err(invalid_data(format!(
+            "backup shared object {} content id mismatch",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn copy_file_atomic(src: &Path, dst: &Path) -> io::Result<()> {
     let tmp = dst.with_extension("tmp");
-    fs::copy(src, &tmp)?;
+    {
+        let mut input = File::open(src)?;
+        let mut output = File::create(&tmp)?;
+        io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+    }
     fs::rename(&tmp, dst)?;
+    durability::sync_parent_dir(dst)?;
     Ok(())
 }
 
@@ -317,7 +381,12 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         f.sync_all()?;
     }
     fs::rename(&tmp, path)?;
+    durability::sync_parent_dir(path)?;
     Ok(())
+}
+
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
 fn shared_filename(hash: u128) -> String {
@@ -559,6 +628,24 @@ mod tests {
             .unwrap_or(0)
     }
 
+    fn shared_file_paths(dir: &Path) -> Vec<PathBuf> {
+        let shared = dir.join("shared");
+        let mut paths: Vec<_> = fs::read_dir(&shared)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    fn corrupt_file_same_size(path: &Path) {
+        let mut bytes = fs::read(path).unwrap();
+        assert!(!bytes.is_empty());
+        bytes[0] ^= 0xFF;
+        fs::write(path, bytes).unwrap();
+    }
+
     #[test]
     fn backup_and_restore_roundtrip() {
         let src_dir = TempDir::new().unwrap();
@@ -604,6 +691,61 @@ mod tests {
         assert_eq!(shared_bytes_1, shared_bytes_2);
         assert_eq!(shared_count_1, shared_count_2);
         assert_eq!(engine.list_backups().len(), 2);
+    }
+
+    #[test]
+    fn create_backup_replaces_corrupt_existing_shared_object() {
+        let src_dir = TempDir::new().unwrap();
+        let bkp_dir = TempDir::new().unwrap();
+        let tgt_dir = TempDir::new().unwrap();
+        let db = Db::open(src_dir.path(), tiny_flush_opts()).unwrap();
+        populate(&db, "r", 400);
+        db.compact_range(None, None).unwrap();
+
+        let mut engine = BackupEngine::open(bkp_dir.path()).unwrap();
+        let _id1 = engine.create_backup(&db).unwrap();
+        let shared_files = shared_file_paths(bkp_dir.path());
+        assert!(!shared_files.is_empty());
+        let original_sizes: Vec<u64> = shared_files
+            .iter()
+            .map(|path| fs::metadata(path).unwrap().len())
+            .collect();
+        for path in &shared_files {
+            corrupt_file_same_size(path);
+        }
+
+        let id2 = engine.create_backup(&db).unwrap();
+
+        for (path, original_size) in shared_files.iter().zip(original_sizes) {
+            assert_eq!(fs::metadata(path).unwrap().len(), original_size);
+        }
+        engine.restore(id2, tgt_dir.path()).unwrap();
+        drop(db);
+        let restored = Db::open(tgt_dir.path(), Options::default()).unwrap();
+        assert_has(&restored, "r", 400);
+    }
+
+    #[test]
+    fn restore_rejects_corrupt_shared_object() {
+        let src_dir = TempDir::new().unwrap();
+        let bkp_dir = TempDir::new().unwrap();
+        let tgt_dir = TempDir::new().unwrap();
+        let db = Db::open(src_dir.path(), tiny_flush_opts()).unwrap();
+        populate(&db, "bad", 300);
+        db.compact_range(None, None).unwrap();
+
+        let mut engine = BackupEngine::open(bkp_dir.path()).unwrap();
+        let id = engine.create_backup(&db).unwrap();
+        let shared_files = shared_file_paths(bkp_dir.path());
+        assert!(!shared_files.is_empty());
+        corrupt_file_same_size(&shared_files[0]);
+
+        let kind = match engine.restore(id, tgt_dir.path()) {
+            Err(Error::Io(e)) => e.kind(),
+            Err(e) => panic!("expected I/O error, got {e:?}"),
+            Ok(()) => panic!("expected restore to reject corrupt shared object"),
+        };
+        assert_eq!(kind, io::ErrorKind::InvalidData);
     }
 
     #[test]
