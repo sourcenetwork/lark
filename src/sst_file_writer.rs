@@ -29,6 +29,8 @@ pub struct SstFileWriter {
     path: PathBuf,
     last_user_key: Option<Vec<u8>>,
     num_entries: u64,
+    max_key_size: usize,
+    max_value_size: usize,
 }
 
 /// Summary of a finished ingest file, returned by [`SstFileWriter::finish`].
@@ -96,6 +98,8 @@ impl SstFileWriter {
             path,
             last_user_key: None,
             num_entries: 0,
+            max_key_size: opts.max_key_size,
+            max_value_size: opts.max_value_size,
         })
     }
 
@@ -134,6 +138,26 @@ impl SstFileWriter {
     }
 
     fn add(&mut self, key: &[u8], value: &[u8], value_type: u8) -> crate::Result<()> {
+        let user_key_len = key.len().saturating_sub(4);
+        if user_key_len > self.max_key_size {
+            return Err(crate::Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "key length {} exceeds configured max_key_size {}",
+                    user_key_len, self.max_key_size
+                ),
+            )));
+        }
+        if value.len() > self.max_value_size {
+            return Err(crate::Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "value length {} exceeds configured max_value_size {}",
+                    value.len(),
+                    self.max_value_size
+                ),
+            )));
+        }
         if let Some(last) = &self.last_user_key {
             if key <= last.as_slice() {
                 return Err(crate::Error::Io(io::Error::new(
@@ -233,6 +257,22 @@ mod tests {
         let path = dir.path().join("empty.sst");
         let w = SstFileWriter::create(&path, &Options::default()).unwrap();
         assert!(w.finish().is_err());
+    }
+
+    #[test]
+    fn test_configured_key_value_size_limits_are_enforced() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("limited.sst");
+        let opts = Options {
+            max_key_size: 3,
+            max_value_size: 4,
+            ..Options::default()
+        };
+        let mut w = SstFileWriter::create(&path, &opts).unwrap();
+
+        w.put(b"abc", b"1234").unwrap();
+        assert!(w.put(b"abcd", b"1").is_err());
+        assert!(w.put(b"bcd", b"12345").is_err());
     }
 
     #[test]

@@ -26,6 +26,19 @@ impl DbDirectoryLock {
             path,
         })
     }
+
+    pub(crate) fn acquire_shared(db_dir: &Path) -> io::Result<Self> {
+        let path = db_dir.join(LOCK_FILE);
+        let file = open_lock_file_read_only(&path).map_err(|e| lock_error(&path, e))?;
+
+        lock_shared(&file).map_err(|e| lock_error(&path, e))?;
+
+        Ok(Self {
+            file,
+            #[cfg(not(any(unix, windows)))]
+            path,
+        })
+    }
 }
 
 impl Drop for DbDirectoryLock {
@@ -69,6 +82,10 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
         .write(true)
         .create_new(true)
         .open(path)
+}
+
+fn open_lock_file_read_only(path: &Path) -> io::Result<File> {
+    OpenOptions::new().read(true).open(path)
 }
 
 fn lock_error(path: &Path, err: io::Error) -> io::Error {
@@ -115,12 +132,23 @@ fn lock_exclusive(file: &File) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+fn lock_shared(file: &File) -> io::Result<()> {
+    rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockShared)
+        .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))
+}
+
+#[cfg(unix)]
 fn unlock(file: &File) {
     let _ = rustix::fs::flock(file, rustix::fs::FlockOperation::Unlock);
 }
 
 #[cfg(not(unix))]
 fn lock_exclusive(_file: &File) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn lock_shared(_file: &File) -> io::Result<()> {
     Ok(())
 }
 

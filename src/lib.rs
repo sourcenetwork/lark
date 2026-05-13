@@ -72,7 +72,7 @@ pub use iter::Iter;
 pub use options::{
     CompactionDecision, CompactionFilter, CompactionStyle, CompressionType, DurabilityMode,
     FifoCompactionOptions, FixedLengthPrefix, MergeOperator, Options, PrefixExtractor,
-    UniversalCompactionOptions, WriteOptions,
+    UniversalCompactionOptions, WriteOptions, DEFAULT_MAX_KEY_SIZE, DEFAULT_MAX_VALUE_SIZE,
 };
 pub use perf_context::{PerfContext, PerfContextSnapshot, PerfLevel};
 pub use rate_limiter::{Priority, RateLimiter, TokenBucketRateLimiter};
@@ -176,6 +176,13 @@ fn invalid_cf_handle_error(cf: &ColumnFamilyHandle) -> Error {
     ))
 }
 
+fn invalid_input_error(message: impl Into<String>) -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        message.into(),
+    ))
+}
+
 fn invalid_cf_id_io_error(cf_id: u32) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
@@ -206,6 +213,9 @@ fn prefixed_cf_id(prefixed_key: &[u8]) -> std::io::Result<u32> {
 struct OptionsSnapshot {
     durability: engine::DurabilityMode,
     default_cf: &'static str,
+    read_only: bool,
+    max_key_size: usize,
+    max_value_size: usize,
 }
 
 /// Format a raw engine key for inclusion in a property string.
@@ -263,12 +273,16 @@ pub struct Db {
     engine: Arc<LarkEngine>,
     durability: engine::DurabilityMode,
     cfs: Arc<CfRegistry>,
+    read_only: bool,
+    max_key_size: usize,
+    max_value_size: usize,
 }
 
 impl std::fmt::Debug for Db {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Db")
             .field("durability", &self.durability)
+            .field("read_only", &self.read_only)
             .finish_non_exhaustive()
     }
 }
@@ -282,19 +296,41 @@ impl Db {
     /// call [`Db::create_column_family`] for additional CFs; those
     /// calls persist into the database and survive reopen.
     pub fn open<P: AsRef<Path>>(path: P, opts: Options) -> Result<Self> {
+        let read_only = opts.read_only;
+        let max_key_size = opts.max_key_size;
+        let max_value_size = opts.max_value_size;
         let durability = match opts.durability {
             DurabilityMode::Immediate => engine::DurabilityMode::Immediate,
             DurabilityMode::Eventual => engine::DurabilityMode::Eventual,
         };
-        let engine = LarkEngine::open(path.as_ref(), opts.to_engine_options())?;
+        let engine_opts = opts.to_engine_options();
+        let engine = if read_only {
+            LarkEngine::open_read_only(path.as_ref(), engine_opts)?
+        } else {
+            LarkEngine::open(path.as_ref(), engine_opts)?
+        };
         let cfs = Arc::new(CfRegistry::new());
         let db = Self {
             engine,
             durability,
             cfs,
+            read_only,
+            max_key_size,
+            max_value_size,
         };
         db.load_cf_registry()?;
         Ok(db)
+    }
+
+    /// Open an existing database in read-only mode.
+    ///
+    /// The handle replays any existing WAL files into memory so reads
+    /// see committed-but-unflushed writes, but it does not create,
+    /// rewrite, compact, or delete files. Mutating APIs return
+    /// [`std::io::ErrorKind::PermissionDenied`].
+    pub fn open_read_only<P: AsRef<Path>>(path: P, mut opts: Options) -> Result<Self> {
+        opts.read_only = true;
+        Self::open(path, opts)
     }
 
     /// Populate the in-memory [`CfRegistry`] from the on-disk
@@ -404,6 +440,8 @@ impl Db {
     /// Set a key-value pair in the default column family with an
     /// explicit [`WriteOptions`] override.
     pub fn put_opt(&self, opts: &WriteOptions, key: &[u8], value: &[u8]) -> Result<()> {
+        self.ensure_writable()?;
+        self.validate_write_kv_sizes(key, value)?;
         self.wait_for_write_capacity(opts)?;
         let stats = self.stats();
         let _scope = statistics::TimeScope::new(stats, Histogram::DbWrite);
@@ -434,6 +472,8 @@ impl Db {
     /// Delete a key from the default column family with an
     /// explicit [`WriteOptions`] override.
     pub fn delete_opt(&self, opts: &WriteOptions, key: &[u8]) -> Result<()> {
+        self.ensure_writable()?;
+        self.validate_key_size(key)?;
         self.wait_for_write_capacity(opts)?;
         if let Some(s) = self.stats() {
             s.add(Ticker::KeysDeleted, 1);
@@ -459,6 +499,8 @@ impl Db {
 
     /// [`Db::merge`] with an explicit [`WriteOptions`] override.
     pub fn merge_opt(&self, opts: &WriteOptions, key: &[u8], operand: &[u8]) -> Result<()> {
+        self.ensure_writable()?;
+        self.validate_write_kv_sizes(key, operand)?;
         self.wait_for_write_capacity(opts)?;
         if let Some(s) = self.stats() {
             s.add(Ticker::MergesWritten, 1);
@@ -495,6 +537,9 @@ impl Db {
         if start >= end {
             return Ok(());
         }
+        self.ensure_writable()?;
+        self.validate_key_size(start)?;
+        self.validate_key_size(end)?;
         self.wait_for_write_capacity(opts)?;
         if let Some(s) = self.stats() {
             s.add(Ticker::RangeDeletesWritten, 1);
@@ -526,7 +571,9 @@ impl Db {
         if batch.is_empty() {
             return Ok(());
         }
+        self.ensure_writable()?;
         self.validate_batch_cf_liveness(&batch)?;
+        self.validate_batch_sizes(&batch)?;
         self.wait_for_write_capacity(opts)?;
         perf_context::record_write_call();
         let stats = self.stats();
@@ -605,6 +652,79 @@ impl Db {
     /// any stall condition is currently active.
     fn wait_for_write_capacity(&self, opts: &WriteOptions) -> Result<()> {
         self.engine.wait_for_write_capacity(opts.no_slowdown)?;
+        Ok(())
+    }
+
+    fn ensure_writable(&self) -> Result<()> {
+        if self.read_only {
+            Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "database was opened read-only",
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn validate_key_size(&self, key: &[u8]) -> Result<()> {
+        if key.len() <= self.max_key_size {
+            return Ok(());
+        }
+
+        Err(invalid_input_error(format!(
+            "key length {} exceeds configured max_key_size {}",
+            key.len(),
+            self.max_key_size
+        )))
+    }
+
+    fn validate_value_size(&self, value: &[u8]) -> Result<()> {
+        if value.len() <= self.max_value_size {
+            return Ok(());
+        }
+
+        Err(invalid_input_error(format!(
+            "value length {} exceeds configured max_value_size {}",
+            value.len(),
+            self.max_value_size
+        )))
+    }
+
+    fn validate_write_kv_sizes(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.validate_key_size(key)?;
+        self.validate_value_size(value)
+    }
+
+    fn validate_prefixed_key_size(&self, prefixed_key: &[u8]) -> Result<()> {
+        let user_key_len = prefixed_key.len().saturating_sub(4);
+        if user_key_len <= self.max_key_size {
+            return Ok(());
+        }
+
+        Err(invalid_input_error(format!(
+            "key length {} exceeds configured max_key_size {}",
+            user_key_len, self.max_key_size
+        )))
+    }
+
+    fn validate_batch_sizes(&self, batch: &WriteBatch) -> Result<()> {
+        for op in &batch.ops {
+            match op {
+                WriteBatchOp::Put { key, value } => {
+                    self.validate_prefixed_key_size(key)?;
+                    self.validate_value_size(value)?;
+                }
+                WriteBatchOp::Delete { key } => self.validate_prefixed_key_size(key)?,
+                WriteBatchOp::DeleteRange { start, end } => {
+                    self.validate_prefixed_key_size(start)?;
+                    self.validate_prefixed_key_size(end)?;
+                }
+                WriteBatchOp::Merge { key, operand } => {
+                    self.validate_prefixed_key_size(key)?;
+                    self.validate_value_size(operand)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -713,6 +833,7 @@ impl Db {
 
     /// Delete all data in the database.
     pub fn drop_all(&self) -> Result<()> {
+        self.ensure_writable()?;
         self.engine.drop_all().map_err(Error::Io)
     }
 
@@ -729,6 +850,13 @@ impl Db {
     /// is finished and is serialized with the background compaction
     /// scheduler so the two paths can't fight over the same inputs.
     pub fn compact_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
+        self.ensure_writable()?;
+        if let Some(start) = start {
+            self.validate_key_size(start)?;
+        }
+        if let Some(end) = end {
+            self.validate_key_size(end)?;
+        }
         let lower = match start {
             Some(s) => prefix_key(DEFAULT_CF_ID, s),
             None => cf_lower_bound(DEFAULT_CF_ID),
@@ -869,6 +997,9 @@ impl Db {
         OptionsSnapshot {
             durability: self.durability,
             default_cf: DEFAULT_CF_NAME,
+            read_only: self.read_only,
+            max_key_size: self.max_key_size,
+            max_value_size: self.max_value_size,
         }
     }
 
@@ -959,6 +1090,7 @@ impl Db {
         files: &[std::path::PathBuf],
         opts: IngestOptions,
     ) -> Result<()> {
+        self.ensure_writable()?;
         self.engine
             .ingest_external_files(files, &opts, |user_key| {
                 self.validate_prefixed_cf_io(user_key)
@@ -984,6 +1116,7 @@ impl Db {
     /// memtable and compacts the manifest before any files are
     /// linked; concurrent writers continue to make progress.
     pub fn checkpoint<P: AsRef<Path>>(&self, target_dir: P) -> Result<()> {
+        self.ensure_writable()?;
         let cp = Checkpoint::new(self)?;
         cp.create(target_dir)
     }
@@ -1020,6 +1153,7 @@ impl Db {
     /// The new CF is persisted to the on-disk metadata before this
     /// call returns, so it survives a crash and a reopen.
     pub fn create_column_family(&self, name: &str) -> Result<ColumnFamilyHandle> {
+        self.ensure_writable()?;
         if name.is_empty() {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1029,6 +1163,7 @@ impl Db {
         if let Some(existing) = self.cfs.get(name) {
             return Ok(existing);
         }
+        self.validate_prefixed_key_size(&meta::name_key(name))?;
         let (handle, next_id) = self.cfs.allocate(name);
         let mut batch = BTreeMap::new();
         batch.insert(
@@ -1051,6 +1186,7 @@ impl Db {
     /// Dropping the default column family is not allowed and
     /// returns an error.
     pub fn drop_column_family(&self, cf: ColumnFamilyHandle) -> Result<()> {
+        self.ensure_writable()?;
         if cf.id() == DEFAULT_CF_ID {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1101,7 +1237,9 @@ impl Db {
 
     /// Write `key → value` in column family `cf`.
     pub fn put_cf(&self, cf: &ColumnFamilyHandle, key: &[u8], value: &[u8]) -> Result<()> {
+        self.ensure_writable()?;
         self.validate_cf_handle(cf)?;
+        self.validate_write_kv_sizes(key, value)?;
         let mut batch = BTreeMap::new();
         batch.insert(prefix_key(cf.id(), key), Some(value.to_vec()));
         self.engine
@@ -1111,7 +1249,9 @@ impl Db {
 
     /// Delete `key` in column family `cf`.
     pub fn delete_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<()> {
+        self.ensure_writable()?;
         self.validate_cf_handle(cf)?;
+        self.validate_key_size(key)?;
         let mut batch = BTreeMap::new();
         batch.insert(prefix_key(cf.id(), key), None);
         self.engine
@@ -1121,10 +1261,13 @@ impl Db {
 
     /// Delete every key in `[start, end)` in column family `cf`.
     pub fn delete_range_cf(&self, cf: &ColumnFamilyHandle, start: &[u8], end: &[u8]) -> Result<()> {
-        self.validate_cf_handle(cf)?;
         if start >= end {
             return Ok(());
         }
+        self.ensure_writable()?;
+        self.validate_cf_handle(cf)?;
+        self.validate_key_size(start)?;
+        self.validate_key_size(end)?;
         self.engine
             .apply_grouped_batch(
                 BTreeMap::new(),
@@ -1139,7 +1282,9 @@ impl Db {
     /// Layer a merge operand on top of `key` in column family `cf`.
     /// Requires [`Options::merge_operator`] to be set.
     pub fn merge_cf(&self, cf: &ColumnFamilyHandle, key: &[u8], operand: &[u8]) -> Result<()> {
+        self.ensure_writable()?;
         self.validate_cf_handle(cf)?;
+        self.validate_write_kv_sizes(key, operand)?;
         self.engine
             .apply_grouped_batch(
                 BTreeMap::new(),
@@ -1753,6 +1898,101 @@ mod tests {
 
         let reopened = Db::open(dir.path(), Options::default()).unwrap();
         assert_eq!(reopened.get(b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn test_open_read_only_replays_wal_without_mutating_files() {
+        let dir = TempDir::new().unwrap();
+        {
+            let opts = Options {
+                durability: DurabilityMode::Immediate,
+                ..Options::default()
+            };
+            let db = Db::open(dir.path(), opts).unwrap();
+            db.put(b"wal_only", b"value").unwrap();
+        }
+
+        let manifest_len = std::fs::metadata(dir.path().join("MANIFEST"))
+            .unwrap()
+            .len();
+        let mut wal_names_before: Vec<_> = std::fs::read_dir(dir.path().join("wal"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        wal_names_before.sort();
+
+        let ro = Db::open_read_only(dir.path(), Options::default()).unwrap();
+        assert_eq!(ro.get(b"wal_only").unwrap(), Some(b"value".to_vec()));
+
+        let err = ro.put(b"blocked", b"write").unwrap_err();
+        match err {
+            Error::Io(io) => assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied),
+            other => panic!("expected permission error, got {other:?}"),
+        }
+
+        let writer_err = Db::open(dir.path(), Options::default()).unwrap_err();
+        match writer_err {
+            Error::Io(io) => assert_eq!(io.kind(), std::io::ErrorKind::AlreadyExists),
+            other => panic!("expected lock conflict, got {other:?}"),
+        }
+        ro.close().unwrap();
+        drop(ro);
+
+        assert_eq!(
+            std::fs::metadata(dir.path().join("MANIFEST"))
+                .unwrap()
+                .len(),
+            manifest_len
+        );
+        let mut wal_names_after: Vec<_> = std::fs::read_dir(dir.path().join("wal"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        wal_names_after.sort();
+        assert_eq!(wal_names_after, wal_names_before);
+    }
+
+    #[test]
+    fn test_open_read_only_missing_db_errors() {
+        let dir = TempDir::new().unwrap();
+        let err = Db::open_read_only(dir.path(), Options::default()).unwrap_err();
+        match err {
+            Error::Io(io) => assert_eq!(io.kind(), std::io::ErrorKind::NotFound),
+            other => panic!("expected missing DB error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_configured_key_value_size_limits_are_enforced() {
+        let dir = TempDir::new().unwrap();
+        let opts = Options {
+            max_key_size: 8,
+            max_value_size: 4,
+            ..Options::default()
+        };
+        let db = Db::open(dir.path(), opts).unwrap();
+
+        db.put(b"abc", b"1234").unwrap();
+        assert!(db.put(b"toolongky", b"1").is_err());
+        assert!(db.put(b"a", b"12345").is_err());
+        assert!(db.delete(b"toolongky").is_err());
+        assert!(db.merge(b"toolongky", b"1").is_err());
+        assert!(db.merge(b"a", b"12345").is_err());
+
+        let mut batch = WriteBatch::new();
+        batch.put(b"ok", b"1");
+        batch.put(b"toolong", b"2");
+        db.write(batch).unwrap();
+        assert_eq!(db.get(b"ok").unwrap(), Some(b"1".to_vec()));
+
+        let mut batch = WriteBatch::new();
+        batch.put(b"ok2", b"1");
+        batch.put(b"toolongky", b"2");
+        assert!(db.write(batch).is_err());
+        assert_eq!(db.get(b"ok2").unwrap(), None);
+
+        let cf = db.create_column_family("cf").unwrap();
+        assert!(db.put_cf(&cf, b"toolongky", b"1").is_err());
     }
 
     /// Options that force flushes early so tests can exercise the SSTable path.

@@ -33,6 +33,15 @@ pub(crate) struct CompactionScheduler {
 }
 
 impl CompactionScheduler {
+    /// Construct a scheduler with no background workers.
+    pub(crate) fn disabled() -> Self {
+        Self {
+            shutdown: Arc::new(AtomicBool::new(true)),
+            trigger: Arc::new((Mutex::new(false), Condvar::new())),
+            handles: Vec::new(),
+        }
+    }
+
     /// Start one or more background compaction threads.
     ///
     /// `compaction_lock` is the engine-wide RwLock that serializes

@@ -261,6 +261,23 @@ impl VersionSet {
         })
     }
 
+    /// Recover an existing VersionSet without mutating the manifest.
+    ///
+    /// This is used by read-only opens: replay still tolerates a
+    /// truncated trailing record exactly like the read-write path, but
+    /// the file is not repaired in place and no append writer is kept.
+    pub(crate) fn open_read_only(db_dir: &Path, sst_dir: &Path) -> io::Result<Self> {
+        let manifest_path = db_dir.join("MANIFEST");
+        let data = fs::read(&manifest_path)?;
+        let replay = Self::replay_manifest(&data, sst_dir)?;
+
+        Ok(Self {
+            current: Arc::new(RwLock::new(Arc::new(replay.version))),
+            manifest_path,
+            manifest_writer: None,
+        })
+    }
+
     /// Get the current version.
     pub(crate) fn current(&self) -> Arc<Version> {
         Arc::clone(&*self.current.read())
