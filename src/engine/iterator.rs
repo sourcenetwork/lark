@@ -9,8 +9,8 @@
 //! 1. The active memtable (newest data)
 //! 2. Frozen memtables (newest first)
 //! 3. L0 SSTables (newest first; L0 files may overlap)
-//! 4. L1..Ln SSTables (one level at a time; within a level files are
-//!    non-overlapping so their order is irrelevant)
+//! 4. L1..Ln SSTables (one level at a time; point files within a level
+//!    are non-overlapping, and RT-only files carry no point entries)
 //!
 //! Each level iterator yields `(internal_key, value)` pairs in sorted
 //! internal-key order. Because the internal key encodes `!seq`, newer
@@ -68,7 +68,7 @@ use super::internal_key::{
 };
 use super::manifest::Version;
 use super::memtable::MemTable;
-use super::range_tombstone::{max_covering_seq, RangeTombstone};
+use super::range_tombstone::{RangeTombstone, RangeTombstoneSet};
 use super::sstable::{LiveSst, SsTableReader};
 use crate::options::MergeOperator;
 use crate::options::PrefixExtractor;
@@ -519,8 +519,9 @@ impl SsTableLevelIter {
 
 // ─── LevelConcatIter ───────────────────────────────────────────────────────
 
-/// Concatenation iterator for a sorted, non-overlapping level (L1+).
-/// Opens one SSTable at a time and walks through files in order.
+/// Concatenation iterator for a sorted L1+ level. Opens one SSTable at a
+/// time, skipping RT-only files whose metadata can overlap point files at
+/// range boundaries.
 struct LevelConcatIter {
     files: Vec<Arc<LiveSst>>,
     cache: Arc<BlockCache>,
@@ -555,9 +556,20 @@ impl LevelConcatIter {
             self.current = None;
             return Ok(());
         }
+
         self.file_idx = 0;
-        self.open_current()?;
-        self.current.as_mut().unwrap().seek_to_first()
+        loop {
+            self.open_current()?;
+            self.current.as_mut().unwrap().seek_to_first()?;
+            if self.current.as_ref().is_some_and(|it| it.valid) {
+                return Ok(());
+            }
+            self.file_idx += 1;
+            if self.file_idx >= self.files.len() {
+                self.current = None;
+                return Ok(());
+            }
+        }
     }
 
     fn seek_to_last(&mut self) -> io::Result<()> {
@@ -565,9 +577,20 @@ impl LevelConcatIter {
             self.current = None;
             return Ok(());
         }
+
         self.file_idx = self.files.len() - 1;
-        self.open_current()?;
-        self.current.as_mut().unwrap().seek_to_last()
+        loop {
+            self.open_current()?;
+            self.current.as_mut().unwrap().seek_to_last()?;
+            if self.current.as_ref().is_some_and(|it| it.valid) {
+                return Ok(());
+            }
+            if self.file_idx == 0 {
+                self.current = None;
+                return Ok(());
+            }
+            self.file_idx -= 1;
+        }
     }
 
     fn seek(&mut self, target: &[u8]) -> io::Result<()> {
@@ -584,18 +607,18 @@ impl LevelConcatIter {
             return Ok(());
         }
         self.file_idx = idx;
-        self.open_current()?;
-        self.current.as_mut().unwrap().seek(target)?;
-        if !self.current.as_ref().unwrap().valid {
+        loop {
+            self.open_current()?;
+            self.current.as_mut().unwrap().seek(target)?;
+            if self.current.as_ref().is_some_and(|it| it.valid) {
+                return Ok(());
+            }
             self.file_idx += 1;
             if self.file_idx >= self.files.len() {
                 self.current = None;
                 return Ok(());
             }
-            self.open_current()?;
-            self.current.as_mut().unwrap().seek_to_first()?;
         }
-        Ok(())
     }
 
     fn seek_for_prev(&mut self, target: &[u8]) -> io::Result<()> {
@@ -613,18 +636,18 @@ impl LevelConcatIter {
             idx
         };
         self.file_idx = idx;
-        self.open_current()?;
-        self.current.as_mut().unwrap().seek_for_prev(target)?;
-        if !self.current.as_ref().unwrap().valid {
+        loop {
+            self.open_current()?;
+            self.current.as_mut().unwrap().seek_for_prev(target)?;
+            if self.current.as_ref().is_some_and(|it| it.valid) {
+                return Ok(());
+            }
             if self.file_idx == 0 {
                 self.current = None;
                 return Ok(());
             }
             self.file_idx -= 1;
-            self.open_current()?;
-            self.current.as_mut().unwrap().seek_to_last()?;
         }
-        Ok(())
     }
 
     fn advance(&mut self) -> io::Result<()> {
@@ -639,8 +662,18 @@ impl LevelConcatIter {
             self.current = None;
             return Ok(());
         }
-        self.open_current()?;
-        self.current.as_mut().unwrap().seek_to_first()
+        loop {
+            self.open_current()?;
+            self.current.as_mut().unwrap().seek_to_first()?;
+            if self.current.as_ref().is_some_and(|it| it.valid) {
+                return Ok(());
+            }
+            self.file_idx += 1;
+            if self.file_idx >= self.files.len() {
+                self.current = None;
+                return Ok(());
+            }
+        }
     }
 
     fn advance_backward(&mut self) -> io::Result<()> {
@@ -655,8 +688,18 @@ impl LevelConcatIter {
             return Ok(());
         }
         self.file_idx -= 1;
-        self.open_current()?;
-        self.current.as_mut().unwrap().seek_to_last()
+        loop {
+            self.open_current()?;
+            self.current.as_mut().unwrap().seek_to_last()?;
+            if self.current.as_ref().is_some_and(|it| it.valid) {
+                return Ok(());
+            }
+            if self.file_idx == 0 {
+                self.current = None;
+                return Ok(());
+            }
+            self.file_idx -= 1;
+        }
     }
 
     fn key(&self) -> Option<&[u8]> {
@@ -828,14 +871,10 @@ pub(crate) struct LarkIterator {
     /// Owned storage for the rare merge-result case, where the
     /// value is computed rather than borrowed from a block.
     merge_result: Option<(Vec<u8>, Vec<u8>)>,
-    /// Flat snapshot of every range tombstone the iterator must honor
-    /// — the union of memtable RTs and SSTable RTs from every level
-    /// reachable through the pinned `Version`. Captured once at
-    /// construction so the merging walk can consult it without
-    /// re-locking memtables on each step. Range tombstone counts are
-    /// expected to be small relative to point entries; a linear scan
-    /// per user-key group is acceptable.
-    range_tombstones: Vec<RangeTombstone>,
+    /// Snapshot of every range tombstone the iterator must honor, indexed
+    /// once at construction so per-key visibility checks do not re-lock
+    /// memtables or scan unrelated ranges.
+    range_tombstones: RangeTombstoneSet,
     /// Pinning handle — keeping this alive guarantees compaction cannot
     /// drop SSTable metadata out from under us. The SsTableReaders owned
     /// by the level iterators similarly keep file handles live.
@@ -920,8 +959,10 @@ impl LarkIterator {
                 Arc::clone(&cache),
             )));
         }
-        // L1+: non-overlapping files; use a single concatenation
-        // iterator per level instead of one LevelIter per file.
+        // L1+: use a single concatenation iterator per level instead
+        // of one LevelIter per file. Point files are non-overlapping;
+        // RT-only files have no entries and are skipped by the concat
+        // iterator.
         for level in 1..version.levels.len() {
             if version.levels[level].is_empty() {
                 continue;
@@ -946,7 +987,7 @@ impl LarkIterator {
             curr_user_key: Vec::new(),
             reverse_curr: None,
             merge_result: None,
-            range_tombstones,
+            range_tombstones: RangeTombstoneSet::from_vec(range_tombstones),
             _version: version,
             error: None,
             upper_bound: None,
@@ -962,7 +1003,8 @@ impl LarkIterator {
         if self.range_tombstones.is_empty() {
             return 0;
         }
-        max_covering_seq(&self.range_tombstones, user_key, self.snapshot_seq)
+        self.range_tombstones
+            .max_covering_seq(user_key, self.snapshot_seq)
     }
 
     pub(crate) fn seek_to_first(&mut self) {

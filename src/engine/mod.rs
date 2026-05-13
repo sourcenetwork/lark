@@ -693,7 +693,10 @@ impl LarkEngine {
             }
         }
 
-        // L1+: binary search for the right SSTable per level.
+        // L1+: point files are non-overlapping, but RT-only files can
+        // share a boundary with neighboring point files. Scan metadata
+        // ranges at the level so those empty files cannot hide the
+        // actual point-containing SSTable.
         for level in 1..version.levels.len() {
             let files = &version.levels[level];
             if files.is_empty() {
@@ -715,9 +718,14 @@ impl LarkEngine {
                 }
             }
 
-            let idx = files.partition_point(|f| f.meta.largest_key.as_slice() < key);
-            if idx < files.len() && files[idx].meta.smallest_key.as_slice() <= key {
-                let file = &files[idx];
+            for file in files {
+                if file.meta.num_entries == 0 {
+                    continue;
+                }
+                if file.meta.smallest_key.as_slice() > key || key > file.meta.largest_key.as_slice()
+                {
+                    continue;
+                }
                 match file.reader.get(key, snapshot_seq, &self.cache)? {
                     LookupResult::Found { seq, value } => {
                         return Ok(if seq > max_rt_seq { Some(value) } else { None });
@@ -825,9 +833,8 @@ impl LarkEngine {
                 }
             }
 
-            // L1+: one file per level could contain the key. Also
-            // scan every file at the level for RT coverage (RTs may
-            // sit in a sibling file).
+            // L1+: point files are non-overlapping, while RT coverage
+            // may sit in sibling RT-only files.
             if !terminated {
                 for level in 1..version.levels.len() {
                     let files = &version.levels[level];
@@ -844,19 +851,27 @@ impl LarkEngine {
                             }
                         }
                     }
-                    let idx = files.partition_point(|f| f.meta.largest_key.as_slice() < key);
-                    if idx >= files.len() || files[idx].meta.smallest_key.as_slice() > key {
-                        continue;
+                    for file in files {
+                        if file.meta.num_entries == 0 {
+                            continue;
+                        }
+                        if file.meta.smallest_key.as_slice() > key
+                            || key > file.meta.largest_key.as_slice()
+                        {
+                            continue;
+                        }
+                        let mut partial = Vec::new();
+                        file.reader.collect_merge_chain(
+                            key,
+                            snapshot_seq,
+                            &self.cache,
+                            &mut partial,
+                        )?;
+                        terminated = consume_partial(partial, max_rt_seq, &mut chain);
+                        if terminated {
+                            break;
+                        }
                     }
-                    let file = &files[idx];
-                    let mut partial = Vec::new();
-                    file.reader.collect_merge_chain(
-                        key,
-                        snapshot_seq,
-                        &self.cache,
-                        &mut partial,
-                    )?;
-                    terminated = consume_partial(partial, max_rt_seq, &mut chain);
                     if terminated {
                         break;
                     }
@@ -1032,11 +1047,10 @@ impl LarkEngine {
             }
         }
 
-        // 4. L1..Ln: within each level files are non-overlapping, so a
-        //    single partition_point locates the at-most-one file that
-        //    could contain a given key's point entry. Range tombstones
-        //    may live in a sibling file, though, so we scan all files
-        //    whose user-key range covers `k` for RT coverage first.
+        // 4. L1..Ln: point files are non-overlapping, while RT-only
+        //    files can cover gaps or boundaries. Scan files whose
+        //    metadata covers each key for both RT coverage and the
+        //    point entry.
         for level in 1..version.levels.len() {
             let files = &version.levels[level];
             if files.is_empty() {
@@ -1056,23 +1070,30 @@ impl LarkEngine {
                         }
                     }
                 }
-                let idx = files.partition_point(|f| f.meta.largest_key.as_slice() < k);
-                if idx >= files.len() || files[idx].meta.smallest_key.as_slice() > *k {
-                    continue;
-                }
-                let file = &files[idx];
-                match file.reader.get(k, snapshot_seq, &self.cache)? {
-                    LookupResult::Found { seq, value } => {
-                        results[i] = resolve(seq, Some(value), max_rt[i]);
-                        resolved[i] = true;
-                        unresolved -= 1;
+                for file in files {
+                    if file.meta.num_entries == 0 {
+                        continue;
                     }
-                    LookupResult::FoundTombstone { .. } => {
-                        results[i] = None;
-                        resolved[i] = true;
-                        unresolved -= 1;
+                    if file.meta.smallest_key.as_slice() > *k
+                        || *k > file.meta.largest_key.as_slice()
+                    {
+                        continue;
                     }
-                    LookupResult::NotInTable => {}
+                    match file.reader.get(k, snapshot_seq, &self.cache)? {
+                        LookupResult::Found { seq, value } => {
+                            results[i] = resolve(seq, Some(value), max_rt[i]);
+                            resolved[i] = true;
+                            unresolved -= 1;
+                            break;
+                        }
+                        LookupResult::FoundTombstone { .. } => {
+                            results[i] = None;
+                            resolved[i] = true;
+                            unresolved -= 1;
+                            break;
+                        }
+                        LookupResult::NotInTable => {}
+                    }
                 }
             }
             if unresolved == 0 {
@@ -1474,9 +1495,15 @@ impl LarkEngine {
             if files.is_empty() {
                 continue;
             }
-            let idx = files.partition_point(|f| f.meta.largest_key.as_slice() < key);
-            if idx < files.len() && files[idx].meta.smallest_key.as_slice() <= key {
-                match files[idx].reader.get(key, snap, &self.cache)? {
+            for file in files {
+                if file.meta.num_entries == 0 {
+                    continue;
+                }
+                if file.meta.smallest_key.as_slice() > key || key > file.meta.largest_key.as_slice()
+                {
+                    continue;
+                }
+                match file.reader.get(key, snap, &self.cache)? {
                     LookupResult::Found { seq, .. } | LookupResult::FoundTombstone { seq } => {
                         return Ok(Some(seq));
                     }
