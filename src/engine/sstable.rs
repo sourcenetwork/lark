@@ -699,6 +699,32 @@ pub(crate) struct SsTableReader {
     partitioned: bool,
 }
 
+pub(crate) struct SsTableInternalIter<'a> {
+    reader: &'a SsTableReader,
+    cache: &'a BlockCache,
+    index: Vec<IndexEntry>,
+    next_block_idx: usize,
+    current_block: std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
+}
+
+impl<'a> SsTableInternalIter<'a> {
+    pub(crate) fn next_entry(&mut self) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+        loop {
+            if let Some(entry) = self.current_block.next() {
+                return Ok(Some(entry));
+            }
+
+            let Some(index_entry) = self.index.get(self.next_block_idx) else {
+                return Ok(None);
+            };
+            self.next_block_idx += 1;
+
+            let block = self.reader.read_block(index_entry.handle, self.cache)?;
+            self.current_block = block.iter().collect::<Vec<_>>().into_iter();
+        }
+    }
+}
+
 impl SsTableReader {
     /// Open an SSTable file and load index + bloom into memory.
     pub(crate) fn open(path: &Path, file_id: u64) -> io::Result<Self> {
@@ -1006,6 +1032,26 @@ impl SsTableReader {
             }
         }
         Ok(result)
+    }
+
+    /// Stream every entry in internal-key order with no dedup or
+    /// filtering. At most one decoded data block is buffered at a time.
+    pub(crate) fn iter_internal_stream<'a>(
+        &'a self,
+        cache: &'a BlockCache,
+    ) -> io::Result<SsTableInternalIter<'a>> {
+        let index = if self.partitioned {
+            self.expand_all_leaves()?
+        } else {
+            self.index.clone()
+        };
+        Ok(SsTableInternalIter {
+            reader: self,
+            cache,
+            index,
+            next_block_idx: 0,
+            current_block: Vec::new().into_iter(),
+        })
     }
 
     /// Approximate on-disk bytes whose user key falls in
@@ -1790,6 +1836,35 @@ mod tests {
         // no tombstone hiding.
         let user_keys: Vec<&[u8]> = pairs.iter().map(|(k, _)| user_key_of(k)).collect();
         assert_eq!(user_keys, vec![&b"a"[..], &b"a"[..], &b"b"[..]]);
+    }
+
+    #[test]
+    fn iter_internal_stream_matches_vec_iterator() {
+        for partitioned in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("stream.sst");
+            let cache = BlockCache::new(1024 * 1024);
+            let mut writer =
+                SsTableWriter::new(&path, 64, 10, CompressionType::None, None, partitioned, 96)
+                    .unwrap();
+            for i in 0..128 {
+                let key = format!("k{i:04}");
+                let value = format!("v{i}");
+                writer
+                    .add(&ik(key.as_bytes(), 1), value.as_bytes())
+                    .unwrap();
+            }
+            writer.finish().unwrap().unwrap();
+
+            let reader = SsTableReader::open(&path, 1).unwrap();
+            let expected = reader.iter_internal(&cache).unwrap();
+            let mut stream = reader.iter_internal_stream(&cache).unwrap();
+            let mut actual = Vec::new();
+            while let Some(entry) = stream.next_entry().unwrap() {
+                actual.push(entry);
+            }
+            assert_eq!(actual, expected);
+        }
     }
 
     // ── approximate size ───────────────────────────────────────

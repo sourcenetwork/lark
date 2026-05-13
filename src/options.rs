@@ -449,23 +449,11 @@ pub struct Options {
     /// `1` (default) keeps compaction single-threaded and matches
     /// pre-multi-worker behavior.
     pub max_background_compactions: usize,
-    /// Parallelism used to write a single compaction's output
-    /// SSTables.
+    /// Accepted for compatibility with earlier releases.
     ///
-    /// When `>= 2`, the compaction thread splits a single job's
-    /// sorted entries into this many chunks at user-key
-    /// boundaries and writes each chunk on its own OS thread.
-    /// Each chunk still goes through the usual `target_file_size`
-    /// splitting, so a large subcompaction may produce multiple
-    /// output files per worker. All resulting files land in the
-    /// same atomic version edit.
-    ///
-    /// `1` (default) keeps compactions single-threaded and
-    /// matches pre-subcompaction behavior byte-for-byte. Values
-    /// greater than the number of user-key groups in the
-    /// compaction's input are silently capped to the group
-    /// count, and very small compactions fall back to a single
-    /// worker so the thread-spawn overhead is never a loss.
+    /// Compaction now streams a k-way merge with bounded memory
+    /// and writes outputs on the compaction worker thread, so this
+    /// knob does not change behavior.
     pub max_subcompactions: usize,
     /// Hint the OS page cache to drop pages backing SSTables
     /// that are read or written by background compaction.
@@ -656,7 +644,6 @@ impl Options {
             universal_compaction_options: self.universal_compaction_options,
             use_direct_io_for_compaction: self.use_direct_io_for_compaction,
             max_background_compactions: self.max_background_compactions,
-            max_subcompactions: self.max_subcompactions,
             partitioned_index: self.partitioned_index,
             metadata_block_size: self.metadata_block_size,
             read_only: self.read_only,
@@ -732,9 +719,10 @@ mod tests {
     }
 
     #[test]
-    fn options_to_engine_options_preserves_every_field() {
-        // Defaults must survive the translation unchanged — any
-        // divergence here is almost always a copy-paste bug.
+    fn options_to_engine_options_preserves_engine_fields() {
+        // Defaults consumed by the engine must survive the translation
+        // unchanged; compatibility-only public knobs are intentionally
+        // not present in EngineOptions.
         let opts = Options::default();
         let eo = opts.to_engine_options();
         assert_eq!(eo.write_buffer_size, opts.write_buffer_size);
