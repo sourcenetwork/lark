@@ -1,5 +1,11 @@
 use std::sync::Arc;
 
+/// Default maximum user-key length accepted by write APIs: 8 MiB.
+pub const DEFAULT_MAX_KEY_SIZE: usize = 8 * 1024 * 1024;
+
+/// Default maximum value / merge-operand length accepted by write APIs: 64 MiB.
+pub const DEFAULT_MAX_VALUE_SIZE: usize = 64 * 1024 * 1024;
+
 /// Decision returned by a [`CompactionFilter`] for each entry it sees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactionDecision {
@@ -487,6 +493,17 @@ pub struct Options {
     /// [`Options::partitioned_index`] is enabled. Ignored when
     /// partitioned indexing is off. Default: 4096.
     pub metadata_block_size: usize,
+    /// Open an existing database without creating files, rewriting
+    /// recovered WALs, compacting, or allowing writes. Mutating APIs
+    /// return [`std::io::ErrorKind::PermissionDenied`].
+    ///
+    /// Default: `false`.
+    pub read_only: bool,
+    /// Maximum user-key length accepted by write APIs. Default: 8 MiB.
+    pub max_key_size: usize,
+    /// Maximum value and merge-operand length accepted by write APIs.
+    /// Default: 64 MiB.
+    pub max_value_size: usize,
 }
 
 impl Default for Options {
@@ -525,6 +542,9 @@ impl Default for Options {
             max_subcompactions: 1,
             partitioned_index: false,
             metadata_block_size: 4096,
+            read_only: false,
+            max_key_size: DEFAULT_MAX_KEY_SIZE,
+            max_value_size: DEFAULT_MAX_VALUE_SIZE,
         }
     }
 }
@@ -598,6 +618,9 @@ impl std::fmt::Debug for Options {
             .field("max_subcompactions", &self.max_subcompactions)
             .field("partitioned_index", &self.partitioned_index)
             .field("metadata_block_size", &self.metadata_block_size)
+            .field("read_only", &self.read_only)
+            .field("max_key_size", &self.max_key_size)
+            .field("max_value_size", &self.max_value_size)
             .finish()
     }
 }
@@ -636,6 +659,9 @@ impl Options {
             max_subcompactions: self.max_subcompactions,
             partitioned_index: self.partitioned_index,
             metadata_block_size: self.metadata_block_size,
+            read_only: self.read_only,
+            max_key_size: self.max_key_size,
+            max_value_size: self.max_value_size,
         }
     }
 }
@@ -720,6 +746,9 @@ mod tests {
         assert_eq!(eo.level_size_multiplier, opts.level_size_multiplier);
         assert_eq!(eo.target_file_size, opts.target_file_size);
         assert_eq!(eo.compaction_style, opts.compaction_style);
+        assert_eq!(eo.read_only, opts.read_only);
+        assert_eq!(eo.max_key_size, opts.max_key_size);
+        assert_eq!(eo.max_value_size, opts.max_value_size);
         assert_eq!(
             eo.max_background_compactions,
             opts.max_background_compactions

@@ -159,6 +159,9 @@ pub(crate) struct EngineOptions {
     pub(crate) max_background_compactions: usize,
     pub(crate) partitioned_index: bool,
     pub(crate) metadata_block_size: usize,
+    pub(crate) read_only: bool,
+    pub(crate) max_key_size: usize,
+    pub(crate) max_value_size: usize,
 }
 
 impl EngineOptions {
@@ -207,6 +210,9 @@ impl Default for EngineOptions {
             max_background_compactions: 1,
             partitioned_index: false,
             metadata_block_size: 4096,
+            read_only: false,
+            max_key_size: crate::options::DEFAULT_MAX_KEY_SIZE,
+            max_value_size: crate::options::DEFAULT_MAX_VALUE_SIZE,
         }
     }
 }
@@ -218,7 +224,7 @@ pub(crate) struct LarkEngine {
     versions: Arc<Mutex<VersionSet>>,
     cache: Arc<BlockCache>,
     latest_seq: AtomicU64,
-    active_wal: Mutex<Wal>,
+    active_wal: Mutex<Option<Wal>>,
     wal_id: AtomicU64,
     sst_dir: PathBuf,
     wal_dir: PathBuf,
@@ -279,7 +285,8 @@ impl StallSignal {
 
 impl LarkEngine {
     /// Open or create the database at the given path.
-    pub(crate) fn open(db_dir: &Path, options: EngineOptions) -> std::io::Result<Arc<Self>> {
+    pub(crate) fn open(db_dir: &Path, mut options: EngineOptions) -> std::io::Result<Arc<Self>> {
+        options.read_only = false;
         let db_lock = DbDirectoryLock::acquire_exclusive(db_dir)?;
         let sst_dir = db_dir.join("sst");
         let wal_dir = db_dir.join("wal");
@@ -376,7 +383,7 @@ impl LarkEngine {
             versions,
             cache,
             latest_seq: AtomicU64::new(latest_seq),
-            active_wal: Mutex::new(wal),
+            active_wal: Mutex::new(Some(wal)),
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
             wal_dir,
@@ -393,8 +400,159 @@ impl LarkEngine {
         Ok(engine)
     }
 
+    /// Open an existing database without mutating files or starting
+    /// background writers.
+    pub(crate) fn open_read_only(
+        db_dir: &Path,
+        mut options: EngineOptions,
+    ) -> std::io::Result<Arc<Self>> {
+        let db_lock = DbDirectoryLock::acquire_shared(db_dir)?;
+        let sst_dir = db_dir.join("sst");
+        let wal_dir = db_dir.join("wal");
+
+        if !sst_dir.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "missing SST directory for read-only open: {}",
+                    sst_dir.display()
+                ),
+            ));
+        }
+        if !wal_dir.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "missing WAL directory for read-only open: {}",
+                    wal_dir.display()
+                ),
+            ));
+        }
+
+        options.read_only = true;
+        let version_set = VersionSet::open_read_only(db_dir, &sst_dir)?;
+        let version = version_set.current();
+        let mut latest_seq = version.last_seq;
+
+        let memtable = Arc::new(MemTable::new());
+        let mut wal_files = list_wal_files(&wal_dir)?;
+        wal_files.sort();
+
+        for wal_path in &wal_files {
+            tracing::info!(path = %wal_path.display(), "Replaying WAL for read-only open");
+            let entries = Wal::replay(wal_path)?;
+            for entry in entries {
+                latest_seq = latest_seq.max(apply_replayed_wal_entry(&memtable, entry));
+            }
+        }
+
+        let cache = Arc::new(
+            BlockCache::with_config(
+                options.block_cache_size,
+                options.block_cache_num_shard_bits,
+                options.strict_capacity_limit,
+            )
+            .with_stats(options.statistics.clone()),
+        );
+        let versions = Arc::new(Mutex::new(version_set));
+        let compaction_lock = Arc::new(RwLock::new(()));
+        let snapshot_registry = Arc::new(SnapshotRegistry::new());
+        let stall_signal = Arc::new(StallSignal::new());
+        let wal_id = next_wal_id(version.next_file_id, &wal_files);
+
+        Ok(Arc::new(Self {
+            active_memtable: RwLock::new(memtable),
+            frozen_memtables: RwLock::new(Vec::new()),
+            versions,
+            cache,
+            latest_seq: AtomicU64::new(latest_seq),
+            active_wal: Mutex::new(None),
+            wal_id: AtomicU64::new(wal_id),
+            sst_dir,
+            wal_dir,
+            compaction: Mutex::new(CompactionScheduler::disabled()),
+            compaction_lock,
+            snapshot_registry,
+            options,
+            write_lock: Mutex::new(()),
+            stall_signal,
+            cached_stall_level: AtomicU8::new(0),
+            _db_lock: db_lock,
+        }))
+    }
+
     pub(crate) fn snapshot_seq(&self) -> u64 {
         self.latest_seq.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.options.read_only
+    }
+
+    fn read_only_error() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "database was opened read-only",
+        )
+    }
+
+    fn ensure_writable(&self) -> std::io::Result<()> {
+        if self.is_read_only() {
+            Err(Self::read_only_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn validate_prefixed_key_size(&self, key: &[u8]) -> std::io::Result<()> {
+        let user_key_len = key.len().saturating_sub(4);
+        if user_key_len <= self.options.max_key_size {
+            return Ok(());
+        }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "key length {} exceeds configured max_key_size {}",
+                user_key_len, self.options.max_key_size
+            ),
+        ))
+    }
+
+    fn validate_value_size(&self, value: &[u8]) -> std::io::Result<()> {
+        if value.len() <= self.options.max_value_size {
+            return Ok(());
+        }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "value length {} exceeds configured max_value_size {}",
+                value.len(),
+                self.options.max_value_size
+            ),
+        ))
+    }
+
+    fn validate_ops_sizes(&self, ops: &[WriteBatchOp]) -> std::io::Result<()> {
+        for op in ops {
+            match op {
+                WriteBatchOp::Put { key, value } => {
+                    self.validate_prefixed_key_size(key)?;
+                    self.validate_value_size(value)?;
+                }
+                WriteBatchOp::Delete { key } => self.validate_prefixed_key_size(key)?,
+                WriteBatchOp::DeleteRange { start, end } => {
+                    self.validate_prefixed_key_size(start)?;
+                    self.validate_prefixed_key_size(end)?;
+                }
+                WriteBatchOp::Merge { key, operand } => {
+                    self.validate_prefixed_key_size(key)?;
+                    self.validate_value_size(operand)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Borrow the engine's `Statistics` sink if one is configured.
@@ -1080,9 +1238,11 @@ impl LarkEngine {
         durability: DurabilityMode,
         disable_wal: bool,
     ) -> std::io::Result<()> {
+        self.ensure_writable()?;
         if ops.is_empty() {
             return Ok(());
         }
+        self.validate_ops_sizes(&ops)?;
 
         let _write_guard = self.write_lock.lock();
         self.apply_batch_locked(ops, durability, disable_wal)
@@ -1112,6 +1272,9 @@ impl LarkEngine {
         durability: DurabilityMode,
         disable_wal: bool,
     ) -> std::io::Result<()> {
+        self.ensure_writable()?;
+        self.validate_prefixed_key_size(&key)?;
+        self.validate_value_size(&value)?;
         let _write_guard = self.write_lock.lock();
         let seq = self.latest_seq.fetch_add(1, Ordering::AcqRel) + 1;
 
@@ -1120,6 +1283,7 @@ impl LarkEngine {
                 crate::perf_context::PerfTimer::new(crate::perf_context::PerfTimerField::WriteWal);
             let wal_start = std::time::Instant::now();
             let mut wal = self.active_wal.lock();
+            let wal = wal.as_mut().ok_or_else(Self::read_only_error)?;
             wal.append_put(&key, &value, seq)?;
             let wal_bytes = (key.len() + value.len() + 8) as u64;
             match durability {
@@ -1164,9 +1328,11 @@ impl LarkEngine {
         durability: DurabilityMode,
         disable_wal: bool,
     ) -> std::io::Result<()> {
+        self.ensure_writable()?;
         if ops.is_empty() {
             return Ok(());
         }
+        self.validate_ops_sizes(&ops)?;
 
         let total_ops = ops.len();
         let base_seq = self
@@ -1179,9 +1345,10 @@ impl LarkEngine {
                 crate::perf_context::PerfTimer::new(crate::perf_context::PerfTimerField::WriteWal);
             let wal_start = std::time::Instant::now();
             let mut wal = self.active_wal.lock();
+            let wal = wal.as_mut().ok_or_else(Self::read_only_error)?;
             let wal_bytes: u64 = ops.iter().map(batch_op_wal_bytes).sum();
             if total_ops == 1 {
-                append_single_wal_op(&mut wal, &ops[0], base_seq)?;
+                append_single_wal_op(wal, &ops[0], base_seq)?;
             } else {
                 let wal_entries: Vec<WalEntry> = ops
                     .iter()
@@ -1250,6 +1417,7 @@ impl LarkEngine {
         merges: Vec<(Vec<u8>, Vec<u8>)>,
         durability: DurabilityMode,
     ) -> std::io::Result<CommitOutcome> {
+        self.ensure_writable()?;
         let _write_guard = self.write_lock.lock();
 
         // Conflict check: for each tracked key, peek at the latest
@@ -1323,6 +1491,7 @@ impl LarkEngine {
     }
 
     fn rotate_memtable(&self) -> std::io::Result<()> {
+        self.ensure_writable()?;
         {
             let mut active = self.active_memtable.write();
             let old = Arc::clone(&active);
@@ -1343,7 +1512,7 @@ impl LarkEngine {
 
         let old_wal = {
             let mut wal = self.active_wal.lock();
-            std::mem::replace(&mut *wal, new_wal)
+            wal.replace(new_wal).ok_or_else(Self::read_only_error)?
         };
 
         self.wal_id.store(new_wal_id, Ordering::Release);
@@ -1528,6 +1697,7 @@ impl LarkEngine {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> std::io::Result<()> {
+        self.ensure_writable()?;
         // 1. Flush the active memtable so any in-memory data that
         //    overlaps the range is materialized in L0. We only touch
         //    the write lock if there's actually data to flush. "Data"
@@ -1640,6 +1810,8 @@ impl LarkEngine {
     {
         use crate::engine::internal_key::decode_internal_key;
 
+        self.ensure_writable()?;
+
         if files.is_empty() {
             return Ok(());
         }
@@ -1661,8 +1833,26 @@ impl LarkEngine {
             })?;
             let entries = reader.iter_internal(&self.cache)?;
             let rts = reader.range_tombstones();
-            for (ik, _) in &entries {
+            for (ik, value) in &entries {
                 let (user_key, _, _) = decode_internal_key(ik);
+                self.validate_prefixed_key_size(user_key).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "ingest: source file {} contains an over-sized key: {e}",
+                            path.display()
+                        ),
+                    )
+                })?;
+                self.validate_value_size(value).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "ingest: source file {} contains an over-sized value: {e}",
+                            path.display()
+                        ),
+                    )
+                })?;
                 validate_user_key(user_key).map_err(|e| {
                     std::io::Error::new(
                         e.kind(),
@@ -1674,6 +1864,24 @@ impl LarkEngine {
                 })?;
             }
             for rt in rts {
+                self.validate_prefixed_key_size(&rt.start).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "ingest: source file {} contains an over-sized range tombstone start: {e}",
+                            path.display()
+                        ),
+                    )
+                })?;
+                self.validate_prefixed_key_size(&rt.end).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "ingest: source file {} contains an over-sized range tombstone end: {e}",
+                            path.display()
+                        ),
+                    )
+                })?;
                 validate_user_key(&rt.start).map_err(|e| {
                     std::io::Error::new(
                         e.kind(),
@@ -1898,6 +2106,7 @@ impl LarkEngine {
     /// compaction thread (the thread will block on the same lock the
     /// snapshot holds).
     pub(crate) fn checkpoint_capture(&self) -> std::io::Result<CheckpointSnapshot> {
+        self.ensure_writable()?;
         {
             let has_any = {
                 let mt = self.active_memtable.read();
@@ -2075,6 +2284,7 @@ impl LarkEngine {
 
     /// Drop all data in the engine.
     pub(crate) fn drop_all(&self) -> std::io::Result<()> {
+        self.ensure_writable()?;
         let _write_guard = self.write_lock.lock();
 
         *self.active_memtable.write() = Arc::new(MemTable::new());
@@ -2122,7 +2332,7 @@ impl LarkEngine {
         };
         let wal_path = self.wal_dir.join(wal_filename(wal_id));
         let new_wal = Wal::create(&wal_path)?;
-        *self.active_wal.lock() = new_wal;
+        *self.active_wal.lock() = Some(new_wal);
         self.wal_id.store(wal_id, Ordering::Release);
         self.latest_seq.store(0, Ordering::Release);
 
@@ -2185,6 +2395,11 @@ impl LarkEngine {
 
     /// Flush all data to disk and shut down background threads.
     pub(crate) fn close(&self) -> std::io::Result<()> {
+        if self.is_read_only() {
+            self.compaction.lock().shutdown();
+            return Ok(());
+        }
+
         let has_any = {
             let mt = self.active_memtable.read();
             !mt.is_empty() || !mt.clone_range_tombstones().is_empty()
@@ -2203,14 +2418,22 @@ impl LarkEngine {
                 self.frozen_memtables.write().push(old_memtable);
 
                 let wal_for_flush = Wal::create(&self.wal_dir.join("flush_tmp.wal"))?;
-                let old_wal = std::mem::replace(&mut *self.active_wal.lock(), wal_for_flush);
+                let old_wal = self
+                    .active_wal
+                    .lock()
+                    .replace(wal_for_flush)
+                    .ok_or_else(Self::read_only_error)?;
 
                 drop(_write_guard);
                 self.flush_frozen_memtable(old_wal)?;
             }
         }
 
-        self.active_wal.lock().sync()?;
+        self.active_wal
+            .lock()
+            .as_mut()
+            .ok_or_else(Self::read_only_error)?
+            .sync()?;
         self.compaction.lock().shutdown();
 
         Ok(())
