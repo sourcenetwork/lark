@@ -2890,6 +2890,36 @@ mod tests {
         assert_eq!(db.get(b"m").unwrap(), Some(b"new".to_vec()));
     }
 
+    #[test]
+    fn test_compaction_splits_range_tombstones_around_point_outputs() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        db.put(b"b", b"old-left").unwrap();
+        db.put(b"y", b"old-right").unwrap();
+        db.compact_range(None, None).unwrap();
+
+        db.delete_range(b"a", b"z").unwrap();
+        db.put(b"m", b"new").unwrap();
+        db.compact_range(None, None).unwrap();
+
+        assert_eq!(db.get(b"b").unwrap(), None);
+        assert_eq!(db.get(b"m").unwrap(), Some(b"new".to_vec()));
+        assert_eq!(db.get(b"y").unwrap(), None);
+
+        let version = db.engine.current_version();
+        let rt_only_files = version
+            .levels
+            .iter()
+            .flatten()
+            .filter(|file| file.meta.num_entries == 0)
+            .count();
+        assert!(
+            rt_only_files >= 2,
+            "range tombstone gaps should be emitted separately, got {rt_only_files}"
+        );
+    }
+
     // ─── MultiGet tests ─────────────────────────────────────────────────
 
     #[test]

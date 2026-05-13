@@ -32,7 +32,7 @@ use super::internal_key::{
     compare_internal_keys, decode_internal_key, lookup_key, user_key_of, VALUE_TYPE_DELETION,
     VALUE_TYPE_MERGE,
 };
-use super::range_tombstone::{max_covering_seq, RangeTombstone};
+use super::range_tombstone::{RangeTombstone, RangeTombstoneSet};
 use crate::options::{CompressionType, PrefixExtractor};
 
 /// SSTable magic number: "LARKSST\x01" — flat-index format.
@@ -509,10 +509,12 @@ impl SsTableWriter {
 
         // Range tombstone meta block comes right after the data blocks
         // and before the bloom filter. A size of 0 means no tombstones.
-        let range_tombstone_data = if self.range_tombstones.is_empty() {
+        let range_tombstone_set =
+            RangeTombstoneSet::from_vec(std::mem::take(&mut self.range_tombstones));
+        let range_tombstone_data = if range_tombstone_set.is_empty() {
             Vec::new()
         } else {
-            encode_range_tombstone_block(&self.range_tombstones)
+            encode_range_tombstone_block(range_tombstone_set.as_slice())
         };
         let range_tombstone_offset = self.current_offset;
         self.writer.write_all(&range_tombstone_data)?;
@@ -604,7 +606,7 @@ impl SsTableWriter {
 
         let mut smallest_user_key = self.smallest_user_key.take();
         let mut largest_user_key = self.largest_user_key.take();
-        for rt in &self.range_tombstones {
+        for rt in range_tombstone_set.iter() {
             if smallest_user_key
                 .as_ref()
                 .is_none_or(|smallest| rt.start.as_slice() < smallest.as_slice())
@@ -691,7 +693,7 @@ pub(crate) struct SsTableReader {
     /// A query against a reader without a prefix bloom conservatively
     /// returns `true` — the file might contain the prefix.
     prefix_bloom: Option<BloomFilter>,
-    range_tombstones: Vec<RangeTombstone>,
+    range_tombstones: RangeTombstoneSet,
     /// `true` when the file was written with `MAGIC_V2` (partitioned
     /// index). `self.index` then holds only the compact top-level
     /// entries; each entry's `handle` points to a leaf sub-block that
@@ -809,7 +811,7 @@ impl SsTableReader {
             index,
             bloom,
             prefix_bloom,
-            range_tombstones,
+            range_tombstones: RangeTombstoneSet::from_vec(range_tombstones),
             partitioned,
         })
     }
@@ -917,14 +919,15 @@ impl SsTableReader {
         if self.range_tombstones.is_empty() {
             return 0;
         }
-        max_covering_seq(&self.range_tombstones, user_key, snapshot_seq)
+        self.range_tombstones
+            .max_covering_seq(user_key, snapshot_seq)
     }
 
     /// Borrow this SSTable's range tombstones. Used by compaction to
     /// merge them into the output file and by the iterator to honor
     /// RT coverage during scans.
     pub(crate) fn range_tombstones(&self) -> &[RangeTombstone] {
-        &self.range_tombstones
+        self.range_tombstones.as_slice()
     }
 
     /// Point lookup for `user_key` visible at `snapshot_seq`.
@@ -1679,7 +1682,7 @@ mod tests {
             index: Vec::new(),
             bloom: BloomFilter::new(Vec::new(), 0),
             prefix_bloom: None,
-            range_tombstones: Vec::new(),
+            range_tombstones: RangeTombstoneSet::default(),
             partitioned: false,
         };
         let cache = BlockCache::new(1024);

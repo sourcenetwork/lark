@@ -7,7 +7,7 @@ use super::internal_key::{
     decode_internal_key, encode_internal_key, lookup_key, InternalKey, VALUE_TYPE_DELETION,
     VALUE_TYPE_MERGE, VALUE_TYPE_VALUE,
 };
-use super::range_tombstone::{max_covering_seq, RangeTombstone};
+use super::range_tombstone::{RangeTombstone, RangeTombstoneSet};
 
 /// Concurrent in-memory sorted table backed by a lock-free skip list.
 ///
@@ -20,7 +20,7 @@ use super::range_tombstone::{max_covering_seq, RangeTombstone};
 /// keeping them separate lets point-entry lookups stay lock-free.
 pub(crate) struct MemTable {
     data: SkipMap<InternalKey, Vec<u8>>,
-    range_tombstones: Mutex<Vec<RangeTombstone>>,
+    range_tombstones: Mutex<RangeTombstoneSet>,
     approximate_size: AtomicUsize,
 }
 
@@ -28,7 +28,7 @@ impl MemTable {
     pub(crate) fn new() -> Self {
         Self {
             data: SkipMap::new(),
-            range_tombstones: Mutex::new(Vec::new()),
+            range_tombstones: Mutex::new(RangeTombstoneSet::default()),
             approximate_size: AtomicUsize::new(0),
         }
     }
@@ -73,14 +73,16 @@ impl MemTable {
     /// Used by flush (to persist them into the produced SSTable)
     /// and by the iterator / scan paths to query cover info.
     pub(crate) fn clone_range_tombstones(&self) -> Vec<RangeTombstone> {
-        self.range_tombstones.lock().clone()
+        self.range_tombstones.lock().as_slice().to_vec()
     }
 
     /// Largest seq of any range tombstone covering `user_key` that is
     /// visible at `snapshot_seq`. Returns `0` if no such tombstone
     /// exists — `0` is a safe sentinel because real seqs start at 1.
     pub(crate) fn covering_range_tombstone_seq(&self, user_key: &[u8], snapshot_seq: u64) -> u64 {
-        max_covering_seq(&self.range_tombstones.lock(), user_key, snapshot_seq)
+        self.range_tombstones
+            .lock()
+            .max_covering_seq(user_key, snapshot_seq)
     }
 
     /// Look up the newest point entry for `key` visible at

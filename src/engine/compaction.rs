@@ -8,7 +8,9 @@ use std::thread;
 use super::block_cache::BlockCache;
 use super::internal_key::{compare_internal_keys, decode_internal_key, user_key_of};
 use super::manifest::{VersionEdit, VersionSet, MAX_LEVELS};
-use super::range_tombstone::{max_covering_seq, RangeTombstone};
+use super::range_tombstone::{
+    exclusive_successor, sort_dedup_tombstones, RangeTombstone, RangeTombstoneSet,
+};
 use super::snapshot_registry::SnapshotRegistry;
 use super::sstable::{
     remove_sst, sst_filename, LiveSst, SsTableInternalIter, SsTableMeta, SsTableReader,
@@ -885,14 +887,7 @@ fn perform_compaction_to(
     // Dedup merged range tombstones by (start, end, seq) — a single
     // logical RT may appear in multiple input files after previous
     // compactions carried it forward.
-    merged_range_tombstones.sort_by(|a, b| {
-        (a.start.as_slice(), a.end.as_slice(), a.seq).cmp(&(
-            b.start.as_slice(),
-            b.end.as_slice(),
-            b.seq,
-        ))
-    });
-    merged_range_tombstones.dedup_by(|a, b| a.start == b.start && a.end == b.end && a.seq == b.seq);
+    let merged_range_tombstones = RangeTombstoneSet::from_vec(merged_range_tombstones);
 
     let mut edits = Vec::new();
 
@@ -1341,7 +1336,7 @@ fn stream_compaction_outputs(
     input_files: &[Arc<LiveSst>],
     overlap_files: &[Arc<LiveSst>],
     pin_seq: u64,
-    merged_range_tombstones: &[RangeTombstone],
+    merged_range_tombstones: &RangeTombstoneSet,
 ) -> std::io::Result<(Vec<VersionEdit>, Vec<OutputFileInfo>)> {
     let all_files: Vec<Arc<LiveSst>> = input_files
         .iter()
@@ -1403,7 +1398,7 @@ fn stream_compaction_outputs(
         }
 
         let (_, seq, _) = decode_internal_key(&entry.key);
-        let rt_seq = max_covering_seq(merged_range_tombstones, user_key, pin_seq);
+        let rt_seq = merged_range_tombstones.max_covering_seq(user_key, pin_seq);
         if rt_seq <= seq {
             group.push((entry.key, entry.value));
         }
@@ -1444,6 +1439,8 @@ struct StreamingOutputBuilder {
     path: PathBuf,
     writer: SsTableWriter,
     estimated_size: u64,
+    smallest_user_key: Option<Vec<u8>>,
+    largest_user_key: Option<Vec<u8>>,
 }
 
 struct StreamingCompactionWriter<'a> {
@@ -1451,7 +1448,8 @@ struct StreamingCompactionWriter<'a> {
     sst_dir: &'a Path,
     opts: &'a CompactionOptions,
     target_level: usize,
-    range_tombstones: &'a [RangeTombstone],
+    range_tombstones: &'a RangeTombstoneSet,
+    point_ranges: Vec<(Vec<u8>, Vec<u8>)>,
     current: Option<StreamingOutputBuilder>,
     edits: Vec<VersionEdit>,
     infos: Vec<OutputFileInfo>,
@@ -1463,7 +1461,7 @@ impl<'a> StreamingCompactionWriter<'a> {
         sst_dir: &'a Path,
         opts: &'a CompactionOptions,
         target_level: usize,
-        range_tombstones: &'a [RangeTombstone],
+        range_tombstones: &'a RangeTombstoneSet,
     ) -> Self {
         Self {
             versions,
@@ -1471,6 +1469,7 @@ impl<'a> StreamingCompactionWriter<'a> {
             opts,
             target_level,
             range_tombstones,
+            point_ranges: Vec::new(),
             current: None,
             edits: Vec::new(),
             infos: Vec::new(),
@@ -1492,6 +1491,11 @@ impl<'a> StreamingCompactionWriter<'a> {
 
         self.ensure_current()?;
         let current = self.current.as_mut().expect("current output is open");
+        let user_key = user_key_of(&entries[0].0);
+        if current.smallest_user_key.is_none() {
+            current.smallest_user_key = Some(user_key.to_vec());
+        }
+        current.largest_user_key = Some(user_key.to_vec());
         for (ik, value) in entries {
             current.writer.add(ik, value)?;
             current.estimated_size += (ik.len() + value.len()) as u64;
@@ -1500,10 +1504,8 @@ impl<'a> StreamingCompactionWriter<'a> {
     }
 
     fn finish(mut self) -> std::io::Result<(Vec<VersionEdit>, Vec<OutputFileInfo>)> {
-        if self.current.is_none() && self.infos.is_empty() && !self.range_tombstones.is_empty() {
-            self.ensure_current()?;
-        }
         self.finish_current()?;
+        self.write_uncovered_range_tombstones()?;
         Ok((self.edits, self.infos))
     }
 
@@ -1536,6 +1538,8 @@ impl<'a> StreamingCompactionWriter<'a> {
             path,
             writer,
             estimated_size: 0,
+            smallest_user_key: None,
+            largest_user_key: None,
         });
         Ok(())
     }
@@ -1545,10 +1549,18 @@ impl<'a> StreamingCompactionWriter<'a> {
             return Ok(());
         };
 
-        for rt in self.range_tombstones {
-            current
-                .writer
-                .add_range_tombstone(&rt.start, &rt.end, rt.seq);
+        let point_range = current
+            .smallest_user_key
+            .as_ref()
+            .zip(current.largest_user_key.as_ref())
+            .map(|(smallest, largest)| (smallest.clone(), exclusive_successor(largest)));
+
+        if let Some((start, end)) = &point_range {
+            for rt in self.range_tombstones.clipped_overlaps(start, end) {
+                current
+                    .writer
+                    .add_range_tombstone(&rt.start, &rt.end, rt.seq);
+            }
         }
 
         let summary = match current.writer.finish()? {
@@ -1559,6 +1571,7 @@ impl<'a> StreamingCompactionWriter<'a> {
             }
         };
 
+        let num_entries = summary.num_entries;
         let file_size = std::fs::metadata(&current.path)?.len();
 
         if let Some(limiter) = &self.opts.rate_limiter {
@@ -1570,9 +1583,113 @@ impl<'a> StreamingCompactionWriter<'a> {
         }
 
         let reader = Arc::new(SsTableReader::open(&current.path, current.file_id)?);
+        let (smallest_key, largest_key) = match (
+            current.smallest_user_key.take(),
+            current.largest_user_key.take(),
+        ) {
+            (Some(smallest), Some(largest)) => {
+                if let Some((start, end)) = point_range {
+                    self.point_ranges.push((start, end));
+                }
+                (smallest, largest)
+            }
+            _ => (summary.smallest_user_key, summary.largest_user_key),
+        };
         let new_file = LiveSst::new(
             SsTableMeta {
                 file_id: current.file_id,
+                smallest_key,
+                largest_key,
+                file_size,
+                num_entries,
+            },
+            reader,
+        );
+
+        self.infos.push(OutputFileInfo {
+            file_id: current.file_id,
+            path: current.path.clone(),
+            file_size,
+            num_entries,
+        });
+
+        self.edits.push(VersionEdit::AddFile {
+            level: self.target_level,
+            file: new_file,
+        });
+
+        Ok(())
+    }
+
+    fn write_uncovered_range_tombstones(&mut self) -> std::io::Result<()> {
+        if self.range_tombstones.is_empty() {
+            return Ok(());
+        }
+
+        let fragments = uncovered_range_tombstone_fragments(
+            self.range_tombstones.as_slice(),
+            &self.point_ranges,
+        );
+        if fragments.is_empty() {
+            return Ok(());
+        }
+
+        for chunk in group_range_tombstone_fragments(fragments) {
+            self.write_range_tombstone_only_file(&chunk)?;
+        }
+
+        Ok(())
+    }
+
+    fn write_range_tombstone_only_file(
+        &mut self,
+        tombstones: &[RangeTombstone],
+    ) -> std::io::Result<()> {
+        if tombstones.is_empty() {
+            return Ok(());
+        }
+
+        let file_id = {
+            let mut guard = self.versions.lock();
+            let current = guard.current();
+            let id = current.next_file_id;
+            guard.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
+            id
+        };
+
+        let path = self.sst_dir.join(sst_filename(file_id));
+        let mut writer = SsTableWriter::new(
+            &path,
+            self.opts.block_size,
+            self.opts.bloom_bits_per_key,
+            self.opts.compression_for_level(self.target_level),
+            self.opts.prefix_extractor.clone(),
+            self.opts.partitioned_index,
+            self.opts.metadata_block_size,
+        )?;
+        for rt in tombstones {
+            writer.add_range_tombstone(&rt.start, &rt.end, rt.seq);
+        }
+
+        let Some(summary) = writer.finish()? else {
+            let _ = std::fs::remove_file(&path);
+            return Ok(());
+        };
+
+        let file_size = std::fs::metadata(&path)?.len();
+
+        if let Some(limiter) = &self.opts.rate_limiter {
+            limiter.request(file_size, crate::rate_limiter::Priority::Low);
+        }
+
+        if self.opts.use_direct_io_for_compaction {
+            crate::os_hint::drop_page_cache_by_path(&path);
+        }
+
+        let reader = Arc::new(SsTableReader::open(&path, file_id)?);
+        let new_file = LiveSst::new(
+            SsTableMeta {
+                file_id,
                 smallest_key: summary.smallest_user_key,
                 largest_key: summary.largest_user_key,
                 file_size,
@@ -1582,8 +1699,8 @@ impl<'a> StreamingCompactionWriter<'a> {
         );
 
         self.infos.push(OutputFileInfo {
-            file_id: current.file_id,
-            path: current.path.clone(),
+            file_id,
+            path: path.clone(),
             file_size,
             num_entries: summary.num_entries,
         });
@@ -1594,6 +1711,115 @@ impl<'a> StreamingCompactionWriter<'a> {
         });
 
         Ok(())
+    }
+}
+
+fn uncovered_range_tombstone_fragments(
+    tombstones: &[RangeTombstone],
+    covered_ranges: &[(Vec<u8>, Vec<u8>)],
+) -> Vec<RangeTombstone> {
+    let covered_ranges = merge_key_ranges(covered_ranges);
+    let mut fragments = Vec::new();
+
+    for rt in tombstones {
+        let mut cursor = rt.start.clone();
+        for (covered_start, covered_end) in &covered_ranges {
+            if covered_end.as_slice() <= cursor.as_slice() {
+                continue;
+            }
+            if covered_start.as_slice() >= rt.end.as_slice() {
+                break;
+            }
+
+            if cursor.as_slice() < covered_start.as_slice() {
+                let fragment_end = min_key(covered_start, &rt.end);
+                if cursor.as_slice() < fragment_end.as_slice() {
+                    fragments.push(RangeTombstone::new(cursor.clone(), fragment_end, rt.seq));
+                }
+            }
+
+            if cursor.as_slice() < covered_end.as_slice() {
+                cursor = max_key(covered_end, &cursor);
+            }
+            if cursor.as_slice() >= rt.end.as_slice() {
+                break;
+            }
+        }
+
+        if cursor.as_slice() < rt.end.as_slice() {
+            fragments.push(RangeTombstone::new(cursor, rt.end.clone(), rt.seq));
+        }
+    }
+
+    sort_dedup_tombstones(&mut fragments);
+    fragments
+}
+
+fn group_range_tombstone_fragments(mut fragments: Vec<RangeTombstone>) -> Vec<Vec<RangeTombstone>> {
+    sort_dedup_tombstones(&mut fragments);
+    let mut groups: Vec<Vec<RangeTombstone>> = Vec::new();
+    let mut current: Vec<RangeTombstone> = Vec::new();
+    let mut current_end: Option<Vec<u8>> = None;
+
+    for rt in fragments {
+        if let Some(end) = &current_end {
+            if rt.start.as_slice() > end.as_slice() {
+                groups.push(std::mem::take(&mut current));
+                current_end = None;
+            }
+        }
+
+        if current_end
+            .as_ref()
+            .is_none_or(|end| end.as_slice() < rt.end.as_slice())
+        {
+            current_end = Some(rt.end.clone());
+        }
+        current.push(rt);
+    }
+
+    if !current.is_empty() {
+        groups.push(current);
+    }
+
+    groups
+}
+
+fn merge_key_ranges(ranges: &[(Vec<u8>, Vec<u8>)]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = ranges
+        .iter()
+        .filter(|(start, end)| start < end)
+        .cloned()
+        .collect();
+    ranges.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut merged: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some((_, merged_end)) if start.as_slice() <= merged_end.as_slice() => {
+                if merged_end.as_slice() < end.as_slice() {
+                    *merged_end = end;
+                }
+            }
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
+fn min_key(a: &[u8], b: &[u8]) -> Vec<u8> {
+    if a <= b {
+        a.to_vec()
+    } else {
+        b.to_vec()
+    }
+}
+
+fn max_key(a: &[u8], b: &[u8]) -> Vec<u8> {
+    if a >= b {
+        a.to_vec()
+    } else {
+        b.to_vec()
     }
 }
 
@@ -1639,5 +1865,52 @@ fn delete_old_files(
                 "Failed to delete old SSTable"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rt(start: &[u8], end: &[u8], seq: u64) -> RangeTombstone {
+        RangeTombstone::new(start.to_vec(), end.to_vec(), seq)
+    }
+
+    #[test]
+    fn uncovered_fragments_split_around_point_ranges() {
+        let fragments = uncovered_range_tombstone_fragments(
+            &[rt(b"a", b"z", 7)],
+            &[(b"m".to_vec(), b"m\0".to_vec())],
+        );
+
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(fragments[0].start, b"a");
+        assert_eq!(fragments[0].end, b"m");
+        assert_eq!(fragments[0].seq, 7);
+        assert_eq!(fragments[1].start, b"m\0");
+        assert_eq!(fragments[1].end, b"z");
+        assert_eq!(fragments[1].seq, 7);
+    }
+
+    #[test]
+    fn uncovered_fragments_drop_fully_covered_ranges() {
+        let fragments = uncovered_range_tombstone_fragments(
+            &[rt(b"b", b"d", 3)],
+            &[(b"a".to_vec(), b"z".to_vec())],
+        );
+        assert!(fragments.is_empty());
+    }
+
+    #[test]
+    fn tombstone_fragments_group_overlapping_gaps() {
+        let groups = group_range_tombstone_fragments(vec![
+            rt(b"a", b"c", 1),
+            rt(b"b", b"d", 2),
+            rt(b"f", b"g", 3),
+        ]);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[1].len(), 1);
     }
 }
