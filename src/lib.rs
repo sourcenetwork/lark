@@ -190,6 +190,23 @@ fn invalid_cf_id_io_error(cf_id: u32) -> std::io::Error {
     )
 }
 
+/// One bounded page of ordered scan results.
+///
+/// Returned by [`Db::scan_page`], [`Db::scan_page_cf`],
+/// [`Snapshot::scan_page`], and [`Snapshot::scan_page_cf`] when callers
+/// want an explicit memory cap without manually driving an iterator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanPage {
+    /// Key-value pairs returned for this page, ordered by key.
+    pub entries: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Inclusive start key to pass to the next page request, or
+    /// `None` when the requested range has been exhausted.
+    ///
+    /// This key is the first matching key that was not returned in
+    /// [`ScanPage::entries`].
+    pub next_start: Option<Vec<u8>>,
+}
+
 fn prefixed_cf_id(prefixed_key: &[u8]) -> std::io::Result<u32> {
     let bytes: [u8; 4] = prefixed_key
         .get(..4)
@@ -786,9 +803,13 @@ impl Db {
         }
     }
 
-    /// Scan a key range in the default column family. Returns all
-    /// key-value pairs where `start <= key < end`, with keys in
-    /// their user-visible form (no CF prefix).
+    /// Scan a key range in the default column family.
+    ///
+    /// Returns all key-value pairs where `start <= key < end`, with
+    /// keys in their user-visible form (no CF prefix). This is a
+    /// convenience method that materializes the entire range into
+    /// memory. Prefer [`Db::iter`] for streaming scans or
+    /// [`Db::scan_page`] when the caller needs an explicit page size.
     pub fn scan(
         &self,
         start: Option<&[u8]>,
@@ -805,6 +826,32 @@ impl Db {
         let seq = self.engine.snapshot_seq();
         let raw = collect_range(&self.engine, Some(&lo), Some(&hi), seq)?;
         Ok(raw.into_iter().map(|(k, v)| (k[4..].to_vec(), v)).collect())
+    }
+
+    /// Scan a bounded page in the default column family.
+    ///
+    /// At most `limit` entries are materialized. When
+    /// [`ScanPage::next_start`] is `Some`, pass that key back as
+    /// `start` to continue the scan. Each `Db` call captures its own
+    /// read snapshot; create a [`Snapshot`] and call
+    /// [`Snapshot::scan_page`] for a stable multi-page walk while
+    /// writes continue.
+    pub fn scan_page(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<ScanPage> {
+        let lo = match start {
+            Some(s) => prefix_key(DEFAULT_CF_ID, s),
+            None => cf_lower_bound(DEFAULT_CF_ID),
+        };
+        let hi = match end {
+            Some(e) => prefix_key(DEFAULT_CF_ID, e),
+            None => cf_upper_bound(DEFAULT_CF_ID),
+        };
+        let seq = self.engine.snapshot_seq();
+        collect_page(&self.engine, &lo, &hi, seq, limit).map(strip_cf_prefix_page)
     }
 
     /// Create a streaming iterator over the default column family.
@@ -1296,9 +1343,13 @@ impl Db {
             .map_err(Error::Io)
     }
 
-    /// Scan a key range inside column family `cf`. Returned keys
-    /// have the CF prefix stripped — they appear exactly as the
-    /// caller supplied them on put.
+    /// Scan a key range inside column family `cf`.
+    ///
+    /// Returned keys have the CF prefix stripped — they appear
+    /// exactly as the caller supplied them on put. This convenience
+    /// method materializes the entire range into memory. Prefer
+    /// [`Db::iter_cf`] for streaming scans or [`Db::scan_page_cf`]
+    /// when the caller needs an explicit page size.
     pub fn scan_cf(
         &self,
         cf: &ColumnFamilyHandle,
@@ -1317,6 +1368,31 @@ impl Db {
         let seq = self.engine.snapshot_seq();
         let raw = collect_range(&self.engine, Some(&lo), Some(&hi), seq)?;
         Ok(raw.into_iter().map(|(k, v)| (k[4..].to_vec(), v)).collect())
+    }
+
+    /// Scan a bounded page inside column family `cf`.
+    ///
+    /// At most `limit` entries are materialized, and returned keys have
+    /// the CF prefix stripped. When [`ScanPage::next_start`] is `Some`,
+    /// pass that key back as `start` to continue the scan.
+    pub fn scan_page_cf(
+        &self,
+        cf: &ColumnFamilyHandle,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<ScanPage> {
+        self.validate_cf_handle(cf)?;
+        let lo = match start {
+            Some(s) => prefix_key(cf.id(), s),
+            None => cf_lower_bound(cf.id()),
+        };
+        let hi = match end {
+            Some(e) => prefix_key(cf.id(), e),
+            None => cf_upper_bound(cf.id()),
+        };
+        let seq = self.engine.snapshot_seq();
+        collect_page(&self.engine, &lo, &hi, seq, limit).map(strip_cf_prefix_page)
     }
 
     /// Streaming iterator bounded to column family `cf`. The
@@ -1571,6 +1647,11 @@ impl Snapshot {
     }
 
     /// Scan a key range at this snapshot (default CF).
+    ///
+    /// This convenience method materializes the entire range into
+    /// memory. Prefer [`Snapshot::iter`] for streaming scans or
+    /// [`Snapshot::scan_page`] when the caller needs an explicit page
+    /// size.
     pub fn scan(
         &self,
         start: Option<&[u8]>,
@@ -1586,6 +1667,28 @@ impl Snapshot {
         };
         let raw = collect_range(&self.engine, Some(&lo), Some(&hi), self.seq)?;
         Ok(raw.into_iter().map(|(k, v)| (k[4..].to_vec(), v)).collect())
+    }
+
+    /// Scan a bounded page at this snapshot (default CF).
+    ///
+    /// At most `limit` entries are materialized. When
+    /// [`ScanPage::next_start`] is `Some`, pass that key back as
+    /// `start` to continue the same snapshot-consistent range.
+    pub fn scan_page(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<ScanPage> {
+        let lo = match start {
+            Some(s) => prefix_key(DEFAULT_CF_ID, s),
+            None => cf_lower_bound(DEFAULT_CF_ID),
+        };
+        let hi = match end {
+            Some(e) => prefix_key(DEFAULT_CF_ID, e),
+            None => cf_upper_bound(DEFAULT_CF_ID),
+        };
+        collect_page(&self.engine, &lo, &hi, self.seq, limit).map(strip_cf_prefix_page)
     }
 
     /// Create a streaming iterator anchored at this snapshot
@@ -1618,8 +1721,13 @@ impl Snapshot {
         self.engine.multi_get(&refs, self.seq).map_err(Error::Io)
     }
 
-    /// CF-scoped scan at this snapshot. Returned keys have the
-    /// CF prefix stripped.
+    /// CF-scoped scan at this snapshot.
+    ///
+    /// Returned keys have the CF prefix stripped. This convenience
+    /// method materializes the entire range into memory. Prefer
+    /// [`Snapshot::iter_cf`] for streaming scans or
+    /// [`Snapshot::scan_page_cf`] when the caller needs an explicit
+    /// page size.
     pub fn scan_cf(
         &self,
         cf: &ColumnFamilyHandle,
@@ -1637,6 +1745,31 @@ impl Snapshot {
         };
         let raw = collect_range(&self.engine, Some(&lo), Some(&hi), self.seq)?;
         Ok(raw.into_iter().map(|(k, v)| (k[4..].to_vec(), v)).collect())
+    }
+
+    /// CF-scoped bounded page at this snapshot.
+    ///
+    /// At most `limit` entries are materialized, and returned keys have
+    /// the CF prefix stripped. When [`ScanPage::next_start`] is `Some`,
+    /// pass that key back as `start` to continue the same
+    /// snapshot-consistent range.
+    pub fn scan_page_cf(
+        &self,
+        cf: &ColumnFamilyHandle,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<ScanPage> {
+        self.validate_cf_handle(cf)?;
+        let lo = match start {
+            Some(s) => prefix_key(cf.id(), s),
+            None => cf_lower_bound(cf.id()),
+        };
+        let hi = match end {
+            Some(e) => prefix_key(cf.id(), e),
+            None => cf_upper_bound(cf.id()),
+        };
+        collect_page(&self.engine, &lo, &hi, self.seq, limit).map(strip_cf_prefix_page)
     }
 
     /// CF-scoped streaming iterator at this snapshot.
@@ -1682,6 +1815,57 @@ fn collect_range(
     }
     iter.status().map_err(Error::Io)?;
     Ok(out)
+}
+
+fn collect_page(
+    engine: &LarkEngine,
+    start: &[u8],
+    end: &[u8],
+    snapshot_seq: u64,
+    limit: usize,
+) -> Result<ScanPage> {
+    if limit == 0 {
+        return Err(invalid_input_error(
+            "scan page limit must be greater than zero",
+        ));
+    }
+
+    let mut iter = engine.new_iter(snapshot_seq);
+    iter.seek(start);
+    iter.status().map_err(Error::Io)?;
+
+    let mut entries = Vec::new();
+    let mut next_start = None;
+    while iter.valid() {
+        let (Some(k), Some(v)) = (iter.key(), iter.value()) else {
+            break;
+        };
+        if k >= end {
+            break;
+        }
+        if entries.len() == limit {
+            next_start = Some(k.to_vec());
+            break;
+        }
+        entries.push((k.to_vec(), v.to_vec()));
+        iter.next();
+    }
+    iter.status().map_err(Error::Io)?;
+    Ok(ScanPage {
+        entries,
+        next_start,
+    })
+}
+
+fn strip_cf_prefix_page(page: ScanPage) -> ScanPage {
+    ScanPage {
+        entries: page
+            .entries
+            .into_iter()
+            .map(|(k, v)| (k[4..].to_vec(), v))
+            .collect(),
+        next_start: page.next_start.map(|k| k[4..].to_vec()),
+    }
 }
 
 /// One ordered operation in a [`WriteBatch`].
@@ -2092,6 +2276,97 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0], (b"b".to_vec(), b"2".to_vec()));
         assert_eq!(results[1], (b"c".to_vec(), b"3".to_vec()));
+    }
+
+    #[test]
+    fn test_scan_page_limits_and_resumes() {
+        let (db, _dir) = open_tmp();
+
+        for c in b'a'..=b'e' {
+            db.put(&[c], &[c]).unwrap();
+        }
+
+        let page = db.scan_page(Some(b"b"), Some(b"e"), 2).unwrap();
+        assert_eq!(
+            page,
+            ScanPage {
+                entries: vec![
+                    (b"b".to_vec(), b"b".to_vec()),
+                    (b"c".to_vec(), b"c".to_vec()),
+                ],
+                next_start: Some(b"d".to_vec()),
+            }
+        );
+
+        let next = db
+            .scan_page(page.next_start.as_deref(), Some(b"e"), 2)
+            .unwrap();
+        assert_eq!(
+            next,
+            ScanPage {
+                entries: vec![(b"d".to_vec(), b"d".to_vec())],
+                next_start: None,
+            }
+        );
+
+        let exact_end = db.scan_page(Some(b"b"), Some(b"d"), 2).unwrap();
+        assert_eq!(
+            exact_end,
+            ScanPage {
+                entries: vec![
+                    (b"b".to_vec(), b"b".to_vec()),
+                    (b"c".to_vec(), b"c".to_vec()),
+                ],
+                next_start: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_scan_page_rejects_zero_limit() {
+        let (db, _dir) = open_tmp();
+
+        let err = db.scan_page(None, None, 0).unwrap_err();
+        match err {
+            Error::Io(io) => {
+                assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(io.to_string().contains("greater than zero"));
+            }
+            other => panic!("expected invalid input error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_snapshot_scan_page_is_stable() {
+        let (db, _dir) = open_tmp();
+
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        let snap = db.snapshot();
+
+        db.put(b"a", b"new").unwrap();
+        db.delete(b"b").unwrap();
+        db.put(b"c", b"3").unwrap();
+
+        let first = snap.scan_page(None, None, 1).unwrap();
+        assert_eq!(
+            first,
+            ScanPage {
+                entries: vec![(b"a".to_vec(), b"1".to_vec())],
+                next_start: Some(b"b".to_vec()),
+            }
+        );
+
+        let second = snap
+            .scan_page(first.next_start.as_deref(), None, 2)
+            .unwrap();
+        assert_eq!(
+            second,
+            ScanPage {
+                entries: vec![(b"b".to_vec(), b"2".to_vec())],
+                next_start: None,
+            }
+        );
     }
 
     #[test]
@@ -4966,6 +5241,40 @@ mod tests {
         assert_eq!(
             db.scan(None, None).unwrap(),
             vec![(b"apple".to_vec(), b"D".to_vec())]
+        );
+    }
+
+    #[test]
+    fn test_cf_scan_page_is_scoped_and_resumable() {
+        let (db, _dir) = open_tmp();
+        let cf = db.create_column_family("paged").unwrap();
+
+        db.put(b"a", b"default").unwrap();
+        db.put_cf(&cf, b"a", b"1").unwrap();
+        db.put_cf(&cf, b"b", b"2").unwrap();
+        db.put_cf(&cf, b"c", b"3").unwrap();
+
+        let first = db.scan_page_cf(&cf, None, None, 2).unwrap();
+        assert_eq!(
+            first,
+            ScanPage {
+                entries: vec![
+                    (b"a".to_vec(), b"1".to_vec()),
+                    (b"b".to_vec(), b"2".to_vec()),
+                ],
+                next_start: Some(b"c".to_vec()),
+            }
+        );
+
+        let second = db
+            .scan_page_cf(&cf, first.next_start.as_deref(), None, 2)
+            .unwrap();
+        assert_eq!(
+            second,
+            ScanPage {
+                entries: vec![(b"c".to_vec(), b"3".to_vec())],
+                next_start: None,
+            }
         );
     }
 

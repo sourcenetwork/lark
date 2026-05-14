@@ -21,7 +21,9 @@ use crate::Result;
 ///
 /// Unlike [`Db::scan`](crate::Db::scan), which materializes an entire
 /// result set at once, `Iter` yields entries on demand and bounds memory
-/// by the size of a single block.
+/// by the size of a single block. Use [`Db::scan_page`](crate::Db::scan_page)
+/// when a Vec-backed page is more convenient than manually driving the
+/// iterator.
 ///
 /// # Lifecycle
 ///
