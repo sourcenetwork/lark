@@ -19,6 +19,8 @@
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -185,6 +187,35 @@ struct IndexEntry {
     handle: BlockHandle,
 }
 
+#[derive(Clone)]
+pub(crate) enum SsTableBlockCursor {
+    Flat(usize),
+    Partitioned {
+        leaf_idx: usize,
+        entry_idx: usize,
+        leaf_handles: Arc<Vec<BlockHandle>>,
+    },
+}
+
+impl SsTableBlockCursor {
+    fn handle(&self, flat_index: &[IndexEntry]) -> io::Result<BlockHandle> {
+        match self {
+            Self::Flat(idx) => flat_index
+                .get(*idx)
+                .map(|entry| entry.handle)
+                .ok_or_else(|| invalid_data("block index out of bounds")),
+            Self::Partitioned {
+                entry_idx,
+                leaf_handles,
+                ..
+            } => leaf_handles
+                .get(*entry_idx)
+                .copied()
+                .ok_or_else(|| invalid_data("partitioned block index out of bounds")),
+        }
+    }
+}
+
 /// Result of looking up a user key in a single SSTable.
 ///
 /// The `seq` carried by [`LookupResult::Found`] / [`LookupResult::FoundTombstone`]
@@ -257,6 +288,24 @@ fn decode_index_block(data: &[u8]) -> io::Result<Vec<IndexEntry>> {
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+fn approximate_size_from_index(index: &[IndexEntry], lo_probe: &[u8], hi_probe: &[u8]) -> u64 {
+    if index.is_empty() {
+        return 0;
+    }
+
+    let first = index.partition_point(|entry| compare_internal_keys(&entry.key, lo_probe).is_lt());
+    let last = index.partition_point(|entry| compare_internal_keys(&entry.key, hi_probe).is_lt());
+    let end_idx = last.min(index.len() - 1);
+    if first > end_idx {
+        return 0;
+    }
+
+    index[first..=end_idx]
+        .iter()
+        .map(|entry| entry.handle.size)
+        .sum()
 }
 
 fn read_u32(data: &[u8], pos: &mut usize, field: &'static str) -> io::Result<u32> {
@@ -699,13 +748,14 @@ pub(crate) struct SsTableReader {
     /// entries; each entry's `handle` points to a leaf sub-block that
     /// must be read via [`SsTableReader::read_index_leaf`].
     partitioned: bool,
+    #[cfg(test)]
+    index_leaf_reads: AtomicUsize,
 }
 
 pub(crate) struct SsTableInternalIter<'a> {
     reader: &'a SsTableReader,
     cache: &'a BlockCache,
-    index: Vec<IndexEntry>,
-    next_block_idx: usize,
+    next_cursor: Option<SsTableBlockCursor>,
     current_block: std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
 }
 
@@ -716,12 +766,12 @@ impl<'a> SsTableInternalIter<'a> {
                 return Ok(Some(entry));
             }
 
-            let Some(index_entry) = self.index.get(self.next_block_idx) else {
+            let Some(cursor) = self.next_cursor.take() else {
                 return Ok(None);
             };
-            self.next_block_idx += 1;
+            self.next_cursor = self.reader.next_block_cursor(&cursor)?;
 
-            let block = self.reader.read_block(index_entry.handle, self.cache)?;
+            let block = self.reader.load_block_at_cursor(&cursor, self.cache)?;
             self.current_block = block.iter().collect::<Vec<_>>().into_iter();
         }
     }
@@ -813,6 +863,8 @@ impl SsTableReader {
             prefix_bloom,
             range_tombstones: RangeTombstoneSet::from_vec(range_tombstones),
             partitioned,
+            #[cfg(test)]
+            index_leaf_reads: AtomicUsize::new(0),
         })
     }
 
@@ -821,6 +873,9 @@ impl SsTableReader {
     /// top-level index entries in `self.index`. No block cache is
     /// consulted — the OS page cache keeps hot leaves warm.
     fn read_index_leaf(&self, handle: BlockHandle) -> io::Result<Vec<IndexEntry>> {
+        #[cfg(test)]
+        self.index_leaf_reads.fetch_add(1, Ordering::Relaxed);
+
         let mut file = self.file.lock();
         let buf = read_file_region(
             &mut file,
@@ -832,34 +887,72 @@ impl SsTableReader {
         decode_index_block(&buf)
     }
 
-    /// Expand the top-level index into a flat list of all data-block
-    /// index entries by reading every leaf. Used by paths that need to
-    /// enumerate all blocks (iteration, `approximate_size_in_range`).
-    fn expand_all_leaves(&self) -> io::Result<Vec<IndexEntry>> {
-        let mut all = Vec::new();
-        for entry in &self.index {
-            let leaf = self.read_index_leaf(entry.handle)?;
-            all.extend(leaf);
-        }
-        Ok(all)
+    #[cfg(test)]
+    fn index_leaf_read_count(&self) -> usize {
+        self.index_leaf_reads.load(Ordering::Relaxed)
     }
 
-    /// Resolve a lookup key against the (possibly partitioned) index to
-    /// Binary-search the (possibly two-level) index for the first
-    /// data block whose last key is `>= search_key`. Returns the
-    /// `BlockHandle` of that data block, or `None` if every block's
-    /// last key is strictly less than `search_key`.
-    ///
-    /// For non-partitioned (V1) files, this is a single binary
-    /// search on the in-memory `self.index`. For partitioned (V2)
-    /// files, this is two binary searches: one on the top-level
-    /// index, then one on the single leaf that covers `search_key`
-    /// (loaded from disk on demand).
-    fn find_block_handle(&self, search_key: &[u8]) -> io::Result<Option<BlockHandle>> {
+    #[cfg(test)]
+    fn reset_index_leaf_read_count(&self) {
+        self.index_leaf_reads.store(0, Ordering::Relaxed);
+    }
+
+    fn cursor_from_leaf(
+        &self,
+        leaf_idx: usize,
+        entry_idx: usize,
+        leaf: Vec<IndexEntry>,
+    ) -> Option<SsTableBlockCursor> {
+        if entry_idx >= leaf.len() {
+            return None;
+        }
+        let leaf_handles = Arc::new(leaf.into_iter().map(|entry| entry.handle).collect());
+        Some(SsTableBlockCursor::Partitioned {
+            leaf_idx,
+            entry_idx,
+            leaf_handles,
+        })
+    }
+
+    pub(crate) fn first_block_cursor(&self) -> io::Result<Option<SsTableBlockCursor>> {
+        if !self.partitioned {
+            return Ok((!self.index.is_empty()).then_some(SsTableBlockCursor::Flat(0)));
+        }
+
+        for (leaf_idx, top_entry) in self.index.iter().enumerate() {
+            let leaf = self.read_index_leaf(top_entry.handle)?;
+            if let Some(cursor) = self.cursor_from_leaf(leaf_idx, 0, leaf) {
+                return Ok(Some(cursor));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn last_block_cursor(&self) -> io::Result<Option<SsTableBlockCursor>> {
+        if !self.partitioned {
+            return Ok(
+                (!self.index.is_empty()).then_some(SsTableBlockCursor::Flat(self.index.len() - 1))
+            );
+        }
+
+        for (leaf_idx, top_entry) in self.index.iter().enumerate().rev() {
+            let leaf = self.read_index_leaf(top_entry.handle)?;
+            if !leaf.is_empty() {
+                let entry_idx = leaf.len() - 1;
+                return Ok(self.cursor_from_leaf(leaf_idx, entry_idx, leaf));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn seek_block_cursor(
+        &self,
+        target: &[u8],
+    ) -> io::Result<Option<SsTableBlockCursor>> {
         if !self.partitioned {
             let idx = match self
                 .index
-                .binary_search_by(|e| compare_internal_keys(&e.key, search_key))
+                .binary_search_by(|entry| compare_internal_keys(&entry.key, target))
             {
                 Ok(i) => i,
                 Err(i) => {
@@ -869,13 +962,12 @@ impl SsTableReader {
                     i
                 }
             };
-            return Ok(Some(self.index[idx].handle));
+            return Ok(Some(SsTableBlockCursor::Flat(idx)));
         }
 
-        // Partitioned: binary search top-level to find which leaf.
-        let top_idx = match self
+        let mut leaf_idx = match self
             .index
-            .binary_search_by(|e| compare_internal_keys(&e.key, search_key))
+            .binary_search_by(|entry| compare_internal_keys(&entry.key, target))
         {
             Ok(i) => i,
             Err(i) => {
@@ -886,18 +978,115 @@ impl SsTableReader {
             }
         };
 
-        // Read ONLY the one leaf that may contain the key.
-        let leaf = self.read_index_leaf(self.index[top_idx].handle)?;
-        let inner_idx = match leaf.binary_search_by(|e| compare_internal_keys(&e.key, search_key)) {
-            Ok(i) => i,
-            Err(i) => {
-                if i >= leaf.len() {
-                    return Ok(None);
-                }
-                i
+        while leaf_idx < self.index.len() {
+            let leaf = self.read_index_leaf(self.index[leaf_idx].handle)?;
+            let entry_idx =
+                match leaf.binary_search_by(|entry| compare_internal_keys(&entry.key, target)) {
+                    Ok(i) => i,
+                    Err(i) => i,
+                };
+            if let Some(cursor) = self.cursor_from_leaf(leaf_idx, entry_idx, leaf) {
+                return Ok(Some(cursor));
             }
-        };
-        Ok(Some(leaf[inner_idx].handle))
+            leaf_idx += 1;
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn next_block_cursor(
+        &self,
+        cursor: &SsTableBlockCursor,
+    ) -> io::Result<Option<SsTableBlockCursor>> {
+        match cursor {
+            SsTableBlockCursor::Flat(idx) => {
+                let next = idx + 1;
+                Ok((next < self.index.len()).then_some(SsTableBlockCursor::Flat(next)))
+            }
+            SsTableBlockCursor::Partitioned {
+                leaf_idx,
+                entry_idx,
+                leaf_handles,
+            } => {
+                let next_entry = entry_idx + 1;
+                if next_entry < leaf_handles.len() {
+                    return Ok(Some(SsTableBlockCursor::Partitioned {
+                        leaf_idx: *leaf_idx,
+                        entry_idx: next_entry,
+                        leaf_handles: Arc::clone(leaf_handles),
+                    }));
+                }
+                for next_leaf_idx in leaf_idx + 1..self.index.len() {
+                    let leaf = self.read_index_leaf(self.index[next_leaf_idx].handle)?;
+                    if let Some(cursor) = self.cursor_from_leaf(next_leaf_idx, 0, leaf) {
+                        return Ok(Some(cursor));
+                    }
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    pub(crate) fn prev_block_cursor(
+        &self,
+        cursor: &SsTableBlockCursor,
+    ) -> io::Result<Option<SsTableBlockCursor>> {
+        match cursor {
+            SsTableBlockCursor::Flat(idx) => {
+                if *idx == 0 {
+                    Ok(None)
+                } else {
+                    Ok(Some(SsTableBlockCursor::Flat(idx - 1)))
+                }
+            }
+            SsTableBlockCursor::Partitioned {
+                leaf_idx,
+                entry_idx,
+                leaf_handles,
+            } => {
+                if *entry_idx > 0 {
+                    return Ok(Some(SsTableBlockCursor::Partitioned {
+                        leaf_idx: *leaf_idx,
+                        entry_idx: entry_idx - 1,
+                        leaf_handles: Arc::clone(leaf_handles),
+                    }));
+                }
+                for prev_leaf_idx in (0..*leaf_idx).rev() {
+                    let leaf = self.read_index_leaf(self.index[prev_leaf_idx].handle)?;
+                    if !leaf.is_empty() {
+                        let entry_idx = leaf.len() - 1;
+                        return Ok(self.cursor_from_leaf(prev_leaf_idx, entry_idx, leaf));
+                    }
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    pub(crate) fn load_block_at_cursor(
+        &self,
+        cursor: &SsTableBlockCursor,
+        cache: &BlockCache,
+    ) -> io::Result<Arc<Block>> {
+        let handle = cursor.handle(&self.index)?;
+        self.read_block(handle, cache)
+    }
+
+    /// Resolve a lookup key against the (possibly partitioned) index.
+    ///
+    /// Binary-searches the first data block whose last key is
+    /// `>= search_key`. Returns that data block's [`BlockHandle`], or
+    /// `None` if every block's last key is strictly less than
+    /// `search_key`.
+    ///
+    /// For non-partitioned (V1) files, this is a single binary
+    /// search on the in-memory `self.index`. For partitioned (V2)
+    /// files, this is two binary searches: one on the top-level
+    /// index, then one on the single leaf that covers `search_key`
+    /// (loaded from disk on demand).
+    fn find_block_handle(&self, search_key: &[u8]) -> io::Result<Option<BlockHandle>> {
+        self.seek_block_cursor(search_key)?
+            .map(|cursor| cursor.handle(&self.index))
+            .transpose()
     }
 
     /// Whether this SSTable *might* contain a user key whose prefix
@@ -1020,19 +1209,10 @@ impl SsTableReader {
     /// Read every entry in internal-key order with no dedup or filtering.
     /// Used by compaction to merge tables without losing versions.
     pub(crate) fn iter_internal(&self, cache: &BlockCache) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let owned_index;
-        let data_index: &[IndexEntry] = if self.partitioned {
-            owned_index = self.expand_all_leaves()?;
-            &owned_index
-        } else {
-            &self.index
-        };
+        let mut stream = self.iter_internal_stream(cache)?;
         let mut result = Vec::new();
-        for entry in data_index {
-            let block = self.read_block(entry.handle, cache)?;
-            for (ik, value) in block.iter() {
-                result.push((ik, value));
-            }
+        while let Some(entry) = stream.next_entry()? {
+            result.push(entry);
         }
         Ok(result)
     }
@@ -1043,156 +1223,52 @@ impl SsTableReader {
         &'a self,
         cache: &'a BlockCache,
     ) -> io::Result<SsTableInternalIter<'a>> {
-        let index = if self.partitioned {
-            self.expand_all_leaves()?
-        } else {
-            self.index.clone()
-        };
         Ok(SsTableInternalIter {
             reader: self,
             cache,
-            index,
-            next_block_idx: 0,
+            next_cursor: self.first_block_cursor()?,
             current_block: Vec::new().into_iter(),
         })
     }
 
     /// Approximate on-disk bytes whose user key falls in
     /// `[start, end)`. Computed from the index alone — no data-block
-    /// decompression — so the cost is `O(log num_blocks)` regardless
-    /// of the range size. The estimate is accurate to about one
-    /// data block per partially-covered range boundary, matching the
-    /// "within ~block_size" contract in the `Db::get_approximate_sizes`
-    /// docs.
+    /// decompression. Flat-index tables search the in-memory block
+    /// index directly; partitioned-index tables only read index leaves
+    /// whose top-level key range intersects the requested bounds. The
+    /// estimate is accurate to about one data block per partially-covered
+    /// range boundary, matching the "within ~block_size" contract in the
+    /// `Db::get_approximate_sizes` docs.
     pub(crate) fn approximate_size_in_range(&self, start: &[u8], end: &[u8]) -> u64 {
         if self.index.is_empty() || start >= end {
             return 0;
         }
-        let owned_approx;
-        let data_index: &[IndexEntry] = if self.partitioned {
-            match self.expand_all_leaves() {
-                Ok(v) => {
-                    owned_approx = v;
-                    &owned_approx
-                }
-                Err(_) => return 0,
-            }
-        } else {
-            &self.index
-        };
-        if data_index.is_empty() {
-            return 0;
-        }
         let lo_probe = lookup_key(start, u64::MAX);
         let hi_probe = lookup_key(end, u64::MAX);
-        let first =
-            data_index.partition_point(|e| compare_internal_keys(&e.key, &lo_probe).is_lt());
-        let last = data_index.partition_point(|e| compare_internal_keys(&e.key, &hi_probe).is_lt());
-        let end_idx = last.min(data_index.len() - 1);
-        if first > end_idx {
+        if !self.partitioned {
+            return approximate_size_from_index(&self.index, &lo_probe, &hi_probe);
+        }
+
+        let first_leaf = self
+            .index
+            .partition_point(|entry| compare_internal_keys(&entry.key, &lo_probe).is_lt());
+        let last_leaf = self
+            .index
+            .partition_point(|entry| compare_internal_keys(&entry.key, &hi_probe).is_lt());
+        let end_leaf = last_leaf.min(self.index.len() - 1);
+        if first_leaf > end_leaf {
             return 0;
         }
-        let mut total: u64 = 0;
-        for entry in &data_index[first..=end_idx] {
-            total += entry.handle.size;
+
+        let mut total = 0;
+        for top_entry in &self.index[first_leaf..=end_leaf] {
+            let leaf = match self.read_index_leaf(top_entry.handle) {
+                Ok(leaf) => leaf,
+                Err(_) => return 0,
+            };
+            total += approximate_size_from_index(&leaf, &lo_probe, &hi_probe);
         }
         total
-    }
-
-    /// Number of data blocks in this table. For partitioned-index
-    /// files, expands all leaf blocks to count data blocks.
-    pub(crate) fn num_blocks(&self) -> usize {
-        if !self.partitioned {
-            return self.index.len();
-        }
-        // Expand leaves to count data blocks. On error, fall back to
-        // the top-level count (conservative, but avoids panics in a
-        // method that returns usize).
-        match self.expand_all_leaves() {
-            Ok(v) => v.len(),
-            Err(_) => self.index.len(),
-        }
-    }
-
-    /// Find the first block whose last internal key is `>= target`. Used by
-    /// the streaming iterator to seek to a position within this SSTable.
-    pub(crate) fn seek_block(&self, target: &[u8]) -> Option<usize> {
-        if self.partitioned {
-            let data_index = match self.expand_all_leaves() {
-                Ok(v) => v,
-                Err(_) => return None,
-            };
-            return match data_index.binary_search_by(|e| compare_internal_keys(&e.key, target)) {
-                Ok(i) => Some(i),
-                Err(i) => {
-                    if i >= data_index.len() {
-                        None
-                    } else {
-                        Some(i)
-                    }
-                }
-            };
-        }
-        match self
-            .index
-            .binary_search_by(|e| compare_internal_keys(&e.key, target))
-        {
-            Ok(i) => Some(i),
-            Err(i) => {
-                if i >= self.index.len() {
-                    None
-                } else {
-                    Some(i)
-                }
-            }
-        }
-    }
-
-    /// Load block `block_idx` through the cache. Used by the streaming
-    /// iterator for zero-copy entry decoding within a block.
-    pub(crate) fn load_block_by_idx(
-        &self,
-        block_idx: usize,
-        cache: &BlockCache,
-    ) -> io::Result<Arc<Block>> {
-        let handle = if self.partitioned {
-            let leaves = self.expand_all_leaves()?;
-            leaves
-                .get(block_idx)
-                .ok_or_else(|| invalid_data("partitioned block index out of bounds"))?
-                .handle
-        } else {
-            self.index
-                .get(block_idx)
-                .ok_or_else(|| invalid_data("block index out of bounds"))?
-                .handle
-        };
-        self.read_block(handle, cache)
-    }
-
-    /// Materialize every entry in `block_idx` as a vector of `(internal_key,
-    /// value)` pairs through the block cache. Retained for compaction paths
-    /// that need fully materialized entry vectors.
-    #[allow(dead_code)]
-    pub(crate) fn load_block_entries(
-        &self,
-        block_idx: usize,
-        cache: &BlockCache,
-    ) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let handle = if self.partitioned {
-            let data_index = self.expand_all_leaves()?;
-            data_index
-                .get(block_idx)
-                .ok_or_else(|| invalid_data("partitioned block index out of bounds"))?
-                .handle
-        } else {
-            self.index
-                .get(block_idx)
-                .ok_or_else(|| invalid_data("block index out of bounds"))?
-                .handle
-        };
-        let block = self.read_block(handle, cache)?;
-        Ok(block.iter().collect())
     }
 
     fn read_block(&self, handle: BlockHandle, cache: &BlockCache) -> io::Result<Arc<Block>> {
@@ -1684,6 +1760,7 @@ mod tests {
             prefix_bloom: None,
             range_tombstones: RangeTombstoneSet::default(),
             partitioned: false,
+            index_leaf_reads: AtomicUsize::new(0),
         };
         let cache = BlockCache::new(1024);
 
@@ -2111,22 +2188,23 @@ mod tests {
 
     // ── partitioned index variant ──────────────────────────────
 
+    fn write_partitioned_fixture(path: &Path) {
+        let mut writer =
+            SsTableWriter::new(path, 96, 10, CompressionType::None, None, true, 96).unwrap();
+        for i in 0..300 {
+            writer
+                .add(&ik(format!("k_{:04}", i).as_bytes(), 1), b"value")
+                .unwrap();
+        }
+        writer.finish().unwrap().unwrap();
+    }
+
     #[test]
     fn partitioned_index_round_trip() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("partitioned.sst");
         let cache = BlockCache::new(1024 * 1024);
-        {
-            // Tiny metadata_block_size forces multiple index leaves.
-            let mut writer =
-                SsTableWriter::new(&path, 128, 10, CompressionType::None, None, true, 128).unwrap();
-            for i in 0..300 {
-                writer
-                    .add(&ik(format!("k_{:04}", i).as_bytes(), 1), b"value")
-                    .unwrap();
-            }
-            writer.finish().unwrap().unwrap();
-        }
+        write_partitioned_fixture(&path);
         let reader = SsTableReader::open(&path, 1).unwrap();
         // Spot-check across the range.
         for i in [0usize, 75, 150, 225, 299] {
@@ -2139,5 +2217,82 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn partitioned_point_lookup_reads_one_index_leaf() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("partitioned_point.sst");
+        let cache = BlockCache::new(1024 * 1024);
+        write_partitioned_fixture(&path);
+
+        let reader = SsTableReader::open(&path, 1).unwrap();
+        assert!(
+            reader.index.len() > 3,
+            "fixture must contain several index leaves"
+        );
+
+        reader.reset_index_leaf_read_count();
+        assert_eq!(
+            reader.get(b"k_0150", u64::MAX, &cache).unwrap(),
+            LookupResult::Found {
+                seq: 1,
+                value: b"value".to_vec(),
+            }
+        );
+        assert_eq!(
+            reader.index_leaf_read_count(),
+            1,
+            "point lookup must load only the selected leaf index"
+        );
+    }
+
+    #[test]
+    fn partitioned_internal_stream_starts_without_expanding_all_leaves() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("partitioned_stream.sst");
+        let cache = BlockCache::new(1024 * 1024);
+        write_partitioned_fixture(&path);
+
+        let reader = SsTableReader::open(&path, 1).unwrap();
+        let leaf_count = reader.index.len();
+        assert!(leaf_count > 3, "fixture must contain several index leaves");
+
+        reader.reset_index_leaf_read_count();
+        let mut stream = reader.iter_internal_stream(&cache).unwrap();
+        assert_eq!(
+            reader.index_leaf_read_count(),
+            1,
+            "stream construction should open only the first leaf"
+        );
+
+        let first = stream.next_entry().unwrap().expect("fixture has entries");
+        assert_eq!(user_key_of(&first.0), b"k_0000");
+        assert!(
+            reader.index_leaf_read_count() < leaf_count,
+            "reading the first entry must not expand every leaf"
+        );
+    }
+
+    #[test]
+    fn partitioned_approximate_size_reads_only_overlapped_leaves() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("partitioned_approx.sst");
+        write_partitioned_fixture(&path);
+
+        let reader = SsTableReader::open(&path, 1).unwrap();
+        let leaf_count = reader.index.len();
+        assert!(leaf_count > 3, "fixture must contain several index leaves");
+
+        reader.reset_index_leaf_read_count();
+        assert!(reader.approximate_size_in_range(b"k_0100", b"k_0101") > 0);
+        assert!(
+            reader.index_leaf_read_count() <= 2,
+            "narrow range should load at most the boundary leaves"
+        );
+        assert!(
+            reader.index_leaf_read_count() < leaf_count,
+            "narrow range must not expand every leaf"
+        );
     }
 }

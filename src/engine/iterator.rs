@@ -69,7 +69,7 @@ use super::internal_key::{
 use super::manifest::Version;
 use super::memtable::MemTable;
 use super::range_tombstone::{RangeTombstone, RangeTombstoneSet};
-use super::sstable::{LiveSst, SsTableReader};
+use super::sstable::{LiveSst, SsTableBlockCursor, SsTableReader};
 use crate::options::MergeOperator;
 use crate::options::PrefixExtractor;
 
@@ -261,7 +261,7 @@ struct SsTableLevelIter {
     reader: Arc<SsTableReader>,
     cache: Arc<BlockCache>,
     block: Option<Arc<Block>>,
-    block_idx: usize,
+    block_cursor: Option<SsTableBlockCursor>,
     /// Byte offset of the current entry within `block.entry_data()`.
     entry_pos: usize,
     /// Byte offset just past the current entry (start of the next).
@@ -281,7 +281,7 @@ impl SsTableLevelIter {
             reader,
             cache,
             block: None,
-            block_idx: 0,
+            block_cursor: None,
             entry_pos: 0,
             next_entry_pos: 0,
             cached_key: Vec::new(),
@@ -292,9 +292,9 @@ impl SsTableLevelIter {
         }
     }
 
-    fn load_block(&mut self, idx: usize) -> io::Result<()> {
-        self.block_idx = idx;
-        self.block = Some(self.reader.load_block_by_idx(idx, &self.cache)?);
+    fn load_block(&mut self, cursor: SsTableBlockCursor) -> io::Result<()> {
+        self.block = Some(self.reader.load_block_at_cursor(&cursor, &self.cache)?);
+        self.block_cursor = Some(cursor);
         self.entry_pos = 0;
         self.next_entry_pos = 0;
         self.entry_offsets = None;
@@ -317,24 +317,24 @@ impl SsTableLevelIter {
     }
 
     fn seek_to_first(&mut self) -> io::Result<()> {
-        if self.reader.num_blocks() == 0 {
+        let Some(cursor) = self.reader.first_block_cursor()? else {
             self.valid = false;
             return Ok(());
-        }
-        self.load_block(0)?;
+        };
+        self.load_block(cursor)?;
         self.decode_current();
         Ok(())
     }
 
     fn seek(&mut self, target: &[u8]) -> io::Result<()> {
-        let block_idx = match self.reader.seek_block(target) {
-            Some(i) => i,
+        let cursor = match self.reader.seek_block_cursor(target)? {
+            Some(cursor) => cursor,
             None => {
                 self.valid = false;
                 return Ok(());
             }
         };
-        self.load_block(block_idx)?;
+        self.load_block(cursor)?;
         let data = self.block.as_ref().unwrap().entry_data();
         self.entry_pos = 0;
         self.cached_key.clear();
@@ -351,24 +351,30 @@ impl SsTableLevelIter {
             self.entry_pos = self.next_entry_pos;
         }
         // Fell off end of block — try next block.
-        self.block_idx += 1;
-        if self.block_idx >= self.reader.num_blocks() {
+        let next = self
+            .reader
+            .next_block_cursor(self.block_cursor.as_ref().unwrap())?;
+        let Some(next) = next else {
             self.valid = false;
             return Ok(());
-        }
-        self.load_block(self.block_idx)?;
+        };
+        self.load_block(next)?;
         self.decode_current();
         Ok(())
     }
 
     fn seek_for_prev(&mut self, target: &[u8]) -> io::Result<()> {
-        let num_blocks = self.reader.num_blocks();
-        if num_blocks == 0 {
-            self.valid = false;
-            return Ok(());
-        }
-        let block_idx = self.reader.seek_block(target).unwrap_or(num_blocks - 1);
-        self.load_block(block_idx)?;
+        let cursor = match self.reader.seek_block_cursor(target)? {
+            Some(cursor) => cursor,
+            None => match self.reader.last_block_cursor()? {
+                Some(cursor) => cursor,
+                None => {
+                    self.valid = false;
+                    return Ok(());
+                }
+            },
+        };
+        self.load_block(cursor)?;
         self.build_entry_offsets();
         let offsets = self.entry_offsets.as_ref().unwrap();
         let data = self.block.as_ref().unwrap().entry_data();
@@ -388,12 +394,14 @@ impl SsTableLevelIter {
                 self.valid = true;
             }
             None => {
-                if self.block_idx == 0 {
+                let prev = self
+                    .reader
+                    .prev_block_cursor(self.block_cursor.as_ref().unwrap())?;
+                let Some(prev) = prev else {
                     self.valid = false;
                     return Ok(());
-                }
-                self.block_idx -= 1;
-                self.load_block(self.block_idx)?;
+                };
+                self.load_block(prev)?;
                 self.build_entry_offsets();
                 let last = self.entry_offsets.as_ref().unwrap().len() - 1;
                 self.replay_key_to_index(last);
@@ -410,24 +418,25 @@ impl SsTableLevelIter {
         self.entry_pos = self.next_entry_pos;
         let data = self.block.as_ref().unwrap().entry_data();
         if self.entry_pos >= data.len() {
-            self.block_idx += 1;
-            if self.block_idx >= self.reader.num_blocks() {
+            let next = self
+                .reader
+                .next_block_cursor(self.block_cursor.as_ref().unwrap())?;
+            let Some(next) = next else {
                 self.valid = false;
                 return Ok(());
-            }
-            self.load_block(self.block_idx)?;
+            };
+            self.load_block(next)?;
         }
         self.decode_current();
         Ok(())
     }
 
     fn seek_to_last(&mut self) -> io::Result<()> {
-        let n = self.reader.num_blocks();
-        if n == 0 {
+        let Some(cursor) = self.reader.last_block_cursor()? else {
             self.valid = false;
             return Ok(());
-        }
-        self.load_block(n - 1)?;
+        };
+        self.load_block(cursor)?;
         self.build_entry_offsets();
         let offsets = self.entry_offsets.as_ref().unwrap();
         if offsets.is_empty() {
@@ -453,12 +462,14 @@ impl SsTableLevelIter {
             .position(|&o| o == self.entry_pos)
             .unwrap_or(0);
         if cur_idx == 0 {
-            if self.block_idx == 0 {
+            let prev = self
+                .reader
+                .prev_block_cursor(self.block_cursor.as_ref().unwrap())?;
+            let Some(prev) = prev else {
                 self.valid = false;
                 return Ok(());
-            }
-            self.block_idx -= 1;
-            self.load_block(self.block_idx)?;
+            };
+            self.load_block(prev)?;
             self.build_entry_offsets();
             let offsets = self.entry_offsets.as_ref().unwrap();
             if offsets.is_empty() {
