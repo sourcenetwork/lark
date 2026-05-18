@@ -60,8 +60,8 @@ fn first_wal(db_dir: &Path) -> PathBuf {
 
 fn assert_open_fails_with_kind(dir: &TempDir, expected: io::ErrorKind) {
     match Db::open(dir.path(), Default::default()) {
-        Err(Error::Io(e)) => assert_eq!(e.kind(), expected),
-        Err(e) => panic!("expected I/O error, got {e:?}"),
+        Err(Error::Corruption(e)) => assert_eq!(e.kind(), expected),
+        Err(e) => panic!("expected corruption error, got {e:?}"),
         Ok(_) => panic!("expected DB open to fail"),
     }
 }

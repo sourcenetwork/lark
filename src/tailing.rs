@@ -264,7 +264,7 @@ impl TailingIter {
 
     /// Propagate any I/O error from the underlying cursor.
     pub fn status(&self) -> Result<()> {
-        self.inner.status().map_err(crate::Error::Io)
+        self.inner.status().map_err(crate::Error::from)
     }
 }
 

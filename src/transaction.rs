@@ -104,6 +104,17 @@ impl From<Error> for TransactionError {
     fn from(e: Error) -> Self {
         match e {
             Error::Io(io) => TransactionError::Io(io),
+            Error::Corruption(io) => TransactionError::Io(io),
+            Error::InvalidArgument(message) | Error::InvalidColumnFamily(message) => {
+                TransactionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    message,
+                ))
+            }
+            Error::ReadOnly => TransactionError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "database was opened read-only",
+            )),
             other => TransactionError::Io(std::io::Error::other(other.to_string())),
         }
     }

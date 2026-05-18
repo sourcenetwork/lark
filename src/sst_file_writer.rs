@@ -8,7 +8,6 @@
 //! placeholder seq (`0`) embedded by this writer is rewritten as the
 //! engine re-emits the file into `sst_dir`.
 
-use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::column_family::{prefix_key, ColumnFamilyHandle, DEFAULT_CF_ID};
@@ -92,7 +91,7 @@ impl SstFileWriter {
             opts.partitioned_index,
             opts.metadata_block_size,
         )
-        .map_err(crate::Error::Io)?;
+        .map_err(crate::Error::from)?;
         Ok(Self {
             inner: Some(inner),
             path,
@@ -140,30 +139,23 @@ impl SstFileWriter {
     fn add(&mut self, key: &[u8], value: &[u8], value_type: u8) -> crate::Result<()> {
         let user_key_len = key.len().saturating_sub(4);
         if user_key_len > self.max_key_size {
-            return Err(crate::Error::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "key length {} exceeds configured max_key_size {}",
-                    user_key_len, self.max_key_size
-                ),
+            return Err(crate::Error::invalid_argument(format!(
+                "key length {} exceeds configured max_key_size {}",
+                user_key_len, self.max_key_size
             )));
         }
         if value.len() > self.max_value_size {
-            return Err(crate::Error::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "value length {} exceeds configured max_value_size {}",
-                    value.len(),
-                    self.max_value_size
-                ),
+            return Err(crate::Error::invalid_argument(format!(
+                "value length {} exceeds configured max_value_size {}",
+                value.len(),
+                self.max_value_size
             )));
         }
         if let Some(last) = &self.last_user_key {
             if key <= last.as_slice() {
-                return Err(crate::Error::Io(io::Error::new(
-                    io::ErrorKind::InvalidInput,
+                return Err(crate::Error::invalid_argument(
                     "SstFileWriter keys must arrive in strictly ascending order",
-                )));
+                ));
             }
         }
         let internal = encode_internal_key(key, 0, value_type);
@@ -171,7 +163,7 @@ impl SstFileWriter {
             .inner
             .as_mut()
             .expect("SstFileWriter used after finish");
-        inner.add(&internal, value).map_err(crate::Error::Io)?;
+        inner.add(&internal, value).map_err(crate::Error::from)?;
         self.last_user_key = Some(key.to_vec());
         self.num_entries += 1;
         Ok(())
@@ -182,11 +174,8 @@ impl SstFileWriter {
     /// ingest time anyway.
     pub fn finish(mut self) -> crate::Result<SstFileMeta> {
         let inner = self.inner.take().expect("SstFileWriter used after finish");
-        let summary = inner.finish().map_err(crate::Error::Io)?.ok_or_else(|| {
-            crate::Error::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "SstFileWriter::finish called with no entries",
-            ))
+        let summary = inner.finish().map_err(crate::Error::from)?.ok_or_else(|| {
+            crate::Error::invalid_argument("SstFileWriter::finish called with no entries")
         })?;
         Ok(SstFileMeta {
             path: self.path,

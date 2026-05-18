@@ -166,21 +166,19 @@ use std::sync::Arc;
 use engine::LarkEngine;
 
 fn invalid_cf_handle_error(cf: &ColumnFamilyHandle) -> Error {
-    Error::Io(std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        format!(
-            "column family handle '{}' with id {} is not live",
-            cf.name(),
-            cf.id()
-        ),
+    Error::invalid_column_family(format!(
+        "column family handle '{}' with id {} is not live",
+        cf.name(),
+        cf.id()
     ))
 }
 
 fn invalid_input_error(message: impl Into<String>) -> Error {
-    Error::Io(std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        message.into(),
-    ))
+    Error::invalid_argument(message)
+}
+
+fn invalid_cf_id_error(cf_id: u32) -> Error {
+    Error::invalid_column_family(format!("column family id {cf_id} is not live"))
 }
 
 fn invalid_cf_id_io_error(cf_id: u32) -> std::io::Error {
@@ -188,6 +186,17 @@ fn invalid_cf_id_io_error(cf_id: u32) -> std::io::Error {
         std::io::ErrorKind::InvalidInput,
         format!("column family id {cf_id} is not live"),
     )
+}
+
+fn map_point_read_error(err: std::io::Error, prefixed_key: &[u8]) -> Error {
+    if err.kind() == std::io::ErrorKind::InvalidData
+        && err.to_string().starts_with("merge operator ")
+    {
+        let user_key = prefixed_key.get(4..).unwrap_or(prefixed_key).to_vec();
+        Error::MergeFailed(user_key)
+    } else {
+        Error::from(err)
+    }
 }
 
 /// One bounded page of ordered scan results.
@@ -344,7 +353,7 @@ impl Db {
     /// The handle replays any existing WAL files into memory so reads
     /// see committed-but-unflushed writes, but it does not create,
     /// rewrite, compact, or delete files. Mutating APIs return
-    /// [`std::io::ErrorKind::PermissionDenied`].
+    /// [`Error::ReadOnly`].
     pub fn open_read_only<P: AsRef<Path>>(path: P, mut opts: Options) -> Result<Self> {
         opts.read_only = true;
         Self::open(path, opts)
@@ -383,7 +392,7 @@ impl Db {
         let next_id_raw = self
             .engine
             .get(&meta::next_id_key(), self.engine.snapshot_seq())
-            .map_err(Error::Io)?;
+            .map_err(Error::from)?;
         let next_id = match next_id_raw {
             Some(bytes) if bytes.len() == 4 => {
                 u32::from_be_bytes(bytes.as_slice().try_into().unwrap())
@@ -416,7 +425,10 @@ impl Db {
         }
         perf_context::record_get_call();
         let seq = self.engine.snapshot_seq();
-        let result = self.engine.get(prefixed_key, seq).map_err(Error::Io);
+        let result = self
+            .engine
+            .get(prefixed_key, seq)
+            .map_err(|err| map_point_read_error(err, prefixed_key));
         if let (Some(s), Ok(Some(v))) = (stats, &result) {
             s.add(Ticker::BytesRead, v.len() as u64);
             s.record(Histogram::BytesPerRead, v.len() as u64);
@@ -444,7 +456,7 @@ impl Db {
         let owned: Vec<Vec<u8>> = keys.iter().map(|k| prefix_key(DEFAULT_CF_ID, k)).collect();
         let refs: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
         let seq = self.engine.snapshot_seq();
-        self.engine.multi_get(&refs, seq).map_err(Error::Io)
+        self.engine.multi_get(&refs, seq).map_err(Error::from)
     }
 
     /// Set a key-value pair in the default column family using
@@ -477,7 +489,7 @@ impl Db {
                 dm,
                 disable_wal,
             )
-            .map_err(Error::Io)
+            .map_err(Error::from)
     }
 
     /// Delete a key from the default column family using the
@@ -500,7 +512,7 @@ impl Db {
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
             .apply_grouped_batch(batch, Vec::new(), Vec::new(), dm, disable_wal)
-            .map_err(Error::Io)
+            .map_err(Error::from)
     }
 
     /// Layer a merge operand on top of `key` in the default
@@ -531,7 +543,7 @@ impl Db {
                 dm,
                 disable_wal,
             )
-            .map_err(Error::Io)
+            .map_err(Error::from)
     }
 
     /// Delete every key in `[start, end)` in the default column
@@ -573,7 +585,7 @@ impl Db {
                 dm,
                 disable_wal,
             )
-            .map_err(Error::Io)
+            .map_err(Error::from)
     }
 
     /// Apply a batch of writes atomically using the database-global
@@ -629,7 +641,7 @@ impl Db {
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
             .apply_batch(batch.ops, dm, disable_wal)
-            .map_err(Error::Io)
+            .map_err(Error::from)
     }
 
     /// Apply a batch of writes atomically with an explicit
@@ -674,10 +686,7 @@ impl Db {
 
     fn ensure_writable(&self) -> Result<()> {
         if self.read_only {
-            Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "database was opened read-only",
-            )))
+            Err(Error::ReadOnly)
         } else {
             Ok(())
         }
@@ -767,8 +776,12 @@ impl Db {
     }
 
     fn validate_prefixed_cf(&self, prefixed_key: &[u8]) -> Result<()> {
-        self.validate_prefixed_cf_io(prefixed_key)
-            .map_err(Error::Io)
+        let cf_id = prefixed_cf_id(prefixed_key).map_err(Error::from)?;
+        if self.cfs.contains_id(cf_id) {
+            Ok(())
+        } else {
+            Err(invalid_cf_id_error(cf_id))
+        }
     }
 
     fn validate_batch_cf_liveness(&self, batch: &WriteBatch) -> Result<()> {
@@ -881,7 +894,7 @@ impl Db {
     /// Delete all data in the database.
     pub fn drop_all(&self) -> Result<()> {
         self.ensure_writable()?;
-        self.engine.drop_all().map_err(Error::Io)
+        self.engine.drop_all().map_err(Error::from)
     }
 
     /// Synchronously compact every SSTable overlapping the default
@@ -914,7 +927,7 @@ impl Db {
         };
         self.engine
             .compact_range(Some(&lower), Some(&upper))
-            .map_err(Error::Io)
+            .map_err(Error::from)
     }
 
     /// Return the string value of a named property, or `None` if
@@ -1142,12 +1155,12 @@ impl Db {
             .ingest_external_files(files, &opts, |user_key| {
                 self.validate_prefixed_cf_io(user_key)
             })
-            .map_err(Error::Io)
+            .map_err(Error::from)
     }
 
     /// Flush all data to disk and shut down background threads.
     pub fn close(&self) -> Result<()> {
-        self.engine.close().map_err(Error::Io)
+        self.engine.close().map_err(Error::from)
     }
 
     /// Test-only: number of SSTable files at `level`.
@@ -1202,10 +1215,9 @@ impl Db {
     pub fn create_column_family(&self, name: &str) -> Result<ColumnFamilyHandle> {
         self.ensure_writable()?;
         if name.is_empty() {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+            return Err(Error::invalid_argument(
                 "column family name must not be empty",
-            )));
+            ));
         }
         if let Some(existing) = self.cfs.get(name) {
             return Ok(existing);
@@ -1220,7 +1232,7 @@ impl Db {
         batch.insert(meta::next_id_key(), Some(next_id.to_be_bytes().to_vec()));
         self.engine
             .apply_grouped_batch(batch, Vec::new(), Vec::new(), self.durability, false)
-            .map_err(Error::Io)?;
+            .map_err(Error::from)?;
         Ok(handle)
     }
 
@@ -1235,16 +1247,14 @@ impl Db {
     pub fn drop_column_family(&self, cf: ColumnFamilyHandle) -> Result<()> {
         self.ensure_writable()?;
         if cf.id() == DEFAULT_CF_ID {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+            return Err(Error::invalid_argument(
                 "cannot drop the default column family",
-            )));
+            ));
         }
         if cf.id() == META_CF_ID {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+            return Err(Error::invalid_argument(
                 "cannot drop the reserved metadata column family",
-            )));
+            ));
         }
         self.validate_cf_handle(&cf)?;
         let lo = cf_lower_bound(cf.id());
@@ -1257,7 +1267,7 @@ impl Db {
         let range_deletes = vec![(lo, hi)];
         self.engine
             .apply_grouped_batch(point_ops, range_deletes, Vec::new(), self.durability, false)
-            .map_err(Error::Io)?;
+            .map_err(Error::from)?;
         self.cfs.remove(cf.name());
         Ok(())
     }
@@ -1279,7 +1289,7 @@ impl Db {
         let owned: Vec<Vec<u8>> = keys.iter().map(|k| prefix_key(cf.id(), k)).collect();
         let refs: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
         let seq = self.engine.snapshot_seq();
-        self.engine.multi_get(&refs, seq).map_err(Error::Io)
+        self.engine.multi_get(&refs, seq).map_err(Error::from)
     }
 
     /// Write `key → value` in column family `cf`.
@@ -1291,7 +1301,7 @@ impl Db {
         batch.insert(prefix_key(cf.id(), key), Some(value.to_vec()));
         self.engine
             .apply_grouped_batch(batch, Vec::new(), Vec::new(), self.durability, false)
-            .map_err(Error::Io)
+            .map_err(Error::from)
     }
 
     /// Delete `key` in column family `cf`.
@@ -1303,7 +1313,7 @@ impl Db {
         batch.insert(prefix_key(cf.id(), key), None);
         self.engine
             .apply_grouped_batch(batch, Vec::new(), Vec::new(), self.durability, false)
-            .map_err(Error::Io)
+            .map_err(Error::from)
     }
 
     /// Delete every key in `[start, end)` in column family `cf`.
@@ -1323,7 +1333,7 @@ impl Db {
                 self.durability,
                 false,
             )
-            .map_err(Error::Io)
+            .map_err(Error::from)
     }
 
     /// Layer a merge operand on top of `key` in column family `cf`.
@@ -1340,7 +1350,7 @@ impl Db {
                 self.durability,
                 false,
             )
-            .map_err(Error::Io)
+            .map_err(Error::from)
     }
 
     /// Scan a key range inside column family `cf`.
@@ -1634,16 +1644,17 @@ impl Snapshot {
 
     /// Get the value for a key at this snapshot (default CF).
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let prefixed = prefix_key(DEFAULT_CF_ID, key);
         self.engine
-            .get(&prefix_key(DEFAULT_CF_ID, key), self.seq)
-            .map_err(Error::Io)
+            .get(&prefixed, self.seq)
+            .map_err(|err| map_point_read_error(err, &prefixed))
     }
 
     /// Batched point lookup anchored at this snapshot (default CF).
     pub fn multi_get(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
         let owned: Vec<Vec<u8>> = keys.iter().map(|k| prefix_key(DEFAULT_CF_ID, k)).collect();
         let refs: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
-        self.engine.multi_get(&refs, self.seq).map_err(Error::Io)
+        self.engine.multi_get(&refs, self.seq).map_err(Error::from)
     }
 
     /// Scan a key range at this snapshot (default CF).
@@ -1704,9 +1715,10 @@ impl Snapshot {
     /// CF-scoped get at this snapshot.
     pub fn get_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.validate_cf_handle(cf)?;
+        let prefixed = prefix_key(cf.id(), key);
         self.engine
-            .get(&prefix_key(cf.id(), key), self.seq)
-            .map_err(Error::Io)
+            .get(&prefixed, self.seq)
+            .map_err(|err| map_point_read_error(err, &prefixed))
     }
 
     /// CF-scoped multi_get at this snapshot.
@@ -1718,7 +1730,7 @@ impl Snapshot {
         self.validate_cf_handle(cf)?;
         let owned: Vec<Vec<u8>> = keys.iter().map(|k| prefix_key(cf.id(), k)).collect();
         let refs: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
-        self.engine.multi_get(&refs, self.seq).map_err(Error::Io)
+        self.engine.multi_get(&refs, self.seq).map_err(Error::from)
     }
 
     /// CF-scoped scan at this snapshot.
@@ -1798,7 +1810,7 @@ fn collect_range(
         Some(s) => iter.seek(s),
         None => iter.seek_to_first(),
     }
-    iter.status().map_err(Error::Io)?;
+    iter.status().map_err(Error::from)?;
 
     let mut out = Vec::new();
     while iter.valid() {
@@ -1813,7 +1825,7 @@ fn collect_range(
         out.push((k.to_vec(), v.to_vec()));
         iter.next();
     }
-    iter.status().map_err(Error::Io)?;
+    iter.status().map_err(Error::from)?;
     Ok(out)
 }
 
@@ -1832,7 +1844,7 @@ fn collect_page(
 
     let mut iter = engine.new_iter(snapshot_seq);
     iter.seek(start);
-    iter.status().map_err(Error::Io)?;
+    iter.status().map_err(Error::from)?;
 
     let mut entries = Vec::new();
     let mut next_start = None;
@@ -1850,7 +1862,7 @@ fn collect_page(
         entries.push((k.to_vec(), v.to_vec()));
         iter.next();
     }
-    iter.status().map_err(Error::Io)?;
+    iter.status().map_err(Error::from)?;
     Ok(ScanPage {
         entries,
         next_start,
@@ -2110,8 +2122,8 @@ mod tests {
 
         let err = ro.put(b"blocked", b"write").unwrap_err();
         match err {
-            Error::Io(io) => assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied),
-            other => panic!("expected permission error, got {other:?}"),
+            Error::ReadOnly => {}
+            other => panic!("expected read-only error, got {other:?}"),
         }
 
         let writer_err = Db::open(dir.path(), Options::default()).unwrap_err();
@@ -2328,11 +2340,8 @@ mod tests {
 
         let err = db.scan_page(None, None, 0).unwrap_err();
         match err {
-            Error::Io(io) => {
-                assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput);
-                assert!(io.to_string().contains("greater than zero"));
-            }
-            other => panic!("expected invalid input error, got {other:?}"),
+            Error::InvalidArgument(message) => assert!(message.contains("greater than zero")),
+            other => panic!("expected invalid argument error, got {other:?}"),
         }
     }
 
@@ -4757,6 +4766,19 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_failure_surfaces_key() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), counter_opts()).unwrap();
+        db.merge(b"counter", b"not an i64").unwrap();
+
+        let err = db.get(b"counter").unwrap_err();
+        match err {
+            Error::MergeFailed(key) => assert_eq!(key, b"counter".to_vec()),
+            other => panic!("expected merge failure, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_merge_snapshot_isolation() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
@@ -5083,7 +5105,11 @@ mod tests {
         db.put_cf(&cf, b"k", b"v").unwrap();
         db.drop_column_family(cf.clone()).unwrap();
 
-        assert!(db.get_cf(&cf, b"k").is_err());
+        let err = db.get_cf(&cf, b"k").unwrap_err();
+        match err {
+            Error::InvalidColumnFamily(message) => assert!(message.contains("tmp")),
+            other => panic!("expected invalid column family error, got {other:?}"),
+        }
         assert!(db.multi_get_cf(&cf, &[b"k"]).is_err());
         assert!(db.put_cf(&cf, b"k", b"ghost").is_err());
         assert!(db.delete_cf(&cf, b"k").is_err());
@@ -5132,7 +5158,11 @@ mod tests {
 
         let mut batch = WriteBatch::new();
         batch.put_cf(&stale, b"k", b"ghost");
-        assert!(db.write(batch).is_err());
+        let err = db.write(batch).unwrap_err();
+        match err {
+            Error::InvalidColumnFamily(message) => assert!(message.contains("column family id")),
+            other => panic!("expected invalid column family error, got {other:?}"),
+        }
 
         let live = db.create_column_family("tmp").unwrap();
         assert_eq!(db.get_cf(&live, b"k").unwrap(), None);
