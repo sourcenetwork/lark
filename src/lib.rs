@@ -3418,6 +3418,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_multi_get_compacted_level_range_tombstones() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        for i in 0..30 {
+            let key = format!("k{:02}", i);
+            let value = format!("v{:02}", i);
+            db.put(key.as_bytes(), value.as_bytes()).unwrap();
+        }
+        force_flush(&db, "base");
+        db.delete_range(b"k10", b"k20").unwrap();
+        db.compact_range(None, None).unwrap();
+
+        let version = db.engine.current_version();
+        assert!(
+            version.levels.iter().skip(1).any(|level| !level.is_empty()),
+            "test must exercise L1+ files"
+        );
+
+        let keys_owned = ["k09", "k10", "k15", "k20", "k15", "k09", "missing", "k29"];
+        let keys: Vec<&[u8]> = keys_owned.iter().map(|key| key.as_bytes()).collect();
+        let individual: Vec<_> = keys.iter().map(|key| db.get(key).unwrap()).collect();
+        let batched = db.multi_get(&keys).unwrap();
+
+        assert_eq!(batched, individual);
+        assert_eq!(batched[0], Some(b"v09".to_vec()));
+        assert_eq!(batched[1], None);
+        assert_eq!(batched[2], None);
+        assert_eq!(batched[3], Some(b"v20".to_vec()));
+        assert_eq!(batched[4], None);
+        assert_eq!(batched[5], Some(b"v09".to_vec()));
+        assert_eq!(batched[6], None);
+        assert_eq!(batched[7], Some(b"v29".to_vec()));
+    }
+
     // ─── Reverse iteration tests ─────────────────────────────────────────
 
     fn collect_reverse(db: &Db) -> Vec<(Vec<u8>, Vec<u8>)> {

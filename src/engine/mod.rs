@@ -125,6 +125,61 @@ fn apply_batch_op_to_memtable(memtable: &MemTable, op: &WriteBatchOp, seq: u64) 
     }
 }
 
+struct MultiGetEntry {
+    key: Vec<u8>,
+    output_indexes: Vec<usize>,
+    max_rt: u64,
+    resolved: bool,
+}
+
+fn grouped_multi_get_entries(keys: &[&[u8]]) -> Vec<MultiGetEntry> {
+    let mut grouped: BTreeMap<Vec<u8>, Vec<usize>> = BTreeMap::new();
+    for (idx, key) in keys.iter().enumerate() {
+        grouped.entry((*key).to_vec()).or_default().push(idx);
+    }
+    grouped
+        .into_iter()
+        .map(|(key, output_indexes)| MultiGetEntry {
+            key,
+            output_indexes,
+            max_rt: 0,
+            resolved: false,
+        })
+        .collect()
+}
+
+fn file_covers_key(file: &LiveSst, key: &[u8]) -> bool {
+    file.meta.smallest_key.as_slice() <= key && key <= file.meta.largest_key.as_slice()
+}
+
+fn key_range_for_file(entries: &[MultiGetEntry], file: &LiveSst) -> std::ops::Range<usize> {
+    let start =
+        entries.partition_point(|entry| entry.key.as_slice() < file.meta.smallest_key.as_slice());
+    let end = start
+        + entries[start..]
+            .partition_point(|entry| entry.key.as_slice() <= file.meta.largest_key.as_slice());
+    start..end
+}
+
+fn resolve_multi_get_value(pseq: u64, popt: Option<Vec<u8>>, rt_seq: u64) -> Option<Vec<u8>> {
+    if pseq > rt_seq {
+        popt
+    } else {
+        None
+    }
+}
+
+fn set_multi_get_result(
+    entry: &mut MultiGetEntry,
+    results: &mut [Option<Vec<u8>>],
+    value: Option<Vec<u8>>,
+) {
+    for &output_idx in &entry.output_indexes {
+        results[output_idx] = value.clone();
+    }
+    entry.resolved = true;
+}
+
 /// Configuration for the Lark engine.
 #[derive(Clone)]
 pub(crate) struct EngineOptions {
@@ -951,39 +1006,26 @@ impl LarkEngine {
         }
 
         let mut results: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
-        let mut resolved: Vec<bool> = vec![false; keys.len()];
-        // Running max of range-tombstone seq covering `keys[i]` across
-        // all sources walked so far (newest → oldest).
-        let mut max_rt: Vec<u64> = vec![0; keys.len()];
-        let mut unresolved = keys.len();
-        if unresolved == 0 {
+        if keys.is_empty() {
             return Ok(results);
         }
-
-        // Helper that, given a point lookup result and the accumulated
-        // max RT seq, decides the final per-key outcome.
-        let resolve = |pseq: u64, popt: Option<Vec<u8>>, rt_seq: u64| -> Option<Vec<u8>> {
-            if pseq > rt_seq {
-                popt
-            } else {
-                None
-            }
-        };
+        let mut entries = grouped_multi_get_entries(keys);
+        let mut unresolved = entries.len();
 
         // 1. Active memtable.
         {
             let mt = self.active_memtable.read();
-            for (i, k) in keys.iter().enumerate() {
-                if resolved[i] {
+            for entry in &mut entries {
+                if entry.resolved {
                     continue;
                 }
-                let rt = mt.covering_range_tombstone_seq(k, snapshot_seq);
-                if rt > max_rt[i] {
-                    max_rt[i] = rt;
+                let rt = mt.covering_range_tombstone_seq(&entry.key, snapshot_seq);
+                if rt > entry.max_rt {
+                    entry.max_rt = rt;
                 }
-                if let Some((pseq, popt)) = mt.get(k, snapshot_seq) {
-                    results[i] = resolve(pseq, popt, max_rt[i]);
-                    resolved[i] = true;
+                if let Some((pseq, popt)) = mt.get(&entry.key, snapshot_seq) {
+                    let value = resolve_multi_get_value(pseq, popt, entry.max_rt);
+                    set_multi_get_result(entry, &mut results, value);
                     unresolved -= 1;
                 }
             }
@@ -996,17 +1038,17 @@ impl LarkEngine {
         {
             let frozen = self.frozen_memtables.read();
             for mt in frozen.iter().rev() {
-                for (i, k) in keys.iter().enumerate() {
-                    if resolved[i] {
+                for entry in &mut entries {
+                    if entry.resolved {
                         continue;
                     }
-                    let rt = mt.covering_range_tombstone_seq(k, snapshot_seq);
-                    if rt > max_rt[i] {
-                        max_rt[i] = rt;
+                    let rt = mt.covering_range_tombstone_seq(&entry.key, snapshot_seq);
+                    if rt > entry.max_rt {
+                        entry.max_rt = rt;
                     }
-                    if let Some((pseq, popt)) = mt.get(k, snapshot_seq) {
-                        results[i] = resolve(pseq, popt, max_rt[i]);
-                        resolved[i] = true;
+                    if let Some((pseq, popt)) = mt.get(&entry.key, snapshot_seq) {
+                        let value = resolve_multi_get_value(pseq, popt, entry.max_rt);
+                        set_multi_get_result(entry, &mut results, value);
                         unresolved -= 1;
                     }
                 }
@@ -1020,23 +1062,24 @@ impl LarkEngine {
 
         // 3. L0 SSTables, newest first.
         for file in version.levels[0].iter().rev() {
-            for (i, k) in keys.iter().enumerate() {
-                if resolved[i] {
+            for entry in &mut entries {
+                if entry.resolved || !file_covers_key(file, &entry.key) {
                     continue;
                 }
-                let rt = file.reader.covering_range_tombstone_seq(k, snapshot_seq);
-                if rt > max_rt[i] {
-                    max_rt[i] = rt;
+                let rt = file
+                    .reader
+                    .covering_range_tombstone_seq(&entry.key, snapshot_seq);
+                if rt > entry.max_rt {
+                    entry.max_rt = rt;
                 }
-                match file.reader.get(k, snapshot_seq, &self.cache)? {
+                match file.reader.get(&entry.key, snapshot_seq, &self.cache)? {
                     LookupResult::Found { seq, value } => {
-                        results[i] = resolve(seq, Some(value), max_rt[i]);
-                        resolved[i] = true;
+                        let value = resolve_multi_get_value(seq, Some(value), entry.max_rt);
+                        set_multi_get_result(entry, &mut results, value);
                         unresolved -= 1;
                     }
                     LookupResult::FoundTombstone { .. } => {
-                        results[i] = None;
-                        resolved[i] = true;
+                        set_multi_get_result(entry, &mut results, None);
                         unresolved -= 1;
                     }
                     LookupResult::NotInTable => {}
@@ -1048,51 +1091,54 @@ impl LarkEngine {
         }
 
         // 4. L1..Ln: point files are non-overlapping, while RT-only
-        //    files can cover gaps or boundaries. Scan files whose
-        //    metadata covers each key for both RT coverage and the
-        //    point entry.
+        //    files can cover gaps or boundaries. Entries are sorted
+        //    and deduplicated, so each file only examines the key
+        //    subrange overlapped by its metadata instead of every
+        //    unresolved input key.
         for level in 1..version.levels.len() {
             let files = &version.levels[level];
             if files.is_empty() {
                 continue;
             }
-            for (i, k) in keys.iter().enumerate() {
-                if resolved[i] {
+
+            for file in files {
+                for idx in key_range_for_file(&entries, file) {
+                    let entry = &mut entries[idx];
+                    if entry.resolved {
+                        continue;
+                    }
+                    let rt = file
+                        .reader
+                        .covering_range_tombstone_seq(&entry.key, snapshot_seq);
+                    if rt > entry.max_rt {
+                        entry.max_rt = rt;
+                    }
+                }
+            }
+
+            for file in files {
+                if file.meta.num_entries == 0 {
                     continue;
                 }
-                for file in files {
-                    if file.meta.smallest_key.as_slice() <= *k
-                        && *k <= file.meta.largest_key.as_slice()
-                    {
-                        let rt = file.reader.covering_range_tombstone_seq(k, snapshot_seq);
-                        if rt > max_rt[i] {
-                            max_rt[i] = rt;
-                        }
-                    }
-                }
-                for file in files {
-                    if file.meta.num_entries == 0 {
+                for idx in key_range_for_file(&entries, file) {
+                    let entry = &mut entries[idx];
+                    if entry.resolved {
                         continue;
                     }
-                    if file.meta.smallest_key.as_slice() > *k
-                        || *k > file.meta.largest_key.as_slice()
-                    {
-                        continue;
-                    }
-                    match file.reader.get(k, snapshot_seq, &self.cache)? {
+                    match file.reader.get(&entry.key, snapshot_seq, &self.cache)? {
                         LookupResult::Found { seq, value } => {
-                            results[i] = resolve(seq, Some(value), max_rt[i]);
-                            resolved[i] = true;
+                            let value = resolve_multi_get_value(seq, Some(value), entry.max_rt);
+                            set_multi_get_result(entry, &mut results, value);
                             unresolved -= 1;
-                            break;
                         }
                         LookupResult::FoundTombstone { .. } => {
-                            results[i] = None;
-                            resolved[i] = true;
+                            set_multi_get_result(entry, &mut results, None);
                             unresolved -= 1;
-                            break;
                         }
                         LookupResult::NotInTable => {}
+                    }
+                    if unresolved == 0 {
+                        return Ok(results);
                     }
                 }
             }
