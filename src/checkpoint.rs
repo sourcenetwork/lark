@@ -73,10 +73,10 @@ impl<'db> Checkpoint<'db> {
         let target_sst = target_dir.join("sst");
         let target_wal = target_dir.join("wal");
 
-        fs::create_dir_all(&target_sst).map_err(Error::Io)?;
-        fs::create_dir_all(&target_wal).map_err(Error::Io)?;
+        fs::create_dir_all(&target_sst).map_err(Error::from)?;
+        fs::create_dir_all(&target_wal).map_err(Error::from)?;
 
-        if target_sst.read_dir().map_err(Error::Io)?.next().is_some() {
+        if target_sst.read_dir().map_err(Error::from)?.next().is_some() {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 "checkpoint target sst directory is not empty",
@@ -90,14 +90,14 @@ impl<'db> Checkpoint<'db> {
         // releasing the lock without outlasting this function.
         // Keeping the lock scoped this way is what lets a caller
         // safely call `db.close()` or `drop(db)` after `create`.
-        let snapshot = self.db.engine().checkpoint_capture().map_err(Error::Io)?;
+        let snapshot = self.db.engine().checkpoint_capture().map_err(Error::from)?;
 
         for level in &snapshot.version.levels {
             for file in level {
                 let name = CheckpointSnapshot::sst_filename(file.meta.file_id);
                 let src = snapshot.sst_dir.join(&name);
                 let dst = target_sst.join(&name);
-                fs::hard_link(&src, &dst).map_err(Error::Io)?;
+                fs::hard_link(&src, &dst).map_err(Error::from)?;
             }
         }
 
@@ -107,7 +107,7 @@ impl<'db> Checkpoint<'db> {
             &target_manifest,
             snapshot.manifest_len,
         )
-        .map_err(Error::Io)?;
+        .map_err(Error::from)?;
 
         Ok(())
     }

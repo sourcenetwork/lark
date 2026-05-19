@@ -188,6 +188,6 @@ impl<'a> Iter<'a> {
     /// or the most recent error otherwise. An iterator that reports an
     /// error stops yielding entries (`valid()` returns `false`).
     pub fn status(&self) -> Result<()> {
-        self.inner.status().map_err(crate::Error::Io)
+        self.inner.status().map_err(crate::Error::from)
     }
 }

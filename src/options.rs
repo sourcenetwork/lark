@@ -483,7 +483,7 @@ pub struct Options {
     pub metadata_block_size: usize,
     /// Open an existing database without creating files, rewriting
     /// recovered WALs, compacting, or allowing writes. Mutating APIs
-    /// return [`std::io::ErrorKind::PermissionDenied`].
+    /// return [`crate::Error::ReadOnly`].
     ///
     /// Default: `false`.
     pub read_only: bool,

@@ -258,7 +258,7 @@ fn compaction_loop(
                         // itself keeps running.
                         if !opts.listeners.is_empty() {
                             let err =
-                                crate::Error::Io(std::io::Error::new(e.kind(), e.to_string()));
+                                crate::Error::from(std::io::Error::new(e.kind(), e.to_string()));
                             crate::event_listener::dispatch(&opts.listeners, |l| {
                                 l.on_background_error(
                                     crate::event_listener::BackgroundErrorReason::Compaction,

@@ -97,12 +97,12 @@ impl BackupEngine {
         let root = backup_dir.as_ref().to_path_buf();
         let meta_dir = root.join("meta");
         let shared_dir = root.join("shared");
-        fs::create_dir_all(&meta_dir).map_err(Error::Io)?;
-        fs::create_dir_all(&shared_dir).map_err(Error::Io)?;
-        durability::sync_parent_dir(&root).map_err(Error::Io)?;
-        durability::sync_dir(&root).map_err(Error::Io)?;
-        durability::sync_dir(&meta_dir).map_err(Error::Io)?;
-        durability::sync_dir(&shared_dir).map_err(Error::Io)?;
+        fs::create_dir_all(&meta_dir).map_err(Error::from)?;
+        fs::create_dir_all(&shared_dir).map_err(Error::from)?;
+        durability::sync_parent_dir(&root).map_err(Error::from)?;
+        durability::sync_dir(&root).map_err(Error::from)?;
+        durability::sync_dir(&meta_dir).map_err(Error::from)?;
+        durability::sync_dir(&shared_dir).map_err(Error::from)?;
         Ok(Self {
             root,
             meta_dir,
@@ -130,7 +130,7 @@ impl BackupEngine {
         // engine's compaction lock, which pins the captured file
         // set against concurrent unlink while we hash + copy.
         let (files, next_file_id, last_seq) = {
-            let snapshot = db.engine().checkpoint_capture().map_err(Error::Io)?;
+            let snapshot = db.engine().checkpoint_capture().map_err(Error::from)?;
 
             let mut files = Vec::new();
             for (level_idx, level) in snapshot.version.levels.iter().enumerate() {
@@ -138,11 +138,11 @@ impl BackupEngine {
                     let src = snapshot
                         .sst_dir
                         .join(CheckpointSnapshot::sst_filename(file.meta.file_id));
-                    let hash = hash_file(&src).map_err(Error::Io)?;
+                    let hash = hash_file(&src).map_err(Error::from)?;
                     let shared_name = shared_filename(hash);
                     let shared_path = self.shared_dir.join(&shared_name);
                     ensure_shared_file(&src, &shared_path, hash, file.meta.file_size)
-                        .map_err(Error::Io)?;
+                        .map_err(Error::from)?;
                     files.push(BackupFileEntry {
                         level: level_idx as u32,
                         file_id: file.meta.file_id,
@@ -170,7 +170,7 @@ impl BackupEngine {
         };
         let bytes = encode_manifest(&manifest);
         let manifest_path = self.meta_dir.join(backup_filename(id.0));
-        atomic_write(&manifest_path, &bytes).map_err(Error::Io)?;
+        atomic_write(&manifest_path, &bytes).map_err(Error::from)?;
         Ok(id)
     }
 
@@ -212,23 +212,23 @@ impl BackupEngine {
         let target_dir = target_dir.as_ref();
         let target_sst = target_dir.join("sst");
         let target_wal = target_dir.join("wal");
-        fs::create_dir_all(&target_sst).map_err(Error::Io)?;
-        fs::create_dir_all(&target_wal).map_err(Error::Io)?;
-        durability::sync_parent_dir(target_dir).map_err(Error::Io)?;
-        durability::sync_dir(target_dir).map_err(Error::Io)?;
-        durability::sync_dir(&target_sst).map_err(Error::Io)?;
-        durability::sync_dir(&target_wal).map_err(Error::Io)?;
+        fs::create_dir_all(&target_sst).map_err(Error::from)?;
+        fs::create_dir_all(&target_wal).map_err(Error::from)?;
+        durability::sync_parent_dir(target_dir).map_err(Error::from)?;
+        durability::sync_dir(target_dir).map_err(Error::from)?;
+        durability::sync_dir(&target_sst).map_err(Error::from)?;
+        durability::sync_dir(&target_wal).map_err(Error::from)?;
 
         for f in &manifest.files {
             let src = self.shared_dir.join(shared_filename(f.hash));
-            verify_shared_file(&src, f.hash, f.file_size).map_err(Error::Io)?;
+            verify_shared_file(&src, f.hash, f.file_size).map_err(Error::from)?;
             let dst = target_sst.join(CheckpointSnapshot::sst_filename(f.file_id));
-            copy_file_atomic(&src, &dst).map_err(Error::Io)?;
+            copy_file_atomic(&src, &dst).map_err(Error::from)?;
         }
 
         let manifest_bytes = encode_engine_manifest(&manifest);
         let manifest_path = target_dir.join("MANIFEST");
-        atomic_write(&manifest_path, &manifest_bytes).map_err(Error::Io)?;
+        atomic_write(&manifest_path, &manifest_bytes).map_err(Error::from)?;
         Ok(())
     }
 
@@ -240,7 +240,7 @@ impl BackupEngine {
             return Ok(());
         }
         let manifest = self.read_manifest(backup_id)?;
-        durability::remove_file_and_sync_parent(&path).map_err(Error::Io)?;
+        durability::remove_file_and_sync_parent(&path).map_err(Error::from)?;
         self.gc_shared(&manifest)?;
         Ok(())
     }
@@ -282,7 +282,7 @@ impl BackupEngine {
                 match durability::remove_file_and_sync_parent(&p) {
                     Ok(()) => {}
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(Error::Io(e)),
+                    Err(e) => return Err(Error::from(e)),
                 }
             }
         }
@@ -291,14 +291,14 @@ impl BackupEngine {
 
     fn read_manifest(&self, id: BackupId) -> Result<BackupManifest> {
         let path = self.meta_dir.join(backup_filename(id.0));
-        let bytes = fs::read(&path).map_err(Error::Io)?;
-        decode_manifest(&bytes).map_err(Error::Io)
+        let bytes = fs::read(&path).map_err(Error::from)?;
+        decode_manifest(&bytes).map_err(Error::from)
     }
 
     fn next_backup_id(&self) -> Result<u64> {
         let mut max_id = 0u64;
-        for entry in fs::read_dir(&self.meta_dir).map_err(Error::Io)? {
-            let entry = entry.map_err(Error::Io)?;
+        for entry in fs::read_dir(&self.meta_dir).map_err(Error::from)? {
+            let entry = entry.map_err(Error::from)?;
             if let Some(id) = parse_backup_id(&entry.file_name().to_string_lossy()) {
                 if id > max_id {
                     max_id = id;
@@ -741,8 +741,8 @@ mod tests {
         corrupt_file_same_size(&shared_files[0]);
 
         let kind = match engine.restore(id, tgt_dir.path()) {
-            Err(Error::Io(e)) => e.kind(),
-            Err(e) => panic!("expected I/O error, got {e:?}"),
+            Err(Error::Corruption(e)) => e.kind(),
+            Err(e) => panic!("expected corruption error, got {e:?}"),
             Ok(()) => panic!("expected restore to reject corrupt shared object"),
         };
         assert_eq!(kind, io::ErrorKind::InvalidData);

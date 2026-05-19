@@ -1,9 +1,22 @@
 /// Errors returned by lark operations.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// An underlying I/O error from the filesystem layer.
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    /// A caller supplied an invalid option, key, value, range, or
+    /// other API argument.
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+    /// On-disk database, WAL, SSTable, manifest, or backup data was
+    /// malformed or truncated.
+    #[error("corruption: {0}")]
+    Corruption(#[source] std::io::Error),
+    /// A mutating operation was attempted through a read-only handle.
+    #[error("database was opened read-only")]
+    ReadOnly,
+    /// A column-family handle or id is stale, dropped, or belongs to a
+    /// different database handle.
+    #[error("invalid column family: {0}")]
+    InvalidColumnFamily(String),
     /// The engine refused to block the caller and returned early.
     /// Returned when [`crate::WriteOptions::no_slowdown`] is set and
     /// the engine is currently stalling writes (too many L0 files,
@@ -19,6 +32,31 @@ pub enum Error {
     /// diagnostics.
     #[error("merge operator failed for key {0:?}")]
     MergeFailed(Vec<u8>),
+    /// An underlying I/O error from the filesystem or operating system.
+    #[error("I/O error: {0}")]
+    Io(#[source] std::io::Error),
+}
+
+impl Error {
+    pub(crate) fn invalid_argument(message: impl Into<String>) -> Self {
+        Self::InvalidArgument(message.into())
+    }
+
+    pub(crate) fn invalid_column_family(message: impl Into<String>) -> Self {
+        Self::InvalidColumnFamily(message.into())
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        match err.kind() {
+            std::io::ErrorKind::InvalidInput => Self::InvalidArgument(err.to_string()),
+            std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof => {
+                Self::Corruption(err)
+            }
+            _ => Self::Io(err),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -26,10 +64,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn io_error_converts_via_from() {
+    fn io_error_converts_via_from_when_filesystem_related() {
         let ioe = std::io::Error::new(std::io::ErrorKind::NotFound, "nope");
         let e: Error = ioe.into();
         assert!(matches!(e, Error::Io(_)));
+    }
+
+    #[test]
+    fn invalid_input_converts_to_invalid_argument() {
+        let ioe = std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad key");
+        let e: Error = ioe.into();
+        assert!(matches!(e, Error::InvalidArgument(msg) if msg.contains("bad key")));
+    }
+
+    #[test]
+    fn corruption_kinds_convert_to_corruption() {
+        for kind in [
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            let ioe = std::io::Error::new(kind, "bad bytes");
+            let e: Error = ioe.into();
+            assert!(matches!(e, Error::Corruption(source) if source.kind() == kind));
+        }
     }
 
     #[test]
