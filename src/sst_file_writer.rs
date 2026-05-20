@@ -24,7 +24,7 @@ use crate::options::Options;
 /// real sequence number is assigned by the engine when the file is
 /// ingested.
 pub struct SstFileWriter {
-    inner: Option<SsTableWriter>,
+    inner: SsTableWriter,
     path: PathBuf,
     last_user_key: Option<Vec<u8>>,
     num_entries: u64,
@@ -93,7 +93,7 @@ impl SstFileWriter {
         )
         .map_err(crate::Error::from)?;
         Ok(Self {
-            inner: Some(inner),
+            inner,
             path,
             last_user_key: None,
             num_entries: 0,
@@ -159,11 +159,9 @@ impl SstFileWriter {
             }
         }
         let internal = encode_internal_key(key, 0, value_type);
-        let inner = self
-            .inner
-            .as_mut()
-            .expect("SstFileWriter used after finish");
-        inner.add(&internal, value).map_err(crate::Error::from)?;
+        self.inner
+            .add(&internal, value)
+            .map_err(crate::Error::from)?;
         self.last_user_key = Some(key.to_vec());
         self.num_entries += 1;
         Ok(())
@@ -172,13 +170,13 @@ impl SstFileWriter {
     /// Finalize the file. Errors if no entries were written — an empty
     /// ingest file is almost certainly a bug and would be rejected at
     /// ingest time anyway.
-    pub fn finish(mut self) -> crate::Result<SstFileMeta> {
-        let inner = self.inner.take().expect("SstFileWriter used after finish");
+    pub fn finish(self) -> crate::Result<SstFileMeta> {
+        let Self { inner, path, .. } = self;
         let summary = inner.finish().map_err(crate::Error::from)?.ok_or_else(|| {
             crate::Error::invalid_argument("SstFileWriter::finish called with no entries")
         })?;
         Ok(SstFileMeta {
-            path: self.path,
+            path,
             smallest_user_key: summary.smallest_user_key,
             largest_user_key: summary.largest_user_key,
             num_entries: summary.num_entries,
@@ -245,7 +243,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("empty.sst");
         let w = SstFileWriter::create(&path, &Options::default()).unwrap();
-        assert!(w.finish().is_err());
+        match w.finish().unwrap_err() {
+            crate::Error::InvalidArgument(message) => assert!(message.contains("no entries")),
+            other => panic!("expected invalid argument error, got {other:?}"),
+        }
     }
 
     #[test]

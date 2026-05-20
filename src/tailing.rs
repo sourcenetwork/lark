@@ -251,7 +251,7 @@ impl TailingIter {
         if !self.valid() {
             return None;
         }
-        self.inner.key().map(|k| &k[4..])
+        self.inner.key().and_then(|k| k.get(4..))
     }
 
     /// Current value, or `None` if the iterator is not valid.

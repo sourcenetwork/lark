@@ -199,6 +199,18 @@ fn map_point_read_error(err: std::io::Error, prefixed_key: &[u8]) -> Error {
     }
 }
 
+fn strip_cf_prefix_key(key: &[u8]) -> Result<Vec<u8>> {
+    key.get(4..)
+        .map(|user_key| user_key.to_vec())
+        .ok_or_else(|| Error::corruption("internal key is shorter than the column-family prefix"))
+}
+
+fn strip_cf_prefix_entries(raw: Vec<(Vec<u8>, Vec<u8>)>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    raw.into_iter()
+        .map(|(k, v)| strip_cf_prefix_key(&k).map(|user_key| (user_key, v)))
+        .collect()
+}
+
 /// One bounded page of ordered scan results.
 ///
 /// Returned by [`Db::scan_page`], [`Db::scan_page_cf`],
@@ -217,16 +229,14 @@ pub struct ScanPage {
 }
 
 fn prefixed_cf_id(prefixed_key: &[u8]) -> std::io::Result<u32> {
-    let bytes: [u8; 4] = prefixed_key
-        .get(..4)
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "prefixed key is shorter than the column-family id",
-            )
-        })?
-        .try_into()
-        .unwrap();
+    let prefix = prefixed_key.get(..4).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "prefixed key is shorter than the column-family id",
+        )
+    })?;
+    let mut bytes = [0; 4];
+    bytes.copy_from_slice(prefix);
     Ok(u32::from_be_bytes(bytes))
 }
 
@@ -838,7 +848,7 @@ impl Db {
         };
         let seq = self.engine.snapshot_seq();
         let raw = collect_range(&self.engine, Some(&lo), Some(&hi), seq)?;
-        Ok(raw.into_iter().map(|(k, v)| (k[4..].to_vec(), v)).collect())
+        strip_cf_prefix_entries(raw)
     }
 
     /// Scan a bounded page in the default column family.
@@ -864,7 +874,7 @@ impl Db {
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
         let seq = self.engine.snapshot_seq();
-        collect_page(&self.engine, &lo, &hi, seq, limit).map(strip_cf_prefix_page)
+        collect_page(&self.engine, &lo, &hi, seq, limit).and_then(strip_cf_prefix_page)
     }
 
     /// Create a streaming iterator over the default column family.
@@ -1187,9 +1197,10 @@ impl Db {
     /// present — [`Db::open`] creates it if the database didn't
     /// already contain one.
     pub fn default_cf(&self) -> ColumnFamilyHandle {
-        self.cfs
-            .get(DEFAULT_CF_NAME)
-            .expect("default CF is created at Db::open time")
+        ColumnFamilyHandle {
+            name: Arc::new(DEFAULT_CF_NAME.to_string()),
+            id: DEFAULT_CF_ID,
+        }
     }
 
     /// Look up a column family by name. Returns `None` when no CF
@@ -1377,7 +1388,7 @@ impl Db {
         };
         let seq = self.engine.snapshot_seq();
         let raw = collect_range(&self.engine, Some(&lo), Some(&hi), seq)?;
-        Ok(raw.into_iter().map(|(k, v)| (k[4..].to_vec(), v)).collect())
+        strip_cf_prefix_entries(raw)
     }
 
     /// Scan a bounded page inside column family `cf`.
@@ -1402,7 +1413,7 @@ impl Db {
             None => cf_upper_bound(cf.id()),
         };
         let seq = self.engine.snapshot_seq();
-        collect_page(&self.engine, &lo, &hi, seq, limit).map(strip_cf_prefix_page)
+        collect_page(&self.engine, &lo, &hi, seq, limit).and_then(strip_cf_prefix_page)
     }
 
     /// Streaming iterator bounded to column family `cf`. The
@@ -1586,7 +1597,7 @@ impl<'a> CfIter<'a> {
         if !self.valid() {
             return None;
         }
-        self.inner.key().map(|k| &k[4..])
+        self.inner.key().and_then(|k| k.get(4..))
     }
 
     /// Current value.
@@ -1677,7 +1688,7 @@ impl Snapshot {
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
         let raw = collect_range(&self.engine, Some(&lo), Some(&hi), self.seq)?;
-        Ok(raw.into_iter().map(|(k, v)| (k[4..].to_vec(), v)).collect())
+        strip_cf_prefix_entries(raw)
     }
 
     /// Scan a bounded page at this snapshot (default CF).
@@ -1699,7 +1710,7 @@ impl Snapshot {
             Some(e) => prefix_key(DEFAULT_CF_ID, e),
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
-        collect_page(&self.engine, &lo, &hi, self.seq, limit).map(strip_cf_prefix_page)
+        collect_page(&self.engine, &lo, &hi, self.seq, limit).and_then(strip_cf_prefix_page)
     }
 
     /// Create a streaming iterator anchored at this snapshot
@@ -1756,7 +1767,7 @@ impl Snapshot {
             None => cf_upper_bound(cf.id()),
         };
         let raw = collect_range(&self.engine, Some(&lo), Some(&hi), self.seq)?;
-        Ok(raw.into_iter().map(|(k, v)| (k[4..].to_vec(), v)).collect())
+        strip_cf_prefix_entries(raw)
     }
 
     /// CF-scoped bounded page at this snapshot.
@@ -1781,7 +1792,7 @@ impl Snapshot {
             Some(e) => prefix_key(cf.id(), e),
             None => cf_upper_bound(cf.id()),
         };
-        collect_page(&self.engine, &lo, &hi, self.seq, limit).map(strip_cf_prefix_page)
+        collect_page(&self.engine, &lo, &hi, self.seq, limit).and_then(strip_cf_prefix_page)
     }
 
     /// CF-scoped streaming iterator at this snapshot.
@@ -1869,15 +1880,16 @@ fn collect_page(
     })
 }
 
-fn strip_cf_prefix_page(page: ScanPage) -> ScanPage {
-    ScanPage {
-        entries: page
-            .entries
-            .into_iter()
-            .map(|(k, v)| (k[4..].to_vec(), v))
-            .collect(),
-        next_start: page.next_start.map(|k| k[4..].to_vec()),
-    }
+fn strip_cf_prefix_page(page: ScanPage) -> Result<ScanPage> {
+    let entries = strip_cf_prefix_entries(page.entries)?;
+    let next_start = page
+        .next_start
+        .map(|k| strip_cf_prefix_key(&k))
+        .transpose()?;
+    Ok(ScanPage {
+        entries,
+        next_start,
+    })
 }
 
 /// One ordered operation in a [`WriteBatch`].
@@ -2342,6 +2354,19 @@ mod tests {
         match err {
             Error::InvalidArgument(message) => assert!(message.contains("greater than zero")),
             other => panic!("expected invalid argument error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_strip_cf_prefix_page_rejects_short_internal_key() {
+        let page = ScanPage {
+            entries: vec![(vec![0, 1, 2], b"value".to_vec())],
+            next_start: None,
+        };
+
+        match strip_cf_prefix_page(page).unwrap_err() {
+            Error::Corruption(source) => assert_eq!(source.kind(), std::io::ErrorKind::InvalidData),
+            other => panic!("expected corruption error, got {other:?}"),
         }
     }
 

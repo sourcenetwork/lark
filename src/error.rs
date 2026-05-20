@@ -45,6 +45,13 @@ impl Error {
     pub(crate) fn invalid_column_family(message: impl Into<String>) -> Self {
         Self::InvalidColumnFamily(message.into())
     }
+
+    pub(crate) fn corruption(message: impl Into<String>) -> Self {
+        Self::Corruption(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message.into(),
+        ))
+    }
 }
 
 impl From<std::io::Error> for Error {
