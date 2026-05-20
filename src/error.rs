@@ -13,6 +13,9 @@ pub enum Error {
     /// A mutating operation was attempted through a read-only handle.
     #[error("database was opened read-only")]
     ReadOnly,
+    /// An operation was attempted after the database handle was closed.
+    #[error("database is closed")]
+    Closed,
     /// A column-family handle or id is stale, dropped, or belongs to a
     /// different database handle.
     #[error("invalid column family: {0}")]
@@ -60,6 +63,9 @@ impl From<std::io::Error> for Error {
             std::io::ErrorKind::InvalidInput => Self::InvalidArgument(err.to_string()),
             std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof => {
                 Self::Corruption(err)
+            }
+            std::io::ErrorKind::NotConnected if err.to_string() == "database is closed" => {
+                Self::Closed
             }
             _ => Self::Io(err),
         }

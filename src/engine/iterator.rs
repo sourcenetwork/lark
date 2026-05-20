@@ -893,6 +893,10 @@ pub(crate) struct LarkIterator {
     /// Sticky error from the most recent I/O attempt, if any. Cleared on
     /// the next successful seek.
     error: Option<io::Error>,
+    /// True when `error` represents a terminal iterator state, such as
+    /// constructing an iterator from a closed engine. Terminal errors
+    /// are reported by `status` and are not cleared by later seeks.
+    terminal_error: bool,
     /// Exclusive upper bound set by [`LarkIterator::seek_prefix`]. When
     /// `Some`, forward iteration stops as soon as the next visible key
     /// is `>= upper_bound`, confining the scan to the originally seeked
@@ -1001,6 +1005,7 @@ impl LarkIterator {
             range_tombstones: RangeTombstoneSet::from_vec(range_tombstones),
             _version: version,
             error: None,
+            terminal_error: false,
             upper_bound: None,
             prefix_extractor,
             merge_operator,
@@ -1019,6 +1024,9 @@ impl LarkIterator {
     }
 
     pub(crate) fn seek_to_first(&mut self) {
+        if self.terminal_error {
+            return;
+        }
         self.error = None;
         self.valid_entry = false;
         self.merge_result = None;
@@ -1034,6 +1042,9 @@ impl LarkIterator {
     }
 
     pub(crate) fn seek_to_last(&mut self) {
+        if self.terminal_error {
+            return;
+        }
         self.error = None;
         self.valid_entry = false;
         self.merge_result = None;
@@ -1049,6 +1060,9 @@ impl LarkIterator {
     }
 
     pub(crate) fn seek(&mut self, target: &[u8]) {
+        if self.terminal_error {
+            return;
+        }
         self.error = None;
         self.valid_entry = false;
         self.merge_result = None;
@@ -1068,6 +1082,9 @@ impl LarkIterator {
     }
 
     pub(crate) fn seek_for_prev(&mut self, target: &[u8]) {
+        if self.terminal_error {
+            return;
+        }
         self.error = None;
         self.valid_entry = false;
         self.merge_result = None;
@@ -1096,6 +1113,9 @@ impl LarkIterator {
     /// entirely; files built without a prefix bloom are consulted
     /// normally (safe superset).
     pub(crate) fn seek_prefix(&mut self, prefix: &[u8]) {
+        if self.terminal_error {
+            return;
+        }
         self.error = None;
         self.valid_entry = false;
         self.merge_result = None;
@@ -1203,6 +1223,14 @@ impl LarkIterator {
             Some(e) => Err(io::Error::new(e.kind(), e.to_string())),
             None => Ok(()),
         }
+    }
+
+    pub(crate) fn set_error(&mut self, err: io::Error) {
+        self.error = Some(err);
+        self.terminal_error = true;
+        self.valid_entry = false;
+        self.merge_result = None;
+        self.reverse_curr = None;
     }
 
     /// Walk the merging iterator forward until the first user key whose

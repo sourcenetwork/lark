@@ -16,7 +16,7 @@ pub(crate) mod wal;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use parking_lot::{Condvar, Mutex, RwLock};
@@ -277,6 +277,7 @@ pub(crate) struct LarkEngine {
     versions: Arc<Mutex<VersionSet>>,
     cache: Arc<BlockCache>,
     latest_seq: AtomicU64,
+    closed: AtomicBool,
     active_wal: Mutex<Option<Wal>>,
     wal_id: AtomicU64,
     sst_dir: PathBuf,
@@ -435,6 +436,7 @@ impl LarkEngine {
             versions,
             cache,
             latest_seq: AtomicU64::new(latest_seq),
+            closed: AtomicBool::new(false),
             active_wal: Mutex::new(Some(wal)),
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
@@ -518,6 +520,7 @@ impl LarkEngine {
             versions,
             cache,
             latest_seq: AtomicU64::new(latest_seq),
+            closed: AtomicBool::new(false),
             active_wal: Mutex::new(None),
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
@@ -541,6 +544,22 @@ impl LarkEngine {
         self.options.read_only
     }
 
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    fn closed_error() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::NotConnected, "database is closed")
+    }
+
+    fn ensure_open(&self) -> std::io::Result<()> {
+        if self.is_closed() {
+            Err(Self::closed_error())
+        } else {
+            Ok(())
+        }
+    }
+
     fn read_only_error() -> std::io::Error {
         std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -549,6 +568,7 @@ impl LarkEngine {
     }
 
     fn ensure_writable(&self) -> std::io::Result<()> {
+        self.ensure_open()?;
         if self.is_read_only() {
             Err(Self::read_only_error())
         } else {
@@ -626,6 +646,9 @@ impl LarkEngine {
     /// every version it might need to see. Balanced by
     /// [`Self::release_snapshot`] when the snapshot drops.
     pub(crate) fn register_snapshot(&self, seq: u64) {
+        if self.is_closed() {
+            return;
+        }
         self.snapshot_registry.register(seq);
         if let Some(s) = self.statistics() {
             s.add(crate::statistics::Ticker::SnapshotsRegistered, 1);
@@ -652,6 +675,7 @@ impl LarkEngine {
     /// access happens here — file handles are already open in the
     /// pinned `Arc<LiveSst>`s carried by the version.
     pub(crate) fn new_iter(&self, snapshot_seq: u64) -> iterator::LarkIterator {
+        let closed = self.is_closed();
         let active = Arc::clone(&self.active_memtable.read());
         let frozen: Vec<Arc<MemTable>> = self
             .frozen_memtables
@@ -660,7 +684,7 @@ impl LarkEngine {
             .map(Arc::clone)
             .collect();
         let version = self.versions.lock().current();
-        iterator::LarkIterator::new(
+        let mut iter = iterator::LarkIterator::new(
             active,
             frozen,
             version,
@@ -668,7 +692,11 @@ impl LarkEngine {
             snapshot_seq,
             self.options.prefix_extractor.clone(),
             self.options.merge_operator.clone(),
-        )
+        );
+        if closed {
+            iter.set_error(Self::closed_error());
+        }
+        iter
     }
 
     /// Point lookup at a given snapshot. Returns `Ok(Some(value))` or `Ok(None)`.
@@ -687,6 +715,7 @@ impl LarkEngine {
     /// and calls the operator to collapse the chain into a final
     /// value at visibility time.
     pub(crate) fn get(&self, key: &[u8], snapshot_seq: u64) -> std::io::Result<Option<Vec<u8>>> {
+        self.ensure_open()?;
         if self.options.merge_operator.is_some() {
             return self.get_with_merge(key, snapshot_seq);
         }
@@ -992,6 +1021,7 @@ impl LarkEngine {
         keys: &[&[u8]],
         snapshot_seq: u64,
     ) -> std::io::Result<Vec<Option<Vec<u8>>>> {
+        self.ensure_open()?;
         // When a merge operator is configured, fall back to per-key
         // resolution — the batched walk's short-circuiting logic
         // doesn't compose cleanly with merge-chain collection, and
@@ -1231,6 +1261,9 @@ impl LarkEngine {
     }
 
     pub(crate) fn wait_for_write_capacity(&self, no_slowdown: bool) -> Result<u64, crate::Error> {
+        if self.is_closed() {
+            return Err(crate::Error::Closed);
+        }
         // Fast path: if the cached stall level is 0, skip the
         // expensive stall_state() call that locks versions +
         // frozen_memtables. This saves ~2 lock round-trips per
@@ -1243,6 +1276,9 @@ impl LarkEngine {
         let mut any_stall = false;
 
         loop {
+            if self.is_closed() {
+                return Err(crate::Error::Closed);
+            }
             match self.stall_state() {
                 None => {
                     // Stall cleared — update the cache so
@@ -1340,6 +1376,7 @@ impl LarkEngine {
         self.validate_prefixed_key_size(&key)?;
         self.validate_value_size(&value)?;
         let _write_guard = self.write_lock.lock();
+        self.ensure_writable()?;
         let seq = self.latest_seq.fetch_add(1, Ordering::AcqRel) + 1;
 
         if !disable_wal {
@@ -1784,6 +1821,7 @@ impl LarkEngine {
         //    range walk. Write lock blocks until every in-flight
         //    background pass releases its read lock.
         let _compact_guard = self.compaction_lock.write();
+        self.ensure_writable()?;
 
         // 3. Compute the snapshot-pinning GC horizon so compaction can
         //    drop versions that no live snapshot needs.
@@ -2004,6 +2042,7 @@ impl LarkEngine {
         // Exclude all background workers for the duration of the ingest
         // — same pattern as `compact_range`.
         let _compact_guard = self.compaction_lock.write();
+        self.ensure_writable()?;
 
         for source in &sources {
             self.ingest_one(source, ingest_opts)?;
@@ -2194,6 +2233,7 @@ impl LarkEngine {
         }
 
         let compaction_guard = self.compaction_lock.write_arc();
+        self.ensure_writable()?;
 
         let version;
         let manifest_path;
@@ -2355,6 +2395,7 @@ impl LarkEngine {
     pub(crate) fn drop_all(&self) -> std::io::Result<()> {
         self.ensure_writable()?;
         let _write_guard = self.write_lock.lock();
+        self.ensure_writable()?;
 
         *self.active_memtable.write() = Arc::new(MemTable::new());
         self.frozen_memtables.write().clear();
@@ -2464,6 +2505,11 @@ impl LarkEngine {
 
     /// Flush all data to disk and shut down background threads.
     pub(crate) fn close(&self) -> std::io::Result<()> {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        self.stall_signal.notify_all();
+
         if self.is_read_only() {
             self.compaction.lock().shutdown();
             return Ok(());
@@ -2483,7 +2529,7 @@ impl LarkEngine {
                 old
             };
 
-            if !old_memtable.is_empty() {
+            if !old_memtable.is_empty() || !old_memtable.clone_range_tombstones().is_empty() {
                 self.frozen_memtables.write().push(old_memtable);
 
                 let wal_for_flush = Wal::create(&self.wal_dir.join("flush_tmp.wal"))?;
