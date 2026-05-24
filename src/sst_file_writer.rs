@@ -79,8 +79,10 @@ impl Default for IngestOptions {
 impl SstFileWriter {
     /// Create a new SSTable file at `path`. The file is overwritten if
     /// it already exists. The writer borrows `block_size`,
-    /// `bloom_bits_per_key`, and `compression` from `opts`.
+    /// `bloom_bits_per_key`, and `compression` from `opts` after
+    /// validating the option invariants.
     pub fn create<P: AsRef<Path>>(path: P, opts: &Options) -> crate::Result<Self> {
+        opts.validate()?;
         let path = path.as_ref().to_path_buf();
         let inner = SsTableWriter::new(
             &path,
@@ -205,6 +207,23 @@ mod tests {
             }
         }
         w.finish().unwrap()
+    }
+
+    #[test]
+    fn test_create_rejects_invalid_options() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad-options.sst");
+        match SstFileWriter::create(
+            &path,
+            &Options {
+                block_size: 0,
+                ..Options::default()
+            },
+        ) {
+            Ok(_) => panic!("expected invalid options error"),
+            Err(crate::Error::InvalidArgument(message)) => assert!(message.contains("block_size")),
+            Err(other) => panic!("expected invalid argument, got {other:?}"),
+        }
     }
 
     #[test]

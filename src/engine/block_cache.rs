@@ -6,6 +6,7 @@ use parking_lot::Mutex;
 use xxhash_rust::xxh3::xxh3_64;
 
 use super::block::Block;
+use crate::options::MAX_BLOCK_CACHE_SHARD_BITS;
 use crate::statistics::{Statistics, Ticker};
 
 /// Cache key: (file_id, block_offset).
@@ -18,7 +19,7 @@ struct CacheKey {
 /// Hard upper bound on the number of shards the cache will ever
 /// create. A 32-bit shard-bit config of 8 → 256 shards is plenty
 /// for a single-process embedded store.
-const MAX_SHARD_BITS: u32 = 8;
+const MAX_SHARD_BITS: u32 = MAX_BLOCK_CACHE_SHARD_BITS;
 
 /// Minimum per-shard capacity. Tiny caches with many shards
 /// would otherwise produce shards with 0 bytes of capacity, which
