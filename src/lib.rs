@@ -73,6 +73,7 @@ pub use options::{
     CompactionDecision, CompactionFilter, CompactionStyle, CompressionType, DurabilityMode,
     FifoCompactionOptions, FixedLengthPrefix, MergeOperator, Options, PrefixExtractor,
     UniversalCompactionOptions, WriteOptions, DEFAULT_MAX_KEY_SIZE, DEFAULT_MAX_VALUE_SIZE,
+    MAX_BLOCK_CACHE_SHARD_BITS, MAX_BLOOM_BITS_PER_KEY,
 };
 pub use perf_context::{PerfContext, PerfContextSnapshot, PerfLevel};
 pub use rate_limiter::{Priority, RateLimiter, TokenBucketRateLimiter};
@@ -330,8 +331,10 @@ impl Db {
     /// is created automatically and every non-`*_cf` method uses
     /// it. Callers who want logical keyspace isolation can then
     /// call [`Db::create_column_family`] for additional CFs; those
-    /// calls persist into the database and survive reopen.
+    /// calls persist into the database and survive reopen. Invalid
+    /// option combinations fail before any filesystem work starts.
     pub fn open<P: AsRef<Path>>(path: P, opts: Options) -> Result<Self> {
+        opts.validate()?;
         let read_only = opts.read_only;
         let max_key_size = opts.max_key_size;
         let max_value_size = opts.max_value_size;
@@ -2122,6 +2125,23 @@ mod tests {
 
         let reopened = Db::open(dir.path(), Options::default()).unwrap();
         assert_eq!(reopened.get(b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn test_db_open_rejects_invalid_options() {
+        let dir = TempDir::new().unwrap();
+        let err = Db::open(
+            dir.path(),
+            Options {
+                write_buffer_size: 0,
+                ..Options::default()
+            },
+        )
+        .unwrap_err();
+        match err {
+            Error::InvalidArgument(message) => assert!(message.contains("write_buffer_size")),
+            other => panic!("expected invalid argument, got {other:?}"),
+        }
     }
 
     #[test]
@@ -7375,7 +7395,7 @@ mod tests {
         let opts = Options {
             write_buffer_size: 4 * 1024,
             l0_compaction_trigger: 1000,
-            level0_slowdown_writes_trigger: 10_000,
+            level0_slowdown_writes_trigger: 0,
             level0_stop_writes_trigger: 2,
             max_write_buffer_number: 0,
             ..Options::default()

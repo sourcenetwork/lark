@@ -6,6 +6,13 @@ pub const DEFAULT_MAX_KEY_SIZE: usize = 8 * 1024 * 1024;
 /// Default maximum value / merge-operand length accepted by write APIs: 64 MiB.
 pub const DEFAULT_MAX_VALUE_SIZE: usize = 64 * 1024 * 1024;
 
+/// Highest supported block-cache shard exponent.
+pub const MAX_BLOCK_CACHE_SHARD_BITS: u32 = 8;
+
+/// Highest supported Bloom-filter density. Larger values waste space
+/// because the hash count is already capped internally.
+pub const MAX_BLOOM_BITS_PER_KEY: usize = 64;
+
 /// Decision returned by a [`CompactionFilter`] for each entry it sees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactionDecision {
@@ -239,7 +246,8 @@ pub struct FifoCompactionOptions {
     /// flush, if the sum of file sizes exceeds this number, the
     /// background compaction thread unlinks the oldest SSTables
     /// (smallest `file_id` first) until the cap is satisfied or
-    /// only one file remains. Default: 1 GiB.
+    /// only one file remains. Must be greater than zero when FIFO
+    /// compaction is selected. Default: 1 GiB.
     pub max_table_files_size: u64,
 }
 
@@ -262,21 +270,27 @@ pub struct UniversalCompactionOptions {
     /// [`UniversalCompactionOptions::min_merge_width`] files, the
     /// picker merges them into one new L0 file. A larger
     /// `size_ratio` groups more files per merge (lower write
-    /// amplification, larger output); smaller is pickier.
+    /// amplification, larger output); smaller is pickier. Must be
+    /// greater than zero when universal compaction is selected.
     /// Default: 1 (percent).
     pub size_ratio: u32,
     /// Smallest number of files the size-ratio rule is willing to
-    /// merge. Pass `2` for the most aggressive grouping. Default: 2.
+    /// merge. Must be at least `2` when universal compaction is
+    /// selected. Pass `2` for the most aggressive grouping.
+    /// Default: 2.
     pub min_merge_width: u32,
     /// Cap on the number of files a single size-ratio merge can
-    /// consume. `u32::MAX` disables the cap. Default: `u32::MAX`.
+    /// consume. Must be >= [`UniversalCompactionOptions::min_merge_width`]
+    /// when universal compaction is selected. `u32::MAX` disables
+    /// the cap. Default: `u32::MAX`.
     pub max_merge_width: u32,
     /// Size-amplification trigger, as a percent. When
     /// `total_size_of_all_older_files * 100 / size_of_oldest_file`
     /// exceeds this value, the picker forces a full merge of
     /// every L0 file into one run. Default: 200 (i.e., full merge
     /// fires once the accumulated non-oldest content is ~2× the
-    /// oldest run).
+    /// oldest run). Must be greater than zero when universal
+    /// compaction is selected.
     pub max_size_amplification_percent: u32,
 }
 
@@ -326,17 +340,22 @@ pub enum CompressionType {
 /// Configuration options for a lark database.
 #[derive(Clone)]
 pub struct Options {
-    /// Write buffer (memtable) size before flush. Default: 64 MB.
+    /// Write buffer (memtable) size before flush. Must be greater
+    /// than zero. Default: 64 MB.
     pub write_buffer_size: usize,
-    /// Data block size in SSTables. Default: 16 KB.
+    /// Data block size in SSTables. Must be greater than zero.
+    /// Default: 16 KB.
     pub block_size: usize,
-    /// Block cache size for decompressed blocks. Default: 512 MB.
+    /// Block cache size for decompressed blocks. Must be greater
+    /// than zero. Default: 512 MB.
     pub block_cache_size: usize,
     /// Base-2 log of the block cache shard count. The block cache
     /// is split into `2^block_cache_num_shard_bits` shards keyed
     /// by `hash(file_id, offset)` so concurrent readers contend
     /// only with other readers that hash to the same shard.
-    /// Default: 6 (64 shards). Clamped to `[0, 8]`.
+    /// Must be <= [`MAX_BLOCK_CACHE_SHARD_BITS`]. Tiny cache budgets
+    /// may use fewer effective shards so each shard has usable
+    /// capacity. Default: 6 (64 shards).
     pub block_cache_num_shard_bits: u32,
     /// If `true`, the block cache refuses to admit a single entry
     /// that is larger than one shard's byte capacity; the caller
@@ -344,7 +363,8 @@ pub struct Options {
     /// (default), an oversized entry evicts everything else in
     /// its shard and is admitted anyway.
     pub strict_capacity_limit: bool,
-    /// Bloom filter bits per key. Default: 10.
+    /// Bloom filter bits per key. Must be in
+    /// `1..=MAX_BLOOM_BITS_PER_KEY`. Default: 10.
     pub bloom_bits_per_key: usize,
     /// Default block compression codec. Used at every level unless
     /// overridden by [`Options::compression_per_level`]. Default: LZ4.
@@ -354,13 +374,17 @@ pub struct Options {
     /// back to [`Options::compression`]. `None` (default) means "use
     /// the default codec at every level".
     pub compression_per_level: Option<Vec<CompressionType>>,
-    /// Number of L0 SSTables before triggering compaction. Default: 4.
+    /// Number of L0 SSTables before triggering compaction. Must be
+    /// greater than zero. Default: 4.
     pub l0_compaction_trigger: usize,
-    /// Target size for level 1. Default: 256 MB.
+    /// Target size for level 1. Must be greater than zero.
+    /// Default: 256 MB.
     pub level_base_bytes: u64,
-    /// Size multiplier between levels. Default: 10.
+    /// Size multiplier between levels. Must be greater than zero.
+    /// Default: 10.
     pub level_size_multiplier: u64,
-    /// Target SSTable file size during compaction. Default: 64 MB.
+    /// Target SSTable file size during compaction. Must be greater
+    /// than zero. Default: 64 MB.
     pub target_file_size: u64,
     /// Durability mode. Default: Eventual.
     pub durability: DurabilityMode,
@@ -411,23 +435,30 @@ pub struct Options {
     /// Start slowing foreground writes when the number of L0
     /// SSTables reaches this threshold. Each affected write
     /// incurs a small fixed delay, back-pressuring callers so
-    /// background compaction can catch up. Default: 20.
+    /// background compaction can catch up. `0` disables this
+    /// trigger. If both L0 triggers are enabled, this must be <=
+    /// [`Options::level0_stop_writes_trigger`]. Default: 20.
     pub level0_slowdown_writes_trigger: usize,
     /// Stop foreground writes entirely when the number of L0
     /// SSTables reaches this threshold. Writers block on a
     /// condvar that compaction notifies once it reduces the
-    /// count below the slowdown trigger. Default: 36.
+    /// count below the slowdown trigger. `0` disables this
+    /// trigger. Default: 36.
     pub level0_stop_writes_trigger: usize,
     /// Start slowing writes when total bytes in L0 (lark's
-    /// approximation of "pending compaction bytes") exceed this
-    /// limit. Default: 64 GB.
+    /// approximation of "pending compaction bytes") reach this
+    /// limit. `0` disables this trigger. If both pending-byte
+    /// triggers are enabled, this must be <=
+    /// [`Options::hard_pending_compaction_bytes_limit`].
+    /// Default: 64 GB.
     pub soft_pending_compaction_bytes_limit: u64,
-    /// Stop writes when total bytes in L0 exceed this limit.
-    /// Default: 256 GB.
+    /// Stop writes when total bytes in L0 reach this limit. `0`
+    /// disables this trigger. Default: 256 GB.
     pub hard_pending_compaction_bytes_limit: u64,
     /// Soft cap on the number of in-memory memtables (active +
     /// frozen). Reaching this count slows writes; reaching
-    /// `2 * max_write_buffer_number` stops them. Default: 2.
+    /// `2 * max_write_buffer_number` stops them. `0` disables
+    /// this trigger. Default: 2.
     pub max_write_buffer_number: usize,
     /// Compaction strategy. See [`CompactionStyle`] for the
     /// trade-offs. Default: [`CompactionStyle::Level`].
@@ -446,8 +477,8 @@ pub struct Options {
     /// compactions are exclusive — only one L0 job runs at a
     /// time because L0 files can overlap arbitrarily.
     ///
-    /// `1` (default) keeps compaction single-threaded and matches
-    /// pre-multi-worker behavior.
+    /// Must be greater than zero. `1` (default) keeps compaction
+    /// single-threaded and matches pre-multi-worker behavior.
     pub max_background_compactions: usize,
     /// Accepted for compatibility with earlier releases.
     ///
@@ -478,8 +509,9 @@ pub struct Options {
     /// cache). Default: `false` (flat index loaded eagerly).
     pub partitioned_index: bool,
     /// Target size for each index leaf block when
-    /// [`Options::partitioned_index`] is enabled. Ignored when
-    /// partitioned indexing is off. Default: 4096.
+    /// [`Options::partitioned_index`] is enabled. Must be greater
+    /// than zero. Ignored when partitioned indexing is off.
+    /// Default: 4096.
     pub metadata_block_size: usize,
     /// Open an existing database without creating files, rewriting
     /// recovered WALs, compacting, or allowing writes. Mutating APIs
@@ -614,6 +646,99 @@ impl std::fmt::Debug for Options {
 }
 
 impl Options {
+    /// Validate option invariants before the database uses them.
+    ///
+    /// Public open paths call this automatically. Callers that build
+    /// option sets dynamically can also call it directly to fail fast
+    /// before touching the filesystem.
+    pub fn validate(&self) -> crate::Result<()> {
+        require_nonzero_usize("write_buffer_size", self.write_buffer_size)?;
+        require_nonzero_usize("block_size", self.block_size)?;
+        require_nonzero_usize("block_cache_size", self.block_cache_size)?;
+        require_nonzero_usize("l0_compaction_trigger", self.l0_compaction_trigger)?;
+        require_nonzero_u64("level_base_bytes", self.level_base_bytes)?;
+        require_nonzero_u64("level_size_multiplier", self.level_size_multiplier)?;
+        require_nonzero_u64("target_file_size", self.target_file_size)?;
+        require_nonzero_usize("metadata_block_size", self.metadata_block_size)?;
+
+        if self.block_cache_num_shard_bits > MAX_BLOCK_CACHE_SHARD_BITS {
+            return invalid_option(
+                "block_cache_num_shard_bits",
+                format!("must be <= {MAX_BLOCK_CACHE_SHARD_BITS}"),
+            );
+        }
+
+        if !(1..=MAX_BLOOM_BITS_PER_KEY).contains(&self.bloom_bits_per_key) {
+            return invalid_option(
+                "bloom_bits_per_key",
+                format!("must be in 1..={MAX_BLOOM_BITS_PER_KEY}"),
+            );
+        }
+
+        if self.level0_slowdown_writes_trigger > 0
+            && self.level0_stop_writes_trigger > 0
+            && self.level0_slowdown_writes_trigger > self.level0_stop_writes_trigger
+        {
+            return invalid_option(
+                "level0_slowdown_writes_trigger",
+                "must be <= level0_stop_writes_trigger when both triggers are nonzero",
+            );
+        }
+
+        if self.soft_pending_compaction_bytes_limit > 0
+            && self.hard_pending_compaction_bytes_limit > 0
+            && self.soft_pending_compaction_bytes_limit > self.hard_pending_compaction_bytes_limit
+        {
+            return invalid_option(
+                "soft_pending_compaction_bytes_limit",
+                "must be <= hard_pending_compaction_bytes_limit when both limits are nonzero",
+            );
+        }
+
+        if self.max_background_compactions == 0 {
+            return invalid_option("max_background_compactions", "must be greater than 0");
+        }
+
+        match self.compaction_style {
+            CompactionStyle::Level => {}
+            CompactionStyle::Fifo => {
+                require_nonzero_u64(
+                    "fifo_compaction_options.max_table_files_size",
+                    self.fifo_compaction_options.max_table_files_size,
+                )?;
+            }
+            CompactionStyle::Universal => {
+                let universal = self.universal_compaction_options;
+                if universal.size_ratio == 0 {
+                    return invalid_option(
+                        "universal_compaction_options.size_ratio",
+                        "must be greater than 0",
+                    );
+                }
+                if universal.min_merge_width < 2 {
+                    return invalid_option(
+                        "universal_compaction_options.min_merge_width",
+                        "must be at least 2",
+                    );
+                }
+                if universal.max_merge_width < universal.min_merge_width {
+                    return invalid_option(
+                        "universal_compaction_options.max_merge_width",
+                        "must be >= universal_compaction_options.min_merge_width",
+                    );
+                }
+                if universal.max_size_amplification_percent == 0 {
+                    return invalid_option(
+                        "universal_compaction_options.max_size_amplification_percent",
+                        "must be greater than 0",
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn to_engine_options(&self) -> crate::engine::EngineOptions {
         crate::engine::EngineOptions {
             write_buffer_size: self.write_buffer_size,
@@ -653,9 +778,44 @@ impl Options {
     }
 }
 
+fn require_nonzero_usize(name: &'static str, value: usize) -> crate::Result<()> {
+    if value == 0 {
+        invalid_option(name, "must be greater than 0")
+    } else {
+        Ok(())
+    }
+}
+
+fn require_nonzero_u64(name: &'static str, value: u64) -> crate::Result<()> {
+    if value == 0 {
+        invalid_option(name, "must be greater than 0")
+    } else {
+        Ok(())
+    }
+}
+
+fn invalid_option(name: &'static str, requirement: impl Into<String>) -> crate::Result<()> {
+    Err(crate::Error::invalid_argument(format!(
+        "invalid option `{name}`: {}",
+        requirement.into()
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_invalid_option(opts: Options, expected: &str) {
+        match opts.validate().unwrap_err() {
+            crate::Error::InvalidArgument(message) => {
+                assert!(
+                    message.contains(expected),
+                    "expected invalid option message to contain {expected:?}, got {message:?}"
+                );
+            }
+            other => panic!("expected invalid argument, got {other:?}"),
+        }
+    }
 
     #[test]
     fn fixed_length_prefix_extract() {
@@ -716,6 +876,201 @@ mod tests {
     fn fifo_compaction_options_default_is_one_gib() {
         let f = FifoCompactionOptions::default();
         assert_eq!(f.max_table_files_size, 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn options_validate_accepts_defaults_and_disabled_stall_triggers() {
+        Options::default().validate().unwrap();
+
+        let opts = Options {
+            level0_slowdown_writes_trigger: 0,
+            level0_stop_writes_trigger: 0,
+            soft_pending_compaction_bytes_limit: 0,
+            hard_pending_compaction_bytes_limit: 0,
+            max_write_buffer_number: 0,
+            ..Options::default()
+        };
+        opts.validate().unwrap();
+    }
+
+    #[test]
+    fn options_validate_rejects_zero_core_sizes() {
+        assert_invalid_option(
+            Options {
+                write_buffer_size: 0,
+                ..Options::default()
+            },
+            "write_buffer_size",
+        );
+        assert_invalid_option(
+            Options {
+                block_size: 0,
+                ..Options::default()
+            },
+            "block_size",
+        );
+        assert_invalid_option(
+            Options {
+                block_cache_size: 0,
+                ..Options::default()
+            },
+            "block_cache_size",
+        );
+        assert_invalid_option(
+            Options {
+                l0_compaction_trigger: 0,
+                ..Options::default()
+            },
+            "l0_compaction_trigger",
+        );
+        assert_invalid_option(
+            Options {
+                level_base_bytes: 0,
+                ..Options::default()
+            },
+            "level_base_bytes",
+        );
+        assert_invalid_option(
+            Options {
+                level_size_multiplier: 0,
+                ..Options::default()
+            },
+            "level_size_multiplier",
+        );
+        assert_invalid_option(
+            Options {
+                target_file_size: 0,
+                ..Options::default()
+            },
+            "target_file_size",
+        );
+        assert_invalid_option(
+            Options {
+                metadata_block_size: 0,
+                ..Options::default()
+            },
+            "metadata_block_size",
+        );
+    }
+
+    #[test]
+    fn options_validate_rejects_unsupported_ranges() {
+        assert_invalid_option(
+            Options {
+                block_cache_num_shard_bits: MAX_BLOCK_CACHE_SHARD_BITS + 1,
+                ..Options::default()
+            },
+            "block_cache_num_shard_bits",
+        );
+        assert_invalid_option(
+            Options {
+                bloom_bits_per_key: 0,
+                ..Options::default()
+            },
+            "bloom_bits_per_key",
+        );
+        assert_invalid_option(
+            Options {
+                bloom_bits_per_key: MAX_BLOOM_BITS_PER_KEY + 1,
+                ..Options::default()
+            },
+            "bloom_bits_per_key",
+        );
+        assert_invalid_option(
+            Options {
+                max_background_compactions: 0,
+                ..Options::default()
+            },
+            "max_background_compactions",
+        );
+    }
+
+    #[test]
+    fn options_validate_rejects_inconsistent_stall_thresholds() {
+        assert_invalid_option(
+            Options {
+                level0_slowdown_writes_trigger: 10,
+                level0_stop_writes_trigger: 5,
+                ..Options::default()
+            },
+            "level0_slowdown_writes_trigger",
+        );
+        assert_invalid_option(
+            Options {
+                soft_pending_compaction_bytes_limit: 10,
+                hard_pending_compaction_bytes_limit: 5,
+                ..Options::default()
+            },
+            "soft_pending_compaction_bytes_limit",
+        );
+    }
+
+    #[test]
+    fn options_validate_checks_selected_compaction_style_options() {
+        Options {
+            fifo_compaction_options: FifoCompactionOptions {
+                max_table_files_size: 0,
+            },
+            ..Options::default()
+        }
+        .validate()
+        .unwrap();
+
+        assert_invalid_option(
+            Options {
+                compaction_style: CompactionStyle::Fifo,
+                fifo_compaction_options: FifoCompactionOptions {
+                    max_table_files_size: 0,
+                },
+                ..Options::default()
+            },
+            "fifo_compaction_options.max_table_files_size",
+        );
+        assert_invalid_option(
+            Options {
+                compaction_style: CompactionStyle::Universal,
+                universal_compaction_options: UniversalCompactionOptions {
+                    size_ratio: 0,
+                    ..UniversalCompactionOptions::default()
+                },
+                ..Options::default()
+            },
+            "universal_compaction_options.size_ratio",
+        );
+        assert_invalid_option(
+            Options {
+                compaction_style: CompactionStyle::Universal,
+                universal_compaction_options: UniversalCompactionOptions {
+                    min_merge_width: 1,
+                    ..UniversalCompactionOptions::default()
+                },
+                ..Options::default()
+            },
+            "universal_compaction_options.min_merge_width",
+        );
+        assert_invalid_option(
+            Options {
+                compaction_style: CompactionStyle::Universal,
+                universal_compaction_options: UniversalCompactionOptions {
+                    min_merge_width: 4,
+                    max_merge_width: 3,
+                    ..UniversalCompactionOptions::default()
+                },
+                ..Options::default()
+            },
+            "universal_compaction_options.max_merge_width",
+        );
+        assert_invalid_option(
+            Options {
+                compaction_style: CompactionStyle::Universal,
+                universal_compaction_options: UniversalCompactionOptions {
+                    max_size_amplification_percent: 0,
+                    ..UniversalCompactionOptions::default()
+                },
+                ..Options::default()
+            },
+            "universal_compaction_options.max_size_amplification_percent",
+        );
     }
 
     #[test]
