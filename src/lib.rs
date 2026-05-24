@@ -573,6 +573,7 @@ impl Db {
     /// Delete every key in `[start, end)` in the default column
     /// family with an explicit [`WriteOptions`] override.
     pub fn delete_range_opt(&self, opts: &WriteOptions, start: &[u8], end: &[u8]) -> Result<()> {
+        self.ensure_open()?;
         if start >= end {
             return Ok(());
         }
@@ -607,6 +608,7 @@ impl Db {
     /// Apply a batch of writes atomically with an explicit
     /// [`WriteOptions`] override.
     pub fn write_opt(&self, opts: &WriteOptions, batch: WriteBatch) -> Result<()> {
+        self.ensure_open()?;
         if batch.is_empty() {
             return Ok(());
         }
@@ -694,7 +696,16 @@ impl Db {
         Ok(())
     }
 
+    fn ensure_open(&self) -> Result<()> {
+        if self.engine.is_closed() {
+            Err(Error::Closed)
+        } else {
+            Ok(())
+        }
+    }
+
     fn ensure_writable(&self) -> Result<()> {
+        self.ensure_open()?;
         if self.read_only {
             Err(Error::ReadOnly)
         } else {
@@ -1169,6 +1180,10 @@ impl Db {
     }
 
     /// Flush all data to disk and shut down background threads.
+    ///
+    /// After a successful close, result-returning operations on this
+    /// handle fail with [`Error::Closed`]. Calling `close` more than
+    /// once is allowed.
     pub fn close(&self) -> Result<()> {
         self.engine.close().map_err(Error::from)
     }
@@ -1329,6 +1344,7 @@ impl Db {
 
     /// Delete every key in `[start, end)` in column family `cf`.
     pub fn delete_range_cf(&self, cf: &ColumnFamilyHandle, start: &[u8], end: &[u8]) -> Result<()> {
+        self.ensure_open()?;
         if start >= end {
             return Ok(());
         }
@@ -2167,6 +2183,49 @@ mod tests {
         match err {
             Error::Io(io) => assert_eq!(io.kind(), std::io::ErrorKind::NotFound),
             other => panic!("expected missing DB error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_close_transitions_handle_to_closed_state() {
+        let (db, _dir) = open_tmp();
+        db.put(b"k", b"v").unwrap();
+        let snap = db.snapshot();
+
+        db.close().unwrap();
+        db.close().unwrap();
+
+        match db.get(b"k").unwrap_err() {
+            Error::Closed => {}
+            other => panic!("expected closed error from get, got {other:?}"),
+        }
+        match db.put(b"after", b"close").unwrap_err() {
+            Error::Closed => {}
+            other => panic!("expected closed error from put, got {other:?}"),
+        }
+        match db.write(WriteBatch::new()).unwrap_err() {
+            Error::Closed => {}
+            other => panic!("expected closed error from empty write, got {other:?}"),
+        }
+        match db.delete_range(b"z", b"a").unwrap_err() {
+            Error::Closed => {}
+            other => panic!("expected closed error from no-op range delete, got {other:?}"),
+        }
+        let default_cf = db.default_cf();
+        match db.delete_range_cf(&default_cf, b"z", b"a").unwrap_err() {
+            Error::Closed => {}
+            other => panic!("expected closed error from no-op cf range delete, got {other:?}"),
+        }
+        match snap.get(b"k").unwrap_err() {
+            Error::Closed => {}
+            other => panic!("expected closed error from snapshot get, got {other:?}"),
+        }
+
+        let mut iter = db.iter();
+        iter.seek_to_first();
+        match iter.status().unwrap_err() {
+            Error::Closed => {}
+            other => panic!("expected closed error from iterator, got {other:?}"),
         }
     }
 
@@ -4618,6 +4677,33 @@ mod tests {
         }
         let db = Db::open(dir.path(), opts).unwrap();
         assert_eq!(db.get(b"bulk").unwrap(), Some(b"loaded".to_vec()));
+    }
+
+    #[test]
+    fn test_close_flushes_range_tombstone_only_memtable() {
+        // A disable_wal range delete lives only in the active memtable
+        // until close. Clean close must flush it even though there are
+        // no point entries in that memtable.
+        let dir = TempDir::new().unwrap();
+        let opts = Options::default();
+
+        {
+            let db = Db::open(dir.path(), opts.clone()).unwrap();
+            db.put(b"k", b"v").unwrap();
+            db.close().unwrap();
+        }
+
+        {
+            let db = Db::open(dir.path(), opts.clone()).unwrap();
+            assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+            db.delete_range_opt(&WriteOptions::disable_wal(), b"a", b"z")
+                .unwrap();
+            assert_eq!(db.get(b"k").unwrap(), None);
+            db.close().unwrap();
+        }
+
+        let db = Db::open(dir.path(), opts).unwrap();
+        assert_eq!(db.get(b"k").unwrap(), None);
     }
 
     #[test]

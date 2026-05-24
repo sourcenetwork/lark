@@ -115,6 +115,10 @@ impl From<Error> for TransactionError {
                 std::io::ErrorKind::PermissionDenied,
                 "database was opened read-only",
             )),
+            Error::Closed => TransactionError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "database is closed",
+            )),
             other => TransactionError::Io(std::io::Error::other(other.to_string())),
         }
     }
