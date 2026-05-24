@@ -155,7 +155,7 @@ pub(crate) struct CompactionOptions {
     pub(crate) compaction_style: crate::options::CompactionStyle,
     pub(crate) fifo_compaction_options: crate::options::FifoCompactionOptions,
     pub(crate) universal_compaction_options: crate::options::UniversalCompactionOptions,
-    pub(crate) use_direct_io_for_compaction: bool,
+    pub(crate) evict_compaction_data_from_page_cache: bool,
     pub(crate) max_background_compactions: usize,
     pub(crate) partitioned_index: bool,
     pub(crate) metadata_block_size: usize,
@@ -192,7 +192,7 @@ impl Default for CompactionOptions {
             compaction_style: crate::options::CompactionStyle::Level,
             fifo_compaction_options: crate::options::FifoCompactionOptions::default(),
             universal_compaction_options: crate::options::UniversalCompactionOptions::default(),
-            use_direct_io_for_compaction: false,
+            evict_compaction_data_from_page_cache: false,
             max_background_compactions: 1,
             partitioned_index: false,
             metadata_block_size: 4096,
@@ -918,9 +918,9 @@ fn perform_compaction_to(
     edits.extend(new_file_edits);
 
     // Tell the OS it can drop pages we just read from the page cache.
-    // Opt-in via `use_direct_io_for_compaction`; on non-Linux targets
+    // Opt-in via `evict_compaction_data_from_page_cache`; on non-Linux targets
     // the hint is a no-op.
-    if opts.use_direct_io_for_compaction {
+    if opts.evict_compaction_data_from_page_cache {
         for file in input_files.iter().chain(overlap_files.iter()) {
             let path = sst_dir.join(sst_filename(file.meta.file_id));
             crate::os_hint::drop_page_cache_by_path(&path);
@@ -1578,7 +1578,7 @@ impl<'a> StreamingCompactionWriter<'a> {
             limiter.request(file_size, crate::rate_limiter::Priority::Low);
         }
 
-        if self.opts.use_direct_io_for_compaction {
+        if self.opts.evict_compaction_data_from_page_cache {
             crate::os_hint::drop_page_cache_by_path(&current.path);
         }
 
@@ -1682,7 +1682,7 @@ impl<'a> StreamingCompactionWriter<'a> {
             limiter.request(file_size, crate::rate_limiter::Priority::Low);
         }
 
-        if self.opts.use_direct_io_for_compaction {
+        if self.opts.evict_compaction_data_from_page_cache {
             crate::os_hint::drop_page_cache_by_path(&path);
         }
 

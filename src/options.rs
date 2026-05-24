@@ -501,7 +501,7 @@ pub struct Options {
     /// hint is a no-op. `false` by default — callers who care
     /// about foreground latency stability on Linux should turn
     /// it on.
-    pub use_direct_io_for_compaction: bool,
+    pub evict_compaction_data_from_page_cache: bool,
     /// Split the SSTable index into small leaf blocks on disk and keep
     /// only a compact top-level index in memory. Reduces resident
     /// memory when thousands of SSTables are open, at the cost of one
@@ -557,7 +557,7 @@ impl Default for Options {
             compaction_style: CompactionStyle::Level,
             fifo_compaction_options: FifoCompactionOptions::default(),
             universal_compaction_options: UniversalCompactionOptions::default(),
-            use_direct_io_for_compaction: false,
+            evict_compaction_data_from_page_cache: false,
             max_background_compactions: 1,
             max_subcompactions: 1,
             partitioned_index: false,
@@ -628,8 +628,8 @@ impl std::fmt::Debug for Options {
                 &self.universal_compaction_options,
             )
             .field(
-                "use_direct_io_for_compaction",
-                &self.use_direct_io_for_compaction,
+                "evict_compaction_data_from_page_cache",
+                &self.evict_compaction_data_from_page_cache,
             )
             .field(
                 "max_background_compactions",
@@ -767,7 +767,7 @@ impl Options {
             compaction_style: self.compaction_style,
             fifo_compaction_options: self.fifo_compaction_options,
             universal_compaction_options: self.universal_compaction_options,
-            use_direct_io_for_compaction: self.use_direct_io_for_compaction,
+            evict_compaction_data_from_page_cache: self.evict_compaction_data_from_page_cache,
             max_background_compactions: self.max_background_compactions,
             partitioned_index: self.partitioned_index,
             metadata_block_size: self.metadata_block_size,
@@ -1095,6 +1095,10 @@ mod tests {
         assert_eq!(
             eo.max_background_compactions,
             opts.max_background_compactions
+        );
+        assert_eq!(
+            eo.evict_compaction_data_from_page_cache,
+            opts.evict_compaction_data_from_page_cache
         );
         assert_eq!(eo.partitioned_index, opts.partitioned_index);
     }
