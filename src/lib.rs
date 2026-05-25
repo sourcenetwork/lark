@@ -6808,7 +6808,7 @@ mod tests {
     }
 
     #[test]
-    fn test_use_direct_io_for_compaction_is_correctness_neutral() {
+    fn test_evict_compaction_data_from_page_cache_is_correctness_neutral() {
         // Enabling the page-cache hint must not change what a
         // compaction produces. On Linux the `posix_fadvise`
         // syscall runs but is a best-effort hint; on other
@@ -6817,7 +6817,7 @@ mod tests {
         // readers must see identical values afterward.
         let opts = Options {
             write_buffer_size: 4 * 1024,
-            use_direct_io_for_compaction: true,
+            evict_compaction_data_from_page_cache: true,
             ..Options::default()
         };
         let dir = TempDir::new().unwrap();
