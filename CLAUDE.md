@@ -8,7 +8,7 @@ Early-stage. The public API (`Db`, `Snapshot`, `WriteBatch`, `Options`) is small
 
 ### Design goals
 
-- **Pure Rust, no FFI** — no C/C++ toolchain, no `bindgen`, no linker surprises
+- **Pure Rust, no FFI** — no C/C++ toolchain, no `bindgen`, no linker surprises in the library or checked-in workspace tools
 - **LSM-tree** — write-optimized with level-based background compaction
 - **MVCC** — point-in-time consistent reads via global sequence numbers
 - **Crash recovery** — WAL with xxhash-checksummed records
@@ -41,39 +41,79 @@ No `ROADMAP.md`, `DEVELOPMENT.md`, `docs/` directories, or planning documents.
 
 ## 4. File Organization
 
-**One concept per file. Small files over large files.**
+**One concept per file. Small files over large files for new code.**
 
 ### Module Map
 
-Single crate (`lark-kv`), all code under `src/`.
+Workspace layout:
+
+```text
+src/                    # Publishable lark-kv library crate
+tests/                  # Public-API integration, corruption, concurrency, and property tests
+tools/lark-bench/       # Pure-Rust benchmark CLI
+tools/lark-stress/      # Pure-Rust stress CLI
+tools/lark-ycsb/        # Pure-Rust YCSB-style workload CLI
+fuzz/                   # cargo-fuzz harnesses, outside the normal workspace
+```
+
+Library modules:
 
 ```text
 src/
-├── lib.rs              # Public API: Db, Snapshot, WriteBatch, re-exports
+├── lib.rs              # Public API: Db, Snapshot, WriteBatch, column families, transactions, re-exports
+├── backup.rs           # BackupEngine and restore flow
+├── checkpoint.rs       # Hardlinked checkpoint creation
+├── column_family.rs    # Column-family handles and descriptors
 ├── error.rs            # Error enum, Result alias
-├── options.rs          # Options, DurabilityMode
+├── event_listener.rs   # Flush/compaction event callbacks
+├── iter.rs             # Public iterator wrappers
+├── options.rs          # Options and tuning enums
+├── os_hint.rs          # Best-effort OS cache hints
+├── perf_context.rs     # Per-operation performance counters
+├── rate_limiter.rs     # Token-bucket rate limiter
+├── sst_file_writer.rs  # External SSTable writer API
+├── statistics.rs       # Tickers, histograms, and properties
+├── tailing.rs          # Tailing iterator API
+├── transaction.rs      # Optimistic and pessimistic transaction wrappers
+├── ttl.rs              # TTL database wrapper
 └── engine/
-    ├── mod.rs          # LarkEngine — orchestration, read/write paths, recovery
-    ├── memtable.rs     # Lock-free skip list memtable (MVCC-encoded keys)
-    ├── wal.rs          # Write-ahead log: append, replay, CRC records
+    ├── mod.rs          # LarkEngine orchestration, read/write paths, recovery
     ├── block.rs        # Data blocks: prefix compression, restart points, varint
+    ├── block_cache.rs  # Sharded LRU cache for decompressed SSTable blocks
     ├── bloom.rs        # Bloom filter (double-hashed xxh3)
-    ├── sstable.rs      # SSTable reader/writer, footer, index block
-    ├── block_cache.rs  # LRU cache for decompressed SSTable blocks
+    ├── checksum.rs     # Checksum helpers
+    ├── compaction.rs   # Level/FIFO/universal compaction planning and worker loop
+    ├── db_lock.rs      # Cross-process DB lock file handling
+    ├── durability.rs   # Directory sync helper
+    ├── internal_key.rs # MVCC internal key encoding
+    ├── iterator.rs     # Engine iterator merge logic
     ├── manifest.rs     # VersionSet, VersionEdit log, level tracking
-    ├── compaction.rs   # Level-based compaction scheduler (background thread)
-    └── snapshot.rs     # Snapshot token (captured sequence number)
+    ├── memtable.rs     # Lock-free skip list memtable
+    ├── range_tombstone.rs # Range-delete tombstone encoding
+    ├── snapshot_registry.rs # Active snapshot sequence tracking
+    ├── sstable.rs      # SSTable reader/writer, footer, index block
+    └── wal.rs          # Write-ahead log: append, replay, checksummed records
 ```
 
 ### Public API surface
 
-`Db`, `Snapshot`, `WriteBatch`, `Options`, `DurabilityMode`, `Error`, `Result` — all re-exported from `lib.rs`. Anything not re-exported is internal.
+`lib.rs` is the public surface. Core types include `Db`, `Snapshot`,
+`WriteBatch`, `Options`, `WriteOptions`, `Iter`, `TailingIter`, `Error`,
+and `Result`. Extension surfaces such as column families, transactions,
+TTL, backups, checkpoints, external SST ingestion, statistics, event
+listeners, merge operators, compaction filters, and rate limiting are
+also re-exported from `lib.rs`. Anything not re-exported is internal.
 
 ### File Size Guidelines
 
 - Under 200 lines: Fine
 - 200–400 lines: Check if doing one thing
 - Over 400 lines: Consider splitting
+
+Several core engine files are intentionally larger today because they
+still carry early-stage API and storage-engine code together. Treat that
+as refactoring debt: split them only behind focused issues or while
+touching a cohesive area with tests, and keep new modules small.
 
 ## 5. Naming Conventions
 
@@ -114,30 +154,36 @@ Each worktree is isolated, no branch-switching overhead.
 
 ## Build Dependencies
 
-- **Rust** 1.82+ (see `rust-version` in `Cargo.toml`)
+- **Rust** 1.82+ for the library build (see `rust-version` in `Cargo.toml`); CI runs tests and tools on stable Rust.
 
-That's it. No `protoc`, no `cbindgen`, no system libraries.
+That's it for the checked-in workspace. No `protoc`, no `cbindgen`, no C/C++ toolchain, no system libraries. Tools that need foreign libraries or bindgen-based comparison backends should live outside this workspace so the main CI path remains pure Rust.
 
 ## Common Commands
 
 ```bash
-cargo test                         # Run all tests (inline in src/lib.rs)
-cargo clippy -- -D warnings        # Lint (matches CI)
-cargo fmt -- --check               # Format check (matches CI)
-cargo fmt                          # Apply formatting
-cargo build --release              # Optimized build (LTO, strip)
+cargo test --workspace                         # Run library, integration, and tool tests
+cargo clippy --workspace --all-targets -- -D warnings # Lint all workspace targets (matches CI)
+cargo fmt --all -- --check                     # Format check (matches CI)
+cargo fmt                                      # Apply formatting
+cargo build --release                          # Optimized build (LTO, strip)
 ```
 
-Tests live inline with `#[cfg(test)]` in the modules they cover — there is no separate `tests/` directory.
+Use inline `#[cfg(test)]` tests for module-local invariants and `tests/`
+for public-API integration, corruption, concurrency, parity, and property
+tests. Keep fuzz harnesses under `fuzz/`; they are not part of the normal
+workspace test run.
 
 ## Before Committing
 
-1. `cargo test` passes
-2. `cargo clippy -- -D warnings` clean
-3. `cargo fmt -- --check` clean
+1. `cargo test --workspace` passes
+2. `cargo clippy --workspace --all-targets -- -D warnings` clean
+3. `cargo fmt --all -- --check` clean
 4. `cargo deny check` clean — surfaces RUSTSEC advisories, license violations, and duplicate crates against the allow-list in `deny.toml`
 
-These are exactly what CI runs (`.github/workflows/ci.yml`).
+These are the local gates mirrored in CI (`.github/workflows/ci.yml`).
+CI also builds docs with `cargo doc --workspace --no-deps`, checks the
+library and tools on the MSRV toolchain with `cargo check --workspace`,
+and runs scheduled ignored stress tests.
 
 CI also publishes a coverage summary via `cargo llvm-cov --summary-only` on every push; run it locally with `cargo llvm-cov` (HTML report lands in `target/llvm-cov/html/`) when a change touches a file whose coverage you care about. No hard gate yet — the baseline at the time of writing is ~93% regions / ~91% lines.
 
