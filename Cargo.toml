@@ -1,5 +1,6 @@
 [workspace]
 members = [".", "tools/lark-bench", "tools/lark-stress", "tools/lark-ycsb"]
+resolver = "2"
 
 [package]
 name = "lark-kv"
@@ -28,7 +29,7 @@ tracing = "0.1"
 thiserror = "1.0"
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "0.38", features = ["fs"] }
+rustix = { version = "1.1", features = ["fs"] }
 
 [dev-dependencies]
 proptest = "1"

@@ -32,12 +32,12 @@
 #[cfg(target_os = "linux")]
 pub(crate) fn drop_page_cache(file: &std::fs::File) {
     // `rustix::fs::fadvise` is a safe wrapper around
-    // `posix_fadvise`; a range of `(0, 0)` means "the whole
-    // file". We deliberately ignore the return — this is a
+    // `posix_fadvise`; an offset of `0` with no length means
+    // "the whole file". We deliberately ignore the return — this is a
     // best-effort hint, and a failure (e.g. the file is backed
     // by a filesystem that doesn't implement the advice) is not
     // a correctness issue.
-    let _ = rustix::fs::fadvise(file, 0, 0, rustix::fs::Advice::DontNeed);
+    let _ = rustix::fs::fadvise(file, 0, None, rustix::fs::Advice::DontNeed);
 }
 
 #[cfg(not(target_os = "linux"))]

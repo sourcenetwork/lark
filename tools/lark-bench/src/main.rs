@@ -69,7 +69,7 @@ struct Args {
 
     /// Emit a machine-readable JSON line per benchmark, in
     /// addition to the human-readable report. Use this to feed
-    /// results into `tools/lark-compare`.
+    /// results into external comparison scripts.
     #[arg(long, default_value_t = false)]
     json: bool,
 }

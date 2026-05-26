@@ -33,9 +33,9 @@ confidence-threshold = 0.8
 
 [bans]
 # Duplicate versions of the same crate bloat the binary without
-# obvious benefit; warn so we notice when a new dependency pulls
-# in an older copy of something we already have.
-multiple-versions = "warn"
+# obvious benefit. Keep this as a CI gate so dependency drift is
+# resolved deliberately instead of accumulating in the lockfile.
+multiple-versions = "deny"
 # Wildcard version requirements are a footgun — they float the
 # tree in ways the lockfile can't constrain. Allow them
 # internally (for path dependencies) but warn on external crates.
