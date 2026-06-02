@@ -16,7 +16,7 @@ pub(crate) mod wal;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use parking_lot::{Condvar, Mutex, RwLock};
@@ -81,6 +81,10 @@ fn batch_op_wal_bytes(op: &WriteBatchOp) -> u64 {
         WriteBatchOp::DeleteRange { start, end } => (start.len() + end.len() + 8) as u64,
         WriteBatchOp::Merge { key, operand } => (key.len() + operand.len() + 8) as u64,
     }
+}
+
+fn memtable_needs_flush(memtable: &MemTable) -> bool {
+    !memtable.is_empty() || !memtable.clone_range_tombstones().is_empty()
 }
 
 fn append_single_wal_op(wal: &mut Wal, op: &WriteBatchOp, seq: u64) -> std::io::Result<()> {
@@ -270,6 +274,10 @@ impl Default for EngineOptions {
     }
 }
 
+const CLOSE_STATE_OPEN: u8 = 0;
+const CLOSE_STATE_CLOSING: u8 = 1;
+const CLOSE_STATE_CLOSED: u8 = 2;
+
 /// The core LSM-tree engine.
 pub(crate) struct LarkEngine {
     active_memtable: RwLock<Arc<MemTable>>,
@@ -277,7 +285,8 @@ pub(crate) struct LarkEngine {
     versions: Arc<Mutex<VersionSet>>,
     cache: Arc<BlockCache>,
     latest_seq: AtomicU64,
-    closed: AtomicBool,
+    close_state: AtomicU8,
+    close_lock: Mutex<()>,
     active_wal: Mutex<Option<Wal>>,
     wal_id: AtomicU64,
     sst_dir: PathBuf,
@@ -436,7 +445,8 @@ impl LarkEngine {
             versions,
             cache,
             latest_seq: AtomicU64::new(latest_seq),
-            closed: AtomicBool::new(false),
+            close_state: AtomicU8::new(CLOSE_STATE_OPEN),
+            close_lock: Mutex::new(()),
             active_wal: Mutex::new(Some(wal)),
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
@@ -520,7 +530,8 @@ impl LarkEngine {
             versions,
             cache,
             latest_seq: AtomicU64::new(latest_seq),
-            closed: AtomicBool::new(false),
+            close_state: AtomicU8::new(CLOSE_STATE_OPEN),
+            close_lock: Mutex::new(()),
             active_wal: Mutex::new(None),
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
@@ -545,7 +556,7 @@ impl LarkEngine {
     }
 
     pub(crate) fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Acquire)
+        self.close_state.load(Ordering::Acquire) != CLOSE_STATE_OPEN
     }
 
     fn closed_error() -> std::io::Error {
@@ -2507,44 +2518,38 @@ impl LarkEngine {
 
     /// Flush all data to disk and shut down background threads.
     pub(crate) fn close(&self) -> std::io::Result<()> {
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return Ok(());
+        let _close_guard = self.close_lock.lock();
+        match self.close_state.load(Ordering::Acquire) {
+            CLOSE_STATE_CLOSED => return Ok(()),
+            CLOSE_STATE_CLOSING => return Err(Self::closed_error()),
+            _ => {}
         }
+
+        self.close_state
+            .store(CLOSE_STATE_CLOSING, Ordering::Release);
         self.stall_signal.notify_all();
 
+        match self.close_inner() {
+            Ok(()) => {
+                self.close_state
+                    .store(CLOSE_STATE_CLOSED, Ordering::Release);
+                Ok(())
+            }
+            Err(err) => {
+                self.close_state.store(CLOSE_STATE_OPEN, Ordering::Release);
+                self.stall_signal.notify_all();
+                Err(err)
+            }
+        }
+    }
+
+    fn close_inner(&self) -> std::io::Result<()> {
         if self.is_read_only() {
             self.compaction.lock().shutdown();
             return Ok(());
         }
 
-        let has_any = {
-            let mt = self.active_memtable.read();
-            !mt.is_empty() || !mt.clone_range_tombstones().is_empty()
-        };
-        if has_any {
-            let _write_guard = self.write_lock.lock();
-
-            let old_memtable = {
-                let mut active = self.active_memtable.write();
-                let old = Arc::clone(&active);
-                *active = Arc::new(MemTable::new());
-                old
-            };
-
-            if !old_memtable.is_empty() || !old_memtable.clone_range_tombstones().is_empty() {
-                self.frozen_memtables.write().push(old_memtable);
-
-                let wal_for_flush = Wal::create(&self.wal_dir.join("flush_tmp.wal"))?;
-                let old_wal = self
-                    .active_wal
-                    .lock()
-                    .replace(wal_for_flush)
-                    .ok_or_else(Self::read_only_error)?;
-
-                drop(_write_guard);
-                self.flush_frozen_memtable(old_wal)?;
-            }
-        }
+        self.flush_memtables_for_close()?;
 
         self.active_wal
             .lock()
@@ -2554,6 +2559,61 @@ impl LarkEngine {
         self.compaction.lock().shutdown();
 
         Ok(())
+    }
+
+    fn flush_memtables_for_close(&self) -> std::io::Result<()> {
+        loop {
+            let should_flush = {
+                let active = self.active_memtable.read();
+                memtable_needs_flush(&active) || !self.frozen_memtables.read().is_empty()
+            };
+            if !should_flush {
+                return Ok(());
+            }
+
+            let old_wal = {
+                let _write_guard = self.write_lock.lock();
+                let active_needs_flush = {
+                    let active = self.active_memtable.read();
+                    memtable_needs_flush(&active)
+                };
+                let has_frozen = !self.frozen_memtables.read().is_empty();
+                if !active_needs_flush && !has_frozen {
+                    continue;
+                }
+
+                let new_wal_id = {
+                    let mut versions = self.versions.lock();
+                    let version = versions.current();
+                    let id = version.next_file_id;
+                    versions.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
+                    id
+                };
+                let wal_for_flush = Wal::create(&self.wal_dir.join(wal_filename(new_wal_id)))?;
+
+                if active_needs_flush {
+                    let old_memtable = {
+                        let mut active = self.active_memtable.write();
+                        let old = Arc::clone(&active);
+                        *active = Arc::new(MemTable::new());
+                        old
+                    };
+                    if memtable_needs_flush(&old_memtable) {
+                        self.frozen_memtables.write().push(old_memtable);
+                    }
+                }
+
+                let old_wal = self
+                    .active_wal
+                    .lock()
+                    .replace(wal_for_flush)
+                    .ok_or_else(Self::read_only_error)?;
+                self.wal_id.store(new_wal_id, Ordering::Release);
+                old_wal
+            };
+
+            self.flush_frozen_memtable(old_wal)?;
+        }
     }
 }
 

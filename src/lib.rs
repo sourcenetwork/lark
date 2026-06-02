@@ -2250,6 +2250,38 @@ mod tests {
     }
 
     #[test]
+    fn test_failed_close_can_be_retried() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), Options::default()).unwrap();
+        db.put(b"k", b"v").unwrap();
+
+        let blocked_wal_path = dir.path().join("wal").join("wal_000002.log");
+        std::fs::create_dir(&blocked_wal_path).unwrap();
+
+        match db.close().unwrap_err() {
+            Error::Io(_) => {}
+            other => panic!("expected close I/O error, got {other:?}"),
+        }
+
+        assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+
+        std::fs::remove_dir(&blocked_wal_path).unwrap();
+        db.close().unwrap();
+        db.close().unwrap();
+
+        let sst_count = std::fs::read_dir(dir.path().join("sst"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "sst"))
+            .count();
+        assert!(sst_count > 0);
+
+        drop(db);
+        let reopened = Db::open(dir.path(), Options::default()).unwrap();
+        assert_eq!(reopened.get(b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
     fn test_configured_key_value_size_limits_are_enforced() {
         let dir = TempDir::new().unwrap();
         let opts = Options {
