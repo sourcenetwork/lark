@@ -23,6 +23,7 @@ pub(crate) struct Version {
     pub(crate) levels: Vec<Vec<Arc<LiveSst>>>,
     pub(crate) next_file_id: u64,
     pub(crate) last_seq: u64,
+    pub(crate) min_wal_id: u64,
 }
 
 impl Version {
@@ -31,6 +32,7 @@ impl Version {
             levels: (0..MAX_LEVELS).map(|_| Vec::new()).collect(),
             next_file_id: 1,
             last_seq: 0,
+            min_wal_id: 0,
         }
     }
 
@@ -55,6 +57,7 @@ pub(crate) enum VersionEdit {
     RemoveFile { level: usize, file_id: u64 },
     SetLastSeq(u64),
     SetNextFileId(u64),
+    Reset { next_file_id: u64, min_wal_id: u64 },
 }
 
 /// Serialized form of a version edit. The manifest on disk is a sequence
@@ -65,12 +68,16 @@ enum ManifestRecord {
     RemoveFile { level: usize, file_id: u64 },
     SetLastSeq(u64),
     SetNextFileId(u64),
+    SetMinWalId(u64),
+    Reset { next_file_id: u64, min_wal_id: u64 },
 }
 
 const TAG_ADD_FILE: u8 = 1;
 const TAG_REMOVE_FILE: u8 = 2;
 const TAG_LAST_SEQ: u8 = 3;
 const TAG_NEXT_FILE_ID: u8 = 4;
+const TAG_MIN_WAL_ID: u8 = 5;
+const TAG_RESET: u8 = 6;
 
 impl VersionEdit {
     fn to_record(&self) -> ManifestRecord {
@@ -85,6 +92,13 @@ impl VersionEdit {
             },
             VersionEdit::SetLastSeq(seq) => ManifestRecord::SetLastSeq(*seq),
             VersionEdit::SetNextFileId(id) => ManifestRecord::SetNextFileId(*id),
+            VersionEdit::Reset {
+                next_file_id,
+                min_wal_id,
+            } => ManifestRecord::Reset {
+                next_file_id: *next_file_id,
+                min_wal_id: *min_wal_id,
+            },
         }
     }
 
@@ -122,6 +136,18 @@ impl ManifestRecord {
             ManifestRecord::SetNextFileId(id) => {
                 buf.push(TAG_NEXT_FILE_ID);
                 buf.extend_from_slice(&id.to_le_bytes());
+            }
+            ManifestRecord::SetMinWalId(id) => {
+                buf.push(TAG_MIN_WAL_ID);
+                buf.extend_from_slice(&id.to_le_bytes());
+            }
+            ManifestRecord::Reset {
+                next_file_id,
+                min_wal_id,
+            } => {
+                buf.push(TAG_RESET);
+                buf.extend_from_slice(&next_file_id.to_le_bytes());
+                buf.extend_from_slice(&min_wal_id.to_le_bytes());
             }
         }
     }
@@ -168,6 +194,18 @@ impl ManifestRecord {
             TAG_NEXT_FILE_ID => {
                 let id = read_u64(data, pos)?;
                 Ok(Some(ManifestRecord::SetNextFileId(id)))
+            }
+            TAG_MIN_WAL_ID => {
+                let id = read_u64(data, pos)?;
+                Ok(Some(ManifestRecord::SetMinWalId(id)))
+            }
+            TAG_RESET => {
+                let next_file_id = read_u64(data, pos)?;
+                let min_wal_id = read_u64(data, pos)?;
+                Ok(Some(ManifestRecord::Reset {
+                    next_file_id,
+                    min_wal_id,
+                }))
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -296,7 +334,9 @@ impl VersionSet {
                 VersionEdit::AddFile { level, .. } | VersionEdit::RemoveFile { level, .. } => {
                     validate_level_index(*level)?;
                 }
-                VersionEdit::SetLastSeq(_) | VersionEdit::SetNextFileId(_) => {}
+                VersionEdit::SetLastSeq(_)
+                | VersionEdit::SetNextFileId(_)
+                | VersionEdit::Reset { .. } => {}
             }
         }
 
@@ -315,6 +355,15 @@ impl VersionSet {
                 }
                 VersionEdit::SetNextFileId(id) => {
                     version.next_file_id = *id;
+                }
+                VersionEdit::Reset {
+                    next_file_id,
+                    min_wal_id,
+                } => {
+                    version.levels = (0..MAX_LEVELS).map(|_| Vec::new()).collect();
+                    version.last_seq = 0;
+                    version.next_file_id = *next_file_id;
+                    version.min_wal_id = *min_wal_id;
                 }
             }
         }
@@ -344,6 +393,7 @@ impl VersionSet {
         let mut records = Vec::new();
         records.push(ManifestRecord::SetNextFileId(version.next_file_id));
         records.push(ManifestRecord::SetLastSeq(version.last_seq));
+        records.push(ManifestRecord::SetMinWalId(version.min_wal_id));
         for (level, files) in version.levels.iter().enumerate() {
             for file in files {
                 records.push(ManifestRecord::AddFile {
@@ -401,6 +451,7 @@ impl VersionSet {
         let mut surviving: Vec<Vec<SsTableMeta>> = vec![Vec::new(); MAX_LEVELS];
         let mut last_seq: u64 = 0;
         let mut next_file_id: u64 = 1;
+        let mut min_wal_id: u64 = 0;
         let mut offset = 0;
         let mut valid_len = 0;
 
@@ -447,6 +498,20 @@ impl VersionSet {
                     ManifestRecord::SetNextFileId(id) => {
                         next_file_id = id;
                     }
+                    ManifestRecord::SetMinWalId(id) => {
+                        min_wal_id = id;
+                    }
+                    ManifestRecord::Reset {
+                        next_file_id: reset_next_file_id,
+                        min_wal_id: reset_min_wal_id,
+                    } => {
+                        for level in &mut surviving {
+                            level.clear();
+                        }
+                        last_seq = 0;
+                        next_file_id = reset_next_file_id;
+                        min_wal_id = reset_min_wal_id;
+                    }
                 }
             }
             valid_len = offset;
@@ -456,6 +521,7 @@ impl VersionSet {
         let mut version = Version::new();
         version.last_seq = last_seq;
         version.next_file_id = next_file_id;
+        version.min_wal_id = min_wal_id;
         for (level, files) in surviving.into_iter().enumerate() {
             for meta in files {
                 let path = sst_dir.join(sst_filename(meta.file_id));
@@ -580,6 +646,7 @@ mod tests {
             assert_eq!(v.levels[0][0].meta.file_id, 1);
             assert_eq!(v.last_seq, 42);
             assert_eq!(v.next_file_id, 10);
+            assert_eq!(v.min_wal_id, 0);
         }
 
         // Recover by replaying the manifest; readers are reopened.
@@ -589,6 +656,7 @@ mod tests {
         assert_eq!(v.levels[0][0].meta.file_id, 1);
         assert_eq!(v.last_seq, 42);
         assert_eq!(v.next_file_id, 10);
+        assert_eq!(v.min_wal_id, 0);
     }
 
     #[test]
@@ -639,6 +707,7 @@ mod tests {
         assert!(v.levels.iter().all(|l| l.is_empty()));
         assert_eq!(v.next_file_id, 1);
         assert_eq!(v.last_seq, 0);
+        assert_eq!(v.min_wal_id, 0);
         assert_eq!(v.l0_count(), 0);
         for level in 0..MAX_LEVELS {
             assert_eq!(v.level_size(level), 0);
@@ -675,6 +744,11 @@ mod tests {
             },
             ManifestRecord::SetLastSeq(999),
             ManifestRecord::SetNextFileId(42),
+            ManifestRecord::SetMinWalId(11),
+            ManifestRecord::Reset {
+                next_file_id: 77,
+                min_wal_id: 76,
+            },
         ];
         for r in &records {
             let mut buf = Vec::new();
@@ -826,6 +900,44 @@ mod tests {
     }
 
     #[test]
+    fn reset_record_clears_files_and_sets_wal_floor_atomically() {
+        let dir = TempDir::new().unwrap();
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+
+        let file1 = make_live_sst(&sst_dir, 1, b"a", b"m");
+        let file2 = make_live_sst(&sst_dir, 2, b"n", b"z");
+        {
+            let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+            vs.apply(&[
+                VersionEdit::AddFile {
+                    level: 0,
+                    file: Arc::clone(&file1),
+                },
+                VersionEdit::AddFile {
+                    level: 1,
+                    file: Arc::clone(&file2),
+                },
+                VersionEdit::SetLastSeq(50),
+                VersionEdit::SetNextFileId(9),
+            ])
+            .unwrap();
+            vs.apply(&[VersionEdit::Reset {
+                next_file_id: 10,
+                min_wal_id: 9,
+            }])
+            .unwrap();
+        }
+
+        let vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+        let v = vs.current();
+        assert!(v.levels.iter().all(Vec::is_empty));
+        assert_eq!(v.last_seq, 0);
+        assert_eq!(v.next_file_id, 10);
+        assert_eq!(v.min_wal_id, 9);
+    }
+
+    #[test]
     fn open_truncates_truncated_manifest_tail_before_append() {
         let dir = TempDir::new().unwrap();
         let sst_dir = dir.path().join("sst");
@@ -896,6 +1008,11 @@ mod tests {
         let file2 = make_live_sst(&sst_dir, 2, b"d", b"f");
 
         let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+        vs.apply(&[VersionEdit::Reset {
+            next_file_id: 7,
+            min_wal_id: 7,
+        }])
+        .unwrap();
         vs.apply(&[VersionEdit::AddFile {
             level: 0,
             file: Arc::clone(&file1),
@@ -927,5 +1044,6 @@ mod tests {
         assert_eq!(v.levels[1].len(), 1);
         assert_eq!(v.last_seq, 500);
         assert_eq!(v.next_file_id, 99);
+        assert_eq!(v.min_wal_id, 7);
     }
 }

@@ -356,6 +356,7 @@ impl LarkEngine {
         let memtable = Arc::new(MemTable::new());
         let mut wal_files = list_wal_files(&wal_dir)?;
         wal_files.sort();
+        wal_files.retain(|path| should_replay_wal(path, version.min_wal_id));
 
         for wal_path in &wal_files {
             tracing::info!(path = %wal_path.display(), "Replaying WAL");
@@ -491,6 +492,7 @@ impl LarkEngine {
         let memtable = Arc::new(MemTable::new());
         let mut wal_files = list_wal_files(&wal_dir)?;
         wal_files.sort();
+        wal_files.retain(|path| should_replay_wal(path, version.min_wal_id));
 
         for wal_path in &wal_files {
             tracing::info!(path = %wal_path.display(), "Replaying WAL for read-only open");
@@ -2399,54 +2401,30 @@ impl LarkEngine {
         let _write_guard = self.write_lock.lock();
         self.ensure_writable()?;
 
+        let (old_version, wal_id, wal_path, new_wal) = {
+            let mut versions = self.versions.lock();
+            let old_version = versions.current();
+            let id = old_version.next_file_id;
+            let wal_path = self.wal_dir.join(wal_filename(id));
+            let new_wal = Wal::create(&wal_path)?;
+            versions.apply(&[VersionEdit::Reset {
+                next_file_id: id + 1,
+                min_wal_id: id,
+            }])?;
+            (old_version, id, wal_path, new_wal)
+        };
+
         *self.active_memtable.write() = Arc::new(MemTable::new());
         self.frozen_memtables.write().clear();
-
-        let version = self.versions.lock().current();
-        for level in &version.levels {
-            for file in level {
-                let path = self.sst_dir.join(sst_filename(file.meta.file_id));
-                let _ = std::fs::remove_file(&path);
-            }
-        }
-
         self.cache.clear();
-
-        {
-            let mut versions = self.versions.lock();
-            let mut edits = Vec::new();
-            let ver = versions.current();
-            for (level_idx, level) in ver.levels.iter().enumerate() {
-                for file in level {
-                    edits.push(VersionEdit::RemoveFile {
-                        level: level_idx,
-                        file_id: file.meta.file_id,
-                    });
-                }
-            }
-            if !edits.is_empty() {
-                versions.apply(&edits)?;
-            }
-            versions.compact_manifest()?;
-        }
-
-        let wal_files = list_wal_files(&self.wal_dir)?;
-        for path in wal_files {
-            let _ = std::fs::remove_file(&path);
-        }
-
-        let wal_id = {
-            let mut versions = self.versions.lock();
-            let version = versions.current();
-            let id = version.next_file_id;
-            versions.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
-            id
-        };
-        let wal_path = self.wal_dir.join(wal_filename(wal_id));
-        let new_wal = Wal::create(&wal_path)?;
-        *self.active_wal.lock() = Some(new_wal);
+        let _old_wal = self.active_wal.lock().replace(new_wal);
         self.wal_id.store(wal_id, Ordering::Release);
         self.latest_seq.store(0, Ordering::Release);
+
+        self.versions.lock().compact_manifest()?;
+
+        remove_obsolete_sst_files(&self.sst_dir, &old_version)?;
+        remove_obsolete_wal_files(&self.wal_dir, &wal_path)?;
 
         Ok(())
     }
@@ -2663,9 +2641,54 @@ fn list_wal_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+fn remove_obsolete_sst_files(sst_dir: &Path, version: &manifest::Version) -> std::io::Result<()> {
+    let mut removed_any = false;
+    for level in &version.levels {
+        for file in level {
+            let path = sst_dir.join(sst_filename(file.meta.file_id));
+            removed_any |= remove_file_if_exists(&path)?;
+        }
+    }
+    if removed_any {
+        durability::sync_dir(sst_dir)?;
+    }
+    Ok(())
+}
+
+fn remove_obsolete_wal_files(wal_dir: &Path, keep_path: &Path) -> std::io::Result<()> {
+    let mut removed_any = false;
+    for path in list_wal_files(wal_dir)? {
+        if path == keep_path {
+            continue;
+        }
+        removed_any |= remove_file_if_exists(&path)?;
+    }
+    if removed_any {
+        durability::sync_dir(wal_dir)?;
+    }
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> std::io::Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 fn wal_file_id(path: &Path) -> Option<u64> {
     let stem = path.file_stem()?.to_str()?;
     stem.strip_prefix("wal_")?.parse().ok()
+}
+
+fn should_replay_wal(path: &Path, min_wal_id: u64) -> bool {
+    match wal_file_id(path) {
+        Some(id) => id >= min_wal_id,
+        // Legacy or temporary WAL names predate the reset marker. Once a
+        // reset has committed, they must not be allowed to resurrect data.
+        None => min_wal_id == 0,
+    }
 }
 
 fn next_wal_id(manifest_next_file_id: u64, wal_files: &[PathBuf]) -> u64 {

@@ -2498,6 +2498,31 @@ mod tests {
     }
 
     #[test]
+    fn test_drop_all_reopen_ignores_leftover_old_wal() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
+
+        db.put(b"flushed", b"old").unwrap();
+        force_flush(&db, "drop-all-wal-floor");
+        db.put(b"unflushed", b"old").unwrap();
+        db.drop_all().unwrap();
+        drop(db);
+
+        let stale_wal_path = dir.path().join("wal").join("wal_000001.log");
+        let mut stale_wal = engine::wal::Wal::create(&stale_wal_path).unwrap();
+        stale_wal
+            .append_put(&prefix_key(DEFAULT_CF_ID, b"resurrect"), b"bad", 99)
+            .unwrap();
+        stale_wal.sync().unwrap();
+
+        let db = Db::open(dir.path(), Options::default()).unwrap();
+        assert_eq!(db.get(b"flushed").unwrap(), None);
+        assert_eq!(db.get(b"unflushed").unwrap(), None);
+        assert_eq!(db.get(b"resurrect").unwrap(), None);
+        assert!(db.scan(None, None).unwrap().is_empty());
+    }
+
+    #[test]
     fn test_snapshot_isolation_across_flush() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
