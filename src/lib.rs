@@ -1633,6 +1633,81 @@ impl<'a> CfIter<'a> {
     }
 }
 
+/// Owned streaming iterator over a [`Snapshot`] in the default column
+/// family. This is useful for adapters that need to return an owned
+/// iterator object without tying the type to a borrowed snapshot
+/// lifetime.
+pub struct OwnedSnapshotIter {
+    inner: CfIter<'static>,
+    _snapshot: Snapshot,
+}
+
+impl OwnedSnapshotIter {
+    fn new(snapshot: Snapshot) -> Self {
+        let inner = Iter::<'static>::from_internal(snapshot.engine.new_iter(snapshot.seq))
+            .with_stats(snapshot.engine.statistics_arc());
+        Self {
+            inner: CfIter::new(inner, DEFAULT_CF_ID),
+            _snapshot: snapshot,
+        }
+    }
+
+    /// Position the cursor at the first key in the default CF.
+    pub fn seek_to_first(&mut self) {
+        self.inner.seek_to_first();
+    }
+
+    /// Position the cursor at the last key in the default CF.
+    pub fn seek_to_last(&mut self) {
+        self.inner.seek_to_last();
+    }
+
+    /// Position the cursor at the first key `>= target`.
+    pub fn seek(&mut self, target: &[u8]) {
+        self.inner.seek(target);
+    }
+
+    /// Position the cursor at the last key `<= target`.
+    pub fn seek_for_prev(&mut self, target: &[u8]) {
+        self.inner.seek_for_prev(target);
+    }
+
+    /// Position the cursor at the first key with `prefix`.
+    pub fn seek_prefix(&mut self, prefix: &[u8]) {
+        self.inner.seek_prefix(prefix);
+    }
+
+    /// Advance the cursor forward.
+    pub fn next(&mut self) {
+        self.inner.next();
+    }
+
+    /// Move the cursor backward.
+    pub fn prev(&mut self) {
+        self.inner.prev();
+    }
+
+    /// Whether the cursor is positioned on a visible key.
+    pub fn valid(&self) -> bool {
+        self.inner.valid()
+    }
+
+    /// Current key.
+    pub fn key(&self) -> Option<&[u8]> {
+        self.inner.key()
+    }
+
+    /// Current value.
+    pub fn value(&self) -> Option<&[u8]> {
+        self.inner.value()
+    }
+
+    /// Propagate any I/O error from the underlying iterator.
+    pub fn status(&self) -> Result<()> {
+        self.inner.status()
+    }
+}
+
 /// A point-in-time snapshot for consistent reads.
 pub struct Snapshot {
     engine: Arc<LarkEngine>,
@@ -1660,6 +1735,15 @@ impl std::fmt::Debug for Snapshot {
 }
 
 impl Snapshot {
+    fn clone_pin(&self) -> Self {
+        self.engine.register_snapshot(self.seq);
+        Self {
+            engine: Arc::clone(&self.engine),
+            cfs: Arc::clone(&self.cfs),
+            seq: self.seq,
+        }
+    }
+
     fn validate_cf_handle(&self, cf: &ColumnFamilyHandle) -> Result<()> {
         if self.cfs.is_live_handle(cf) {
             Ok(())
@@ -1740,6 +1824,21 @@ impl Snapshot {
                 .with_stats(self.engine.statistics_arc()),
             DEFAULT_CF_ID,
         )
+    }
+
+    /// Create an owned streaming iterator at this snapshot's sequence
+    /// (default CF). The iterator takes its own snapshot pin, so the
+    /// original snapshot remains usable for later reads.
+    pub fn owned_iter(&self) -> OwnedSnapshotIter {
+        OwnedSnapshotIter::new(self.clone_pin())
+    }
+
+    /// Consume this snapshot and create an owned streaming iterator
+    /// (default CF). The iterator keeps the snapshot pin alive for its
+    /// own lifetime, so it can be stored in trait objects that cannot
+    /// express a borrow from `Snapshot`.
+    pub fn into_owned_iter(self) -> OwnedSnapshotIter {
+        OwnedSnapshotIter::new(self)
     }
 
     /// CF-scoped get at this snapshot.
@@ -2613,6 +2712,33 @@ mod tests {
             assert_eq!(k, format!("k{:02}", i).as_bytes());
             assert_eq!(v, format!("v{}", i).as_bytes());
         }
+    }
+
+    #[test]
+    fn test_owned_snapshot_iter_streams_from_snapshot() {
+        let (db, _dir) = open_tmp();
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        let snapshot = db.snapshot();
+        db.put(b"c", b"3").unwrap();
+
+        let mut it = snapshot.owned_iter();
+        assert_eq!(snapshot.get(b"b").unwrap(), Some(b"2".to_vec()));
+
+        it.seek_to_first();
+        assert!(it.valid());
+        assert_eq!(it.key(), Some(b"a".as_ref()));
+        assert_eq!(it.value(), Some(b"1".as_ref()));
+        it.next();
+        assert_eq!(it.key(), Some(b"b".as_ref()));
+        it.next();
+        assert!(!it.valid());
+
+        it.seek_to_last();
+        assert_eq!(it.key(), Some(b"b".as_ref()));
+        it.prev();
+        assert_eq!(it.key(), Some(b"a".as_ref()));
+        it.status().unwrap();
     }
 
     #[test]
