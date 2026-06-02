@@ -1144,10 +1144,7 @@ impl SsTableReader {
         };
 
         let block = self.read_block(handle, cache)?;
-        for (ik, value) in block.iter() {
-            if compare_internal_keys(ik.as_slice(), search_key.as_slice()).is_lt() {
-                continue;
-            }
+        for (ik, value) in block.iter_from(&search_key) {
             let (uk, seq, vt) = decode_internal_key(&ik);
             if uk != user_key {
                 return Ok(LookupResult::NotInTable);
@@ -1190,10 +1187,7 @@ impl SsTableReader {
         };
 
         let block = self.read_block(handle, cache)?;
-        for (ik, value) in block.iter() {
-            if compare_internal_keys(ik.as_slice(), search_key.as_slice()).is_lt() {
-                continue;
-            }
+        for (ik, value) in block.iter_from(&search_key) {
             let (uk, seq, vt) = decode_internal_key(&ik);
             if uk != user_key {
                 return Ok(false);
