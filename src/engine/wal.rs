@@ -19,6 +19,7 @@ const RECORD_BATCH: u8 = 0x05;
 pub(crate) struct Wal {
     writer: BufWriter<File>,
     path: PathBuf,
+    parent_synced: bool,
 }
 
 /// A replayed WAL entry.
@@ -56,6 +57,7 @@ impl Wal {
         Ok(Self {
             writer: BufWriter::new(file),
             path: path.to_path_buf(),
+            parent_synced: false,
         })
     }
 
@@ -124,8 +126,20 @@ impl Wal {
 
     /// Flush and fsync the WAL to disk.
     pub(crate) fn sync(&mut self) -> io::Result<()> {
+        self.sync_with_parent_sync(durability::sync_parent_dir)
+    }
+
+    fn sync_with_parent_sync(
+        &mut self,
+        mut sync_parent: impl FnMut(&Path) -> io::Result<()>,
+    ) -> io::Result<()> {
         self.writer.flush()?;
-        self.writer.get_ref().sync_all()
+        self.writer.get_ref().sync_all()?;
+        if !self.parent_synced {
+            sync_parent(&self.path)?;
+            self.parent_synced = true;
+        }
+        Ok(())
     }
 
     /// Flush the buffer (without fsync).
@@ -864,6 +878,58 @@ mod tests {
         }
         let entries = Wal::replay(&path).unwrap();
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn sync_syncs_parent_dir_once() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.wal");
+        let mut wal = Wal::create(&path).unwrap();
+        wal.append_put(b"k", b"v", 1).unwrap();
+
+        let mut sync_count = 0;
+        wal.sync_with_parent_sync(|sync_path| {
+            assert_eq!(sync_path, path.as_path());
+            sync_count += 1;
+            Ok(())
+        })
+        .unwrap();
+        wal.sync_with_parent_sync(|_| {
+            sync_count += 1;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(sync_count, 1);
+    }
+
+    #[test]
+    fn sync_retries_parent_dir_sync_after_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.wal");
+        let mut wal = Wal::create(&path).unwrap();
+        wal.append_put(b"k", b"v", 1).unwrap();
+        let mut sync_count = 0;
+
+        let err = match wal.sync_with_parent_sync(|_| {
+            sync_count += 1;
+            Err(io::Error::other("injected parent sync failure"))
+        }) {
+            Ok(_) => panic!("expected parent sync failure"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "injected parent sync failure");
+
+        wal.sync_with_parent_sync(|sync_path| {
+            assert_eq!(sync_path, path.as_path());
+            sync_count += 1;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(sync_count, 2);
     }
 
     #[test]
