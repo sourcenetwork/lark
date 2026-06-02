@@ -100,6 +100,21 @@ impl Block {
             data: self.entry_data(),
             pos: 0,
             current_key: Vec::new(),
+            lower_bound: None,
+        }
+    }
+
+    /// Iterate entries starting at the first key `>= target`.
+    ///
+    /// The iterator begins at the restart point immediately before
+    /// `target` and skips entries until the lower bound is reached. The
+    /// skipped entries only reconstruct keys; their values are not copied.
+    pub(crate) fn iter_from<'a>(&'a self, target: &'a [u8]) -> BlockIterator<'a> {
+        BlockIterator {
+            data: self.entry_data(),
+            pos: self.restart_start_for(target),
+            current_key: Vec::new(),
+            lower_bound: Some(target),
         }
     }
 
@@ -161,22 +176,32 @@ pub(crate) struct BlockIterator<'a> {
     data: &'a [u8],
     pos: usize,
     current_key: Vec<u8>,
+    lower_bound: Option<&'a [u8]>,
 }
 
 impl<'a> Iterator for BlockIterator<'a> {
     type Item = (Vec<u8>, Vec<u8>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.data.len() {
-            return None;
+        loop {
+            if self.pos >= self.data.len() {
+                return None;
+            }
+
+            let (consumed, val_off, val_len) =
+                decode_entry_at(self.data, self.pos, &mut self.current_key);
+            self.pos += consumed;
+
+            if let Some(target) = self.lower_bound {
+                if compare_internal_keys(&self.current_key, target).is_lt() {
+                    continue;
+                }
+                self.lower_bound = None;
+            }
+
+            let value = self.data[val_off..val_off + val_len].to_vec();
+            return Some((self.current_key.clone(), value));
         }
-
-        let (consumed, val_off, val_len) =
-            decode_entry_at(self.data, self.pos, &mut self.current_key);
-        self.pos += consumed;
-        let value = self.data[val_off..val_off + val_len].to_vec();
-
-        Some((self.current_key.clone(), value))
     }
 }
 
@@ -556,6 +581,31 @@ mod tests {
         let block = Block::decode(b.finish()).unwrap();
         let got: Vec<_> = block.iter().collect();
         assert_eq!(got, pairs);
+    }
+
+    #[test]
+    fn iter_from_starts_at_first_entry_ge_target() {
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..20)
+            .map(|i| {
+                (
+                    format!("key_{:04}", i).into_bytes(),
+                    format!("val_{}", i).into_bytes(),
+                )
+            })
+            .collect();
+        let mut b = BlockBuilder::new(4);
+        for (k, v) in &pairs {
+            b.add(k, v);
+        }
+        let block = Block::decode(b.finish()).unwrap();
+
+        let got: Vec<_> = block.iter_from(b"key_0010").collect();
+        assert_eq!(got, pairs[10..].to_vec());
+
+        let got: Vec<_> = block.iter_from(b"key_0010_suffix").collect();
+        assert_eq!(got, pairs[11..].to_vec());
+
+        assert_eq!(block.iter_from(b"zzzz").next(), None);
     }
 
     #[test]
