@@ -3,6 +3,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::{checksum, durability};
+use crate::WriteBatchOp;
 
 /// Record types in the WAL.
 const RECORD_PUT: u8 = 0x01;
@@ -101,24 +102,22 @@ impl Wal {
         self.write_record(RECORD_DELETE_RANGE, &data)
     }
 
-    /// Append a batch record containing multiple logical WAL entries.
-    ///
-    /// The batch is one top-level WAL record with one checksum. Replay
-    /// expands it only after the whole payload parses successfully, so
-    /// a torn or malformed batch cannot recover as a committed prefix.
-    pub(crate) fn append_batch(&mut self, entries: &[WalEntry]) -> io::Result<()> {
-        if entries.is_empty() {
+    /// Append a batch record from write-batch operations without first
+    /// cloning them into replay entries.
+    pub(crate) fn append_ops_batch(
+        &mut self,
+        ops: &[WriteBatchOp],
+        base_seq: u64,
+    ) -> io::Result<()> {
+        if ops.is_empty() {
             return Ok(());
         }
 
-        let mut data = Vec::new();
-        data.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        let mut data = Vec::with_capacity(batch_ops_payload_len(ops));
+        data.extend_from_slice(&(ops.len() as u32).to_le_bytes());
 
-        for entry in entries {
-            let (record_type, payload) = encode_batch_entry(entry);
-            data.push(record_type);
-            data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            data.extend_from_slice(&payload);
+        for (i, op) in ops.iter().enumerate() {
+            encode_batch_op(&mut data, op, base_seq + i as u64);
         }
 
         self.write_record(RECORD_BATCH, &data)
@@ -272,27 +271,68 @@ fn encode_merge_payload(out: &mut Vec<u8>, key: &[u8], operand: &[u8], seq: u64)
     out.extend_from_slice(&seq.to_le_bytes());
 }
 
-fn encode_batch_entry(entry: &WalEntry) -> (u8, Vec<u8>) {
-    match entry {
-        WalEntry::Put { key, value, seq } => {
-            let mut payload = Vec::with_capacity(4 + key.len() + 4 + value.len() + 8);
-            encode_put_payload(&mut payload, key, value, *seq);
-            (RECORD_PUT, payload)
+fn put_payload_len(key: &[u8], value: &[u8]) -> usize {
+    4 + key.len() + 4 + value.len() + 8
+}
+
+fn delete_payload_len(key: &[u8]) -> usize {
+    4 + key.len() + 8
+}
+
+fn delete_range_payload_len(start: &[u8], end: &[u8]) -> usize {
+    4 + start.len() + 4 + end.len() + 8
+}
+
+fn merge_payload_len(key: &[u8], operand: &[u8]) -> usize {
+    4 + key.len() + 4 + operand.len() + 8
+}
+
+fn batch_op_payload_len(op: &WriteBatchOp) -> usize {
+    match op {
+        WriteBatchOp::Put { key, value } => put_payload_len(key, value),
+        WriteBatchOp::Delete { key } => delete_payload_len(key),
+        WriteBatchOp::DeleteRange { start, end } => delete_range_payload_len(start, end),
+        WriteBatchOp::Merge { key, operand } => merge_payload_len(key, operand),
+    }
+}
+
+fn batch_payload_len(entry_payload_len: usize) -> usize {
+    1 + 4 + entry_payload_len
+}
+
+fn batch_ops_payload_len(ops: &[WriteBatchOp]) -> usize {
+    4 + ops
+        .iter()
+        .map(|op| batch_payload_len(batch_op_payload_len(op)))
+        .sum::<usize>()
+}
+
+fn encode_batch_header(out: &mut Vec<u8>, record_type: u8, payload_len: usize) {
+    out.push(record_type);
+    out.extend_from_slice(&(payload_len as u32).to_le_bytes());
+}
+
+fn encode_batch_op(out: &mut Vec<u8>, op: &WriteBatchOp, seq: u64) {
+    match op {
+        WriteBatchOp::Put { key, value } => {
+            encode_batch_header(out, RECORD_PUT, put_payload_len(key, value));
+            encode_put_payload(out, key, value, seq);
         }
-        WalEntry::Delete { key, seq } => {
-            let mut payload = Vec::with_capacity(4 + key.len() + 8);
-            encode_delete_payload(&mut payload, key, *seq);
-            (RECORD_DELETE, payload)
+        WriteBatchOp::Delete { key } => {
+            encode_batch_header(out, RECORD_DELETE, delete_payload_len(key));
+            encode_delete_payload(out, key, seq);
         }
-        WalEntry::DeleteRange { start, end, seq } => {
-            let mut payload = Vec::with_capacity(4 + start.len() + 4 + end.len() + 8);
-            encode_delete_range_payload(&mut payload, start, end, *seq);
-            (RECORD_DELETE_RANGE, payload)
+        WriteBatchOp::DeleteRange { start, end } => {
+            encode_batch_header(
+                out,
+                RECORD_DELETE_RANGE,
+                delete_range_payload_len(start, end),
+            );
+            encode_delete_range_payload(out, start, end, seq);
         }
-        WalEntry::Merge { key, operand, seq } => {
-            let mut payload = Vec::with_capacity(4 + key.len() + 4 + operand.len() + 8);
-            encode_merge_payload(&mut payload, key, operand, *seq);
-            (RECORD_MERGE, payload)
+        WriteBatchOp::Merge { key, operand } => {
+            encode_batch_header(out, RECORD_MERGE, merge_payload_len(key, operand));
+            encode_merge_payload(out, key, operand, seq);
         }
     }
 }
@@ -731,39 +771,56 @@ mod tests {
     fn batch_record_replays_all_entries_in_order() {
         let dir = TempDir::new().unwrap();
         let (mut wal, path) = new_wal(&dir);
-        let expected = vec![
-            WalEntry::Put {
+        let ops = vec![
+            WriteBatchOp::Put {
                 key: b"p".to_vec(),
                 value: b"1".to_vec(),
-                seq: 1,
             },
-            WalEntry::Delete {
-                key: b"d".to_vec(),
-                seq: 2,
-            },
-            WalEntry::DeleteRange {
+            WriteBatchOp::Delete { key: b"d".to_vec() },
+            WriteBatchOp::DeleteRange {
                 start: b"ra".to_vec(),
                 end: b"rb".to_vec(),
-                seq: 3,
             },
-            WalEntry::Merge {
+            WriteBatchOp::Merge {
                 key: b"m".to_vec(),
                 operand: b"op".to_vec(),
-                seq: 4,
             },
         ];
-        wal.append_batch(&expected).unwrap();
+        wal.append_ops_batch(&ops, 10).unwrap();
         wal.flush().unwrap();
         drop(wal);
 
-        assert_eq!(Wal::replay(&path).unwrap(), expected);
+        assert_eq!(
+            Wal::replay(&path).unwrap(),
+            vec![
+                WalEntry::Put {
+                    key: b"p".to_vec(),
+                    value: b"1".to_vec(),
+                    seq: 10,
+                },
+                WalEntry::Delete {
+                    key: b"d".to_vec(),
+                    seq: 11,
+                },
+                WalEntry::DeleteRange {
+                    start: b"ra".to_vec(),
+                    end: b"rb".to_vec(),
+                    seq: 12,
+                },
+                WalEntry::Merge {
+                    key: b"m".to_vec(),
+                    operand: b"op".to_vec(),
+                    seq: 13,
+                },
+            ]
+        );
     }
 
     #[test]
-    fn empty_batch_append_is_noop() {
+    fn empty_ops_batch_append_is_noop() {
         let dir = TempDir::new().unwrap();
         let (mut wal, path) = new_wal(&dir);
-        wal.append_batch(&[]).unwrap();
+        wal.append_ops_batch(&[], 1).unwrap();
         wal.flush().unwrap();
         drop(wal);
 
