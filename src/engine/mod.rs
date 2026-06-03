@@ -96,30 +96,6 @@ fn append_single_wal_op(wal: &mut Wal, op: &WriteBatchOp, seq: u64) -> std::io::
     }
 }
 
-fn wal_entry_for_batch_op(op: &WriteBatchOp, seq: u64) -> WalEntry {
-    match op {
-        WriteBatchOp::Put { key, value } => WalEntry::Put {
-            key: key.clone(),
-            value: value.clone(),
-            seq,
-        },
-        WriteBatchOp::Delete { key } => WalEntry::Delete {
-            key: key.clone(),
-            seq,
-        },
-        WriteBatchOp::DeleteRange { start, end } => WalEntry::DeleteRange {
-            start: start.clone(),
-            end: end.clone(),
-            seq,
-        },
-        WriteBatchOp::Merge { key, operand } => WalEntry::Merge {
-            key: key.clone(),
-            operand: operand.clone(),
-            seq,
-        },
-    }
-}
-
 fn apply_batch_op_to_memtable(memtable: &MemTable, op: &WriteBatchOp, seq: u64) {
     match op {
         WriteBatchOp::Put { key, value } => memtable.put(key, value, seq),
@@ -1464,15 +1440,7 @@ impl LarkEngine {
             if total_ops == 1 {
                 append_single_wal_op(wal, &ops[0], base_seq)?;
             } else {
-                let wal_entries: Vec<WalEntry> = ops
-                    .iter()
-                    .enumerate()
-                    .map(|(i, op)| {
-                        let seq = base_seq + i as u64;
-                        wal_entry_for_batch_op(op, seq)
-                    })
-                    .collect();
-                wal.append_batch(&wal_entries)?;
+                wal.append_ops_batch(&ops, base_seq)?;
             }
             match durability {
                 DurabilityMode::Immediate => wal.sync()?,
