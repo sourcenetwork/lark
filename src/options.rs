@@ -177,6 +177,17 @@ pub trait PrefixExtractor: Send + Sync + 'static {
     /// are simply absent from the prefix bloom.
     fn extract<'a>(&self, key: &'a [u8]) -> Option<&'a [u8]>;
 
+    /// Return the bloom key that is safe to probe for a caller's
+    /// prefix-bounded scan. The default implementation only permits
+    /// exact extracted-prefix queries, preserving correctness for
+    /// custom extractors whose output may depend on more than a fixed
+    /// byte width. Extractors with stronger prefix-stability guarantees
+    /// can override this to enable broader SSTable skipping.
+    fn extract_query<'a>(&self, prefix: &'a [u8]) -> Option<&'a [u8]> {
+        let extracted = self.extract(prefix)?;
+        (extracted == prefix).then_some(extracted)
+    }
+
     /// A stable, human-readable identifier for this extractor. Used
     /// by tracing and diagnostics.
     fn name(&self) -> &'static str;
@@ -194,6 +205,10 @@ impl PrefixExtractor for FixedLengthPrefix {
         } else {
             None
         }
+    }
+
+    fn extract_query<'a>(&self, prefix: &'a [u8]) -> Option<&'a [u8]> {
+        self.extract(prefix)
     }
 
     fn name(&self) -> &'static str {
