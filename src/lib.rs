@@ -4692,6 +4692,39 @@ mod tests {
     }
 
     #[test]
+    fn test_seek_prefix_uses_extracted_bloom_probe_for_longer_prefix() {
+        let stats = Arc::new(Statistics::new());
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(
+            dir.path(),
+            Options {
+                write_buffer_size: 4 * 1024,
+                l0_compaction_trigger: 1_000,
+                bloom_bits_per_key: 64,
+                prefix_extractor: Some(Arc::new(FixedLengthPrefix(8))),
+                statistics: Some(stats.clone()),
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        db.put(b"aaaa:item", b"v").unwrap();
+        db.put(b"zzzz:item", b"v").unwrap();
+        force_flush(&db, "long_prefix_probe");
+
+        stats.reset();
+        let mut it = db.iter();
+        it.seek_prefix(b"bbbb:item");
+        assert!(!it.valid(), "absent long prefix should return empty");
+        it.status().unwrap();
+        assert_eq!(
+            stats.get_ticker(Ticker::BlockCacheMiss),
+            0,
+            "prefix bloom should skip the SSTable before loading a data block"
+        );
+    }
+
+    #[test]
     fn test_seek_prefix_across_flush_boundary() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), prefix_opts()).unwrap();

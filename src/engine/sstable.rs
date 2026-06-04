@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use super::block::{Block, BlockBuilder, BlockHandle, RESTART_INTERVAL};
+use super::block::{decode_entry_at, Block, BlockBuilder, BlockHandle, RESTART_INTERVAL};
 use super::block_cache::BlockCache;
 use super::bloom::{decode_bloom_block, encode_bloom_block, BloomFilter, BloomFilterBuilder};
 use super::checksum;
@@ -756,14 +756,23 @@ pub(crate) struct SsTableInternalIter<'a> {
     reader: &'a SsTableReader,
     cache: &'a BlockCache,
     next_cursor: Option<SsTableBlockCursor>,
-    current_block: std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
+    current_block: Option<Arc<Block>>,
+    current_pos: usize,
+    current_key: Vec<u8>,
 }
 
 impl<'a> SsTableInternalIter<'a> {
     pub(crate) fn next_entry(&mut self) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
         loop {
-            if let Some(entry) = self.current_block.next() {
-                return Ok(Some(entry));
+            if let Some(block) = &self.current_block {
+                let data = block.entry_data();
+                if self.current_pos < data.len() {
+                    let (consumed, value_offset, value_len) =
+                        decode_entry_at(data, self.current_pos, &mut self.current_key);
+                    self.current_pos += consumed;
+                    let value = data[value_offset..value_offset + value_len].to_vec();
+                    return Ok(Some((self.current_key.clone(), value)));
+                }
             }
 
             let Some(cursor) = self.next_cursor.take() else {
@@ -772,7 +781,9 @@ impl<'a> SsTableInternalIter<'a> {
             self.next_cursor = self.reader.next_block_cursor(&cursor)?;
 
             let block = self.reader.load_block_at_cursor(&cursor, self.cache)?;
-            self.current_block = block.iter().collect::<Vec<_>>().into_iter();
+            self.current_block = Some(block);
+            self.current_pos = 0;
+            self.current_key.clear();
         }
     }
 }
@@ -1221,7 +1232,9 @@ impl SsTableReader {
             reader: self,
             cache,
             next_cursor: self.first_block_cursor()?,
-            current_block: Vec::new().into_iter(),
+            current_block: None,
+            current_pos: 0,
+            current_key: Vec::new(),
         })
     }
 

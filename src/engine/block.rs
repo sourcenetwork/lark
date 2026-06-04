@@ -95,6 +95,7 @@ impl Block {
     }
 
     /// Iterate all entries in this block in sorted order.
+    #[cfg(test)]
     pub(crate) fn iter(&self) -> BlockIterator<'_> {
         BlockIterator {
             data: self.entry_data(),

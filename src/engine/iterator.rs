@@ -270,6 +270,7 @@ struct SsTableLevelIter {
     cached_value_offset: usize,
     cached_value_len: usize,
     valid: bool,
+    current_entry_index: Option<usize>,
     /// Lazily built on the first backward step; maps entry index to
     /// byte offset in entry_data.
     entry_offsets: Option<Vec<usize>>,
@@ -288,6 +289,7 @@ impl SsTableLevelIter {
             cached_value_offset: 0,
             cached_value_len: 0,
             valid: false,
+            current_entry_index: None,
             entry_offsets: None,
         }
     }
@@ -298,6 +300,7 @@ impl SsTableLevelIter {
         self.entry_pos = 0;
         self.next_entry_pos = 0;
         self.entry_offsets = None;
+        self.current_entry_index = None;
         self.cached_key.clear();
         Ok(())
     }
@@ -313,6 +316,10 @@ impl SsTableLevelIter {
         self.next_entry_pos = self.entry_pos + consumed;
         self.cached_value_offset = val_off;
         self.cached_value_len = val_len;
+        self.current_entry_index = self
+            .entry_offsets
+            .as_ref()
+            .and_then(|offsets| offsets.binary_search(&self.entry_pos).ok());
         self.valid = true;
     }
 
@@ -457,10 +464,11 @@ impl SsTableLevelIter {
             self.build_entry_offsets();
         }
         let offsets = self.entry_offsets.as_ref().unwrap();
-        let cur_idx = offsets
-            .iter()
-            .position(|&o| o == self.entry_pos)
-            .unwrap_or(0);
+        let cur_idx = self.current_entry_index.unwrap_or_else(|| {
+            offsets
+                .binary_search(&self.entry_pos)
+                .unwrap_or_else(|idx| idx.saturating_sub(1))
+        });
         if cur_idx == 0 {
             let prev = self
                 .reader
@@ -511,7 +519,6 @@ impl SsTableLevelIter {
             0
         };
         self.cached_key.clear();
-        let offsets = self.entry_offsets.as_ref().unwrap();
         let start_entry_idx = restart_idx * RESTART_INTERVAL;
         let mut pos = start_offset;
         for idx in start_entry_idx..=target_idx {
@@ -521,10 +528,10 @@ impl SsTableLevelIter {
                 self.next_entry_pos = pos + consumed;
                 self.cached_value_offset = val_off;
                 self.cached_value_len = val_len;
+                self.current_entry_index = Some(target_idx);
             }
             pos += consumed;
         }
-        let _ = offsets; // used for the target_idx contract only
     }
 }
 
@@ -903,11 +910,10 @@ pub(crate) struct LarkIterator {
     /// prefix. Cleared by any other seek.
     upper_bound: Option<Vec<u8>>,
     /// Prefix extractor captured at construction. Used by
-    /// [`LarkIterator::seek_prefix`] to decide whether the caller's
-    /// query prefix is a valid extracted prefix (in which case the
-    /// per-SSTable prefix bloom can be consulted) or an arbitrary
-    /// byte string (in which case we fall back to a plain upper-bound
-    /// scan without bloom skipping).
+    /// [`LarkIterator::seek_prefix`] to derive the bloom probe for
+    /// the caller's query prefix. If the extractor cannot produce a
+    /// prefix from the query itself, the iterator falls back to a
+    /// plain upper-bound scan without bloom skipping.
     prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
     /// Optional merge operator. When `Some`, the iterator collapses
     /// merge chains encountered during materialization into a
@@ -1124,19 +1130,19 @@ impl LarkIterator {
         self.direction = Direction::Forward;
         self.upper_bound = prefix_upper_bound(prefix);
 
-        // Only consult per-SSTable prefix blooms when the caller's
-        // query prefix is itself a valid extracted prefix — otherwise
-        // the bloom was hashed with different inputs and a negative
-        // answer is meaningless. Fall back to a plain seek + upper
-        // bound walk.
-        let can_skip = match &self.prefix_extractor {
-            Some(ex) => matches!(ex.extract(prefix), Some(p) if p == prefix),
-            None => false,
-        };
+        // Consult per-SSTable prefix blooms when the extractor can
+        // derive the same kind of bloom key from the query prefix that
+        // was indexed for table keys. This lets a fixed-length
+        // extractor skip whole files for longer prefixes that share
+        // the indexed stem.
+        let bloom_probe = self
+            .prefix_extractor
+            .as_ref()
+            .and_then(|ex| ex.extract_query(prefix).map(|p| p.to_vec()));
 
         let search_key = lookup_key(prefix, u64::MAX);
-        let res = if can_skip {
-            self.inner.seek_with_prefix_skip(&search_key, prefix)
+        let res = if let Some(probe) = bloom_probe.as_deref() {
+            self.inner.seek_with_prefix_skip(&search_key, probe)
         } else {
             self.inner.seek(&search_key)
         };
