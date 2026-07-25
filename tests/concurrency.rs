@@ -170,6 +170,72 @@ fn concurrent_batch_writers_are_atomic() {
 }
 
 #[test]
+fn snapshot_never_observes_a_torn_batch() {
+    // A snapshot taken while a batch commit is in flight must see the
+    // batch's keys all-or-nothing. The engine publishes the read horizon
+    // only after the whole batch is applied, so a snapshot at that horizon
+    // cannot catch the memtable mid-batch. Before that fix the sequence was
+    // advanced up front, and a reader could observe a prefix of the batch.
+    use lark_kv::WriteBatch;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as O};
+
+    let dir = TempDir::new().unwrap();
+    let db = Arc::new(open(&dir));
+    let batch_width = 12usize;
+    let total_batches = 6_000usize;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    // The batch the writer is about to commit, so the reader can aim its
+    // snapshots at the in-flight batch instead of hunting for it.
+    let frontier = Arc::new(AtomicUsize::new(0));
+
+    let writer = {
+        let db = Arc::clone(&db);
+        let frontier = Arc::clone(&frontier);
+        thread::spawn(move || {
+            for i in 0..total_batches {
+                frontier.store(i, O::Release);
+                let mut batch = WriteBatch::new();
+                for k in 0..batch_width {
+                    batch.put(format!("b{i}_{k}").as_bytes(), b"v");
+                }
+                db.write(batch).unwrap();
+            }
+        })
+    };
+
+    let reader = {
+        let db = Arc::clone(&db);
+        let stop = Arc::clone(&stop);
+        let frontier = Arc::clone(&frontier);
+        thread::spawn(move || {
+            while !stop.load(O::Relaxed) {
+                let at = frontier.load(O::Acquire);
+                let snap = db.snapshot();
+                // Check the in-flight batch and its neighbour: whichever the
+                // snapshot's horizon includes must be whole, never partial.
+                for i in [at, at + 1] {
+                    if i >= total_batches {
+                        continue;
+                    }
+                    let present = (0..batch_width)
+                        .filter(|k| snap.get(format!("b{i}_{k}").as_bytes()).unwrap().is_some())
+                        .count();
+                    assert!(
+                        present == 0 || present == batch_width,
+                        "snapshot saw a torn batch b{i}: {present}/{batch_width} keys",
+                    );
+                }
+            }
+        })
+    };
+
+    writer.join().unwrap();
+    stop.store(true, O::Relaxed);
+    reader.join().unwrap();
+}
+
+#[test]
 fn reads_during_compaction_return_correct_values() {
     // db_test.cc::ReadsDuringCompaction — reads issued in parallel
     // with a compaction that moves files between levels must keep
