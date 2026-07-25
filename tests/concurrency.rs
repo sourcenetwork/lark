@@ -156,7 +156,7 @@ fn concurrent_batch_writers_are_atomic() {
     // Every batch must have landed atomically — all three keys present.
     for t in 0..writer_count {
         for i in 0..batches_per_writer {
-            let present = [b'a', b'b', b'c']
+            let present = b"abc"
                 .iter()
                 .filter(|&&c| {
                     db.get(format!("t{}_{}_{}", t, i, c as char).as_bytes())
