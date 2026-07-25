@@ -260,7 +260,17 @@ pub(crate) struct LarkEngine {
     frozen_memtables: RwLock<Vec<Arc<MemTable>>>,
     versions: Arc<Mutex<VersionSet>>,
     cache: Arc<BlockCache>,
+    /// Sequence-number allocator. Advanced up front (before a write's
+    /// data lands) so WAL and memtable entries can be stamped, and used
+    /// as the durable "last sequence" marker for WAL replay.
     latest_seq: AtomicU64,
+    /// Published read horizon: the highest sequence whose data is fully
+    /// applied and durable. Snapshots read this, never `latest_seq`, so a
+    /// snapshot taken mid-commit cannot observe a sequence whose WAL and
+    /// memtable writes have not landed yet. Advanced monotonically
+    /// (`fetch_max`) after apply, so a slow writer can never publish a
+    /// lower horizon than a faster concurrent one.
+    visible_seq: AtomicU64,
     close_state: AtomicU8,
     close_lock: Mutex<()>,
     active_wal: Mutex<Option<Wal>>,
@@ -422,6 +432,7 @@ impl LarkEngine {
             versions,
             cache,
             latest_seq: AtomicU64::new(latest_seq),
+            visible_seq: AtomicU64::new(latest_seq),
             close_state: AtomicU8::new(CLOSE_STATE_OPEN),
             close_lock: Mutex::new(()),
             active_wal: Mutex::new(Some(wal)),
@@ -508,6 +519,7 @@ impl LarkEngine {
             versions,
             cache,
             latest_seq: AtomicU64::new(latest_seq),
+            visible_seq: AtomicU64::new(latest_seq),
             close_state: AtomicU8::new(CLOSE_STATE_OPEN),
             close_lock: Mutex::new(()),
             active_wal: Mutex::new(None),
@@ -526,7 +538,7 @@ impl LarkEngine {
     }
 
     pub(crate) fn snapshot_seq(&self) -> u64 {
-        self.latest_seq.load(Ordering::Acquire)
+        self.visible_seq.load(Ordering::Acquire)
     }
 
     pub(crate) fn is_read_only(&self) -> bool {
@@ -1366,6 +1378,7 @@ impl LarkEngine {
         self.validate_value_size(&value)?;
         let _write_guard = self.write_lock.lock();
         self.ensure_writable()?;
+        self.rotate_if_full()?;
         let seq = self.latest_seq.fetch_add(1, Ordering::AcqRel) + 1;
 
         if !disable_wal {
@@ -1400,9 +1413,10 @@ impl LarkEngine {
             memtable.put(&key, &value, seq);
         }
 
-        if self.active_memtable.read().approximate_size() >= self.options.write_buffer_size {
-            self.rotate_memtable()?;
-        }
+        // Publish visibility only now that the write is WAL-durable and
+        // applied. `fetch_max` keeps the horizon monotonic against a
+        // concurrent ingest publishing a different sequence.
+        self.visible_seq.fetch_max(seq, Ordering::AcqRel);
 
         Ok(())
     }
@@ -1423,6 +1437,8 @@ impl LarkEngine {
             return Ok(());
         }
         self.validate_ops_sizes(&ops)?;
+
+        self.rotate_if_full()?;
 
         let total_ops = ops.len();
         let base_seq = self
@@ -1469,9 +1485,12 @@ impl LarkEngine {
             }
         }
 
-        if self.active_memtable.read().approximate_size() >= self.options.write_buffer_size {
-            self.rotate_memtable()?;
-        }
+        // Publish visibility only now that the whole batch is WAL-durable
+        // and applied, so a snapshot can never observe a torn batch.
+        // `fetch_max` keeps the horizon monotonic against a concurrent
+        // ingest publishing a different sequence.
+        self.visible_seq
+            .fetch_max(base_seq + total_ops as u64 - 1, Ordering::AcqRel);
 
         Ok(())
     }
@@ -1576,6 +1595,19 @@ impl LarkEngine {
             }
         }
         Ok(None)
+    }
+
+    /// Rotate the active memtable when it has reached the write-buffer
+    /// size. Called at the *start* of a write path so that a rotation
+    /// failure is surfaced before the write is assigned a sequence or
+    /// applied — keeping write errors determinate: a returned error means
+    /// the write did not land, never that it landed but a later step
+    /// failed. Caller must hold `write_lock`.
+    fn rotate_if_full(&self) -> std::io::Result<()> {
+        if self.active_memtable.read().approximate_size() >= self.options.write_buffer_size {
+            self.rotate_memtable()?;
+        }
+        Ok(())
     }
 
     fn rotate_memtable(&self) -> std::io::Result<()> {
@@ -2139,6 +2171,12 @@ impl LarkEngine {
         ];
         self.versions.lock().apply(&edits)?;
 
+        // The ingested file is now installed in the version, so publish its
+        // sequence. `fetch_max` guards against a concurrent write (ingest
+        // holds the compaction lock, not the write lock) having already
+        // published a higher horizon.
+        self.visible_seq.fetch_max(ingest_seq, Ordering::AcqRel);
+
         if !self.options.listeners.is_empty() {
             // Fire the table-created event first (file-level
             // observation) and then the ingest-specific event
@@ -2399,6 +2437,7 @@ impl LarkEngine {
         let _old_wal = self.active_wal.lock().replace(new_wal);
         self.wal_id.store(wal_id, Ordering::Release);
         self.latest_seq.store(0, Ordering::Release);
+        self.visible_seq.store(0, Ordering::Release);
 
         self.versions.lock().compact_manifest()?;
 
