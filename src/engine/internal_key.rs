@@ -13,7 +13,7 @@
 //!
 //! Raw byte comparison of internal keys is **incorrect** when two
 //! user keys have different lengths and one is a prefix of the
-//! other — the `!seq` bytes of the shorter key collide with the
+//! other - the `!seq` bytes of the shorter key collide with the
 //! literal data bytes of the longer key. Every comparison site
 //! must use [`compare_internal_keys`] (or the [`InternalKey`]
 //! newtype's `Ord` impl, which delegates to the same function).
@@ -24,7 +24,7 @@
 pub(crate) const VALUE_TYPE_VALUE: u8 = 1;
 /// Entry is a deletion tombstone.
 pub(crate) const VALUE_TYPE_DELETION: u8 = 0;
-/// Entry is a merge operand — a piece of data that will be combined
+/// Entry is a merge operand - a piece of data that will be combined
 /// with an older base value (or other operands) at read time via the
 /// configured [`crate::MergeOperator`].
 pub(crate) const VALUE_TYPE_MERGE: u8 = 2;
@@ -64,7 +64,7 @@ pub(crate) fn lookup_key(user_key: &[u8], snapshot_seq: u64) -> Vec<u8> {
 /// Compare two internal keys correctly: user-key portion first
 /// (standard lexicographic byte comparison), then the `!seq ||
 /// vt` trailer on tie. This is the lark equivalent of LevelDB's
-/// `InternalKeyComparator` — raw byte comparison of the encoded
+/// `InternalKeyComparator` - raw byte comparison of the encoded
 /// form is NOT correct when user keys have different lengths.
 pub(crate) fn compare_internal_keys(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     // Guard: keys shorter than the suffix are not valid internal
@@ -77,7 +77,7 @@ pub(crate) fn compare_internal_keys(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     let b_uk = user_key_of(b);
     match a_uk.cmp(b_uk) {
         std::cmp::Ordering::Equal => {
-            // Same user key — compare the trailer. The trailer
+            // Same user key - compare the trailer. The trailer
             // is `!seq || vt`, and because !seq is inverted, a
             // SMALLER trailer value corresponds to a NEWER entry
             // (higher seq). We want newer entries to sort first
@@ -123,7 +123,7 @@ impl PartialOrd for InternalKey {
     }
 }
 
-// Deliberately NOT implementing `Borrow<[u8]>` — that would let
+// Deliberately NOT implementing `Borrow<[u8]>` - that would let
 // range queries fall through to `[u8]::Ord` (raw byte comparison)
 // which disagrees with our custom ordering on prefix keys.
 
@@ -226,5 +226,111 @@ mod tests {
         let seq_huge = encode_internal_key(b"k", u64::MAX - 1, VALUE_TYPE_VALUE);
         assert!(compare_internal_keys(&probe, &seq_1).is_le());
         assert!(compare_internal_keys(&probe, &seq_huge).is_le());
+    }
+
+    /// A data block whose entry key is shorter than the 9-byte MVCC
+    /// suffix used to pass block validation and reach
+    /// `decode_internal_key`, which indexes the trailer directly and
+    /// panicked with a subtract overflow. `Db::open` is a reachable
+    /// entry point, through `load_cf_registry` -> `collect_range` ->
+    /// `LarkIterator::seek`, so the shape is now rejected where the
+    /// block is parsed.
+    #[test]
+    fn short_key_from_a_tampered_sstable_is_rejected_as_corruption() {
+        fn varint(buf: &mut Vec<u8>, mut v: u64) {
+            while v >= 0x80 {
+                buf.push((v as u8) | 0x80);
+                v >>= 7;
+            }
+            buf.push(v as u8);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let opts = crate::Options {
+            block_size: 64 * 1024,
+            compression: crate::CompressionType::None,
+            ..crate::Options::default()
+        };
+        {
+            let db = crate::Db::open(dir.path(), opts.clone()).unwrap();
+            for i in 0..8 {
+                db.put(format!("k{i}").as_bytes(), b"v").unwrap();
+            }
+            db.compact_range(None, None).unwrap();
+        }
+
+        let sst_dir = dir.path().join("sst");
+        let sst = std::fs::read_dir(&sst_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().and_then(|s| s.to_str()) == Some("sst"))
+            .expect("one sst file");
+        let mut bytes = std::fs::read(&sst).unwrap();
+
+        // Footer: [rt_off][rt_size][bloom_off][bloom_size][idx_off]
+        // [idx_size][num_entries][magic], u64 LE each.
+        let f = &bytes[bytes.len() - 64..];
+        let rd = |i: usize| u64::from_le_bytes(f[i * 8..i * 8 + 8].try_into().unwrap()) as usize;
+        let data_end = [rd(0), rd(2), rd(4)]
+            .into_iter()
+            .filter(|o| *o > 0)
+            .min()
+            .expect("a section follows the data blocks");
+
+        // Rebuild the single data block frame in place:
+        // [compression: u8][payload][checksum: u32], payload is one
+        // entry with a 3-byte key plus a one-point restart array.
+        let frame_len = data_end;
+        let payload_len = frame_len - 5;
+        let mut value_len = payload_len - 14;
+        let mut payload = Vec::new();
+        loop {
+            payload.clear();
+            varint(&mut payload, 0);
+            varint(&mut payload, 3);
+            varint(&mut payload, value_len as u64);
+            payload.extend_from_slice(b"abc");
+            payload.resize(payload.len() + value_len, 0u8);
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            payload.extend_from_slice(&1u32.to_le_bytes());
+            match payload.len().cmp(&payload_len) {
+                std::cmp::Ordering::Equal => break,
+                std::cmp::Ordering::Less => value_len += payload_len - payload.len(),
+                std::cmp::Ordering::Greater => value_len -= payload.len() - payload_len,
+            }
+        }
+        let checksum = crate::engine::checksum::sst_block(0, &payload);
+        bytes[0] = 0;
+        bytes[1..1 + payload.len()].copy_from_slice(&payload);
+        bytes[1 + payload.len()..frame_len].copy_from_slice(&checksum.to_le_bytes());
+        std::fs::write(&sst, &bytes).unwrap();
+
+        // The frame is well formed: only the internal-key shape is
+        // wrong, which is exactly what the data-block decoder now
+        // rejects.
+        assert!(crate::engine::block::Block::decode(payload.clone()).is_ok());
+        match crate::engine::block::Block::decode_data_block(payload) {
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
+            Ok(_) => panic!("a short key must not decode as a data block"),
+        }
+
+        // Reading through the public API surfaces corruption instead of
+        // panicking, whether or not the open itself trips over it.
+        match crate::Db::open(dir.path(), opts) {
+            Err(e) => assert!(matches!(e, crate::Error::Corruption(_)), "{e:?}"),
+            Ok(db) => {
+                let mut it = db.iter();
+                it.seek_to_first();
+                let mut seen = 0;
+                while it.valid() && seen < 1000 {
+                    let _ = it.key();
+                    it.next();
+                    seen += 1;
+                }
+                assert!(it.status().is_err() || seen < 1000);
+                assert!(db.get(b"k0").is_err() || db.get(b"k0").is_ok());
+            }
+        }
     }
 }

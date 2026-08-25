@@ -39,10 +39,10 @@ pub(crate) enum DurabilityMode {
     Eventual,
 }
 
-/// Outcome of [`LarkEngine::commit_optimistic`]. `Conflict`
-/// indicates that another writer changed one of the tracked keys
-/// after the transaction's snapshot seq; the caller typically
-/// surfaces this as a retry-able error.
+/// Outcome of [`LarkEngine::commit_with_conflict_check`].
+/// `Conflict` indicates that another writer changed one of the
+/// tracked keys after the sequence the transaction observed it at;
+/// the caller typically surfaces this as a retry-able error.
 #[derive(Debug)]
 pub(crate) enum CommitOutcome {
     Ok,
@@ -302,7 +302,7 @@ pub(crate) struct LarkEngine {
     /// Cached stall level: 0 = none, 1 = slowdown, 2 = stop.
     /// Updated by `rotate_memtable` (after changing L0/memtable
     /// counts) and by the compaction thread (after reducing them).
-    /// Writers check this atomic first — the full `stall_state()`
+    /// Writers check this atomic first - the full `stall_state()`
     /// with its lock acquisitions is only called when the cached
     /// level is nonzero, saving 2 lock round-trips per write in
     /// the common no-stall case.
@@ -416,6 +416,9 @@ impl LarkEngine {
         let compaction_lock = Arc::new(RwLock::new(()));
         let snapshot_registry = Arc::new(SnapshotRegistry::new());
         let stall_signal = Arc::new(StallSignal::new());
+        // A platform that cannot spawn the worker (a single-threaded
+        // target) fails the open here instead of aborting; the
+        // directory lock and the fresh WAL drop with this return.
         let compaction = CompactionScheduler::start(
             Arc::clone(&compaction_lock),
             Arc::clone(&snapshot_registry),
@@ -424,7 +427,7 @@ impl LarkEngine {
             Arc::clone(&cache),
             compaction_opts,
             Arc::clone(&stall_signal),
-        );
+        )?;
 
         let engine = Arc::new(Self {
             active_memtable: RwLock::new(memtable),
@@ -665,7 +668,7 @@ impl LarkEngine {
         }
     }
 
-    /// Current GC horizon for compaction — the smallest live snapshot
+    /// Current GC horizon for compaction - the smallest live snapshot
     /// seq, or `u64::MAX` if no snapshot is currently pinned.
     pub(crate) fn oldest_live_seq(&self) -> u64 {
         self.snapshot_registry.oldest_live_seq()
@@ -673,7 +676,7 @@ impl LarkEngine {
 
     /// Construct a streaming iterator rooted at `snapshot_seq`. Captures
     /// the current memtable state and the current version; no filesystem
-    /// access happens here — file handles are already open in the
+    /// access happens here - file handles are already open in the
     /// pinned `Arc<LiveSst>`s carried by the version.
     pub(crate) fn new_iter(&self, snapshot_seq: u64) -> iterator::LarkIterator {
         let closed = self.is_closed();
@@ -708,7 +711,7 @@ impl LarkEngine {
     /// covering range tombstone, carrying the largest RT seq forward so
     /// a range delete in a newer source can override a point entry in
     /// an older source. The first source yielding a decisive answer
-    /// wins — a point entry with `seq > max_rt_so_far` gives its value;
+    /// wins - a point entry with `seq > max_rt_so_far` gives its value;
     /// otherwise the range tombstone hides it.
     ///
     /// When a [`crate::MergeOperator`] is configured, the walk also
@@ -717,12 +720,12 @@ impl LarkEngine {
     /// value at visibility time.
     pub(crate) fn get(&self, key: &[u8], snapshot_seq: u64) -> std::io::Result<Option<Vec<u8>>> {
         self.ensure_open()?;
-        if self.options.merge_operator.is_some() {
-            return self.get_with_merge(key, snapshot_seq);
+        if let Some(merge_op) = self.options.merge_operator.as_ref() {
+            return self.get_with_merge(key, snapshot_seq, merge_op);
         }
         let mut max_rt_seq: u64 = 0;
 
-        // Memtable phase — timed via `PerfContext` at
+        // Memtable phase - timed via `PerfContext` at
         // `PerfLevel::EnableTime` so per-op breakdowns can
         // attribute time to "memtable vs SSTable".
         {
@@ -753,7 +756,7 @@ impl LarkEngine {
             }
         }
 
-        // SSTable phase — likewise timed. Everything below this
+        // SSTable phase - likewise timed. Everything below this
         // line is the "get_from_output_files" time.
         let _t_ssts = crate::perf_context::PerfTimer::new(
             crate::perf_context::PerfTimerField::GetFromOutputFiles,
@@ -762,7 +765,7 @@ impl LarkEngine {
 
         // L0: check all files (may overlap), newest first. Readers are
         // already open in the pinned `Version`, so no filesystem access
-        // happens here — concurrent compaction unlinking paths cannot
+        // happens here - concurrent compaction unlinking paths cannot
         // break us.
         for file in version.levels[0].iter().rev() {
             let rt = file.reader.covering_range_tombstone_seq(key, snapshot_seq);
@@ -830,17 +833,16 @@ impl LarkEngine {
     /// [`crate::MergeOperator::full_merge`] at the end to materialize
     /// the final value.
     ///
-    /// Callers are responsible for having checked that
-    /// `self.options.merge_operator.is_some()`; this helper asserts
-    /// internally.
-    fn get_with_merge(&self, key: &[u8], snapshot_seq: u64) -> std::io::Result<Option<Vec<u8>>> {
+    /// `merge_op` is the operator the caller already resolved from
+    /// the options, passed in so this helper cannot be reached
+    /// without one.
+    fn get_with_merge(
+        &self,
+        key: &[u8],
+        snapshot_seq: u64,
+        merge_op: &Arc<dyn crate::options::MergeOperator>,
+    ) -> std::io::Result<Option<Vec<u8>>> {
         use internal_key::{VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE};
-
-        let merge_op = self
-            .options
-            .merge_operator
-            .as_ref()
-            .expect("get_with_merge called without a merge operator");
 
         // `chain` records visible entries for `key` in newest-seq-
         // first order, stopping at (and including) the first
@@ -968,14 +970,8 @@ impl LarkEngine {
         // entry (if any) is either a real VALUE / DELETION terminator
         // or (if !terminated) the oldest visible merge operand.
         let (base_slice, has_terminator) = match chain.last() {
-            Some((_, vt, _)) if *vt == VALUE_TYPE_VALUE || *vt == VALUE_TYPE_DELETION => {
-                let base = if *vt == VALUE_TYPE_VALUE {
-                    Some(chain.last().unwrap().2.as_slice())
-                } else {
-                    None
-                };
-                (base, true)
-            }
+            Some((_, VALUE_TYPE_VALUE, value)) => (Some(value.as_slice()), true),
+            Some((_, VALUE_TYPE_DELETION, _)) => (None, true),
             _ => (None, false),
         };
 
@@ -994,7 +990,7 @@ impl LarkEngine {
         }
 
         if operands_owned.is_empty() {
-            // No merges at all — the chain is just a plain
+            // No merges at all - the chain is just a plain
             // Value / Deletion / nothing. Return the base directly.
             return Ok(base_slice.map(|s| s.to_vec()));
         }
@@ -1012,9 +1008,9 @@ impl LarkEngine {
     /// per input key in the same order as `keys`. Duplicate keys in the
     /// input produce duplicate results.
     ///
-    /// The batch amortizes per-call overhead — a single version snapshot,
+    /// The batch amortizes per-call overhead - a single version snapshot,
     /// a single memtable lock acquisition per level, one logical walk of
-    /// the source hierarchy — and short-circuits once every key has been
+    /// the source hierarchy - and short-circuits once every key has been
     /// resolved. All keys see the **same** consistent view, regardless of
     /// concurrent writers.
     pub(crate) fn multi_get(
@@ -1024,14 +1020,14 @@ impl LarkEngine {
     ) -> std::io::Result<Vec<Option<Vec<u8>>>> {
         self.ensure_open()?;
         // When a merge operator is configured, fall back to per-key
-        // resolution — the batched walk's short-circuiting logic
+        // resolution - the batched walk's short-circuiting logic
         // doesn't compose cleanly with merge-chain collection, and
         // merges are rare enough that the cost difference isn't
         // worth a specialized batched path.
-        if self.options.merge_operator.is_some() {
+        if let Some(merge_op) = self.options.merge_operator.as_ref() {
             let mut out = Vec::with_capacity(keys.len());
             for key in keys {
-                out.push(self.get_with_merge(key, snapshot_seq)?);
+                out.push(self.get_with_merge(key, snapshot_seq, merge_op)?);
             }
             return Ok(out);
         }
@@ -1199,10 +1195,10 @@ impl LarkEngine {
     /// Classify the current state against the configured stall
     /// thresholds. Returns:
     ///
-    /// * `None` — writes may proceed freely.
-    /// * `Some(("...", true))` — hard stop: block writers until
+    /// * `None` - writes may proceed freely.
+    /// * `Some(("...", true))` - hard stop: block writers until
     ///   compaction relieves the condition.
-    /// * `Some(("...", false))` — slowdown: add a small delay per
+    /// * `Some(("...", false))` - slowdown: add a small delay per
     ///   write so the foreground write rate tracks compaction.
     fn stall_state(&self) -> Option<(&'static str, bool)> {
         let (l0, memtables, pending_bytes) = self.stall_snapshot();
@@ -1282,7 +1278,7 @@ impl LarkEngine {
             }
             match self.stall_state() {
                 None => {
-                    // Stall cleared — update the cache so
+                    // Stall cleared - update the cache so
                     // subsequent writers take the fast path.
                     self.cached_stall_level.store(0, Ordering::Release);
                     break;
@@ -1305,7 +1301,7 @@ impl LarkEngine {
                     }
                     any_stall = true;
                     std::thread::sleep(Self::SLOWDOWN_DELAY);
-                    // One slowdown delay per call — don't loop, or
+                    // One slowdown delay per call - don't loop, or
                     // a writer that just crossed the trigger would
                     // stall indefinitely at low rates.
                     break;
@@ -1331,7 +1327,7 @@ impl LarkEngine {
     ///
     /// `durability` controls WAL fsync semantics (`Immediate` = fsync
     /// per call, `Eventual` = buffered flush). `disable_wal` skips
-    /// the WAL append entirely — the caller accepts that a crash
+    /// the WAL append entirely - the caller accepts that a crash
     /// before the next memtable flush loses the write.
     pub(crate) fn apply_batch(
         &self,
@@ -1363,7 +1359,7 @@ impl LarkEngine {
         self.apply_batch(ops, durability, disable_wal)
     }
 
-    /// Fast path for a single put — avoids BTreeMap construction,
+    /// Fast path for a single put - avoids BTreeMap construction,
     /// WAL formatting, and memtable insertion overhead for the
     /// most common write operation.
     pub(crate) fn apply_single_put(
@@ -1495,24 +1491,26 @@ impl LarkEngine {
         Ok(())
     }
 
-    /// Attempt to commit an optimistic transaction's buffered
-    /// writes. Performs the write-write conflict check under the
-    /// engine write-lock: for every key the transaction wrote (or
-    /// explicitly tracked for conflict detection), verify that no
-    /// version newer than `snapshot_seq` has landed since the
-    /// transaction started. On conflict returns
-    /// `Ok(CommitOutcome::Conflict { key })`. Otherwise applies the
-    /// buffered writes atomically and returns `Ok(CommitOutcome::Ok)`.
+    /// Commit a transaction's buffered writes under the engine
+    /// write lock. For every `(key, observed_seq)` pair, verify that
+    /// no version of `key` newer than `observed_seq` has landed
+    /// since the transaction observed it; if one has, return
+    /// `Ok(CommitOutcome::Conflict { .. })` without applying
+    /// anything. Otherwise apply the batch atomically and return
+    /// `Ok(CommitOutcome::Ok)`.
+    ///
+    /// An optimistic transaction passes its begin snapshot seq for
+    /// every key. A pessimistic transaction passes, per key, the
+    /// read horizon sampled when it took that key's lock.
     ///
     /// Range-delete operations from a transaction are applied
-    /// unconditionally — their conflict semantics require tracking
+    /// unconditionally: their conflict semantics require tracking
     /// every key the range could shadow, which the initial
     /// transaction impl does not support. See the transaction
     /// module for the caveat.
-    pub(crate) fn commit_optimistic(
+    pub(crate) fn commit_with_conflict_check(
         &self,
-        conflict_keys: &[Vec<u8>],
-        snapshot_seq: u64,
+        conflict_keys: &[(Vec<u8>, u64)],
         point_ops: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
         merges: Vec<(Vec<u8>, Vec<u8>)>,
@@ -1521,16 +1519,16 @@ impl LarkEngine {
         self.ensure_writable()?;
         let _write_guard = self.write_lock.lock();
 
-        // Conflict check: for each tracked key, peek at the latest
-        // visible version without a snapshot bound. If its seq is
-        // newer than `snapshot_seq`, someone wrote to the key after
-        // the transaction began.
-        for key in conflict_keys {
+        // For each tracked key, peek at the latest visible version
+        // without a snapshot bound. If its seq is newer than the one
+        // the transaction observed the key at, someone else wrote to
+        // the key in between.
+        for (key, observed_seq) in conflict_keys {
             if let Some(latest_seq) = self.latest_version_seq(key)? {
-                if latest_seq > snapshot_seq {
+                if latest_seq > *observed_seq {
                     return Ok(CommitOutcome::Conflict {
                         key: key.clone(),
-                        observed_seq: snapshot_seq,
+                        observed_seq: *observed_seq,
                         latest_seq,
                     });
                 }
@@ -1542,33 +1540,43 @@ impl LarkEngine {
         Ok(CommitOutcome::Ok)
     }
 
-    /// Return the sequence number of the newest visible point
-    /// entry for `key` across every source, or `None` if no live
-    /// version exists. Used by optimistic transaction commit to
-    /// detect write-write conflicts. Ignores range tombstones and
-    /// merge operators — the caller only needs to know "was this
-    /// key written to again?".
+    /// Return the sequence number of the newest write that touched
+    /// `key` across every source, or `None` if nothing ever wrote it.
+    /// Used by transaction commit to detect conflicts, so it counts
+    /// every kind of write: point entries, point tombstones, merge
+    /// operands, and range tombstones that cover the key. The caller
+    /// only needs to know "was this key written to again?".
+    ///
+    /// Sources are visited newest-first and range-tombstone coverage
+    /// is accumulated on the way down, mirroring the read path: a
+    /// tombstone in a newer source outranks a point entry found in an
+    /// older one.
     fn latest_version_seq(&self, key: &[u8]) -> std::io::Result<Option<u64>> {
         let snap = u64::MAX;
+        let mut max_rt_seq: u64 = 0;
+        let newest = |point_seq: u64, max_rt_seq: u64| Some(point_seq.max(max_rt_seq));
         {
             let active = self.active_memtable.read();
+            max_rt_seq = max_rt_seq.max(active.covering_range_tombstone_seq(key, snap));
             if let Some((seq, _)) = active.get(key, snap) {
-                return Ok(Some(seq));
+                return Ok(newest(seq, max_rt_seq));
             }
         }
         {
             let frozen = self.frozen_memtables.read();
             for mt in frozen.iter().rev() {
+                max_rt_seq = max_rt_seq.max(mt.covering_range_tombstone_seq(key, snap));
                 if let Some((seq, _)) = mt.get(key, snap) {
-                    return Ok(Some(seq));
+                    return Ok(newest(seq, max_rt_seq));
                 }
             }
         }
         let version = self.versions.lock().current();
         for file in version.levels[0].iter().rev() {
+            max_rt_seq = max_rt_seq.max(file.reader.covering_range_tombstone_seq(key, snap));
             match file.reader.get(key, snap, &self.cache)? {
                 LookupResult::Found { seq, .. } | LookupResult::FoundTombstone { seq } => {
-                    return Ok(Some(seq));
+                    return Ok(newest(seq, max_rt_seq));
                 }
                 LookupResult::NotInTable => {}
             }
@@ -1577,6 +1585,14 @@ impl LarkEngine {
             let files = &version.levels[level];
             if files.is_empty() {
                 continue;
+            }
+            for file in files {
+                if file.meta.smallest_key.as_slice() <= key
+                    && key <= file.meta.largest_key.as_slice()
+                {
+                    max_rt_seq =
+                        max_rt_seq.max(file.reader.covering_range_tombstone_seq(key, snap));
+                }
             }
             for file in files {
                 if file.meta.num_entries == 0 {
@@ -1588,11 +1604,14 @@ impl LarkEngine {
                 }
                 match file.reader.get(key, snap, &self.cache)? {
                     LookupResult::Found { seq, .. } | LookupResult::FoundTombstone { seq } => {
-                        return Ok(Some(seq));
+                        return Ok(newest(seq, max_rt_seq));
                     }
                     LookupResult::NotInTable => {}
                 }
             }
+        }
+        if max_rt_seq > 0 {
+            return Ok(Some(max_rt_seq));
         }
         Ok(None)
     }
@@ -1600,7 +1619,7 @@ impl LarkEngine {
     /// Rotate the active memtable when it has reached the write-buffer
     /// size. Called at the *start* of a write path so that a rotation
     /// failure is surfaced before the write is assigned a sequence or
-    /// applied — keeping write errors determinate: a returned error means
+    /// applied - keeping write errors determinate: a returned error means
     /// the write did not land, never that it landed but a later step
     /// failed. Caller must hold `write_lock`.
     fn rotate_if_full(&self) -> std::io::Result<()> {
@@ -1670,7 +1689,7 @@ impl LarkEngine {
 
         let sst_path = self.sst_dir.join(sst_filename(file_id));
 
-        // Memtable flushes always land at L0 — pick L0's codec.
+        // Memtable flushes always land at L0 - pick L0's codec.
         let mut writer = SsTableWriter::new(
             &sst_path,
             self.options.block_size,
@@ -1917,7 +1936,7 @@ impl LarkEngine {
     ///   disjoint from the input range.
     ///
     /// If `ingest_behind` is set the file is forced to the bottommost
-    /// level — any overlap is an error. If `snapshot_consistency` is
+    /// level - any overlap is an error. If `snapshot_consistency` is
     /// set the call is rejected while any snapshot is pinned (ingest
     /// would otherwise inject a new seq that older snapshots cannot
     /// consistently observe).
@@ -2054,8 +2073,8 @@ impl LarkEngine {
             });
         }
 
-        // Exclude all background workers for the duration of the ingest
-        // — same pattern as `compact_range`.
+        // Exclude all background workers for the duration of the
+        // ingest, the same pattern as `compact_range`.
         let _compact_guard = self.compaction_lock.write();
         self.ensure_writable()?;
 
@@ -2076,7 +2095,7 @@ impl LarkEngine {
 
         // Flush the active memtable if it overlaps the ingest range.
         // The cheapest correct thing is to flush unconditionally when
-        // the memtable is non-empty and we might be landing at L0 —
+        // the memtable is non-empty and we might be landing at L0 -
         // which is the only level where a concurrent memtable could
         // shadow the ingested keys.
         let needs_flush = {
@@ -2229,7 +2248,7 @@ impl LarkEngine {
     /// The returned [`CheckpointSnapshot`] holds the engine's
     /// compaction lock, pinning every referenced file against
     /// concurrent unlink. Callers MUST drop the snapshot as soon as
-    /// their filesystem work is done — a snapshot whose lifetime
+    /// their filesystem work is done - a snapshot whose lifetime
     /// outlives the enclosing function scope can deadlock a
     /// concurrent `db.close()` / `drop(db)` that joins the background
     /// compaction thread (the thread will block on the same lock the
@@ -2269,9 +2288,9 @@ impl LarkEngine {
             // captured boundary. Concurrent flushes still append
             // `AddFile` records (they take `versions.lock()` but not
             // the compaction lock we're holding), and those records
-            // reference files that are *not* in the captured version
-            // — copying them into a checkpoint manifest would cause
-            // recovery to fail on the missing files.
+            // reference files that are *not* in the captured
+            // version. Copying them into a checkpoint manifest would
+            // make recovery fail on the missing files.
             manifest_len = std::fs::metadata(&manifest_path)?.len();
         }
 
@@ -2287,7 +2306,7 @@ impl LarkEngine {
     /// Approximate on-disk bytes whose user key falls in
     /// `[start, end)`. Fans out over every SSTable whose own
     /// user-key range overlaps the query range and sums their
-    /// per-range estimates. Index-only — no data-block decompression
+    /// per-range estimates. Index-only - no data-block decompression
     /// happens, so the cost scales with `num_files * log(num_blocks)`.
     pub(crate) fn approximate_size_in_range(&self, start: &[u8], end: &[u8]) -> u64 {
         if start >= end {
@@ -2311,7 +2330,7 @@ impl LarkEngine {
 
     /// Exact `(count, size)` for every entry in the active memtable
     /// whose user key falls in `[start, end)`. Frozen memtables are
-    /// *not* included — a caller that wants "everything in memory"
+    /// *not* included - a caller that wants "everything in memory"
     /// should call this and also walk the frozen memtables
     /// separately.
     pub(crate) fn approximate_memtable_stats(&self, start: &[u8], end: &[u8]) -> (u64, u64) {
@@ -2323,7 +2342,7 @@ impl LarkEngine {
     // ── property helpers ───────────────────────────────────────────────
     //
     // These return raw values consumed by `Db::get_property` /
-    // `Db::get_int_property`. Every method is cheap — no block
+    // `Db::get_int_property`. Every method is cheap - no block
     // reads, no locks held beyond a short `versions.lock()` or
     // memtable read.
 
@@ -2341,7 +2360,7 @@ impl LarkEngine {
     }
 
     /// Total size in bytes across every level of the current
-    /// version — sum of every `LiveSst::meta.file_size`.
+    /// version - sum of every `LiveSst::meta.file_size`.
     pub(crate) fn total_sst_size(&self) -> u64 {
         let version = self.versions.lock().current();
         version
@@ -2381,7 +2400,7 @@ impl LarkEngine {
             .sum()
     }
 
-    /// Number of live snapshots. Counts pins, not distinct seqs —
+    /// Number of live snapshots. Counts pins, not distinct seqs -
     /// two snapshots taken at the same seq contribute two.
     pub(crate) fn live_snapshot_count(&self) -> u64 {
         self.snapshot_registry.live_count()
@@ -2407,7 +2426,7 @@ impl LarkEngine {
     }
 
     /// Borrow the current version so a caller can walk every
-    /// SSTable's metadata — used by `lark.sstables` formatter.
+    /// SSTable's metadata - used by `lark.sstables` formatter.
     pub(crate) fn current_version(&self) -> Arc<manifest::Version> {
         self.versions.lock().current()
     }
@@ -2477,7 +2496,7 @@ impl LarkEngine {
     /// Test-only: collect every raw `(seq, value_type)` version of
     /// `user_key` currently persisted across all SSTables. Used by the
     /// snapshot-pinning GC tests to check the post-compaction on-disk
-    /// state — not just what reads see.
+    /// state - not just what reads see.
     #[cfg(test)]
     pub(crate) fn all_persisted_versions_of(
         &self,
@@ -2663,7 +2682,7 @@ fn compute_target_level(
 /// lock for its entire lifetime, so no background or foreground
 /// compaction can unlink files referenced by `version` while the
 /// snapshot is alive. Callers MUST drop this snapshot as soon as
-/// they are done with the filesystem work — a snapshot whose
+/// they are done with the filesystem work - a snapshot whose
 /// lifetime outlives the enclosing function scope can deadlock a
 /// concurrent `db.close()` / `drop(db)` that joins the background
 /// compaction thread (the thread will block waiting for the same
@@ -2682,7 +2701,7 @@ pub(crate) struct CheckpointSnapshot {
 }
 
 impl CheckpointSnapshot {
-    /// Format an SSTable filename for the given file id — exposes
+    /// Format an SSTable filename for the given file id - exposes
     /// the engine's naming scheme to callers outside the `engine`
     /// module so they can stage files into checkpoint / backup
     /// directories.

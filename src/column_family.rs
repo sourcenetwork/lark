@@ -1,4 +1,4 @@
-//! Column families — multiple logically isolated keyspaces inside
+//! Column families - multiple logically isolated keyspaces inside
 //! one [`crate::Db`].
 //!
 //! # Design
@@ -36,7 +36,7 @@
 //!
 //! [`crate::Options::atomic_flush`] is accepted for parity with
 //! storage engines that require an explicit opt-in to get this
-//! guarantee — under lark's design its value is irrelevant, the
+//! guarantee - under lark's design its value is irrelevant, the
 //! guarantee is always on.
 //!
 //! ## Metadata storage
@@ -176,7 +176,7 @@ pub(crate) mod meta {
 }
 
 /// In-memory cache of the on-disk CF registry. Guarded by a
-/// single mutex — CF creation and drop are rare relative to point
+/// single mutex - CF creation and drop are rare relative to point
 /// writes, and the common path (`column_family(name)`) only reads.
 pub(crate) struct CfRegistry {
     inner: Mutex<CfRegistryInner>,

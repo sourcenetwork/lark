@@ -1,4 +1,4 @@
-//! `lark-bench` — a simple benchmark driver for lark, modeled
+//! `lark-bench` - a simple benchmark driver for lark, modeled
 //! after the workloads in db_bench.
 //!
 //! ```sh
@@ -294,7 +294,7 @@ fn run_readmissing(db: &Db, args: &Args, seed: u64) {
     let mut rng = SmallRng::seed_from_u64(seed);
     let start = Instant::now();
     for _ in 0..args.num {
-        // Keys that don't exist — random bytes unlikely to match
+        // Keys that don't exist - random bytes unlikely to match
         // the zero-padded sequential format.
         let key = random_key(&mut rng, args.key_size);
         let _ = db.get(&key);
@@ -359,7 +359,7 @@ fn run_fillsync(db: &Db, args: &Args, _seed: u64) {
     let val = random_value(&mut rng, args.value_size);
     let wo = WriteOptions::sync();
     let start = Instant::now();
-    // Cap fillsync at 1/10 the configured count — sync writes
+    // Cap fillsync at 1/10 the configured count - sync writes
     // are orders of magnitude slower, and the user almost
     // certainly doesn't want to run a million of them.
     let n = args.num.min(args.num.max(1) / 10).max(1000);
@@ -409,7 +409,7 @@ fn run_updaterandom(db: &Db, args: &Args, seed: u64) {
 
 fn run_readwhilewriting(db: &Db, args: &Args, seed: u64) {
     // Foreground reads while a background thread writes. The
-    // reporter reports *reader* throughput only — writers run
+    // reporter reports *reader* throughput only - writers run
     // until the reader finishes.
     prefill_sequential(db, args);
     let stop = Arc::new(AtomicBool::new(false));
@@ -419,7 +419,7 @@ fn run_readwhilewriting(db: &Db, args: &Args, seed: u64) {
         let key_size = args.key_size;
         let value_size = args.value_size;
         // SAFETY: Db is Send+Sync; we move a raw pointer across.
-        // Simpler: reopen via args — but we don't have a path
+        // Simpler: reopen via args - but we don't have a path
         // argument here without reshuffling. Use `thread::scope`
         // instead for a borrowed handle.
         let _ = seed;

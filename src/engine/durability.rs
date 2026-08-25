@@ -1,4 +1,4 @@
-use std::fs::{self, File};
+use std::fs;
 use std::io;
 use std::path::Path;
 
@@ -7,7 +7,7 @@ use std::path::Path;
 /// durable across OS crashes once their contents have been synced.
 #[cfg(unix)]
 pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
+    fs::File::open(path)?.sync_all()
 }
 
 /// Best-effort no-op on platforms without portable directory fsync.
@@ -32,6 +32,7 @@ pub(crate) fn remove_file_and_sync_parent(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::io::Write;
 
     #[test]

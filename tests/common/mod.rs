@@ -6,7 +6,7 @@
 //! *not* treated as a standalone test binary, but any test file can
 //! pull it in with `mod common;`.
 //!
-//! Keep this module small and opinionated — helpers here get
+//! Keep this module small and opinionated - helpers here get
 //! recompiled once per test binary, so bloat costs compile time.
 
 #![allow(dead_code)]
@@ -18,7 +18,7 @@ use lark_kv::{Db, Options};
 use tempfile::TempDir;
 
 /// Options with a small write buffer (4 KiB) so memtable flushes
-/// trigger quickly — useful for exercising flush and compaction paths
+/// trigger quickly - useful for exercising flush and compaction paths
 /// in tests without having to write megabytes of data.
 pub fn small_opts() -> Options {
     Options {

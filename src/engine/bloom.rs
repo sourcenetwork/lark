@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn decode_bloom_block_handles_short_input() {
-        // Fewer than 4 bytes means no num_hashes prefix — the decoder
+        // Fewer than 4 bytes means no num_hashes prefix - the decoder
         // falls back to a zero-sized filter whose `may_contain` short-
         // circuits on the empty bit array.
         let bloom = decode_bloom_block(&[0, 1]);

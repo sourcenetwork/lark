@@ -9,7 +9,7 @@
 //! `[prefix_bloom_len: u64 LE][prefix_bloom_bytes][user_key_bloom_bytes]`.
 //! A zero length means the file was written without a prefix extractor.
 //!
-//! Data blocks store **internal keys** — `user_key || !seq || value_type` —
+//! Data blocks store **internal keys** - `user_key || !seq || value_type` -
 //! sorted so that newer versions of the same user key appear before older
 //! ones. Tombstones are first-class entries; reads that land on a tombstone
 //! at or before `snapshot_seq` return "deleted" and suppress older versions
@@ -37,10 +37,10 @@ use super::internal_key::{
 use super::range_tombstone::{RangeTombstone, RangeTombstoneSet};
 use crate::options::{CompressionType, PrefixExtractor};
 
-/// SSTable magic number: "LARKSST\x01" — flat-index format.
+/// SSTable magic number: "LARKSST\x01" - flat-index format.
 const MAGIC_V1: u64 = 0x4C41524B_53535401;
 
-/// SSTable magic number: "LARKSST\x02" — partitioned-index format. The
+/// SSTable magic number: "LARKSST\x02" - partitioned-index format. The
 /// footer's `index_offset/index_size` point to a compact top-level index
 /// whose entries each reference a leaf sub-block on disk.
 const MAGIC_V2: u64 = 0x4C41524B_53535402;
@@ -163,7 +163,7 @@ pub(crate) struct SsTableMeta {
 /// A live SSTable: metadata plus an already-opened reader. Held by
 /// [`super::manifest::Version`] so that as long as any version
 /// referencing this file is alive, the underlying file descriptor stays
-/// open — reads remain valid even after a concurrent compaction unlinks
+/// open - reads remain valid even after a concurrent compaction unlinks
 /// the file from disk (the kernel keeps the inode alive via FD
 /// refcounting).
 ///
@@ -543,7 +543,7 @@ impl SsTableWriter {
     }
 
     /// Finalize the SSTable. Returns `None` only if **nothing** was
-    /// added — no point entries and no range tombstones. A file with
+    /// added - no point entries and no range tombstones. A file with
     /// only range tombstones (and no point entries) is still a valid
     /// SSTable; its smallest/largest user key range is derived from
     /// the tombstone bounds instead of point-entry bounds.
@@ -572,7 +572,7 @@ impl SsTableWriter {
         // Bloom region layout:
         //   [prefix_bloom_len: u64 LE][prefix_bloom_bytes][user_key_bloom_bytes]
         //
-        // A `prefix_bloom_len` of 0 means "no prefix bloom" — the file
+        // A `prefix_bloom_len` of 0 means "no prefix bloom" - the file
         // was built without a prefix extractor (or there were zero
         // extractable prefixes). The reader keeps backward compatibility
         // with pre-prefix SSTables via the same 0 marker written
@@ -697,7 +697,7 @@ impl SsTableWriter {
                     io::Error::new(io::ErrorKind::InvalidData, format!("snappy encode: {e}"))
                 })?;
                 // Prepend the original length so the reader can pre-size
-                // its decode buffer — matches `lz4_flex::compress_prepend_size`.
+                // its decode buffer - matches `lz4_flex::compress_prepend_size`.
                 let mut framed = Vec::with_capacity(4 + compressed.len());
                 framed.extend_from_slice(&(raw_data.len() as u32).to_le_bytes());
                 framed.extend_from_slice(&compressed);
@@ -740,7 +740,7 @@ pub(crate) struct SsTableReader {
     /// Optional prefix bloom filter. `None` when the file was built
     /// without a prefix extractor (or the extractor yielded no prefixes).
     /// A query against a reader without a prefix bloom conservatively
-    /// returns `true` — the file might contain the prefix.
+    /// returns `true` - the file might contain the prefix.
     prefix_bloom: Option<BloomFilter>,
     range_tombstones: RangeTombstoneSet,
     /// `true` when the file was written with `MAGIC_V2` (partitioned
@@ -882,7 +882,7 @@ impl SsTableReader {
     /// Read and decode a leaf index sub-block from disk. Used when
     /// `self.partitioned` is true; the `handle` comes from one of the
     /// top-level index entries in `self.index`. No block cache is
-    /// consulted — the OS page cache keeps hot leaves warm.
+    /// consulted - the OS page cache keeps hot leaves warm.
     fn read_index_leaf(&self, handle: BlockHandle) -> io::Result<Vec<IndexEntry>> {
         #[cfg(test)]
         self.index_leaf_reads.fetch_add(1, Ordering::Relaxed);
@@ -1114,7 +1114,7 @@ impl SsTableReader {
 
     /// Largest seq of any range tombstone in this SSTable that covers
     /// `user_key` and is visible at `snapshot_seq`. Returns `0` when
-    /// nothing covers it — `0` is safe because real seqs start at 1.
+    /// nothing covers it - `0` is safe because real seqs start at 1.
     pub(crate) fn covering_range_tombstone_seq(&self, user_key: &[u8], snapshot_seq: u64) -> u64 {
         if self.range_tombstones.is_empty() {
             return 0;
@@ -1239,7 +1239,7 @@ impl SsTableReader {
     }
 
     /// Approximate on-disk bytes whose user key falls in
-    /// `[start, end)`. Computed from the index alone — no data-block
+    /// `[start, end)`. Computed from the index alone - no data-block
     /// decompression. Flat-index tables search the in-memory block
     /// index directly; partitioned-index tables only read index leaves
     /// whose top-level key range intersects the requested bounds. The
@@ -1347,7 +1347,7 @@ impl SsTableReader {
             }
         };
 
-        let block = Arc::new(Block::decode(raw_data)?);
+        let block = Arc::new(Block::decode_data_block(raw_data)?);
         cache.insert(self.file_id, handle.offset, Arc::clone(&block));
         Ok(block)
     }
@@ -1594,7 +1594,7 @@ mod tests {
             false_positives
         );
 
-        // Point lookups still work — user-key bloom is independent.
+        // Point lookups still work - user-key bloom is independent.
         assert_eq!(
             reader.get(b"bbbb:key2", u64::MAX, &cache).unwrap(),
             LookupResult::Found {
@@ -1607,7 +1607,7 @@ mod tests {
     #[test]
     fn test_sstable_without_prefix_bloom_is_superset() {
         // A file written without an extractor reports every prefix as
-        // possibly present — readers must fall back to conservative
+        // possibly present - readers must fall back to conservative
         // behavior, not crash.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("noprefix.sst");
@@ -1622,7 +1622,7 @@ mod tests {
         }
 
         let reader = SsTableReader::open(&path, 1).unwrap();
-        // Every query comes back `true` — no negative information.
+        // Every query comes back `true` - no negative information.
         assert!(reader.may_have_prefix(b"aaaa"));
         assert!(reader.may_have_prefix(b"zzzz"));
         assert!(reader.may_have_prefix(b"anything"));
@@ -1682,7 +1682,7 @@ mod tests {
     #[test]
     fn footer_decode_rejects_bad_magic() {
         let mut buf = [0u8; FOOTER_SIZE];
-        // Leave magic at zero — any non-V1/V2 value should be rejected.
+        // Leave magic at zero - any non-V1/V2 value should be rejected.
         buf[56..64].copy_from_slice(&0xDEAD_BEEF_u64.to_le_bytes());
         let err = Footer::decode(&buf).expect_err("should reject");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -1919,7 +1919,7 @@ mod tests {
         let reader = SsTableReader::open(&path, 1).unwrap();
         let pairs = reader.iter_internal(&cache).unwrap();
         assert_eq!(pairs.len(), 3);
-        // iter_internal preserves raw internal-key order — no dedup,
+        // iter_internal preserves raw internal-key order - no dedup,
         // no tombstone hiding.
         let user_keys: Vec<&[u8]> = pairs.iter().map(|(k, _)| user_key_of(k)).collect();
         assert_eq!(user_keys, vec![&b"a"[..], &b"a"[..], &b"b"[..]]);
@@ -2004,7 +2004,7 @@ mod tests {
             let mut writer =
                 SsTableWriter::new(&path, 4096, 10, CompressionType::Lz4, None, false, 4096)
                     .unwrap();
-            // Repetitive data compresses well — exercises a realistic path.
+            // Repetitive data compresses well - exercises a realistic path.
             for i in 0..50 {
                 writer
                     .add(
@@ -2078,7 +2078,7 @@ mod tests {
 
     #[test]
     fn range_tombstone_block_rejects_tiny_header() {
-        // 1–3 bytes is ambiguous: not empty, not enough for a count.
+        // 1-3 bytes is ambiguous: not empty, not enough for a count.
         let kind = match decode_range_tombstone_block(&[0, 1]) {
             Err(e) => e.kind(),
             Ok(v) => panic!("expected error, got {} tombstones", v.len()),

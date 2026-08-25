@@ -5,7 +5,7 @@
 //! opened with [`Db::open`] as an independent database, copied
 //! off-host, or used as the seed for a test harness. The checkpoint
 //! is produced by hard-linking every live SSTable into a target
-//! `sst/` directory and copying the manifest — the data itself is
+//! `sst/` directory and copying the manifest - the data itself is
 //! never duplicated on disk, so creating a checkpoint is O(file
 //! count) and costs a few inodes.
 //!
@@ -34,7 +34,7 @@ use crate::engine::CheckpointSnapshot;
 use crate::{Db, Error, Result};
 
 /// A handle to a [`Db`] prepared for checkpointing. The handle itself
-/// captures no engine state — the actual flush, version snapshot,
+/// captures no engine state - the actual flush, version snapshot,
 /// and filesystem work all happen inside [`Checkpoint::create`] under
 /// a single held compaction lock, so dropping the `Checkpoint`
 /// without calling `create` is free.
@@ -58,9 +58,9 @@ impl<'db> Checkpoint<'db> {
     /// 4. Hard-links every captured SSTable into `target_dir/sst/`.
     /// 5. Copies the compacted manifest into `target_dir/MANIFEST`.
     ///
-    /// The engine's compaction lock is held for steps 2–5 so no
+    /// The engine's compaction lock is held for steps 2-5 so no
     /// concurrent compaction can unlink a referenced file mid-copy.
-    /// It is released as soon as `create` returns — so dropping the
+    /// It is released as soon as `create` returns - so dropping the
     /// [`Checkpoint`] or the source [`Db`] after the call cannot
     /// deadlock.
     ///
@@ -86,7 +86,7 @@ impl<'db> Checkpoint<'db> {
         // `checkpoint_capture` holds the compaction lock for the
         // lifetime of the returned snapshot, so the captured file
         // set cannot be unlinked while we hard-link it. The
-        // snapshot is a local — it drops before `create` returns,
+        // snapshot is a local - it drops before `create` returns,
         // releasing the lock without outlasting this function.
         // Keeping the lock scoped this way is what lets a caller
         // safely call `db.close()` or `drop(db)` after `create`.
@@ -298,7 +298,7 @@ mod tests {
         db.close().unwrap();
         drop(db);
         // Wipe the source to prove the checkpoint doesn't depend on
-        // it post-creation — hard-linked inodes outlive the original
+        // it post-creation - hard-linked inodes outlive the original
         // directory entry.
         std::fs::remove_dir_all(src_dir.path()).unwrap();
 

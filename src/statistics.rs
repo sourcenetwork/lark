@@ -21,7 +21,7 @@
 //! The initial histogram implementation tracks `count`, `sum`,
 //! `min`, and `max` only. `HistogramSnapshot::average` gives you
 //! `sum / count`. Percentiles / buckets are intentionally out of
-//! scope for v1 — adding an HDR-style bucket array is a follow-up
+//! scope for v1 - adding an HDR-style bucket array is a follow-up
 //! that drops in behind the existing API without breaking
 //! callers.
 
@@ -62,10 +62,10 @@ pub enum Ticker {
     /// Block cache insertions (one per miss that actually
     /// populated the cache).
     BlockCacheAdd = 9,
-    /// Bloom-filter "useful" hits — the filter correctly
+    /// Bloom-filter "useful" hits - the filter correctly
     /// answered "not present" and spared a block read.
     BloomFilterUseful = 10,
-    /// Bloom-filter "full positive" hits — the filter said
+    /// Bloom-filter "full positive" hits - the filter said
     /// "maybe", and the key was actually present in the block.
     BloomFilterFullPositive = 11,
     /// Bytes read by compaction (sum of input file sizes).
@@ -87,7 +87,7 @@ pub enum Ticker {
     /// Number of `Iter::next` calls that produced a key.
     IterNextCount = 20,
     /// Microseconds the engine spent stalling a writer. Not
-    /// populated yet — reserved for the write-stall plumbing.
+    /// populated yet - reserved for the write-stall plumbing.
     WriteStallMicros = 21,
     /// Number of snapshots registered via `Db::snapshot`.
     SnapshotsRegistered = 22,
@@ -100,7 +100,7 @@ const NUM_TICKERS: usize = 24;
 
 /// Every defined ticker, in discriminant order. Used by
 /// [`Statistics::dump`] to iterate all slots. Keep this in sync
-/// with the [`Ticker`] enum — adding a variant without
+/// with the [`Ticker`] enum - adding a variant without
 /// appending here will silently drop it from the dump output.
 const ALL_TICKERS: &[Ticker] = &[
     Ticker::BytesWritten,
@@ -330,7 +330,7 @@ impl Statistics {
 
     /// Read the current value of a ticker. Guaranteed to be
     /// consistent with the corresponding `fetch_add` via
-    /// `Ordering::Relaxed` — callers that need stronger
+    /// `Ordering::Relaxed` - callers that need stronger
     /// ordering should wrap their own fences.
     pub fn get_ticker(&self, ticker: Ticker) -> u64 {
         self.tickers[ticker as usize].load(Ordering::Relaxed)
@@ -379,7 +379,7 @@ impl Statistics {
         out
     }
 
-    /// Add `amount` to `ticker`. `Ordering::Relaxed` — callers
+    /// Add `amount` to `ticker`. `Ordering::Relaxed` - callers
     /// that need stronger ordering should provide their own.
     pub(crate) fn add(&self, ticker: Ticker, amount: u64) {
         self.tickers[ticker as usize].fetch_add(amount, Ordering::Relaxed);
@@ -394,7 +394,7 @@ impl Statistics {
 /// Convenience RAII helper: creates a timer on construction and
 /// records the elapsed wall-clock microseconds into `hist` on
 /// `Drop`. If the statistics handle is `None` the helper is
-/// optimized out — both construction and drop are no-ops.
+/// optimized out - both construction and drop are no-ops.
 pub(crate) struct TimeScope<'a> {
     start: Option<Instant>,
     stats: Option<&'a Statistics>,
@@ -492,7 +492,7 @@ mod tests {
     #[test]
     fn time_scope_disabled_is_noop() {
         let _t = TimeScope::new(None, Histogram::DbGet);
-        // Nothing to assert — the test is that Drop runs without
+        // Nothing to assert - the test is that Drop runs without
         // panicking when the stats handle is absent.
     }
 }

@@ -1,13 +1,13 @@
 //! Per-operation performance counters captured in thread-local
 //! state.
 //!
-//! [`Statistics`](crate::Statistics) is a database-global sink —
+//! [`Statistics`](crate::Statistics) is a database-global sink -
 //! every thread bumps the same atomic counters and the caller
 //! reads an aggregate view. That's the right shape for metrics
 //! export, but it can't answer "what did *this one* `Db::get`
 //! call spend its time on?". [`PerfContext`] is the
 //! complementary tool: a thread-local bundle of counters that
-//! the caller resets, runs an operation, and snapshots — the
+//! the caller resets, runs an operation, and snapshots - the
 //! per-op breakdown falls out.
 //!
 //! # Usage
@@ -96,7 +96,7 @@ pub struct PerfContextSnapshot {
     /// Number of block cache lookups performed on this thread.
     /// Incremented at both `EnableCount` and `EnableTime`.
     pub block_cache_lookup_count: u64,
-    /// Block cache lookups that hit — i.e. the block was
+    /// Block cache lookups that hit - i.e. the block was
     /// already decompressed and resident.
     pub block_cache_hit_count: u64,
     /// Number of bloom filter checks performed on this thread.

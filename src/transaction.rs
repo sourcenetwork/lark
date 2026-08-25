@@ -2,17 +2,17 @@
 //!
 //! Two flavors:
 //!
-//! - [`OptimisticTransactionDb`] — transactions take no locks,
+//! - [`OptimisticTransactionDb`]: transactions take no locks,
 //!   buffer writes in memory, and detect write-write conflicts at
 //!   commit time by re-checking the visible seq of each touched key
 //!   against the snapshot seq the transaction was anchored at.
 //!   Best for low-contention workloads where most transactions
 //!   commit on the first try.
 //!
-//! - [`TransactionDb`] — transactions acquire exclusive key locks
+//! - [`TransactionDb`]: transactions acquire exclusive key locks
 //!   as they write (or as [`Transaction::get_for_update`] is called)
-//!   and hold them until commit / rollback. Conflict resolution is
-//!   immediate (lock contention), not deferred to commit. A
+//!   and hold them until commit / rollback. Contention is resolved
+//!   when the lock is taken rather than at commit, and a
 //!   timeout-based deadlock defense returns [`TransactionError::Busy`]
 //!   when a lock cannot be acquired in time. Best for workloads
 //!   where contention is high and retry cost dominates.
@@ -23,11 +23,47 @@
 //!
 //! # Isolation level
 //!
-//! Both flavors provide **snapshot isolation**: at [`Transaction`]
-//! begin the current engine seq is captured, and every read within
-//! the transaction sees the database as of that seq (except reads
-//! that hit the transaction's own buffered writes — those see the
-//! written value). Serializable isolation is out of scope for v1.
+//! Both flavors provide **snapshot isolation** and both prevent
+//! lost updates, but they anchor their reads at different points.
+//!
+//! An optimistic transaction reads everything as of the engine seq
+//! captured at begin. A pessimistic transaction reads a key it has
+//! not locked at that same begin seq, and reads a key it locks
+//! through [`Transaction::get_for_update`] as of the moment the
+//! lock was acquired. The lock handoff orders it after every
+//! transaction that committed while it waited, so a
+//! read-modify-write through `get_for_update` sees the value the
+//! previous lock holder committed instead of a stale one. Reads
+//! that hit the transaction's own buffered writes always see the
+//! written value. A read anchor only ever moves forward, so two
+//! reads of the same key inside one transaction never travel
+//! backwards in time.
+//!
+//! At commit each flavor validates a set of keys, every key against
+//! the *earliest* sequence this transaction observed it at:
+//!
+//! - Optimistic: every key the transaction wrote or read through
+//!   `get_for_update`, against the begin snapshot.
+//! - Pessimistic: every key the transaction read and then wrote
+//!   (the read-modify-write set) plus every key it read through
+//!   `get_for_update`. A key written blind, without ever being
+//!   read, is not validated: there is no read to invalidate, and the
+//!   key lock already orders it against every other transaction.
+//!
+//! For a pessimistic transaction the check cannot fire while every
+//! writer goes through the lock manager. It fires when a key the
+//! transaction read was written around the lock manager (for example
+//! through [`TransactionDb::db`]) or before the lock was taken,
+//! which surfaces as [`TransactionError::Conflict`] rather than as
+//! a lost update.
+//!
+//! Rolling back to a savepoint discards buffered writes; it does not
+//! discard what the transaction has already read, so a read anchor
+//! survives the rollback and still guards the commit.
+//!
+//! Serializable isolation is out of scope for v1: reads that are
+//! never written are not validated, so a read-only key can change
+//! underneath a transaction without aborting it.
 //!
 //! # Out of scope (follow-ups)
 //!
@@ -39,10 +75,10 @@
 //!   with timeout-based detection only).
 //! - Column-family-aware transactions (depends on CFs landing).
 //! - Streaming iteration over a transaction's buffered-plus-snapshot
-//!   view (`Transaction::iter` is not implemented — callers can
+//!   view (`Transaction::iter` is not implemented; callers can
 //!   commit then iterate, or use point lookups).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -61,23 +97,25 @@ use crate::{Db, Error, Options, Result};
 const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Reasons a transaction can fail to commit. Not a variant of
-/// [`crate::Error`] — a conflict is a retry-able business outcome,
+/// [`crate::Error`]: a conflict is a retry-able business outcome,
 /// distinct from an I/O failure.
 #[derive(Debug, thiserror::Error)]
 pub enum TransactionError {
     /// Propagated I/O error from the underlying engine.
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    /// An optimistic transaction observed a key that was written
-    /// to by another transaction after the snapshot was captured.
-    /// The caller should roll back and retry.
+    /// A key in the transaction's validation set was written by
+    /// someone else after this transaction first observed it: after
+    /// the begin snapshot for an optimistic transaction, or after
+    /// the read that the pessimistic transaction is about to
+    /// overwrite. The caller should roll back and retry.
     #[error(
         "transaction conflict on key {key:?}: observed seq {observed_seq}, latest seq {latest_seq}"
     )]
     Conflict {
         /// The offending user key.
         key: Vec<u8>,
-        /// The seq the transaction was anchored at.
+        /// The seq the transaction observed the key at.
         observed_seq: u64,
         /// The newest seq found for the key during the commit check.
         latest_seq: u64,
@@ -151,7 +189,7 @@ impl OptimisticTransactionDb {
     }
 
     /// Borrow the underlying [`Db`] for APIs that
-    /// [`OptimisticTransactionDb`] doesn't wrap — snapshots, the
+    /// [`OptimisticTransactionDb`] doesn't wrap: snapshots, the
     /// streaming iterator, `compact_range`, `close`, etc.
     pub fn db(&self) -> &Db {
         &self.inner
@@ -255,7 +293,7 @@ enum TxMode {
 ///
 /// Reads within the transaction see a consistent snapshot captured
 /// at begin time, except for keys that the transaction itself has
-/// written — those always read back the buffered write.
+/// written; those always read back the buffered write.
 ///
 /// Dropping a `Transaction` without committing is equivalent to
 /// calling [`Transaction::rollback`]: buffered writes are
@@ -273,10 +311,11 @@ pub struct Transaction<'db> {
     range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
     /// Merge operands buffered for commit.
     merges: Vec<(Vec<u8>, Vec<u8>)>,
-    /// Keys explicitly flagged for conflict detection by
-    /// `get_for_update`. Merged with the keys in `writes` at
-    /// commit time.
-    conflict_keys: HashSet<Vec<u8>>,
+    /// What this transaction has observed about each key it read.
+    /// Ordered so a multi-key conflict always reports the same key.
+    /// Never rewound: a savepoint rollback undoes buffered writes,
+    /// not reads that already happened.
+    tracked: BTreeMap<Vec<u8>, KeyState>,
     /// Savepoint stack. Each entry captures the full write buffer
     /// and a count of locks held at that point.
     savepoints: Vec<Savepoint>,
@@ -296,8 +335,24 @@ struct Savepoint {
     writes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
     merges: Vec<(Vec<u8>, Vec<u8>)>,
-    conflict_keys: HashSet<Vec<u8>>,
     held_lock_count: usize,
+}
+
+/// What one transaction knows about one key it has read.
+#[derive(Clone, Copy)]
+struct KeyState {
+    /// Earliest sequence this transaction observed the key at.
+    /// Validation uses this one, because it is the read a later
+    /// write of the same key would otherwise silently overwrite.
+    first_read_seq: u64,
+    /// Sequence later reads of the key are served at. Only ever
+    /// moves forward, so `get_for_update` can promote a key that was
+    /// already read at the begin snapshot to the lock horizon
+    /// without any read of this transaction going backwards.
+    read_seq: u64,
+    /// The key was read through [`Transaction::get_for_update`], so
+    /// it is validated at commit whether or not it is written.
+    for_update: bool,
 }
 
 impl<'db> Transaction<'db> {
@@ -318,7 +373,7 @@ impl<'db> Transaction<'db> {
             writes: BTreeMap::new(),
             range_deletes: Vec::new(),
             merges: Vec::new(),
-            conflict_keys: HashSet::new(),
+            tracked: BTreeMap::new(),
             savepoints: Vec::new(),
             held_locks: Vec::new(),
             lock_manager,
@@ -331,31 +386,49 @@ impl<'db> Transaction<'db> {
 
     /// Read `key` from the default column family. Returns the
     /// buffered write if the transaction has already written to
-    /// `key`, otherwise the value visible at the transaction's
-    /// snapshot. Does **not** register the key for conflict
-    /// detection — use [`Transaction::get_for_update`] for that.
-    pub fn get(&self, key: &[u8]) -> TxResult<Option<Vec<u8>>> {
+    /// `key`, otherwise the value visible at the sequence this
+    /// transaction observes `key` at: its begin snapshot, or, for a
+    /// key a pessimistic transaction already holds a lock on, the
+    /// horizon sampled when that lock was acquired.
+    ///
+    /// Takes no lock. The read is remembered, so writing the same
+    /// key later turns it into a read-modify-write that is validated
+    /// at commit and aborts with [`TransactionError::Conflict`]
+    /// rather than losing the update. A key that is read and never
+    /// written is not validated: use
+    /// [`Transaction::get_for_update`] when a read must participate
+    /// in conflict detection on its own.
+    pub fn get(&mut self, key: &[u8]) -> TxResult<Option<Vec<u8>>> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         if let Some(buffered) = self.writes.get(&prefixed) {
             return Ok(buffered.clone());
         }
+        let read_seq = self.observe(&prefixed, self.snapshot_seq, false);
         self.engine
-            .get(&prefixed, self.snapshot_seq)
+            .get(&prefixed, read_seq)
             .map_err(TransactionError::Io)
     }
 
-    /// Read `key` and flag it for conflict detection on commit.
-    /// For pessimistic transactions, also acquires an exclusive
-    /// lock on the key for the duration of the transaction.
+    /// Read `key`, flag it for conflict detection at commit, and,
+    /// for pessimistic transactions, take an exclusive lock on it
+    /// for the rest of the transaction.
+    ///
+    /// A pessimistic transaction reads the value as of the moment
+    /// it acquired the lock, not as of its begin snapshot, so a
+    /// read-modify-write under `get_for_update` observes every
+    /// transaction that committed before the lock was released to
+    /// it. An optimistic transaction reads at its begin snapshot
+    /// and detects the conflict at commit instead.
     pub fn get_for_update(&mut self, key: &[u8]) -> TxResult<Option<Vec<u8>>> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
-        self.acquire_lock_if_needed(&prefixed)?;
-        self.conflict_keys.insert(prefixed.clone());
+        let already_held = self.lock_key(&prefixed)?;
+        let horizon = self.read_horizon(&prefixed, already_held);
+        let read_seq = self.observe(&prefixed, horizon, true);
         if let Some(buffered) = self.writes.get(&prefixed) {
             return Ok(buffered.clone());
         }
         self.engine
-            .get(&prefixed, self.snapshot_seq)
+            .get(&prefixed, read_seq)
             .map_err(TransactionError::Io)
     }
 
@@ -363,7 +436,7 @@ impl<'db> Transaction<'db> {
     /// exclusive lock on the key if not already held.
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> TxResult<()> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
-        self.acquire_lock_if_needed(&prefixed)?;
+        self.lock_key(&prefixed)?;
         self.writes.insert(prefixed, Some(value.to_vec()));
         Ok(())
     }
@@ -372,7 +445,7 @@ impl<'db> Transaction<'db> {
     /// exclusive lock on the key if not already held.
     pub fn delete(&mut self, key: &[u8]) -> TxResult<()> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
-        self.acquire_lock_if_needed(&prefixed)?;
+        self.lock_key(&prefixed)?;
         self.writes.insert(prefixed, None);
         Ok(())
     }
@@ -395,12 +468,11 @@ impl<'db> Transaction<'db> {
     }
 
     /// Buffer a merge operand. Merges are conflict-checked at the
-    /// key level — two transactions cannot concurrently merge the
+    /// key level: two transactions cannot concurrently merge the
     /// same key under optimistic concurrency control.
     pub fn merge(&mut self, key: &[u8], operand: &[u8]) -> TxResult<()> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
-        self.acquire_lock_if_needed(&prefixed)?;
-        self.conflict_keys.insert(prefixed.clone());
+        self.lock_key(&prefixed)?;
         self.merges.push((prefixed, operand.to_vec()));
         Ok(())
     }
@@ -413,33 +485,45 @@ impl<'db> Transaction<'db> {
             writes: self.writes.clone(),
             range_deletes: self.range_deletes.clone(),
             merges: self.merges.clone(),
-            conflict_keys: self.conflict_keys.clone(),
             held_lock_count: self.held_locks.len(),
         });
     }
 
     /// Roll back to the most recent savepoint. Discards every
     /// buffered write made after the savepoint. Locks acquired
-    /// after the savepoint stay held — lark's pessimistic lock
+    /// after the savepoint stay held: lark's pessimistic lock
     /// manager does not release mid-transaction locks.
+    ///
+    /// Reads are not rolled back. A key this transaction has already
+    /// read keeps the sequence it was read at, so a rollback can
+    /// neither rewind a later read of that key nor launder a write
+    /// that landed around the lock manager in the meantime.
     pub fn rollback_to_savepoint(&mut self) -> TxResult<()> {
         let sp = self.savepoints.pop().ok_or(TransactionError::NoSavepoint)?;
         self.writes = sp.writes;
         self.range_deletes = sp.range_deletes;
         self.merges = sp.merges;
-        self.conflict_keys = sp.conflict_keys;
         // Locks acquired after the savepoint remain held.
         let _ = sp.held_lock_count;
         Ok(())
     }
 
-    /// Commit the transaction. For optimistic transactions this
-    /// re-checks every key touched by `put` / `delete` / `merge` /
-    /// `get_for_update` against the snapshot seq and surfaces any
-    /// write-write conflict as [`TransactionError::Conflict`]. For
-    /// pessimistic transactions the held locks already guarantee
-    /// the absence of conflicts, so commit just applies the
-    /// buffered writes.
+    /// Commit the transaction. Every key in the validation set is
+    /// re-checked against the earliest sequence this transaction
+    /// observed it at, and any conflict surfaces as
+    /// [`TransactionError::Conflict`]; otherwise the buffered
+    /// writes are applied atomically.
+    ///
+    /// An optimistic transaction validates every key it wrote or
+    /// read through [`Transaction::get_for_update`] against its
+    /// begin snapshot, so the check catches any concurrent writer. A
+    /// pessimistic transaction validates every key it read and then
+    /// wrote, plus every key it read through `get_for_update`,
+    /// against the sequence that read observed. The check passes
+    /// whenever every writer went through the lock manager and fires
+    /// for a write that bypassed it or that landed before the lock
+    /// was taken. A pessimistic blind write is not validated: the
+    /// key lock orders it, and there is no read to lose.
     pub fn commit(mut self) -> TxResult<()> {
         let result = self.commit_inner();
         self.resolved = true;
@@ -456,87 +540,143 @@ impl<'db> Transaction<'db> {
     }
 
     fn commit_inner(&mut self) -> TxResult<()> {
-        let conflict_keys: Vec<Vec<u8>> = {
-            // Every explicit conflict key plus every buffered
-            // point-write key plus every merge key. We check once,
-            // deduplicated.
-            let mut set = self.conflict_keys.clone();
-            for key in self.writes.keys() {
-                set.insert(key.clone());
-            }
-            for (key, _) in &self.merges {
-                set.insert(key.clone());
-            }
-            set.into_iter().collect()
-        };
-
+        let conflict_keys = self.validation_set();
         let writes = std::mem::take(&mut self.writes);
         let range_deletes = std::mem::take(&mut self.range_deletes);
         let merges = std::mem::take(&mut self.merges);
 
+        let outcome = self
+            .engine
+            .commit_with_conflict_check(
+                &conflict_keys,
+                writes,
+                range_deletes,
+                merges,
+                self.durability,
+            )
+            .map_err(TransactionError::Io)?;
+        match outcome {
+            CommitOutcome::Ok => Ok(()),
+            CommitOutcome::Conflict {
+                key,
+                observed_seq,
+                latest_seq,
+            } => Err(TransactionError::Conflict {
+                key: strip_cf_prefix(key),
+                observed_seq,
+                latest_seq,
+            }),
+        }
+    }
+
+    /// The keys this commit must validate, each mapped to the
+    /// earliest sequence the transaction observed it at.
+    ///
+    /// Optimistic: every key written or merged, plus every key read
+    /// through `get_for_update`, all anchored at the begin snapshot.
+    ///
+    /// Pessimistic: every key that was read and then written (the
+    /// read-modify-write set), plus every key read through
+    /// `get_for_update`. A key written without ever being read is
+    /// left out: its lock already orders it against the other
+    /// transactions, and there is no read for a concurrent writer to
+    /// invalidate.
+    fn validation_set(&mut self) -> Vec<(Vec<u8>, u64)> {
+        let optimistic = matches!(self.mode, TxMode::Optimistic);
+        let mut checks: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+        for (key, state) in std::mem::take(&mut self.tracked) {
+            let written = self.writes.contains_key(&key)
+                || self.merges.iter().any(|(merged, _)| *merged == key);
+            if state.for_update || written {
+                checks.insert(key, state.first_read_seq);
+            }
+        }
+        if optimistic {
+            for key in self.writes.keys() {
+                checks.entry(key.clone()).or_insert(self.snapshot_seq);
+            }
+            for (key, _) in &self.merges {
+                checks.entry(key.clone()).or_insert(self.snapshot_seq);
+            }
+        }
+        checks.into_iter().collect()
+    }
+
+    /// Take `key`'s exclusive lock in pessimistic mode. Returns
+    /// `true` when this transaction already held it. A no-op for an
+    /// optimistic transaction, which takes no locks.
+    fn lock_key(&mut self, key: &[u8]) -> TxResult<bool> {
         match self.mode {
-            TxMode::Optimistic => {
-                let outcome = self
-                    .engine
-                    .commit_optimistic(
-                        &conflict_keys,
-                        self.snapshot_seq,
-                        writes,
-                        range_deletes,
-                        merges,
-                        self.durability,
-                    )
-                    .map_err(TransactionError::Io)?;
-                match outcome {
-                    CommitOutcome::Ok => Ok(()),
-                    CommitOutcome::Conflict {
-                        key,
-                        observed_seq,
-                        latest_seq,
-                    } => {
-                        // Strip the 4-byte CF prefix so the error
-                        // surfaces the user-visible key.
-                        let user_key = if key.len() >= 4 {
-                            key[4..].to_vec()
-                        } else {
-                            key
-                        };
-                        Err(TransactionError::Conflict {
-                            key: user_key,
-                            observed_seq,
-                            latest_seq,
-                        })
+            TxMode::Optimistic => Ok(false),
+            TxMode::Pessimistic { tx_id } => self.acquire_lock(key, tx_id),
+        }
+    }
+
+    /// Sequence a fresh read of `key` is anchored at, given whether
+    /// this transaction already held the key's lock.
+    ///
+    /// The pessimistic horizon is sampled with the lock held: a
+    /// committing writer publishes the engine's visible seq before
+    /// releasing the lock, and the lock manager's mutex is the
+    /// release/acquire edge, so nothing newer can hide behind it.
+    /// Under a lock this transaction already holds nothing can have
+    /// advanced, so the anchor recorded then still stands.
+    fn read_horizon(&self, key: &[u8], already_held: bool) -> u64 {
+        match self.mode {
+            TxMode::Optimistic => self.snapshot_seq,
+            TxMode::Pessimistic { .. } => {
+                if already_held {
+                    if let Some(state) = self.tracked.get(key) {
+                        return state.read_seq;
                     }
                 }
-            }
-            TxMode::Pessimistic { .. } => {
-                // Locks already guarantee no conflict; just apply.
-                self.engine
-                    .apply_grouped_batch(writes, range_deletes, merges, self.durability, false)
-                    .map_err(TransactionError::Io)
+                self.engine.snapshot_seq()
             }
         }
     }
 
-    fn acquire_lock_if_needed(&mut self, key: &[u8]) -> TxResult<()> {
-        if let TxMode::Pessimistic { tx_id } = self.mode {
-            if let Some(lm) = self.lock_manager.as_ref() {
-                if !self.held_locks.iter().any(|k| k.as_slice() == key) {
-                    lm.acquire(key, tx_id, self.lock_timeout).map_err(|_| {
-                        // Strip the 4-byte CF prefix so the error
-                        // surfaces the user-visible key.
-                        let user_key = if key.len() >= 4 {
-                            key[4..].to_vec()
-                        } else {
-                            key.to_vec()
-                        };
-                        TransactionError::Busy(user_key)
-                    })?;
-                    self.held_locks.push(key.to_vec());
-                }
+    /// Record that this transaction observed `key` at `horizon` and
+    /// return the sequence the read should be served at.
+    ///
+    /// `first_read_seq` keeps the earliest observation, because that
+    /// is the read a later write would overwrite. `read_seq` only
+    /// moves forward, so promoting a key from a plain `get` to
+    /// `get_for_update` never makes a later read of the same key
+    /// return an older value than an earlier one.
+    fn observe(&mut self, key: &[u8], horizon: u64, for_update: bool) -> u64 {
+        match self.tracked.get_mut(key) {
+            Some(state) => {
+                state.read_seq = state.read_seq.max(horizon);
+                state.for_update |= for_update;
+                state.read_seq
+            }
+            None => {
+                self.tracked.insert(
+                    key.to_vec(),
+                    KeyState {
+                        first_read_seq: horizon,
+                        read_seq: horizon,
+                        for_update,
+                    },
+                );
+                horizon
             }
         }
-        Ok(())
+    }
+
+    /// Acquire `key`'s exclusive lock. Returns `true` when this
+    /// transaction already held it.
+    fn acquire_lock(&mut self, key: &[u8], tx_id: u64) -> TxResult<bool> {
+        let Some(lm) = self.lock_manager.as_ref() else {
+            return Ok(false);
+        };
+        if self.held_locks.iter().any(|k| k.as_slice() == key) {
+            return Ok(true);
+        }
+        lm.acquire(key, tx_id, self.lock_timeout)
+            .map_err(|_| TransactionError::Busy(strip_cf_prefix(key.to_vec())))?;
+        self.held_locks.push(key.to_vec());
+        Ok(false)
     }
 
     fn release_resources(&mut self) {
@@ -552,6 +692,16 @@ impl<'db> Transaction<'db> {
             }
         }
         self.engine.release_snapshot(self.snapshot_seq);
+    }
+}
+
+/// Drop the 4-byte column-family prefix that `prefix_key` adds so
+/// errors surface the key the caller passed in.
+fn strip_cf_prefix(key: Vec<u8>) -> Vec<u8> {
+    if key.len() >= 4 {
+        key[4..].to_vec()
+    } else {
+        key
     }
 }
 
@@ -571,7 +721,7 @@ impl Drop for Transaction<'_> {
 /// The hash map maps user keys to the tx id that currently holds
 /// the lock. Acquires block on the condvar until the lock is free
 /// or the deadline expires. Sharding the map for higher
-/// concurrency is a future optimization — lark transactions today
+/// concurrency is a future optimization: lark transactions today
 /// expect low-to-moderate concurrency, so a single mutex is fine.
 struct LockManager {
     locks: Mutex<HashMap<Vec<u8>, u64>>,
@@ -724,12 +874,29 @@ mod tests {
         // Concurrent writer invalidates the read.
         db.db().put(b"k", b"v1").unwrap();
         // The tx didn't buffer a write on k, but it flagged k for
-        // conflict detection — commit must still detect.
+        // conflict detection, so commit must still detect.
         tx.put(b"other", b"stuff").unwrap();
         match tx.commit() {
             Err(TransactionError::Conflict { key, .. }) => {
                 assert_eq!(key, b"k".to_vec());
             }
+            other => panic!("expected conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn optimistic_conflict_reports_the_lowest_conflicting_key() {
+        let (db, _dir) = opt_db();
+        db.db().put(b"a", b"v0").unwrap();
+        db.db().put(b"z", b"v0").unwrap();
+        let mut tx = db.begin_transaction();
+        // Tracked in the reverse of their sort order.
+        tx.get_for_update(b"z").unwrap();
+        tx.get_for_update(b"a").unwrap();
+        db.db().put(b"z", b"v1").unwrap();
+        db.db().put(b"a", b"v1").unwrap();
+        match tx.commit() {
+            Err(TransactionError::Conflict { key, .. }) => assert_eq!(key, b"a".to_vec()),
             other => panic!("expected conflict, got {other:?}"),
         }
     }
@@ -748,7 +915,7 @@ mod tests {
     fn optimistic_snapshot_isolation_reads() {
         let (db, _dir) = opt_db();
         db.db().put(b"k", b"v0").unwrap();
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         db.db().put(b"k", b"v1").unwrap();
         // Tx is anchored at the seq before the second put.
         assert_eq!(tx.get(b"k").unwrap(), Some(b"v0".to_vec()));
@@ -837,7 +1004,7 @@ mod tests {
         let db2 = Arc::clone(&db);
         let join = std::thread::spawn(move || {
             // The default lock timeout is 1s, which is too long for
-            // the test — recreate the transaction with a shorter
+            // the test, so recreate the transaction with a shorter
             // manual lock acquisition via `get_for_update`. We
             // rely on acquire_lock_if_needed using the DB's
             // configured timeout; so we just do a normal put and
@@ -847,7 +1014,7 @@ mod tests {
         });
         // Give tx2 some time to actually start waiting.
         std::thread::sleep(std::time::Duration::from_millis(50));
-        // Commit tx1 — lock releases, tx2 should now succeed.
+        // Commit tx1: lock releases, tx2 should now succeed.
         tx1.commit().unwrap();
         let result = join.join().unwrap();
         assert!(result.is_ok(), "tx2 put should succeed once tx1 commits");
@@ -977,6 +1144,202 @@ mod tests {
         tx.commit().unwrap();
         assert_eq!(db.db().get(b"a").unwrap(), Some(b"1".to_vec()));
         assert_eq!(db.db().get(b"b").unwrap(), None);
+    }
+
+    #[test]
+    fn pessimistic_get_for_update_sees_writes_committed_after_begin() {
+        let (db, _dir) = pes_db();
+        db.db().put(b"k", b"v0").unwrap();
+        let mut tx = db.begin_transaction();
+        // Lands after the transaction began, before it locks `k`.
+        db.db().put(b"k", b"v1").unwrap();
+        assert_eq!(tx.get_for_update(b"k").unwrap(), Some(b"v1".to_vec()));
+        // A plain `get` on the locked key reads at the same horizon.
+        assert_eq!(tx.get(b"k").unwrap(), Some(b"v1".to_vec()));
+        tx.put(b"k", b"v2").unwrap();
+        tx.commit().unwrap();
+        assert_eq!(db.db().get(b"k").unwrap(), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn pessimistic_second_locker_does_not_observe_precommit_value() {
+        let (db, _dir) = pes_db();
+        db.db().put(b"k", b"v0").unwrap();
+        // Both transactions begin before either one commits, so both
+        // are anchored at the seq where `k` is still `v0`.
+        let mut tx1 = db.begin_transaction();
+        let mut tx2 = db.begin_transaction();
+        assert_eq!(tx1.get_for_update(b"k").unwrap(), Some(b"v0".to_vec()));
+        tx1.put(b"k", b"v1").unwrap();
+        tx1.commit().unwrap();
+        // tx2 only now gets the lock, so it must not see `v0`.
+        assert_eq!(tx2.get_for_update(b"k").unwrap(), Some(b"v1".to_vec()));
+        tx2.put(b"k", b"v2").unwrap();
+        tx2.commit().unwrap();
+        assert_eq!(db.db().get(b"k").unwrap(), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn pessimistic_commit_detects_write_from_outside_the_lock_manager() {
+        let (db, _dir) = pes_db();
+        let mut tx = db.begin_transaction();
+        tx.get_for_update(b"k").unwrap();
+        // A raw `Db` write never touches the lock manager.
+        db.db().put(b"k", b"racer").unwrap();
+        tx.put(b"k", b"mine").unwrap();
+        match tx.commit() {
+            Err(TransactionError::Conflict { key, .. }) => assert_eq!(key, b"k".to_vec()),
+            other => panic!("expected conflict, got {other:?}"),
+        }
+        assert_eq!(db.db().get(b"k").unwrap(), Some(b"racer".to_vec()));
+    }
+
+    #[test]
+    fn pessimistic_sequential_transactions_do_not_conflict() {
+        let (db, _dir) = pes_db();
+        let mut tx1 = db.begin_transaction();
+        tx1.put(b"k", b"v1").unwrap();
+        tx1.commit().unwrap();
+        let mut tx2 = db.begin_transaction();
+        assert_eq!(tx2.get_for_update(b"k").unwrap(), Some(b"v1".to_vec()));
+        tx2.put(b"k", b"v2").unwrap();
+        tx2.commit().unwrap();
+        assert_eq!(db.db().get(b"k").unwrap(), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn pessimistic_blind_put_after_external_write_is_not_a_conflict() {
+        let (db, _dir) = pes_db();
+        db.db().put(b"k", b"v0").unwrap();
+        let mut tx = db.begin_transaction();
+        db.db().put(b"k", b"v1").unwrap();
+        // Nothing was read, so there is no read to lose: a blind write
+        // is last-writer-wins against a non-transactional writer.
+        tx.put(b"k", b"v2").unwrap();
+        tx.commit().unwrap();
+        assert_eq!(db.db().get(b"k").unwrap(), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn pessimistic_blind_put_before_external_write_is_not_a_conflict() {
+        // The mirror ordering: the external write lands after the
+        // transaction has already buffered its blind write.
+        let (db, _dir) = pes_db();
+        db.db().put(b"k", b"v0").unwrap();
+        let mut tx = db.begin_transaction();
+        tx.put(b"k", b"v2").unwrap();
+        db.db().put(b"k", b"v1").unwrap();
+        tx.commit().unwrap();
+        assert_eq!(db.db().get(b"k").unwrap(), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn pessimistic_savepoint_rollback_keeps_untouched_keys_unvalidated() {
+        let (db, _dir) = pes_db();
+        let mut tx = db.begin_transaction();
+        tx.set_savepoint();
+        tx.put(b"b", b"rolled-back").unwrap();
+        tx.rollback_to_savepoint().unwrap();
+        // `b` was written blind and the write was rolled back, so it
+        // was never read and is not validated. The lock stays held.
+        db.db().put(b"b", b"external").unwrap();
+        tx.put(b"a", b"1").unwrap();
+        tx.commit().unwrap();
+        assert_eq!(db.db().get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(db.db().get(b"b").unwrap(), Some(b"external".to_vec()));
+    }
+
+    #[test]
+    fn pessimistic_savepoint_rollback_keeps_the_read_anchor() {
+        // Rolling back to a savepoint used to restore the conflict map
+        // and let the next write re-anchor at a newer horizon, which
+        // laundered a write that had bypassed the lock manager.
+        let (db, _dir) = pes_db();
+        db.db().put(b"k", b"v0").unwrap();
+        let mut tx = db.begin_transaction();
+        assert_eq!(tx.get_for_update(b"k").unwrap(), Some(b"v0".to_vec()));
+        tx.set_savepoint();
+        tx.put(b"k", b"rolled-back").unwrap();
+        tx.rollback_to_savepoint().unwrap();
+        db.db().put(b"k", b"racer").unwrap();
+        tx.put(b"k", b"mine").unwrap();
+        let err = tx.commit().expect_err("the bypassing write must be caught");
+        assert!(matches!(err, TransactionError::Conflict { .. }), "{err:?}");
+        assert_eq!(db.db().get(b"k").unwrap(), Some(b"racer".to_vec()));
+    }
+
+    #[test]
+    fn pessimistic_reads_do_not_travel_backwards_after_a_savepoint_rollback() {
+        let (db, _dir) = pes_db();
+        db.db().put(b"k", b"v0").unwrap();
+        let mut tx = db.begin_transaction();
+        db.db().put(b"k", b"v1").unwrap();
+        let first = tx.get_for_update(b"k").unwrap();
+        assert_eq!(first, Some(b"v1".to_vec()));
+        tx.set_savepoint();
+        tx.put(b"k", b"staged").unwrap();
+        tx.rollback_to_savepoint().unwrap();
+        // The lock is still held and the read anchor with it, so the
+        // second read cannot return an older value than the first.
+        assert_eq!(tx.get(b"k").unwrap(), first);
+    }
+
+    #[test]
+    fn pessimistic_read_then_write_detects_a_concurrent_write() {
+        // A read-modify-write through plain `get` takes no lock, so the
+        // commit check is the only thing standing between it and a lost
+        // update.
+        let (db, _dir) = pes_db();
+        db.db().put(b"k", b"v0").unwrap();
+        let mut tx = db.begin_transaction();
+        assert_eq!(tx.get(b"k").unwrap(), Some(b"v0".to_vec()));
+        db.db().put(b"k", b"v1").unwrap();
+        tx.put(b"k", b"derived-from-v0").unwrap();
+        let err = tx.commit().expect_err("the stale read must be caught");
+        assert!(matches!(err, TransactionError::Conflict { .. }), "{err:?}");
+        assert_eq!(db.db().get(b"k").unwrap(), Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn pessimistic_read_without_a_write_is_not_validated() {
+        let (db, _dir) = pes_db();
+        db.db().put(b"read-only", b"v0").unwrap();
+        let mut tx = db.begin_transaction();
+        assert_eq!(tx.get(b"read-only").unwrap(), Some(b"v0".to_vec()));
+        db.db().put(b"read-only", b"v1").unwrap();
+        tx.put(b"other", b"1").unwrap();
+        tx.commit().unwrap();
+        assert_eq!(db.db().get(b"other").unwrap(), Some(b"1".to_vec()));
+    }
+
+    #[test]
+    fn pessimistic_range_delete_over_a_tracked_key_is_a_conflict() {
+        let (db, _dir) = pes_db();
+        db.db().put(b"k", b"v0").unwrap();
+        let mut tx = db.begin_transaction();
+        assert_eq!(tx.get_for_update(b"k").unwrap(), Some(b"v0".to_vec()));
+        db.db().delete_range(b"a", b"z").unwrap();
+        tx.put(b"k", b"resurrected").unwrap();
+        let err = tx
+            .commit()
+            .expect_err("a range delete over a tracked key is a conflict");
+        assert!(matches!(err, TransactionError::Conflict { .. }), "{err:?}");
+        assert_eq!(db.db().get(b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn optimistic_range_delete_over_a_tracked_key_is_a_conflict() {
+        let (db, _dir) = opt_db();
+        db.db().put(b"k", b"v0").unwrap();
+        let mut tx = db.begin_transaction();
+        assert_eq!(tx.get_for_update(b"k").unwrap(), Some(b"v0".to_vec()));
+        db.db().delete_range(b"a", b"z").unwrap();
+        tx.put(b"k", b"resurrected").unwrap();
+        let err = tx
+            .commit()
+            .expect_err("a range delete over a tracked key is a conflict");
+        assert!(matches!(err, TransactionError::Conflict { .. }), "{err:?}");
+        assert_eq!(db.db().get(b"k").unwrap(), None);
     }
 
     // ── Shared behavior ─────────────────────────────────────────────────

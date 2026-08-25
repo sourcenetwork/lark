@@ -1,6 +1,6 @@
-//! `lark-ycsb` — Rust-native YCSB driver for lark.
+//! `lark-ycsb` - Rust-native YCSB driver for lark.
 //!
-//! Implements the Yahoo Cloud Serving Benchmark workloads A–F
+//! Implements the Yahoo Cloud Serving Benchmark workloads A-F
 //! with a Zipfian key distribution, so lark can be benchmarked
 //! against the industry-standard methodology.
 //!

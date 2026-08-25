@@ -1,4 +1,3 @@
-use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -34,82 +33,87 @@ const MAX_SHARD_BITS: u32 = MAX_BLOCK_CACHE_SHARD_BITS;
 
 /// Minimum per-shard capacity. Tiny caches with many shards
 /// would otherwise produce shards with 0 bytes of capacity, which
-/// is almost certainly a misconfiguration — fall back to a single
+/// is almost certainly a misconfiguration: fall back to a single
 /// shard in that case.
 const MIN_SHARD_CAPACITY: usize = 64 * 1024;
 
+/// Bookkeeping bytes an entry costs beyond [`Block::charge`]: the LRU
+/// list node, the hash-table slot, the `Arc` reference counts, and
+/// allocator rounding. Charged against the byte budget so the budget
+/// alone bounds everything the cache holds, with no separate
+/// entry-count cap that could bind invisibly below it.
+const ENTRY_OVERHEAD: usize = 128;
+
+/// Bytes one cached entry costs the cache.
+fn entry_charge(block: &Block) -> usize {
+    block.charge() + ENTRY_OVERHEAD
+}
+
 /// Per-shard state.
 struct CacheShard {
-    /// LRU ordering plus the block payload. The LRU itself is
-    /// bounded by a huge entry count so in practice the byte
-    /// budget below is the real cap.
+    /// LRU ordering plus the block payload. Constructed unbounded so
+    /// the map grows with the working set instead of preallocating
+    /// for a full cache; `capacity` is the only bound and it is
+    /// enforced in `insert`, so the LRU never evicts behind `used`'s
+    /// back.
     lru: lru::LruCache<CacheKey, Arc<Block>>,
-    /// Byte budget for this shard — capacity / num_shards.
+    /// Byte budget for this shard: total capacity / num_shards.
     capacity: usize,
-    /// Bytes currently held by entries in `lru`. Kept as a plain
-    /// field (not atomic) because every mutation is done under
-    /// the shard mutex anyway.
+    /// Bytes currently held by entries in `lru`, per
+    /// [`entry_charge`]. Kept as a plain field (not atomic) because
+    /// every mutation is done under the shard mutex anyway.
     used: usize,
 }
 
 impl CacheShard {
     fn new(capacity: usize) -> Self {
         Self {
-            // 1M is larger than any realistic per-shard entry
-            // count; the byte accounting is what actually bounds
-            // the cache.
-            lru: lru::LruCache::new(NonZeroUsize::new(1_000_000).unwrap()),
+            lru: lru::LruCache::unbounded(),
             capacity,
             used: 0,
         }
     }
 
-    /// Try to insert `(key, block)` into this shard, evicting LRU
-    /// entries as needed. Returns `true` if the insert succeeded,
-    /// `false` if the single entry is larger than the shard
-    /// capacity — in that case the caller sees the raw `Arc` and
-    /// `strict_capacity_limit` controls whether we cache anyway.
-    fn insert(&mut self, key: CacheKey, block: Arc<Block>, strict: bool) -> bool {
-        let size = block.charge();
-        if size == 0 {
+    /// Drop any entry already stored at `key` so a re-insert replaces
+    /// rather than double-counts.
+    fn take_existing(&mut self, key: &CacheKey) {
+        if let Some(old) = self.lru.pop(key) {
+            self.used = self.used.saturating_sub(entry_charge(&old));
+        }
+    }
+
+    /// Insert `(key, block)` within this shard's byte budget,
+    /// evicting the LRU tail to make room. Returns `false` without
+    /// storing anything when `size` exceeds the whole shard budget;
+    /// the caller then decides whether the cache-wide budget can
+    /// still absorb it.
+    fn insert_within_budget(&mut self, key: CacheKey, block: &Arc<Block>, size: usize) -> bool {
+        // Checked before the replace-path pop so a refusal leaves
+        // `used` untouched and the caller's byte accounting exact.
+        if size > self.capacity {
             return false;
         }
-
-        // A block larger than the whole shard can only be cached
-        // when strict_capacity_limit is off — in strict mode we
-        // refuse rather than blow past the budget.
-        if size > self.capacity {
-            if strict {
-                return false;
-            }
-            // Non-strict: evict everything, accept the oversized
-            // entry, live with the overshoot.
-            self.lru.clear();
-            self.used = 0;
-            self.used += size;
-            self.lru.put(key, block);
-            return true;
-        }
-
-        // Replace-path: drop any existing entry at this key so we
-        // don't double-count.
-        if let Some(old) = self.lru.pop(&key) {
-            self.used = self.used.saturating_sub(old.charge());
-        }
-
-        // Evict LRU entries until the new one fits.
+        self.take_existing(&key);
         while self.used + size > self.capacity {
             match self.lru.pop_lru() {
                 Some((_, evicted)) => {
-                    self.used = self.used.saturating_sub(evicted.charge());
+                    self.used = self.used.saturating_sub(entry_charge(&evicted));
                 }
                 None => break,
             }
         }
-
         self.used += size;
-        self.lru.put(key, block);
+        self.lru.put(key, Arc::clone(block));
         true
+    }
+
+    /// Replace the whole shard with one entry that is larger than the
+    /// shard's own share of the budget. Only reached once the caller
+    /// has reserved `size` against the cache-wide budget.
+    fn replace_all_with(&mut self, key: CacheKey, block: Arc<Block>, size: usize) {
+        self.lru.clear();
+        self.used = size;
+        self.lru.put(key, block);
     }
 
     fn get(&mut self, key: &CacheKey) -> Option<Arc<Block>> {
@@ -125,7 +129,7 @@ impl CacheShard {
             .collect();
         for key in keys {
             if let Some(block) = self.lru.pop(&key) {
-                self.used = self.used.saturating_sub(block.charge());
+                self.used = self.used.saturating_sub(entry_charge(&block));
             }
         }
     }
@@ -145,16 +149,42 @@ impl CacheShard {
 ///
 /// # Capacity
 ///
-/// `Options::block_cache_size` is the total byte budget. It is
-/// split evenly across shards; each shard evicts its own LRU tail
-/// as inserts would push it over its share. If a single entry is
-/// larger than one shard's capacity, behavior depends on
+/// `Options::block_cache_size` is the total byte budget and it is a
+/// hard bound: the cache never holds more than it, whatever the shard
+/// count, block size, or value size. The budget is split evenly
+/// across shards; each shard evicts its own LRU tail as inserts would
+/// push it over its share.
+///
+/// An entry larger than one shard's share is handled by
 /// [`Options::strict_capacity_limit`]:
 ///
-/// * `false` (default): the shard evicts everything and admits
-///   the oversized entry, accepting a one-entry overshoot.
-/// * `true`: the shard refuses the insert and leaves the caller
-///   to use the block directly; nothing is cached.
+/// * `false` (default): the per-shard split is a soft target. The
+///   shard is emptied and the entry admitted, but only once the
+///   entry has been reserved against the cache-wide budget, so no
+///   number of shards can add up past `block_cache_size`. An entry
+///   larger than the whole budget is never cached.
+/// * `true`: the shard refuses the insert and leaves the caller to
+///   use the block directly; nothing is cached.
+///
+/// The cache-wide reservation is checked against the published total,
+/// which can lag inserts still in flight on other threads; the
+/// per-shard budget is always exact because it is enforced under the
+/// shard's own mutex.
+///
+/// A budget of 0 disables the cache: no shard is allocated, every
+/// `get` misses, every `insert` is dropped, and the block-cache
+/// tickers stay at zero.
+///
+/// # Allocation
+///
+/// Everything the cache allocates is driven by the byte budget,
+/// never by the shard count: the per-shard maps start empty and grow
+/// with the working set, and each entry is charged
+/// [`Block::charge`] plus [`ENTRY_OVERHEAD`], which covers the LRU
+/// node, the hash slot, and the `Arc` header that `Block::charge`
+/// cannot see. `usage()` reports that same total, so the number the
+/// `lark.block-cache-usage` property publishes is what the cache
+/// actually costs rather than payload bytes alone.
 pub(crate) struct BlockCache {
     shards: Box<[Mutex<CacheShard>]>,
     /// Total capacity across all shards, in bytes. Kept
@@ -182,28 +212,43 @@ pub(crate) struct BlockCache {
 
 impl BlockCache {
     /// Create a new block cache with the given capacity in bytes
-    /// and default sharding / strictness.
+    /// and default sharding and strictness.
     #[cfg(test)]
     pub(crate) fn new(capacity_bytes: usize) -> Self {
         Self::with_config(capacity_bytes, 6, false)
     }
 
-    /// Create a new block cache with an explicit shard-bits and
-    /// strictness configuration. `shard_bits` is clamped to
-    /// `[0, MAX_SHARD_BITS]`.
+    /// Create a new block cache with an explicit byte budget,
+    /// shard-bits, and strictness configuration. `shard_bits` is
+    /// clamped to `[0, MAX_SHARD_BITS]`.
+    ///
+    /// A `capacity_bytes` of 0 builds a disabled cache: no shard is
+    /// allocated, nothing is stored, and `get` always misses.
     pub(crate) fn with_config(
         capacity_bytes: usize,
         shard_bits: u32,
         strict_capacity_limit: bool,
     ) -> Self {
+        if capacity_bytes == 0 {
+            return Self {
+                shards: Vec::new().into_boxed_slice(),
+                capacity: 0,
+                shard_mask: 0,
+                #[cfg(test)]
+                num_shards: 0,
+                total_used: AtomicUsize::new(0),
+                strict: strict_capacity_limit,
+                stats: None,
+            };
+        }
         let shard_bits = shard_bits.min(MAX_SHARD_BITS);
         let mut num_shards: usize = 1usize << shard_bits;
-        // Fall back to a single shard if splitting would leave
+        // Fall back to fewer shards if splitting would leave
         // every shard below the minimum useful capacity.
         while num_shards > 1 && capacity_bytes / num_shards < MIN_SHARD_CAPACITY {
             num_shards /= 2;
         }
-        let per_shard = capacity_bytes / num_shards.max(1);
+        let per_shard = capacity_bytes / num_shards;
         let shards: Box<[Mutex<CacheShard>]> = (0..num_shards)
             .map(|_| Mutex::new(CacheShard::new(per_shard)))
             .collect::<Vec<_>>()
@@ -236,8 +281,13 @@ impl BlockCache {
         (xxh3_64(&buf) & self.shard_mask) as usize
     }
 
-    /// Try to get a block from the cache.
+    /// Try to get a block from the cache. A disabled cache
+    /// (`block_cache_size` of 0) always misses and records nothing:
+    /// there was no cache lookup to count.
     pub(crate) fn get(&self, file_id: u64, offset: u64) -> Option<Arc<Block>> {
+        if self.shards.is_empty() {
+            return None;
+        }
         let key = CacheKey { file_id, offset };
         let idx = self.shard_index(&key);
         let hit = self.shards[idx].lock().get(&key);
@@ -255,33 +305,67 @@ impl BlockCache {
     /// Insert a block into the cache. The block may be evicted
     /// before it is next read, especially under memory pressure.
     /// The function signature deliberately takes ownership of the
-    /// `Arc` — the caller's clone is the one they continue to
-    /// use, and the cache's copy is managed internally.
+    /// `Arc`: the caller's clone is the one they continue to
+    /// use, and the cache's copy is managed internally. A disabled
+    /// cache (`block_cache_size` of 0) drops the block.
     pub(crate) fn insert(&self, file_id: u64, offset: u64, block: Arc<Block>) {
-        let size = block.charge();
+        if self.shards.is_empty() {
+            return;
+        }
         let key = CacheKey { file_id, offset };
+        let size = entry_charge(&block);
         let idx = self.shard_index(&key);
-        let (before_used, after_used) = {
+        {
             let mut shard = self.shards[idx].lock();
             let before = shard.used;
-            shard.insert(key, block, self.strict);
-            (before, shard.used)
-        };
-        // Keep the atomic total in sync with the per-shard delta.
-        if after_used >= before_used {
-            self.total_used
-                .fetch_add(after_used - before_used, Ordering::Relaxed);
-        } else {
-            self.total_used
-                .fetch_sub(before_used - after_used, Ordering::Relaxed);
+            if shard.insert_within_budget(key, &block, size) {
+                self.publish(before, shard.used);
+            } else if self.strict || size > self.capacity {
+                // Too big for one shard and either strict mode or too
+                // big for the entire cache: nothing is stored, but the
+                // replace-path pop may still have freed bytes.
+                self.publish(before, shard.used);
+            } else {
+                // Non-strict oversized. Reserve the entry against the
+                // cache-wide budget before touching the shard, so the
+                // total cannot creep up with the shard count the way
+                // an unchecked per-shard overshoot would.
+                let freed = shard.used;
+                loop {
+                    let current = self.total_used.load(Ordering::Acquire);
+                    let after = current.saturating_sub(freed).saturating_add(size);
+                    if after > self.capacity {
+                        self.publish(before, shard.used);
+                        return;
+                    }
+                    if self
+                        .total_used
+                        .compare_exchange_weak(current, after, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+                shard.replace_all_with(key, block, size);
+            }
         }
-        let _ = size;
         if let Some(s) = self.stats.as_deref() {
             s.add(Ticker::BlockCacheAdd, 1);
         }
     }
 
-    /// Record a "useful" bloom-filter hit — the filter correctly
+    /// Publish a shard's byte delta to the lock-free running total.
+    /// Adds and subtracts commute, so deltas from different shards can
+    /// land in any order without drifting.
+    fn publish(&self, before: usize, after: usize) {
+        if after >= before {
+            self.total_used.fetch_add(after - before, Ordering::Relaxed);
+        } else {
+            self.total_used.fetch_sub(before - after, Ordering::Relaxed);
+        }
+    }
+
+    /// Record a "useful" bloom-filter hit - the filter correctly
     /// returned "not present" and spared a block read. Called
     /// from SSTable reader paths that have already consulted the
     /// cache and know they're about to short-circuit the lookup.
@@ -292,7 +376,7 @@ impl BlockCache {
         crate::perf_context::record_bloom_check(true);
     }
 
-    /// Record a "full positive" bloom-filter hit — the filter
+    /// Record a "full positive" bloom-filter hit - the filter
     /// said "maybe", the reader went to the block, and the key
     /// was actually present.
     pub(crate) fn record_bloom_full_positive(&self) {
@@ -318,21 +402,35 @@ impl BlockCache {
     }
 
     /// Clear the entire cache.
+    ///
+    /// Each shard publishes exactly the bytes it dropped, under its own
+    /// lock. Storing a flat zero into the running total instead would
+    /// race an `insert` whose delta has not landed yet and leave
+    /// `usage()` permanently under-reporting what the shards hold.
     pub(crate) fn clear(&self) {
         for shard in self.shards.iter() {
-            shard.lock().clear();
+            let freed = {
+                let mut shard = shard.lock();
+                let freed = shard.used;
+                shard.clear();
+                freed
+            };
+            if freed > 0 {
+                self.total_used.fetch_sub(freed, Ordering::Relaxed);
+            }
         }
-        self.total_used.store(0, Ordering::Relaxed);
     }
 
-    /// Approximate total bytes currently held across every shard.
-    /// Used by the `lark.block-cache-usage` property and by
-    /// unit tests to verify eviction.
+    /// Total bytes currently held across every shard, counting each
+    /// entry's [`Block::charge`] plus [`ENTRY_OVERHEAD`]. Used by the
+    /// `lark.block-cache-usage` property and by unit tests to verify
+    /// eviction. Lock-free, so it can lag an insert in flight on
+    /// another thread by that insert's charge.
     pub(crate) fn usage(&self) -> usize {
         self.total_used.load(Ordering::Relaxed)
     }
 
-    /// Total byte capacity — the sum of every shard's budget.
+    /// Total byte capacity: the sum of every shard's budget.
     /// This may be slightly smaller than the
     /// `Options::block_cache_size` the user requested because the
     /// total is rounded down to an integer multiple of the shard
@@ -354,6 +452,20 @@ impl BlockCache {
     #[cfg(test)]
     pub(crate) fn populated_shards(&self) -> usize {
         self.shards.iter().filter(|s| s.lock().used > 0).count()
+    }
+
+    /// Bytes actually held, recomputed from the shards under their
+    /// own locks. The ground truth `usage()`'s lock-free atomic is
+    /// supposed to track.
+    #[cfg(test)]
+    pub(crate) fn true_usage(&self) -> usize {
+        self.shards.iter().map(|s| s.lock().used).sum()
+    }
+
+    /// Entries currently held across every shard.
+    #[cfg(test)]
+    pub(crate) fn entry_count(&self) -> usize {
+        self.shards.iter().map(|s| s.lock().lru.len()).sum()
     }
 }
 
@@ -389,8 +501,8 @@ mod tests {
         }
         let usage = cache.usage();
         assert!(
-            usage <= cache.capacity() + 2048,
-            "usage {usage} exceeded capacity {} by more than one block",
+            usage <= cache.capacity(),
+            "usage {usage} exceeded capacity {}",
             cache.capacity()
         );
         // Oldest entry should have been evicted.
@@ -411,13 +523,54 @@ mod tests {
     }
 
     #[test]
-    fn non_strict_cache_admits_oversized_entry() {
-        let cache = BlockCache::with_config(64 * 1024, 0, false);
-        let big = dummy_block(128 * 1024);
-        cache.insert(1, 0, big);
+    fn non_strict_cache_admits_an_entry_bigger_than_one_shard() {
+        // 8 shards of 64 KiB. A 128 KiB block does not fit its own
+        // shard but fits the 512 KiB cache-wide budget, so the
+        // non-strict cache empties the shard and takes it.
+        let cache = BlockCache::with_config(512 * 1024, 3, false);
+        assert_eq!(cache.num_shards(), 8);
+        cache.insert(1, 0, dummy_block(128 * 1024));
         assert!(
             cache.get(1, 0).is_some(),
-            "non-strict cache should admit oversized entries"
+            "non-strict cache should admit an entry larger than one shard"
+        );
+        assert!(cache.usage() <= cache.capacity());
+    }
+
+    #[test]
+    fn non_strict_cache_refuses_an_entry_bigger_than_the_whole_budget() {
+        let cache = BlockCache::with_config(64 * 1024, 0, false);
+        cache.insert(1, 0, dummy_block(128 * 1024));
+        assert!(
+            cache.get(1, 0).is_none(),
+            "a block larger than the entire budget must not be cached"
+        );
+        assert_eq!(cache.usage(), 0);
+    }
+
+    #[test]
+    fn oversized_admissions_stay_inside_the_budget_at_every_shard_count() {
+        // One oversized entry per shard used to be admitted with no
+        // cache-wide check, so resident bytes scaled with the shard
+        // count instead of the budget.
+        let budget = 256 * 64 * 1024;
+        let mut usages = Vec::new();
+        for bits in [0u32, 4, 8] {
+            let cache = BlockCache::with_config(budget, bits, false);
+            for file_id in 0..4096u64 {
+                cache.insert(file_id, 0, dummy_block(256 * 1024));
+            }
+            assert!(
+                cache.usage() <= cache.capacity(),
+                "shard_bits {bits}: usage {} over capacity {}",
+                cache.usage(),
+                cache.capacity()
+            );
+            usages.push(cache.usage());
+        }
+        assert_eq!(
+            usages[0], usages[2],
+            "resident bytes still track the shard count"
         );
     }
 
@@ -491,6 +644,185 @@ mod tests {
         let cache = BlockCache::with_config(100_000, 6, false);
         assert!(cache.capacity() <= 100_000);
         assert!(cache.capacity() > 0);
+    }
+
+    #[test]
+    fn resident_bytes_track_the_byte_budget_not_the_shard_count() {
+        // The defect this guards: every shard used to preallocate a
+        // fixed 1,000,000-entry map, so the cache's own footprint
+        // scaled with the shard count and ignored the byte budget.
+        // Nothing is allocated up front now, and the budget is the
+        // only bound at any shard count.
+        let budget = 8 * 1024 * 1024;
+        let mut usages = Vec::new();
+        for bits in [0u32, 2, 4, 6] {
+            let cache = BlockCache::with_config(budget, bits, false);
+            assert_eq!(cache.usage(), 0, "a fresh cache holds nothing");
+            for i in 0..8192u64 {
+                cache.insert(1, i * 4096, dummy_block(4096));
+            }
+            assert!(
+                cache.usage() <= cache.capacity(),
+                "shard_bits {bits}: usage {} over capacity {}",
+                cache.usage(),
+                cache.capacity()
+            );
+            usages.push(cache.usage());
+        }
+        // Every configuration converges on the same budget, within one
+        // entry per shard of rounding.
+        let spread =
+            usages.iter().max().copied().unwrap_or(0) - usages.iter().min().copied().unwrap_or(0);
+        assert!(
+            spread <= budget / 16,
+            "resident bytes moved with shard_bits: {usages:?}"
+        );
+    }
+
+    #[test]
+    fn per_entry_overhead_is_charged_against_the_budget() {
+        // A budget filled with tiny blocks is bounded by the entry
+        // overhead, not just by payload bytes: without charging it, a
+        // 1 MiB budget would hold millions of 64-byte blocks.
+        let cache = BlockCache::with_config(1024 * 1024, 0, false);
+        for i in 0..100_000u64 {
+            cache.insert(1, i * 64, dummy_block(0));
+        }
+        assert!(cache.usage() <= cache.capacity());
+        assert!(
+            cache.entry_count() <= cache.capacity() / ENTRY_OVERHEAD,
+            "held {} entries against a {}-byte budget",
+            cache.entry_count(),
+            cache.capacity()
+        );
+    }
+
+    #[test]
+    fn a_working_set_that_fits_the_budget_is_kept_whole() {
+        // The regression this guards: an entry-count cap derived from
+        // the configured `block_size` evicted entries that fit inside
+        // the byte budget, silently shrinking the cache.
+        let cache = BlockCache::with_config(8 * 1024 * 1024, 0, false);
+        let mut offered = 0usize;
+        for i in 0..3500u64 {
+            let blk = dummy_block(1024);
+            offered += entry_charge(&blk);
+            cache.insert(1, i * 4096, blk);
+        }
+        assert!(
+            offered <= cache.capacity(),
+            "test setup: the working set must fit the byte budget"
+        );
+        assert_eq!(
+            cache.entry_count(),
+            3500,
+            "the cache evicted entries that fit inside its byte budget"
+        );
+        assert_eq!(cache.usage(), offered);
+    }
+
+    #[test]
+    fn zero_budget_disables_the_cache() {
+        let cache = BlockCache::with_config(0, 6, false);
+        assert_eq!(cache.num_shards(), 0);
+        assert_eq!(cache.capacity(), 0);
+        cache.insert(1, 0, dummy_block(256));
+        assert!(cache.get(1, 0).is_none());
+        assert_eq!(cache.usage(), 0);
+        cache.evict_file(1);
+        cache.clear();
+        assert_eq!(cache.usage(), 0);
+    }
+
+    #[test]
+    fn zero_budget_strict_cache_is_also_disabled() {
+        let cache = BlockCache::with_config(0, 0, true);
+        cache.insert(1, 0, dummy_block(256));
+        assert!(cache.get(1, 0).is_none());
+        assert_eq!(cache.usage(), 0);
+    }
+
+    #[test]
+    fn tiny_budget_still_admits_a_block_that_fits() {
+        let cache = BlockCache::with_config(4096, 6, false);
+        cache.insert(1, 0, dummy_block(128));
+        assert!(cache.get(1, 0).is_some());
+        assert!(cache.usage() <= cache.capacity());
+    }
+
+    /// Byte accounting is exact: `usage()` is the sum of every live
+    /// entry's charge, which backs the `lark.block-cache-usage`
+    /// property.
+    #[test]
+    fn byte_accounting_is_exact() {
+        let cache = BlockCache::with_config(64 * 1024 * 1024, 0, false);
+        let mut expected = 0usize;
+        for i in 0..64u64 {
+            let blk = dummy_block(512);
+            expected += entry_charge(&blk);
+            cache.insert(1, i * 4096, blk);
+        }
+        assert_eq!(cache.usage(), expected);
+    }
+
+    /// `clear()` used to store a flat zero into the running total
+    /// outside the shard locks, so a concurrent `insert` could add its
+    /// delta afterwards and leave `usage()` reporting bytes the cache
+    /// does not hold, permanently.
+    #[test]
+    fn usage_does_not_drift_when_clear_races_insert() {
+        use std::sync::atomic::AtomicBool;
+        for _ in 0..50 {
+            let cache = Arc::new(BlockCache::with_config(64 * 1024 * 1024, 6, false));
+            let stop = Arc::new(AtomicBool::new(false));
+            let writer = {
+                let cache = Arc::clone(&cache);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut i = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        cache.insert(i % 97, i * 4096, dummy_block(256));
+                        i += 1;
+                    }
+                })
+            };
+            for _ in 0..300 {
+                cache.clear();
+            }
+            stop.store(true, Ordering::Relaxed);
+            writer.join().expect("writer");
+            assert_eq!(
+                cache.usage(),
+                cache.true_usage(),
+                "usage() drifted away from the real byte total"
+            );
+        }
+    }
+
+    /// Concurrent readers and writers racing eviction: the byte budget
+    /// holds under contention.
+    #[test]
+    fn concurrent_inserts_respect_the_budget() {
+        let cache = Arc::new(BlockCache::with_config(1024 * 1024, 2, false));
+        let mut handles = Vec::new();
+        for t in 0..8u64 {
+            let cache = Arc::clone(&cache);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..4000u64 {
+                    cache.insert(t, i * 64, dummy_block(64));
+                    let _ = cache.get(t, (i / 2) * 64);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker");
+        }
+        assert!(
+            cache.true_usage() <= cache.capacity(),
+            "usage {} over capacity {}",
+            cache.true_usage(),
+            cache.capacity()
+        );
     }
 
     #[test]
