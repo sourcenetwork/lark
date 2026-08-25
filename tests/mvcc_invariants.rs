@@ -20,14 +20,20 @@
 //!
 //! # Why none of these can flake
 //!
-//! Every concurrent test here is **reader-driven**: the reader does a
-//! fixed number of checks and only then tells the writers and the
-//! compactor to stop, and a worker cannot exit before that flag is
-//! set. Overlap is therefore a property of the control flow, not of
-//! the scheduler, and no assertion depends on how fast a machine ran.
-//! A slow machine does fewer writer operations under the same number
-//! of reads and still passes. There is no `sleep` anywhere in this
-//! file.
+//! Every concurrent test here has the same shape. The writers do a
+//! **bounded** amount of work and then leave. The readers do a fixed
+//! minimum number of checks and then keep going until every writer has
+//! left, so a slower machine gets *more* overlap, never less, and the
+//! run still terminates. No assertion is on a count of anything the
+//! scheduler decides: the counts are returned and reported, and only
+//! floors ("at least the minimum ran") are asserted. There is no
+//! `sleep` anywhere in this file.
+//!
+//! Bounding the writers matters for more than runtime. A long-lived
+//! snapshot pins every version written under it, so a reader-paced
+//! writer loop feeds back on itself: more retained versions make each
+//! snapshot scan slower, which lets the writers write more. Fixing the
+//! writer op count breaks that loop and keeps the data volume flat.
 //!
 //! Every workload is generated from a fixed seed, so a failure
 //! reproduces byte for byte.
@@ -36,17 +42,31 @@
 //! properties; see each one's doc comment for its measured runtime.
 //! `just mvcc` runs the fast set, `just mvcc-slow` the full-scale set.
 
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use lark_kv::{Db, Options, Snapshot, Statistics, Ticker, WriteBatch};
+use lark_kv::{Db, Snapshot, WriteBatch};
 use tempfile::TempDir;
 
 mod common;
 
 use common::fault;
+
+/// The shared workload harness. It lives in its own file so neither
+/// half grows past the size where it stops being readable in one
+/// sitting; the `#[path]` attribute is what keeps
+/// `tests/mvcc_invariants/` from being picked up as a second test
+/// target.
+#[path = "mvcc_invariants/harness.rs"]
+mod harness;
+
+use harness::{
+    assert_background_work_happened, assert_same_view, drain_iter, instrumented, key_at,
+    open_instrumented, run_batch_atomicity, run_monotonic_reads, run_monotonic_reads_in_parallel,
+    run_snapshot_stability, stamp_of, stamped_value, AtomicityScale, Entries, Live, MonotonicScale,
+    StabilityScale,
+};
 
 /// Child-process entry point required of every test crate that links
 /// the fault-injection harness. This file injects no faults, so the
@@ -56,265 +76,6 @@ use common::fault;
 #[ignore = "child process entry point, re-executed by the crash harness"]
 fn crash_child() {
     fault::child_entrypoint(fault::builtin_workload);
-}
-
-// ── shared scaffolding ─────────────────────────────────────────────
-
-/// Digits of the generation stamp carried in every value.
-const STAMP_WIDTH: usize = 12;
-/// Total value width. The padding keeps values wide enough that a
-/// small write buffer really does flush and compact.
-const VALUE_LEN: usize = 64;
-
-type Entries = Vec<(Vec<u8>, Vec<u8>)>;
-
-fn key_at(i: usize) -> Vec<u8> {
-    format!("mvcc_key_{i:06}").into_bytes()
-}
-
-fn mono_key(writer: usize, i: usize) -> Vec<u8> {
-    format!("mono_{writer}_{i:04}").into_bytes()
-}
-
-/// A value that carries its generation in its own bytes, so a reader
-/// can tell *which* version it observed rather than only that it
-/// observed something.
-fn stamped_value(stamp: u64) -> Vec<u8> {
-    let mut v = format!("v{stamp:0width$}", width = STAMP_WIDTH).into_bytes();
-    v.resize(VALUE_LEN, b'.');
-    v
-}
-
-fn stamp_of(value: &[u8]) -> u64 {
-    assert_eq!(
-        value.len(),
-        VALUE_LEN,
-        "value {:?} is not a stamped value",
-        String::from_utf8_lossy(value),
-    );
-    let text = std::str::from_utf8(&value[1..=STAMP_WIDTH])
-        .expect("stamp field is not valid utf-8, the value bytes were corrupted");
-    text.parse()
-        .expect("stamp field is not a number, the value bytes were corrupted")
-}
-
-/// Deterministic LCG step. Seeded per thread from a fixed constant so
-/// a workload replays identically.
-fn next_rand(state: &mut u64) -> u64 {
-    *state = state
-        .wrapping_mul(6_364_136_223_846_793_005)
-        .wrapping_add(1_442_695_040_888_963_407);
-    *state >> 11
-}
-
-fn writer_seed(t: usize) -> u64 {
-    0x5EED_0000_0000_0001u64 ^ (t as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-}
-
-fn instrumented(write_buffer_size: usize) -> (Options, Arc<Statistics>) {
-    let stats = Arc::new(Statistics::new());
-    let opts = Options {
-        write_buffer_size,
-        statistics: Some(Arc::clone(&stats)),
-        ..Options::default()
-    };
-    (opts, stats)
-}
-
-fn open_instrumented(path: &Path, write_buffer_size: usize) -> (Db, Arc<Statistics>) {
-    let (opts, stats) = instrumented(write_buffer_size);
-    (Db::open(path, opts).expect("open failed"), stats)
-}
-
-/// Fail loudly if the workload never reached the background paths the
-/// test claims to cover. Without this a future tuning change could let
-/// every test here pass without a single flush or compaction.
-fn assert_background_work_happened(stats: &Statistics, what: &str) {
-    assert!(
-        stats.get_ticker(Ticker::FlushCount) > 0,
-        "{what}: no memtable flush ran, the workload never left the memtable",
-    );
-    assert!(
-        stats.get_ticker(Ticker::CompactionCount) > 0,
-        "{what}: no compaction ran, the workload never exercised the compaction path",
-    );
-}
-
-/// Compare two materialized views and report the *first* divergence,
-/// so a failure names one key instead of dumping thousands.
-fn assert_same_view(baseline: &Entries, view: &Entries, ctx: &str) {
-    for (i, (want, got)) in baseline.iter().zip(view.iter()).enumerate() {
-        assert_eq!(
-            want.0,
-            got.0,
-            "{ctx}: entry {i} changed key from {:?} to {:?}",
-            String::from_utf8_lossy(&want.0),
-            String::from_utf8_lossy(&got.0),
-        );
-        assert_eq!(
-            want.1,
-            got.1,
-            "{ctx}: key {:?} changed value from stamp {} to stamp {}",
-            String::from_utf8_lossy(&want.0),
-            stamp_of(&want.1),
-            stamp_of(&got.1),
-        );
-    }
-    assert_eq!(
-        baseline.len(),
-        view.len(),
-        "{ctx}: view changed length; the two views agree on their common prefix",
-    );
-}
-
-/// Walk a fresh iterator to exhaustion and materialize it.
-fn drain_iter(db: &Db) -> Entries {
-    let mut it = db.iter();
-    it.seek_to_first();
-    let mut out = Entries::new();
-    while it.valid() {
-        out.push((
-            it.key().expect("valid iterator has a key").to_vec(),
-            it.value().expect("valid iterator has a value").to_vec(),
-        ));
-        it.next();
-    }
-    it.status().expect("iterator reported an error");
-    out
-}
-
-// ── 1. snapshot stability ──────────────────────────────────────────
-
-struct StabilityScale {
-    keys: usize,
-    writers: usize,
-    min_writer_ops: usize,
-    reads: usize,
-    min_compactions: usize,
-}
-
-/// Measured counts from one stability run, so the test reports real
-/// numbers instead of guessed ones.
-struct StabilityCounts {
-    snapshot_reads: u64,
-    entries_compared: u64,
-    writer_ops: u64,
-    compactions: u64,
-}
-
-fn run_snapshot_stability(scale: &StabilityScale) -> StabilityCounts {
-    let dir = TempDir::new().unwrap();
-    let (db, stats) = open_instrumented(dir.path(), 16 * 1024);
-    let db = Arc::new(db);
-
-    for i in 0..scale.keys {
-        db.put(&key_at(i), &stamped_value(0)).unwrap();
-    }
-    db.compact_range(None, None).unwrap();
-
-    let snap = db.snapshot();
-    let baseline = snap.scan(None, None).unwrap();
-    assert_eq!(
-        baseline.len(),
-        scale.keys,
-        "the snapshot did not observe the seed data it was taken over",
-    );
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let writer_ops = Arc::new(AtomicU64::new(0));
-    let compactions = Arc::new(AtomicU64::new(0));
-    // Writers, compactor and the reading main thread leave the gate
-    // together, and no worker may exit before the reader sets `stop`,
-    // so every check below provably races live background work.
-    let gate = Arc::new(Barrier::new(scale.writers + 2));
-
-    let mut workers = Vec::new();
-    for t in 0..scale.writers {
-        let db = Arc::clone(&db);
-        let stop = Arc::clone(&stop);
-        let gate = Arc::clone(&gate);
-        let writer_ops = Arc::clone(&writer_ops);
-        let keys = scale.keys;
-        let min_ops = scale.min_writer_ops;
-        workers.push(thread::spawn(move || {
-            let mut seed = writer_seed(t);
-            gate.wait();
-            let mut n = 0u64;
-            loop {
-                n += 1;
-                let k = key_at(next_rand(&mut seed) as usize % keys);
-                if next_rand(&mut seed) % 4 == 0 {
-                    db.delete(&k).unwrap();
-                } else {
-                    db.put(&k, &stamped_value(n)).unwrap();
-                }
-                if n as usize >= min_ops && stop.load(Ordering::Acquire) {
-                    break;
-                }
-            }
-            writer_ops.fetch_add(n, Ordering::Relaxed);
-        }));
-    }
-
-    let compactor = {
-        let db = Arc::clone(&db);
-        let stop = Arc::clone(&stop);
-        let gate = Arc::clone(&gate);
-        let compactions = Arc::clone(&compactions);
-        let min_compactions = scale.min_compactions;
-        thread::spawn(move || {
-            gate.wait();
-            let mut n = 0u64;
-            loop {
-                db.compact_range(None, None).unwrap();
-                n += 1;
-                if n as usize >= min_compactions && stop.load(Ordering::Acquire) {
-                    break;
-                }
-            }
-            compactions.fetch_add(n, Ordering::Relaxed);
-        })
-    };
-
-    gate.wait();
-    let mut entries_compared = 0u64;
-    for round in 0..scale.reads {
-        let view = snap.scan(None, None).unwrap();
-        assert_same_view(&baseline, &view, &format!("snapshot scan round {round}"));
-        entries_compared += view.len() as u64;
-        for i in [0, scale.keys / 2, scale.keys - 1] {
-            assert_eq!(
-                snap.get(&key_at(i)).unwrap().as_deref(),
-                Some(baseline[i].1.as_slice()),
-                "snapshot point read of key {i} disagreed with its own scan at round {round}",
-            );
-        }
-    }
-    stop.store(true, Ordering::Release);
-
-    for w in workers {
-        w.join().unwrap();
-    }
-    compactor.join().unwrap();
-
-    // The view must still hold after every writer and compactor has
-    // finished, not only while they were racing.
-    assert_same_view(&baseline, &snap.scan(None, None).unwrap(), "post-join scan");
-
-    // Guard against a vacuous pass: the writers must actually have
-    // changed the live database out from under the snapshot.
-    assert!(
-        db.scan(None, None).unwrap() != baseline,
-        "the writers never changed the live view, so the snapshot proved nothing",
-    );
-    assert_background_work_happened(&stats, "snapshot stability");
-
-    StabilityCounts {
-        snapshot_reads: scale.reads as u64,
-        entries_compared,
-        writer_ops: writer_ops.load(Ordering::Relaxed),
-        compactions: compactions.load(Ordering::Relaxed),
-    }
 }
 
 /// A snapshot's view is byte-identical for its whole life.
@@ -333,191 +94,37 @@ fn a_snapshots_view_is_byte_identical_for_its_whole_life() {
     let counts = run_snapshot_stability(&StabilityScale {
         keys: 400,
         writers: 6,
-        min_writer_ops: 200,
-        reads: 60,
-        min_compactions: 4,
+        ops_per_writer: 400,
+        min_reads: 20,
+        min_compactions: 3,
     });
-    assert_eq!(counts.snapshot_reads, 60);
-    assert!(counts.entries_compared > 0);
-    assert!(counts.writer_ops > 0);
-    assert!(counts.compactions > 0);
+    assert!(counts.snapshot_reads >= 20);
+    assert!(counts.entries_compared >= 20 * 400);
+    assert!(counts.compactions >= 3);
+    assert_eq!(counts.writer_ops, 2_400);
 }
 
 /// Full-scale version of
 /// [`a_snapshots_view_is_byte_identical_for_its_whole_life`], the
-/// shape the original probe ran at.
+/// shape the original probe ran at: 2000 keys, 6 writer threads and
+/// 120000 writes racing a snapshot that pins every version of them.
 ///
-/// Measured runtime: see the `#[ignore]` reason. Kept out of the
+/// Measured runtime is in the `#[ignore]` reason. Kept out of the
 /// default run so `cargo test` stays fast; `just mvcc-slow` runs it.
 #[test]
-#[ignore = "full-scale MVCC soak; run with `just mvcc-slow`"]
+#[ignore = "full-scale MVCC soak, measured at 13.8s; run with `just mvcc-slow`"]
 fn snapshot_stability_at_full_scale() {
     let counts = run_snapshot_stability(&StabilityScale {
         keys: 2_000,
         writers: 6,
-        min_writer_ops: 5_000,
-        reads: 600,
-        min_compactions: 20,
+        ops_per_writer: 20_000,
+        min_reads: 100,
+        min_compactions: 10,
     });
     println!(
         "snapshot stability: {} scans, {} entries compared, {} writer ops, {} full compactions",
         counts.snapshot_reads, counts.entries_compared, counts.writer_ops, counts.compactions,
     );
-}
-
-// ── 2. WriteBatch atomicity under concurrent readers ───────────────
-
-struct AtomicityScale {
-    width: usize,
-    readers: usize,
-    checks_per_reader: usize,
-    min_generations: u64,
-}
-
-fn assert_uniform_generation(keys: &[Vec<u8>], got: &[Option<Vec<u8>>], ctx: &str) {
-    assert_eq!(
-        keys.len(),
-        got.len(),
-        "{ctx}: read {} values for {} batch keys",
-        got.len(),
-        keys.len(),
-    );
-    let first = got[0].as_deref().unwrap_or_else(|| {
-        panic!(
-            "{ctx}: key {:?} vanished",
-            String::from_utf8_lossy(&keys[0])
-        )
-    });
-    let want = stamp_of(first);
-    for (k, v) in keys.iter().zip(got.iter()) {
-        let v = v.as_deref().unwrap_or_else(|| {
-            panic!(
-                "{ctx}: key {:?} vanished while the rest of its batch was at generation {want}",
-                String::from_utf8_lossy(k),
-            )
-        });
-        assert_eq!(
-            stamp_of(v),
-            want,
-            "{ctx}: torn batch - key {:?} is at generation {} while key {:?} is at generation \
-             {want}",
-            String::from_utf8_lossy(k),
-            stamp_of(v),
-            String::from_utf8_lossy(&keys[0]),
-        );
-    }
-}
-
-fn run_batch_atomicity(scale: &AtomicityScale) -> (u64, u64) {
-    let dir = TempDir::new().unwrap();
-    let (db, stats) = open_instrumented(dir.path(), 16 * 1024);
-    let db = Arc::new(db);
-
-    let batch_keys: Vec<Vec<u8>> = (0..scale.width)
-        .map(|i| format!("atomic_{i:03}").into_bytes())
-        .collect();
-
-    // Generation 0 so a reader always finds the key set present and
-    // asserts on uniformity rather than on presence.
-    let mut seed_batch = WriteBatch::new();
-    for k in &batch_keys {
-        seed_batch.put(k, &stamped_value(0));
-    }
-    db.write(seed_batch).unwrap();
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let generations = Arc::new(AtomicU64::new(0));
-    let checks = Arc::new(AtomicU64::new(0));
-    let gate = Arc::new(Barrier::new(scale.readers + 2));
-
-    let writer = {
-        let db = Arc::clone(&db);
-        let stop = Arc::clone(&stop);
-        let gate = Arc::clone(&gate);
-        let generations = Arc::clone(&generations);
-        let batch_keys = batch_keys.clone();
-        let min_generations = scale.min_generations;
-        thread::spawn(move || {
-            gate.wait();
-            let mut generation = 0u64;
-            loop {
-                generation += 1;
-                let mut batch = WriteBatch::new();
-                for k in &batch_keys {
-                    batch.put(k, &stamped_value(generation));
-                }
-                db.write(batch).unwrap();
-                if generation >= min_generations && stop.load(Ordering::Acquire) {
-                    break;
-                }
-            }
-            generations.store(generation, Ordering::Relaxed);
-        })
-    };
-
-    let compactor = {
-        let db = Arc::clone(&db);
-        let stop = Arc::clone(&stop);
-        let gate = Arc::clone(&gate);
-        thread::spawn(move || {
-            gate.wait();
-            let mut n = 0u64;
-            loop {
-                db.compact_range(None, None).unwrap();
-                n += 1;
-                if n >= 2 && stop.load(Ordering::Acquire) {
-                    break;
-                }
-            }
-        })
-    };
-
-    let mut readers = Vec::new();
-    for r in 0..scale.readers {
-        let db = Arc::clone(&db);
-        let gate = Arc::clone(&gate);
-        let checks = Arc::clone(&checks);
-        let batch_keys = batch_keys.clone();
-        let rounds = scale.checks_per_reader;
-        readers.push(thread::spawn(move || {
-            let refs: Vec<&[u8]> = batch_keys.iter().map(|k| k.as_slice()).collect();
-            gate.wait();
-            let mut local = 0u64;
-            for round in 0..rounds {
-                // Three independent consistent-read surfaces, because a
-                // torn batch could hide in any one of them alone.
-                let got = db.multi_get(&refs).unwrap();
-                assert_uniform_generation(&batch_keys, &got, &format!("multi_get r{r} #{round}"));
-                local += 1;
-
-                let snap = db.snapshot();
-                let got: Vec<Option<Vec<u8>>> =
-                    batch_keys.iter().map(|k| snap.get(k).unwrap()).collect();
-                assert_uniform_generation(&batch_keys, &got, &format!("snapshot r{r} #{round}"));
-                local += 1;
-
-                let scanned = snap.scan(Some(b"atomic_"), Some(b"atomic`")).unwrap();
-                let as_opts: Vec<Option<Vec<u8>>> =
-                    scanned.into_iter().map(|e| Some(e.1)).collect();
-                assert_uniform_generation(&batch_keys, &as_opts, &format!("scan r{r} #{round}"));
-                local += 1;
-            }
-            checks.fetch_add(local, Ordering::Relaxed);
-        }));
-    }
-
-    for rd in readers {
-        rd.join().unwrap();
-    }
-    stop.store(true, Ordering::Release);
-    writer.join().unwrap();
-    compactor.join().unwrap();
-
-    assert_background_work_happened(&stats, "batch atomicity");
-    (
-        checks.load(Ordering::Relaxed),
-        generations.load(Ordering::Relaxed),
-    )
 }
 
 /// A `WriteBatch` that rewrites a whole key set is never observed
@@ -540,154 +147,28 @@ fn a_reader_never_observes_a_write_batch_half_applied() {
     let (checks, generations) = run_batch_atomicity(&AtomicityScale {
         width: 12,
         readers: 4,
-        checks_per_reader: 400,
-        min_generations: 200,
+        min_checks_per_reader: 150,
+        generations: 1_500,
     });
-    assert_eq!(checks, 4 * 400 * 3);
-    assert!(generations >= 200);
+    assert!(checks >= 4 * 150 * 3);
+    assert_eq!(generations, 1_500);
 }
 
 /// Full-scale version of
 /// [`a_reader_never_observes_a_write_batch_half_applied`].
 ///
-/// Measured runtime: see the `#[ignore]` reason. Run with
+/// Measured runtime is in the `#[ignore]` reason. Run with
 /// `just mvcc-slow`.
 #[test]
-#[ignore = "full-scale batch-atomicity soak; run with `just mvcc-slow`"]
+#[ignore = "full-scale batch-atomicity soak, measured at 9.3s; run with `just mvcc-slow`"]
 fn batch_atomicity_at_full_scale() {
     let (checks, generations) = run_batch_atomicity(&AtomicityScale {
         width: 24,
         readers: 4,
-        checks_per_reader: 8_000,
-        min_generations: 5_000,
+        min_checks_per_reader: 2_000,
+        generations: 30_000,
     });
     println!("batch atomicity: {checks} checks over {generations} generations, 0 torn");
-}
-
-// ── 3. monotonic reads ─────────────────────────────────────────────
-
-struct MonotonicScale {
-    writers: usize,
-    keys_per_writer: usize,
-    readers: usize,
-    rounds_per_reader: usize,
-    min_versions: u64,
-}
-
-fn run_monotonic_reads(scale: &MonotonicScale) -> (u64, u64) {
-    let dir = TempDir::new().unwrap();
-    let (db, stats) = open_instrumented(dir.path(), 16 * 1024);
-    let db = Arc::new(db);
-
-    for w in 0..scale.writers {
-        for i in 0..scale.keys_per_writer {
-            db.put(&mono_key(w, i), &stamped_value(0)).unwrap();
-        }
-    }
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let reads = Arc::new(AtomicU64::new(0));
-    let writes = Arc::new(AtomicU64::new(0));
-    let gate = Arc::new(Barrier::new(scale.writers + scale.readers + 1));
-
-    let mut workers = Vec::new();
-    for w in 0..scale.writers {
-        let db = Arc::clone(&db);
-        let stop = Arc::clone(&stop);
-        let gate = Arc::clone(&gate);
-        let writes = Arc::clone(&writes);
-        let keys = scale.keys_per_writer;
-        let min_versions = scale.min_versions;
-        workers.push(thread::spawn(move || {
-            gate.wait();
-            // Exactly one writer owns each key, so the stamp on a key
-            // is a strictly increasing version number by construction.
-            let mut v = 0u64;
-            loop {
-                v += 1;
-                for i in 0..keys {
-                    db.put(&mono_key(w, i), &stamped_value(v)).unwrap();
-                }
-                if v >= min_versions && stop.load(Ordering::Acquire) {
-                    break;
-                }
-            }
-            writes.fetch_add(v * keys as u64, Ordering::Relaxed);
-        }));
-    }
-
-    let compactor = {
-        let db = Arc::clone(&db);
-        let stop = Arc::clone(&stop);
-        let gate = Arc::clone(&gate);
-        thread::spawn(move || {
-            gate.wait();
-            let mut n = 0u64;
-            loop {
-                db.compact_range(None, None).unwrap();
-                n += 1;
-                if n >= 3 && stop.load(Ordering::Acquire) {
-                    break;
-                }
-            }
-        })
-    };
-
-    let mut readers = Vec::new();
-    for r in 0..scale.readers {
-        let db = Arc::clone(&db);
-        let gate = Arc::clone(&gate);
-        let reads = Arc::clone(&reads);
-        let writers = scale.writers;
-        let keys = scale.keys_per_writer;
-        let rounds = scale.rounds_per_reader;
-        readers.push(thread::spawn(move || {
-            let mut seen = vec![0u64; writers * keys];
-            gate.wait();
-            let mut local = 0u64;
-            for round in 0..rounds {
-                for w in 0..writers {
-                    for i in 0..keys {
-                        let k = mono_key(w, i);
-                        let got = db.get(&k).unwrap().unwrap_or_else(|| {
-                            panic!(
-                                "reader {r} round {round}: key {:?} vanished; it is only ever \
-                                 overwritten, never deleted",
-                                String::from_utf8_lossy(&k),
-                            )
-                        });
-                        let stamp = stamp_of(&got);
-                        let slot = &mut seen[w * keys + i];
-                        assert!(
-                            stamp >= *slot,
-                            "reader {r} round {round}: key {:?} went backwards from version {} \
-                             to version {stamp}",
-                            String::from_utf8_lossy(&k),
-                            *slot,
-                        );
-                        *slot = stamp;
-                        local += 1;
-                    }
-                }
-            }
-            reads.fetch_add(local, Ordering::Relaxed);
-        }));
-    }
-
-    for rd in readers {
-        rd.join().unwrap();
-    }
-    stop.store(true, Ordering::Release);
-    for w in workers {
-        w.join().unwrap();
-    }
-    compactor.join().unwrap();
-
-    assert_background_work_happened(&stats, "monotonic reads");
-    (
-        reads.load(Ordering::Relaxed),
-        writes.load(Ordering::Relaxed),
-    )
 }
 
 /// A repeated read of one key never travels backwards in version.
@@ -705,33 +186,111 @@ fn run_monotonic_reads(scale: &MonotonicScale) -> (u64, u64) {
 /// block-cache entry served after its file was rewritten.
 #[test]
 fn a_repeated_read_of_one_key_never_travels_backwards() {
-    let (reads, writes) = run_monotonic_reads(&MonotonicScale {
+    let outcome = run_monotonic_reads(&MonotonicScale {
         writers: 4,
         keys_per_writer: 8,
         readers: 3,
-        rounds_per_reader: 400,
-        min_versions: 40,
+        min_rounds_per_reader: 150,
+        versions: 250,
     });
-    assert_eq!(reads, 3 * 400 * 4 * 8);
-    assert!(writes > 0);
+    outcome.assert_clean("monotonic reads");
+    assert!(outcome.reads >= 3 * 150 * 4 * 8);
+    assert_eq!(outcome.writes, 250 * 32);
 }
 
 /// Full-scale version of
 /// [`a_repeated_read_of_one_key_never_travels_backwards`].
 ///
-/// Measured runtime: see the `#[ignore]` reason. Run with
+/// This test currently **fails intermittently** against the engine, and
+/// the failure is real, not a test defect: see
+/// [`a_user_thread_compact_range_never_makes_a_read_travel_backwards`]
+/// for the measured reproduction and the mechanism. Measured red in 2
+/// of 16 runs at this scale, which is why the focused gate exists.
+///
+/// Measured runtime is in the `#[ignore]` reason. Run with
 /// `just mvcc-slow`.
 #[test]
-#[ignore = "full-scale monotonic-read soak; run with `just mvcc-slow`"]
+#[ignore = "full-scale monotonic-read soak, measured at 4.5s; run with `just mvcc-slow`"]
 fn monotonic_reads_at_full_scale() {
-    let (reads, writes) = run_monotonic_reads(&MonotonicScale {
+    let outcome = run_monotonic_reads(&MonotonicScale {
         writers: 4,
         keys_per_writer: 12,
         readers: 3,
-        rounds_per_reader: 6_000,
-        min_versions: 400,
+        min_rounds_per_reader: 2_000,
+        versions: 4_000,
     });
-    println!("monotonic reads: {reads} reads across {writes} writes, 0 regressions");
+    println!(
+        "monotonic reads: {} reads across {} writes, {} regressions",
+        outcome.reads,
+        outcome.writes,
+        outcome.violations.len(),
+    );
+    outcome.assert_clean("monotonic reads at full scale");
+}
+
+/// A `compact_range` driven from a user thread never makes a
+/// concurrent read travel backwards.
+///
+/// This test currently **fails** against the engine. The failure is a
+/// real defect, and this test is the focused gate for it. It runs the
+/// minimal reproducing shape on 60 databases, 4 at a time, because the
+/// window is short and only opens under real contention.
+///
+/// Property: with writers overwriting their own keys, readers polling
+/// them, and one thread calling `Db::compact_range`, no reader may see
+/// a key move backwards in version or read back as absent.
+///
+/// The defect: `LarkEngine::get` (`src/engine/mod.rs`) takes the active
+/// memtable, the frozen memtable list and the version under three
+/// separate lock acquisitions, releasing each before taking the next,
+/// so no reader ever observes a consistent set of sources. A reader can
+/// miss a key's newest version in every source it looks at and fall
+/// through to an older one, or briefly find it in none of them.
+///
+/// Measured: 11 violating instances out of 300, over five independent
+/// 60-instance batches (4, 3, 3, 1, 0), so about 4 runs in 5 are red.
+/// The same workload with the user-thread `compact_range` removed gave
+/// 0/60, and the same workload with a live `Snapshot` pinning the GC
+/// horizon also gave 0/60. That pair is what narrows the cause to the
+/// read path racing a compaction that is free to drop versions, rather
+/// than to the flush path, which installs the new L0 file *before* it
+/// removes the memtable and so leaves no gap.
+#[test]
+#[ignore = "focused regression gate for the user-thread compact_range read race, measured at 26s; currently red, see the doc comment; run with `just mvcc-slow`"]
+fn a_user_thread_compact_range_never_makes_a_read_travel_backwards() {
+    // 15 rounds of 4 concurrent databases: the exact shape the defect
+    // was measured on, so the rate this prints is comparable with the
+    // 4/60 and 3/60 recorded in the doc comment.
+    let scale = MonotonicScale {
+        writers: 4,
+        keys_per_writer: 12,
+        readers: 3,
+        min_rounds_per_reader: 50,
+        versions: 1_500,
+    };
+    let mut violations = Vec::new();
+    let mut reads = 0u64;
+    let mut instances = 0usize;
+    let mut dirty = 0usize;
+    for _ in 0..15 {
+        for o in run_monotonic_reads_in_parallel(&scale, 4) {
+            instances += 1;
+            reads += o.reads;
+            if !o.violations.is_empty() {
+                dirty += 1;
+                violations.extend(o.violations);
+            }
+        }
+    }
+    println!(
+        "compact_range read race: {dirty} of {instances} instances violated, over {reads} reads",
+    );
+    assert!(
+        violations.is_empty(),
+        "{dirty} of {instances} instances saw a read travel backwards under a user-thread \
+         compact_range:\n  {}",
+        violations.join("\n  "),
+    );
 }
 
 // ── 4. version integrity across delete, compact, reopen ────────────
@@ -939,44 +498,41 @@ fn concurrent_iterators_are_unaffected_by_compactions_beneath_them() {
     assert_eq!(baseline.len(), total);
 
     let readers_count = 3usize;
-    let rounds = 40usize;
-    let stop = Arc::new(AtomicBool::new(false));
+    let min_walks = 10usize;
+    let generations = 8u64;
+    let live = Live::new(1);
     let walks = Arc::new(AtomicU64::new(0));
     let gate = Arc::new(Barrier::new(readers_count + 1));
 
     let compactor = {
         let db = Arc::clone(&db);
-        let stop = Arc::clone(&stop);
+        let live = live.clone();
         let gate = Arc::clone(&gate);
         thread::spawn(move || {
             gate.wait();
-            let mut generation = 1u64;
-            let mut n = 0u64;
-            loop {
-                generation += 1;
+            for generation in 2..=generations + 1 {
                 let mut batch = WriteBatch::new();
                 for i in 0..total {
                     batch.put(&key_at(i), &stamped_value(generation));
                 }
                 db.write(batch).unwrap();
                 db.compact_range(None, None).unwrap();
-                n += 1;
-                if n >= 2 && stop.load(Ordering::Acquire) {
-                    break;
-                }
             }
+            live.done_one();
         })
     };
 
     let mut readers = Vec::new();
     for r in 0..readers_count {
         let db = Arc::clone(&db);
+        let live = live.clone();
         let gate = Arc::clone(&gate);
         let baseline = Arc::clone(&baseline);
         let walks = Arc::clone(&walks);
         readers.push(thread::spawn(move || {
             gate.wait();
-            for round in 0..rounds {
+            let mut round = 0usize;
+            loop {
                 let view = drain_iter(&db);
                 assert_eq!(
                     view.len(),
@@ -1003,20 +559,24 @@ fn concurrent_iterators_are_unaffected_by_compactions_beneath_them() {
                     );
                 }
                 walks.fetch_add(1, Ordering::Relaxed);
+                round += 1;
+                if round >= min_walks && !live.any() {
+                    break;
+                }
             }
         }));
     }
 
-    for rd in readers {
-        rd.join().unwrap();
+    let outcomes: Vec<_> = readers
+        .into_iter()
+        .chain(std::iter::once(compactor))
+        .map(|h| h.join())
+        .collect();
+    for o in outcomes {
+        o.unwrap();
     }
-    stop.store(true, Ordering::Release);
-    compactor.join().unwrap();
 
-    assert_eq!(
-        walks.load(Ordering::Relaxed),
-        (readers_count * rounds) as u64
-    );
+    assert!(walks.load(Ordering::Relaxed) >= (readers_count * min_walks) as u64);
     assert_background_work_happened(&stats, "concurrent iterators");
 }
 

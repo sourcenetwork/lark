@@ -83,3 +83,23 @@ test-crash:
 # here is `#[ignore]`d.
 test-lifecycle:
     cargo test --test lifecycle -- --skip crash_child
+
+# MVCC and concurrency invariants: snapshot stability under concurrent
+# writers and compaction, WriteBatch atomicity seen by concurrent readers,
+# monotonic reads, version integrity across delete/compact/reopen, and
+# iterators pinned across compactions that unlink their files. Measured at
+# 0.5s, so every test in the fast set also runs in the default `cargo test`.
+mvcc:
+    cargo test --test mvcc_invariants -- --skip crash_child
+
+# The `#[ignore]`d full-scale MVCC soaks: 120,000 writes racing a snapshot
+# that pins every version of them, 30,000 WriteBatch generations checked by
+# four readers, 1.9M monotonic point reads, and the focused gate for the
+# user-thread `compact_range` read race. Measured at 13.8s + 9.3s + 4.5s +
+# 26s on a debug build.
+#
+# This recipe is RED today, and that is the point: the focused gate finds a
+# real read-path defect. See the doc comment on
+# `a_user_thread_compact_range_never_makes_a_read_travel_backwards`.
+mvcc-slow:
+    cargo test --test mvcc_invariants -- --ignored --nocapture --skip crash_child
