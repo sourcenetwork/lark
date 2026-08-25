@@ -10,7 +10,7 @@
 //! # Dispatch
 //!
 //! Events are dispatched **synchronously** on the thread that
-//! triggered them — flush events on the write thread, compaction
+//! triggered them - flush events on the write thread, compaction
 //! events on the compaction thread, ingest events on the ingest
 //! caller's thread. Listeners **MUST NOT block** or re-enter the
 //! database. The contract is "do a cheap thing or spawn a task."
@@ -28,7 +28,7 @@
 //!   subset should filter in the callback.
 //! - `on_wal_full` is declared so listener implementations can
 //!   target a common shape across storage backends, but lark
-//!   itself never fires it — the WAL is rotated alongside every
+//!   itself never fires it - the WAL is rotated alongside every
 //!   memtable, so there's no separate "WAL-full" condition.
 
 use std::path::PathBuf;
@@ -216,7 +216,7 @@ pub trait EventListener: Send + Sync + 'static {
     }
 
     /// Called when a background flush / compaction / manifest /
-    /// WAL operation returns an error. The engine keeps running —
+    /// WAL operation returns an error. The engine keeps running -
     /// the listener is for observability, not error handling.
     fn on_background_error(&self, reason: BackgroundErrorReason, err: &Error) {
         let _ = (reason, err);

@@ -12,6 +12,12 @@ const RECORD_DELETE_RANGE: u8 = 0x03;
 const RECORD_MERGE: u8 = 0x04;
 const RECORD_BATCH: u8 = 0x05;
 
+/// On-disk record header: 4-byte little-endian payload length plus a
+/// one-byte record type.
+const WAL_HEADER_LEN: usize = 5;
+/// Trailing 4-byte little-endian checksum of every record.
+const CHECKSUM_LEN: usize = 4;
+
 /// A write-ahead log for crash recovery.
 ///
 /// Records are append-only and carry fast non-cryptographic checksums for
@@ -81,7 +87,7 @@ impl Wal {
         self.write_record(RECORD_DELETE, &data)
     }
 
-    /// Append a merge record — an operand layered on top of any
+    /// Append a merge record - an operand layered on top of any
     /// existing value/merge chain for `key`.
     pub(crate) fn append_merge(&mut self, key: &[u8], operand: &[u8], seq: u64) -> io::Result<()> {
         let mut data = Vec::with_capacity(4 + key.len() + 4 + operand.len() + 8);
@@ -166,17 +172,36 @@ impl Wal {
     /// Replay a WAL file and return all entries.
     pub(crate) fn replay(path: &Path) -> io::Result<Vec<WalEntry>> {
         let file = File::open(path)?;
+        let file_len = file.metadata()?.len();
         let mut reader = BufReader::new(file);
         let mut entries = Vec::new();
+        let mut consumed: u64 = 0;
 
         // Read record headers: length (4 bytes) + type (1 byte).
         while let Some(header) = read_wal_header(&mut reader)? {
-            let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+            consumed += WAL_HEADER_LEN as u64;
+            let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
             let record_type = header[4];
+
+            // A corrupt length field is untrusted input: reject it
+            // against the bytes actually left in the file before
+            // allocating, so a five-byte header cannot make recovery
+            // ask the allocator for 4 GiB.
+            let remaining = file_len.saturating_sub(consumed);
+            if len as u64 + CHECKSUM_LEN as u64 > remaining {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "WAL record length {len} exceeds the {remaining} bytes left in {}",
+                        path.display()
+                    ),
+                ));
+            }
 
             // Read data
             let mut data = vec![0u8; len];
             read_exact_or_truncated(&mut reader, &mut data, "truncated WAL record data")?;
+            consumed += len as u64 + CHECKSUM_LEN as u64;
 
             // Read and verify checksum
             let mut checksum_bytes = [0u8; 4];
@@ -337,7 +362,7 @@ fn encode_batch_op(out: &mut Vec<u8>, op: &WriteBatchOp, seq: u64) {
     }
 }
 
-fn read_wal_header(reader: &mut impl Read) -> io::Result<Option<[u8; 5]>> {
+fn read_wal_header(reader: &mut impl Read) -> io::Result<Option<[u8; WAL_HEADER_LEN]>> {
     let mut header = [0u8; 5];
     let mut read = 0;
 
@@ -614,7 +639,7 @@ mod tests {
     }
 
     /// Append a raw record to an already-opened file. Used to craft
-    /// corruption scenarios the public API can't express — unknown
+    /// corruption scenarios the public API can't express - unknown
     /// record types, bad-length headers, etc.
     fn append_raw_record(
         f: &mut impl Write,
@@ -860,7 +885,7 @@ mod tests {
     fn round_trip_large_value() {
         let dir = TempDir::new().unwrap();
         let (mut wal, path) = new_wal(&dir);
-        // 1 MiB value — larger than BufWriter's default 8 KiB buffer,
+        // 1 MiB value - larger than BufWriter's default 8 KiB buffer,
         // forcing multiple writes to the underlying file.
         let big = vec![0xAB; 1 << 20];
         wal.append_put(b"k", &big, 1).unwrap();

@@ -13,7 +13,7 @@ pub(crate) const MAX_LEVELS: usize = 7;
 
 /// A snapshot of which SSTables exist at each level.
 ///
-/// Each level holds `Arc<LiveSst>` — the metadata plus an open reader —
+/// Each level holds `Arc<LiveSst>` - the metadata plus an open reader -
 /// so that every file referenced by a live version has a pinned file
 /// descriptor. Concurrent compaction can safely `unlink` a file as soon
 /// as it's removed from the *current* version because the Arcs in older
@@ -277,6 +277,7 @@ impl VersionSet {
         let (version, writer) = if manifest_path.exists() {
             let data = fs::read(&manifest_path)?;
             let replay = Self::replay_manifest(&data, sst_dir)?;
+            Self::reject_discarded_tables(&replay, data.len(), sst_dir, &manifest_path)?;
 
             let file = OpenOptions::new().append(true).open(&manifest_path)?;
             if replay.valid_len < data.len() {
@@ -308,6 +309,7 @@ impl VersionSet {
         let manifest_path = db_dir.join("MANIFEST");
         let data = fs::read(&manifest_path)?;
         let replay = Self::replay_manifest(&data, sst_dir)?;
+        Self::reject_discarded_tables(&replay, data.len(), sst_dir, &manifest_path)?;
 
         Ok(Self {
             current: Arc::new(RwLock::new(Arc::new(replay.version))),
@@ -386,7 +388,7 @@ impl VersionSet {
 
     /// Rewrite the manifest from scratch, emitting the current version as
     /// a single compact sequence of records. Readers in the live
-    /// `Version` are preserved — we never close their file descriptors.
+    /// `Version` are preserved - we never close their file descriptors.
     pub(crate) fn compact_manifest(&mut self) -> io::Result<()> {
         let version = self.current();
 
@@ -436,9 +438,52 @@ impl VersionSet {
         buf
     }
 
+    /// Refuse to open when a manifest that did not replay cleanly ends up
+    /// referencing no SSTable at all while the table directory still holds
+    /// some.
+    ///
+    /// Replay stops at the first unreadable record and the tail is
+    /// discarded, which is correct for a record that a crash left half
+    /// written. When the *first* record is unreadable the same rule
+    /// silently turns a populated database into an empty one, so that
+    /// combination is reported instead of served: the table files are
+    /// still on disk and only the manifest needs repairing.
+    fn reject_discarded_tables(
+        replay: &ManifestReplay,
+        manifest_len: usize,
+        sst_dir: &Path,
+        manifest_path: &Path,
+    ) -> io::Result<()> {
+        let replayed_cleanly = manifest_len > 0 && replay.valid_len == manifest_len;
+        if replayed_cleanly || replay.version.levels.iter().any(|level| !level.is_empty()) {
+            return Ok(());
+        }
+        let tables = match fs::read_dir(sst_dir) {
+            Ok(entries) => entries
+                .flatten()
+                .filter(|entry| {
+                    entry.path().extension().and_then(|ext| ext.to_str()) == Some("sst")
+                })
+                .count(),
+            Err(_) => 0,
+        };
+        if tables == 0 {
+            return Ok(());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} is corrupt: it references no SSTable, but {tables} table file(s) are present in {}. \
+                 Opening would discard them, so the database is left untouched.",
+                manifest_path.display(),
+                sst_dir.display()
+            ),
+        ))
+    }
+
     fn replay_manifest(data: &[u8], sst_dir: &Path) -> io::Result<ManifestReplay> {
         // Two-pass replay. The first pass walks every record and tracks
-        // the *logical* state of each level — which file ids are live —
+        // the *logical* state of each level - which file ids are live -
         // without touching the filesystem. Only after replay completes
         // do we open readers for the surviving files.
         //
@@ -682,7 +727,7 @@ mod tests {
         .unwrap();
 
         // Holding a snapshot of the version *before* removal keeps both
-        // files alive — this is the invariant that lets get/iter reads
+        // files alive - this is the invariant that lets get/iter reads
         // survive concurrent compaction.
         let pinned = vs.current();
         assert_eq!(pinned.levels[0].len(), 2);
@@ -758,7 +803,7 @@ mod tests {
                 Ok(Some(d)) => d,
                 other => panic!("expected decoded record, got {:?}", other.is_ok()),
             };
-            // Re-encode and compare — equality via round-trip avoids
+            // Re-encode and compare - equality via round-trip avoids
             // having to add PartialEq to ManifestRecord.
             let mut rebuf = Vec::new();
             decoded.encode(&mut rebuf);
@@ -880,7 +925,7 @@ mod tests {
         vs.apply(&[VersionEdit::SetLastSeq(50)]).unwrap();
         drop(vs);
 
-        // Truncate 2 bytes off the end — enough to damage the final
+        // Truncate 2 bytes off the end - enough to damage the final
         // record's checksum or tail.
         let path = dir.path().join("MANIFEST");
         let current = std::fs::metadata(&path).unwrap().len();

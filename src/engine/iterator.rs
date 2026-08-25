@@ -25,13 +25,13 @@
 //! - Drops entries with `seq > snapshot_seq` (not visible at the captured
 //!   snapshot).
 //! - Deduplicates by user key, keeping only the newest visible version.
-//! - Treats a tombstone as "this user key is deleted" — the whole group
+//! - Treats a tombstone as "this user key is deleted" - the whole group
 //!   is skipped, and any older versions in lower levels are suppressed.
 //!
 //! # Forward vs reverse materialization
 //!
 //! In **forward** mode, entries within a user-key group are visited newest-
-//! seq first, so the first visible entry we see is the answer — the rest
+//! seq first, so the first visible entry we see is the answer - the rest
 //! of the group can be consumed quickly.
 //!
 //! In **reverse** mode, entries within a user-key group are visited
@@ -45,7 +45,7 @@
 //! Calling `next()` while in reverse mode (or vice versa) flips the
 //! direction. To avoid yielding the already-emitted user key again, the
 //! iterator re-seeks every level to the position just past the current
-//! user key in the new direction — see [`LarkIterator::flip_to_forward`]
+//! user key in the new direction - see [`LarkIterator::flip_to_forward`]
 //! and [`LarkIterator::flip_to_reverse`].
 //!
 //! # Safety against concurrent compaction
@@ -357,7 +357,7 @@ impl SsTableLevelIter {
             }
             self.entry_pos = self.next_entry_pos;
         }
-        // Fell off end of block — try next block.
+        // Fell off end of block - try next block.
         let next = self
             .reader
             .next_block_cursor(self.block_cursor.as_ref().unwrap())?;
@@ -410,9 +410,19 @@ impl SsTableLevelIter {
                 };
                 self.load_block(prev)?;
                 self.build_entry_offsets();
-                let last = self.entry_offsets.as_ref().unwrap().len() - 1;
-                self.replay_key_to_index(last);
-                self.valid = true;
+                // An empty data block is representable on disk, so the
+                // last index is computed rather than assumed.
+                match self
+                    .entry_offsets
+                    .as_ref()
+                    .and_then(|offsets| offsets.len().checked_sub(1))
+                {
+                    Some(last) => {
+                        self.replay_key_to_index(last);
+                        self.valid = true;
+                    }
+                    None => self.valid = false,
+                }
             }
         }
         Ok(())
@@ -744,7 +754,7 @@ impl LevelConcatIter {
 
 /// Merges multiple `LevelIter`s into a single stream of internal-key /
 /// value pairs in ascending internal-key order. Picks the winning source
-/// on every step via linear scan — for the small number of levels lark
+/// on every step via linear scan - for the small number of levels lark
 /// produces (≤ 30 in worst case) this beats a heap's overhead.
 struct MergingIter {
     levels: Vec<LevelIter>,
@@ -893,7 +903,7 @@ pub(crate) struct LarkIterator {
     /// once at construction so per-key visibility checks do not re-lock
     /// memtables or scan unrelated ranges.
     range_tombstones: RangeTombstoneSet,
-    /// Pinning handle — keeping this alive guarantees compaction cannot
+    /// Pinning handle - keeping this alive guarantees compaction cannot
     /// drop SSTable metadata out from under us. The SsTableReaders owned
     /// by the level iterators similarly keep file handles live.
     _version: Arc<Version>,
@@ -928,6 +938,12 @@ pub(crate) struct LarkIterator {
     /// halving the number of `advance() + pick_smallest()` cycles
     /// per visible entry in a single-version sequential scan.
     pending_consume: bool,
+    /// Last user key handed to the caller during forward iteration.
+    /// A sorted merge must yield strictly increasing user keys; a file
+    /// whose index has been corrupted into pointing back at a block
+    /// already visited would otherwise stream duplicate keys forever,
+    /// so a violation is reported as corruption instead of scanned.
+    last_forward_user_key: Option<Vec<u8>>,
 }
 
 /// Compute the exclusive upper bound of all keys that start with
@@ -952,7 +968,7 @@ impl LarkIterator {
     /// at the given snapshot sequence. SSTable readers come directly from
     /// the pinned `Version`, which holds `Arc<LiveSst>`s whose file
     /// descriptors are guaranteed to stay open for the lifetime of any
-    /// version that still references them — so the iterator is immune to
+    /// version that still references them - so the iterator is immune to
     /// concurrent compaction unlinking files.
     pub(crate) fn new(
         active: Arc<MemTable>,
@@ -1016,6 +1032,7 @@ impl LarkIterator {
             prefix_extractor,
             merge_operator,
             pending_consume: false,
+            last_forward_user_key: None,
         }
     }
 
@@ -1035,6 +1052,7 @@ impl LarkIterator {
         }
         self.error = None;
         self.valid_entry = false;
+        self.last_forward_user_key = None;
         self.merge_result = None;
         self.reverse_curr = None;
         self.pending_consume = false;
@@ -1053,6 +1071,7 @@ impl LarkIterator {
         }
         self.error = None;
         self.valid_entry = false;
+        self.last_forward_user_key = None;
         self.merge_result = None;
         self.reverse_curr = None;
         self.pending_consume = false;
@@ -1071,6 +1090,7 @@ impl LarkIterator {
         }
         self.error = None;
         self.valid_entry = false;
+        self.last_forward_user_key = None;
         self.merge_result = None;
         self.reverse_curr = None;
         self.pending_consume = false;
@@ -1093,6 +1113,7 @@ impl LarkIterator {
         }
         self.error = None;
         self.valid_entry = false;
+        self.last_forward_user_key = None;
         self.merge_result = None;
         self.reverse_curr = None;
         self.pending_consume = false;
@@ -1124,6 +1145,7 @@ impl LarkIterator {
         }
         self.error = None;
         self.valid_entry = false;
+        self.last_forward_user_key = None;
         self.merge_result = None;
         self.reverse_curr = None;
         self.pending_consume = false;
@@ -1249,7 +1271,7 @@ impl LarkIterator {
     /// in non-overlapping scopes so the borrow checker is satisfied.
     fn consume_curr_user_key_forward(&mut self) {
         // The inner iterator is positioned at the entry we just
-        // yielded. Advance past it unconditionally — we know it
+        // yielded. Advance past it unconditionally - we know it
         // matches curr_user_key, so the first-iteration check is
         // wasted work. This saves one decode_internal_key +
         // one comparison per visible entry in the common case.
@@ -1284,6 +1306,18 @@ impl LarkIterator {
                 return;
             };
             let (uk, seq, vt) = decode_internal_key(ik);
+
+            let went_backwards = self
+                .last_forward_user_key
+                .as_deref()
+                .is_some_and(|last| uk <= last);
+            if went_backwards {
+                self.error = Some(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SSTable iteration went backwards: file index or data block is corrupt",
+                ));
+                return;
+            }
 
             if let Some(ub) = self.upper_bound.as_deref() {
                 if uk >= ub {
@@ -1326,6 +1360,7 @@ impl LarkIterator {
                         Ok(Some(v)) => {
                             self.curr_user_key.clear();
                             self.curr_user_key.extend_from_slice(&uk_owned);
+                            self.last_forward_user_key = Some(uk_owned.clone());
                             self.merge_result = Some((uk_owned, v));
                             self.pending_consume = false;
                             return;
@@ -1343,6 +1378,13 @@ impl LarkIterator {
                     // key()/value() delegate to self.inner.
                     self.curr_user_key.clear();
                     self.curr_user_key.extend_from_slice(uk);
+                    match self.last_forward_user_key.as_mut() {
+                        Some(last) => {
+                            last.clear();
+                            last.extend_from_slice(uk);
+                        }
+                        None => self.last_forward_user_key = Some(uk.to_vec()),
+                    }
                     self.valid_entry = true;
                     self.pending_consume = true;
                     return;
@@ -1375,7 +1417,7 @@ impl LarkIterator {
         let merge_op = match self.merge_operator.clone() {
             Some(op) => op,
             None => {
-                // No merge operator — can't collapse. Treat
+                // No merge operator - can't collapse. Treat
                 // merges as invisible: without an operator there
                 // is no way to produce a value from the chain, so
                 // reads see the key as missing.
@@ -1405,7 +1447,7 @@ impl LarkIterator {
             }
             if rt_seq > 0 && seq <= rt_seq {
                 // Range tombstone hides this and every older entry
-                // for the same user key — synthesize a deletion
+                // for the same user key - synthesize a deletion
                 // terminator and stop.
                 base = None;
                 had_terminator = true;
@@ -1438,7 +1480,7 @@ impl LarkIterator {
         let _ = had_terminator;
 
         if operands_newest_first.is_empty() {
-            // No merges — shouldn't happen because caller saw a
+            // No merges - shouldn't happen because caller saw a
             // merge at the head, but handle it safely.
             return Ok(base);
         }
@@ -1463,7 +1505,7 @@ impl LarkIterator {
     /// In reverse walk, a user-key group is visited in *ascending* seq
     /// order (because higher seq produces a smaller internal key, which
     /// comes later in reverse order). We scan the whole group, keeping
-    /// track of the highest visible seq we see — that is the winning
+    /// track of the highest visible seq we see - that is the winning
     /// version. If it's a tombstone the group is skipped; otherwise it
     /// is emitted.
     fn materialize_prev_visible(&mut self) {
@@ -1578,6 +1620,7 @@ impl LarkIterator {
         }
         self.reverse_curr = None;
         self.direction = Direction::Forward;
+        self.last_forward_user_key = None;
     }
 
     /// Switch from forward to reverse iteration. After a forward pass

@@ -101,7 +101,7 @@ pub mod fuzzing {
 
     /// Decode arbitrary bytes as an SSTable data block.
     pub fn decode_block(data: &[u8]) {
-        let _ = crate::engine::block::Block::decode(data.to_vec());
+        let _ = crate::engine::block::Block::decode_data_block(data.to_vec());
     }
 
     /// Decode arbitrary bytes as an SSTable range-tombstone block.
@@ -242,7 +242,7 @@ fn prefixed_cf_id(prefixed_key: &[u8]) -> std::io::Result<u32> {
 }
 
 /// Minimal snapshot of the currently-configured options, returned
-/// by `Db::get_property("lark.options")`. Deliberately small —
+/// by `Db::get_property("lark.options")`. Deliberately small -
 /// lark doesn't retain the full `Options` past `Db::open`, and
 /// the Debug impl of this struct is the property's string value.
 #[derive(Debug)]
@@ -292,7 +292,7 @@ impl<'a> Range<'a> {
 /// raw entries (including every version and every tombstone) for
 /// user keys in the queried range; `size` is the sum of
 /// `internal_key.len() + value.len()` over those entries. Both
-/// values are exact with respect to the current active memtable —
+/// values are exact with respect to the current active memtable -
 /// this method walks the skip list.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MemTableStats {
@@ -333,6 +333,10 @@ impl Db {
     /// call [`Db::create_column_family`] for additional CFs; those
     /// calls persist into the database and survive reopen. Invalid
     /// option combinations fail before any filesystem work starts.
+    ///
+    /// Returns [`Error::Io`] with [`std::io::ErrorKind::Unsupported`]
+    /// when the platform cannot start the background compaction
+    /// thread, as a single-threaded target does.
     pub fn open<P: AsRef<Path>>(path: P, opts: Options) -> Result<Self> {
         opts.validate()?;
         let read_only = opts.read_only;
@@ -377,7 +381,7 @@ impl Db {
     /// fresh database. Called once from [`Db::open`].
     fn load_cf_registry(&self) -> Result<()> {
         // Scan every `name:*` entry in the meta CF to rebuild the
-        // name→id map. The default CF is not persisted to disk —
+        // name→id map. The default CF is not persisted to disk -
         // it's always injected into the in-memory registry with a
         // hardcoded id so an empty database stays byte-free on
         // disk. User-created CFs are the only thing that produces
@@ -391,14 +395,14 @@ impl Db {
             seq,
         )?;
         for (key, value) in pairs {
-            if value.len() != 4 {
+            // A meta value that is not a 4-byte id is not one of ours.
+            let Ok(id_bytes) = <[u8; 4]>::try_from(value.as_slice()) else {
                 continue;
-            }
+            };
             let Some(name) = meta::name_from_key(&key) else {
                 continue;
             };
-            let id = u32::from_be_bytes(value.as_slice().try_into().unwrap());
-            entries.push((name.to_string(), id));
+            entries.push((name.to_string(), u32::from_be_bytes(id_bytes)));
         }
 
         // Recover `next_id`. Absent on a fresh database.
@@ -406,16 +410,13 @@ impl Db {
             .engine
             .get(&meta::next_id_key(), self.engine.snapshot_seq())
             .map_err(Error::from)?;
-        let next_id = match next_id_raw {
-            Some(bytes) if bytes.len() == 4 => {
-                u32::from_be_bytes(bytes.as_slice().try_into().unwrap())
-            }
-            _ => DEFAULT_CF_ID + 1,
-        };
+        let next_id = next_id_raw
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes.as_slice()).ok())
+            .map_or(DEFAULT_CF_ID + 1, u32::from_be_bytes);
 
         // Inject the default CF into the in-memory registry so
         // `Db::default_cf()` always succeeds. It's never persisted
-        // to the meta CF — any re-open computes the same id.
+        // to the meta CF - any re-open computes the same id.
         entries.push((DEFAULT_CF_NAME.to_string(), DEFAULT_CF_ID));
         self.cfs.load(entries, next_id);
         Ok(())
@@ -462,7 +463,7 @@ impl Db {
     /// order and duplicates); each entry is `None` if the key does
     /// not exist or is tombstoned.
     ///
-    /// All keys in a single call see the **same** consistent view —
+    /// All keys in a single call see the **same** consistent view -
     /// a concurrent writer cannot make two keys disagree about
     /// visibility.
     pub fn multi_get(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
@@ -563,7 +564,7 @@ impl Db {
     /// family.
     ///
     /// Range deletes are cheap regardless of how many keys the range
-    /// covers — internally they are stored as a single range-tombstone
+    /// covers - internally they are stored as a single range-tombstone
     /// record rather than as one point tombstone per key. The delete
     /// is durable under the same rules as [`Db::put`] / [`Db::delete`]
     /// and is atomic with respect to concurrent readers.
@@ -661,7 +662,7 @@ impl Db {
 
     /// Apply a batch of writes atomically with an explicit
     /// [`DurabilityMode`] override. Retained for backwards
-    /// compatibility — prefer [`Db::write_opt`] for new code.
+    /// compatibility - prefer [`Db::write_opt`] for new code.
     pub fn write_with_durability(
         &self,
         batch: WriteBatch,
@@ -893,9 +894,9 @@ impl Db {
 
     /// Create a streaming iterator over the default column family.
     ///
-    /// The iterator captures a consistent view at the moment it is created
-    /// — later writes are invisible to this iterator, and concurrent
-    /// background compaction cannot invalidate it. Keys returned from
+    /// The iterator captures a consistent view at the moment it is
+    /// created: later writes are invisible to this iterator, and
+    /// concurrent background compaction cannot invalidate it. Keys from
     /// the iterator have the CF prefix stripped and appear exactly as
     /// the caller supplied them on put.
     ///
@@ -908,7 +909,7 @@ impl Db {
     }
 
     /// Create a raw streaming iterator over the entire engine
-    /// keyspace, including the reserved metadata CF. Internal —
+    /// keyspace, including the reserved metadata CF. Internal -
     /// used by [`Db::iter_cf`] via `CfIter`.
     fn raw_iter(&self) -> Iter<'_> {
         let seq = self.engine.snapshot_seq();
@@ -967,7 +968,7 @@ impl Db {
             "lark.options" => Some(format!("{:#?}", self.options_snapshot())),
             _ => {
                 // Integer properties surfaced through the string
-                // API too — every int property's string form is
+                // API too - every int property's string form is
                 // just its decimal number.
                 self.get_int_property(name).map(|v| v.to_string())
             }
@@ -1014,8 +1015,8 @@ impl Db {
             "lark.block-cache-usage" => Some(self.engine.block_cache_usage() as u64),
             "lark.block-cache-capacity" => Some(self.engine.block_cache_capacity() as u64),
             // Background errors are surfaced through the
-            // `EventListener::on_background_error` callback today
-            // — no dedicated counter yet. Report `0` so any
+            // `EventListener::on_background_error` callback today,
+            // with no dedicated counter yet. Report `0` so any
             // monitoring layer consuming this property gets a
             // stable numeric value instead of `None`.
             "lark.background-errors" => Some(0),
@@ -1034,7 +1035,7 @@ impl Db {
             out.push('\n');
             out.push_str(&stats.dump());
         } else {
-            out.push_str("\n(no Statistics object configured — see Options::statistics)\n");
+            out.push_str("\n(no Statistics object configured - see Options::statistics)\n");
         }
         out
     }
@@ -1096,7 +1097,7 @@ impl Db {
     /// bounded by one data-block worth of bytes per range
     /// boundary (partially-covered blocks at `start` and `end` are
     /// included whole). Active-memtable contents are **not**
-    /// included — call [`Db::get_approximate_memtable_stats`] for
+    /// included - call [`Db::get_approximate_memtable_stats`] for
     /// those.
     pub fn get_approximate_sizes(&self, ranges: &[Range<'_>]) -> Vec<u64> {
         ranges
@@ -1165,7 +1166,7 @@ impl Db {
     /// [`IngestOptions`] for the snapshot-consistency and placement
     /// rules.
     ///
-    /// The source files are left untouched on disk — the engine
+    /// The source files are left untouched on disk - the engine
     /// re-emits each file into the database's own SSTable directory
     /// so it can rewrite entry sequence numbers. Callers may delete
     /// the source files or re-ingest them at any time.
@@ -1212,7 +1213,7 @@ impl Db {
     // ── column families ─────────────────────────────────────────────────
 
     /// Return a handle to the default column family. Always
-    /// present — [`Db::open`] creates it if the database didn't
+    /// present - [`Db::open`] creates it if the database didn't
     /// already contain one.
     pub fn default_cf(&self) -> ColumnFamilyHandle {
         ColumnFamilyHandle {
@@ -1385,7 +1386,7 @@ impl Db {
 
     /// Scan a key range inside column family `cf`.
     ///
-    /// Returned keys have the CF prefix stripped — they appear
+    /// Returned keys have the CF prefix stripped - they appear
     /// exactly as the caller supplied them on put. This convenience
     /// method materializes the entire range into memory. Prefer
     /// [`Db::iter_cf`] for streaming scans or [`Db::scan_page_cf`]
@@ -1449,7 +1450,7 @@ impl Db {
     /// Create a forward-only [`TailingIter`] over the default
     /// column family. Unlike [`Db::iter`], a tailing iterator
     /// sees writes that arrive after it was created and does not
-    /// pin the database at a point in time — see [`TailingIter`]
+    /// pin the database at a point in time - see [`TailingIter`]
     /// for the ordering rules.
     pub fn iter_tailing(&self) -> TailingIter {
         tailing::new_default(Arc::clone(&self.engine))
@@ -1470,7 +1471,7 @@ impl Db {
         &self.engine
     }
 
-    /// Clone the engine `Arc` — used by transaction facade types
+    /// Clone the engine `Arc` - used by transaction facade types
     /// that need to carry an engine reference around independent
     /// of the owning `Db`'s lifetime. Internal-only.
     pub(crate) fn engine_arc(&self) -> Arc<LarkEngine> {
@@ -1532,7 +1533,7 @@ impl<'a> CfIter<'a> {
         // `seek_for_prev(upper_bound - 1)` is the trick: seek to
         // the largest key strictly less than `upper_bound`.
         let mut probe = self.upper_bound.clone();
-        // Decrement by one — upper_bound is built by incrementing
+        // Decrement by one - upper_bound is built by incrementing
         // the CF id, so it's never all zeros; subtracting one byte
         // gives a valid probe. Simpler: seek_for_prev(upper_bound)
         // which lands on the last key < upper_bound.
@@ -2692,7 +2693,7 @@ mod tests {
             db.put(b"b", b"2").unwrap();
             db.delete(b"a").unwrap();
             db.put(b"c", b"3").unwrap();
-            // Drop without close() — simulates a crash; the WAL must be replayed.
+            // Drop without close() - simulates a crash; the WAL must be replayed.
         }
 
         let db = Db::open(dir.path(), Options::default()).unwrap();
@@ -3054,7 +3055,7 @@ mod tests {
         db.put(b"k", b"v2").unwrap();
         db.put(b"k", b"v3").unwrap();
         let snap = db.snapshot();
-        // `snap` now pins seq=3 — the snapshot sees v3.
+        // `snap` now pins seq=3 - the snapshot sees v3.
 
         for v in 4..10 {
             db.put(b"k", format!("v{}", v).as_bytes()).unwrap();
@@ -3125,7 +3126,7 @@ mod tests {
     #[test]
     fn test_gc_preserves_tombstone_hiding_older_entries() {
         // A tombstone newer than any live snapshot still needs to
-        // survive compaction — it's the newest version and reads
+        // survive compaction - it's the newest version and reads
         // must resolve to "deleted".
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
@@ -3139,7 +3140,7 @@ mod tests {
 
         assert_eq!(db.get(b"k").unwrap(), None);
 
-        // The newest surviving version is a tombstone — look for it
+        // The newest surviving version is a tombstone - look for it
         // on disk.
         let versions = all_versions_of(&db, b"k");
         assert!(!versions.is_empty());
@@ -3259,7 +3260,7 @@ mod tests {
 
     #[test]
     fn test_compact_range_drains_l0() {
-        // After a full compact_range, nothing should remain at L0 —
+        // After a full compact_range, nothing should remain at L0 -
         // every file must have been pushed down to L1+.
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
@@ -3342,7 +3343,7 @@ mod tests {
     fn test_compact_range_reclaims_space_after_overwrite() {
         // Write N keys, overwrite them, force flush, then compact_range.
         // The number of distinct entries after compaction should be N
-        // (one per user key) — the old overwritten versions got merged
+        // (one per user key) - the old overwritten versions got merged
         // away by deduplication during compaction.
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
@@ -3415,7 +3416,7 @@ mod tests {
     #[test]
     fn test_compact_range_tombstones_are_preserved() {
         // Tombstones must survive compaction until the bottommost level
-        // drops them — for now compaction preserves all versions, so a
+        // drops them - for now compaction preserves all versions, so a
         // deleted key is still absent to reads.
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
@@ -4100,7 +4101,7 @@ mod tests {
         let (db, _dir) = open_tmp();
         db.put(b"k", b"old").unwrap();
         db.delete_range(b"a", b"z").unwrap();
-        // A put after the range delete must win — it has a higher seq.
+        // A put after the range delete must win - it has a higher seq.
         db.put(b"k", b"new").unwrap();
         assert_eq!(db.get(b"k").unwrap(), Some(b"new".to_vec()));
     }
@@ -4234,7 +4235,7 @@ mod tests {
                 db.put(&[c], &[c]).unwrap();
             }
             db.delete_range(b"b", b"d").unwrap();
-            // Drop without close — only the WAL has the range delete.
+            // Drop without close - only the WAL has the range delete.
         }
         let db = Db::open(dir.path(), Options::default()).unwrap();
         assert_eq!(db.get(b"a").unwrap(), Some(b"a".to_vec()));
@@ -4624,7 +4625,7 @@ mod tests {
             db.put(&[c], &[c]).unwrap();
         }
         db.delete_range(b"b", b"e").unwrap();
-        // Before compaction, the range-delete is honored — no snapshot
+        // Before compaction, the range-delete is honored - no snapshot
         // pinning, so the read path sees the memtable RT directly.
         for c in b'b'..=b'd' {
             assert_eq!(db.get(&[c]).unwrap(), None);
@@ -4850,7 +4851,7 @@ mod tests {
     fn test_write_options_sync_override_persists_across_reopen() {
         // With Eventual default, a sync write should still land on
         // disk such that a reopen recovers it. (Eventual alone
-        // already survives a clean close — this test's real content
+        // already survives a clean close - this test's real content
         // is that the sync flag doesn't break the normal code path.)
         let dir = TempDir::new().unwrap();
         let opts = Options {
@@ -4861,7 +4862,7 @@ mod tests {
             let db = Db::open(dir.path(), opts.clone()).unwrap();
             db.put_opt(&WriteOptions::sync(), b"critical", b"payload")
                 .unwrap();
-            // Deliberately skip close() — sync must have forced the
+            // Deliberately skip close() - sync must have forced the
             // WAL to durable storage already.
         }
         let db = Db::open(dir.path(), opts).unwrap();
@@ -4879,7 +4880,7 @@ mod tests {
             let db = Db::open(dir.path(), opts.clone()).unwrap();
             db.put_opt(&WriteOptions::disable_wal(), b"ephemeral", b"ghost")
                 .unwrap();
-            // No close() — simulate a crash. The memtable holds the
+            // No close() - simulate a crash. The memtable holds the
             // write but nothing on disk does.
         }
         let db = Db::open(dir.path(), opts).unwrap();
@@ -4889,7 +4890,7 @@ mod tests {
     #[test]
     fn test_write_options_disable_wal_visible_within_session() {
         // Within the same process, a disable_wal write is visible
-        // to subsequent reads via the memtable — only a crash
+        // to subsequent reads via the memtable - only a crash
         // erases it.
         let (db, _dir) = open_tmp();
         db.put_opt(&WriteOptions::disable_wal(), b"k", b"v")
@@ -5106,7 +5107,7 @@ mod tests {
     fn test_merge_without_base_defaults_to_none() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
-        // No put — counter starts at 0 (base=None).
+        // No put - counter starts at 0 (base=None).
         db.merge(b"counter", &encode_i64(7)).unwrap();
         db.merge(b"counter", &encode_i64(5)).unwrap();
         assert_eq!(db.get(b"counter").unwrap(), Some(encode_i64(12)));
@@ -5278,7 +5279,7 @@ mod tests {
             db.put(b"counter", &encode_i64(0)).unwrap();
             db.merge(b"counter", &encode_i64(7)).unwrap();
             db.merge(b"counter", &encode_i64(3)).unwrap();
-            // No close — memtable flush didn't happen; WAL must
+            // No close - memtable flush didn't happen; WAL must
             // survive the chain.
         }
         let db = Db::open(dir.path(), counter_opts()).unwrap();
@@ -5614,7 +5615,7 @@ mod tests {
             batch.put_cf(&cf, b"b", b"2");
             batch.put(b"default_k", b"default_v");
             db.write(batch).unwrap();
-            // No close — simulate a crash. WAL must survive.
+            // No close - simulate a crash. WAL must survive.
         }
         let db = Db::open(dir.path(), Options::default()).unwrap();
         let cf = db.column_family("txn").expect("CF must survive");
@@ -5800,7 +5801,7 @@ mod tests {
         // approximate size against the on-disk file size. The
         // accuracy contract is "within a factor of 2".
         //
-        // Use a high-entropy payload so LZ4 can't crush it — a
+        // Use a high-entropy payload so LZ4 can't crush it - a
         // zero-filled payload compresses to near-nothing and would
         // undercut the accuracy window we're checking.
         let dir = TempDir::new().unwrap();
@@ -5819,7 +5820,7 @@ mod tests {
         assert!(sizes[0] > 0, "whole-range size must be > 0 after flush");
         // Raw on-disk footprint of the point data: 100 entries,
         // each ≈ 256-byte value + ~20-byte key/overhead + a bit
-        // of block framing, so ~28–30k. The approximation
+        // of block framing, so ~28-30k. The approximation
         // includes whole covered blocks, so a 2x window covers
         // it comfortably.
         let approx = sizes[0];
@@ -5856,7 +5857,7 @@ mod tests {
     fn test_approximate_sizes_cf_scoped() {
         let (db, _dir) = open_tmp();
         let cf = db.create_column_family("scoped").unwrap();
-        // Put into default CF but not into `scoped` — the
+        // Put into default CF but not into `scoped` - the
         // scoped CF's whole-range size must be 0.
         for i in 0..20 {
             db.put(format!("k{i}").as_bytes(), b"v").unwrap();
@@ -5864,7 +5865,7 @@ mod tests {
         let default_sizes = db.get_approximate_sizes(&[Range::new(b"a", b"z")]);
         let cf_sizes = db.get_approximate_sizes_cf(&cf, &[Range::new(b"a", b"z")]);
         // Memtable contents aren't in approximate_sizes, but they
-        // aren't on disk either — the default-CF whole-range
+        // aren't on disk either - the default-CF whole-range
         // matches the scoped-CF whole-range (both 0) unless a
         // flush happened. With default write_buffer_size, 20 small
         // writes don't trigger a flush.
@@ -5898,7 +5899,7 @@ mod tests {
             batch.put_cf(&cf_b, b"k2", b"b2");
             batch.put(b"default_k", b"default_v");
             db.write(batch).unwrap();
-            // Drop without close — simulate a crash. WAL is the
+            // Drop without close - simulate a crash. WAL is the
             // source of truth; recovery must restore every key.
         }
         let db = Db::open(dir.path(), Options::default()).unwrap();
@@ -5981,7 +5982,7 @@ mod tests {
 
     #[test]
     fn test_atomic_flush_option_accepted() {
-        // The flag is a no-op for API parity — both values must
+        // The flag is a no-op for API parity - both values must
         // open cleanly and produce the same atomic behavior.
         let dir = TempDir::new().unwrap();
         let opts = Options {
@@ -6297,7 +6298,7 @@ mod tests {
         // and contaminate the counters), every point lookup
         // that reaches a data block fires either a hit or a
         // miss on the block cache. We don't assert the strict
-        // `adds == misses` invariant here — LRU eviction plus
+        // `adds == misses` invariant here - LRU eviction plus
         // any lingering background work can perturb that
         // equality on fast machines. The weaker "both hits and
         // misses see traffic" is the observable contract.
@@ -6323,7 +6324,7 @@ mod tests {
         let adds = stats.get_ticker(Ticker::BlockCacheAdd);
         assert!(misses > 0, "expected at least one block cache miss");
         assert!(hits > 0, "expected at least one block cache hit");
-        // `adds` tracks inserts after a miss — it can never
+        // `adds` tracks inserts after a miss - it can never
         // exceed `misses`.
         assert!(adds <= misses, "adds={adds} misses={misses}");
     }
@@ -6831,7 +6832,7 @@ mod tests {
             }
             db.compact_range(None, None).unwrap();
         }
-        // Reopen — the V2 SSTables must still be readable.
+        // Reopen - the V2 SSTables must still be readable.
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..200 {
             let k = format!("k{i:04}");
@@ -6870,7 +6871,7 @@ mod tests {
                 let k = format!("k{i:04}");
                 db.put(k.as_bytes(), b"v2").unwrap();
             }
-            // Don't compact — leave V1 files at lower levels and
+            // Don't compact - leave V1 files at lower levels and
             // V2 files in L0/L1.
         }
         let opts = Options {
@@ -7113,7 +7114,7 @@ mod tests {
 
     #[test]
     fn test_universal_compaction_never_creates_l1_files() {
-        // Every Universal merge output should stay at L0 — the
+        // Every Universal merge output should stay at L0 - the
         // level-size push-down rule must not fire for this style.
         let opts = Options {
             write_buffer_size: 4 * 1024,
@@ -7221,7 +7222,7 @@ mod tests {
 
     #[test]
     fn test_fifo_compaction_keeps_at_least_one_file() {
-        // A single oversized file must not be deleted — FIFO
+        // A single oversized file must not be deleted - FIFO
         // refuses to drop the last surviving SST because that
         // would wipe the database.
         let opts = Options {
@@ -7278,7 +7279,7 @@ mod tests {
     #[test]
     fn test_tailing_iter_sees_writes_after_creation() {
         // Initial writes, then a tailing iterator, then more
-        // writes — the tailing iterator must surface the later
+        // writes - the tailing iterator must surface the later
         // writes once it advances past the initial set.
         let (db, _dir) = open_tmp();
         for i in 0..5 {
@@ -7342,7 +7343,7 @@ mod tests {
         }
         assert_eq!(seen, 16);
 
-        // Force a flush and a compaction — the existing tail
+        // Force a flush and a compaction - the existing tail
         // iter is no longer pinned to anything visible, but a
         // refresh + new writes should still work.
         db.compact_range(None, None).unwrap();

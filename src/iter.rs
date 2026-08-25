@@ -2,8 +2,8 @@
 //!
 //! An [`Iter`] is obtained from [`Db::iter`](crate::Db::iter) or
 //! [`Snapshot::iter`](crate::Snapshot::iter) and yields user keys in
-//! ascending order. It honors MVCC snapshot visibility — keys written
-//! after the iterator was created are invisible — and hides tombstoned
+//! ascending order. It honors MVCC snapshot visibility - keys written
+//! after the iterator was created are invisible - and hides tombstoned
 //! keys from the stream. The iterator is safe against concurrent
 //! background compaction: it holds pinned references to every SSTable
 //! file that existed at creation time, so compaction can unlink files
@@ -146,7 +146,7 @@ impl<'a> Iter<'a> {
     pub fn next(&mut self) {
         let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterNext);
         self.inner.next();
-        // Only count the step when it produced a key — an
+        // Only count the step when it produced a key - an
         // end-of-stream `next` that invalidates the iterator
         // should not inflate the counter.
         if self.inner.valid() {

@@ -12,7 +12,7 @@
 
 use std::io;
 
-use super::internal_key::compare_internal_keys;
+use super::internal_key::{compare_internal_keys, INTERNAL_KEY_SUFFIX_LEN};
 
 /// Entries per restart point. Smaller = faster lookups, larger = better compression.
 pub(crate) const RESTART_INTERVAL: usize = 16;
@@ -32,7 +32,28 @@ pub(crate) struct Block {
 }
 
 impl Block {
+    /// Decode a block whose entry keys are opaque bytes.
+    ///
+    /// Only unit tests build blocks this way. Every production path
+    /// reads SSTable data blocks and must go through
+    /// [`Block::decode_data_block`], which additionally enforces the
+    /// internal-key shape that the decoders downstream assume.
+    #[cfg(test)]
     pub(crate) fn decode(data: Vec<u8>) -> io::Result<Self> {
+        Self::decode_inner(data, false)
+    }
+
+    /// Decode an SSTable data block.
+    ///
+    /// Rejects any entry whose key is shorter than
+    /// [`INTERNAL_KEY_SUFFIX_LEN`], so a truncated, tampered, or
+    /// foreign-produced file cannot hand a short key to
+    /// `decode_internal_key`, which indexes the trailer directly.
+    pub(crate) fn decode_data_block(data: Vec<u8>) -> io::Result<Self> {
+        Self::decode_inner(data, true)
+    }
+
+    fn decode_inner(data: Vec<u8>, require_internal_keys: bool) -> io::Result<Self> {
         if data.len() < 4 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -60,7 +81,7 @@ impl Block {
                 data[offset..offset + 4].try_into().unwrap(),
             ));
         }
-        validate_restarts_and_entries(&data[..entries_end], &restarts)?;
+        validate_restarts_and_entries(&data[..entries_end], &restarts, require_internal_keys)?;
 
         Ok(Self {
             data,
@@ -336,13 +357,22 @@ struct EntryHeader {
     consumed: usize,
 }
 
-fn validate_restarts_and_entries(data: &[u8], restarts: &[u32]) -> io::Result<()> {
+fn validate_restarts_and_entries(
+    data: &[u8],
+    restarts: &[u32],
+    require_internal_keys: bool,
+) -> io::Result<()> {
     let mut entry_offsets = Vec::new();
     let mut pos = 0usize;
     let mut prev_key = Vec::new();
     while pos < data.len() {
         entry_offsets.push(pos);
         let entry = decode_block_entry_checked(data, pos, &prev_key)?;
+        if require_internal_keys && entry.key.len() < INTERNAL_KEY_SUFFIX_LEN {
+            return Err(invalid_data(
+                "block entry key is shorter than the internal-key trailer",
+            ));
+        }
         pos += entry.consumed;
         prev_key = entry.key;
     }
@@ -720,7 +750,7 @@ mod tests {
     #[test]
     fn seek_ge_before_first_key_returns_first() {
         let block = build_block(&[(b"b", b"2"), (b"c", b"3")]);
-        // Empty target sorts before every key — the ordering function
+        // Empty target sorts before every key - the ordering function
         // short-circuits on suffix-length so any user key > "" wins.
         assert_eq!(block.seek_ge(b""), Some((b"b".to_vec(), b"2".to_vec())));
     }

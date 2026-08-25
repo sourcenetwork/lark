@@ -56,6 +56,12 @@ impl CompactionScheduler {
     ///
     /// `snapshot_registry` lets each compaction pass query the current
     /// pin seq so it can drop versions that no live snapshot needs.
+    ///
+    /// Returns the spawn error if a worker thread cannot be created,
+    /// after shutting down and joining any worker already started, so
+    /// a failed open leaves no detached thread behind. Single-threaded
+    /// targets such as `wasm32-wasip1` report
+    /// [`std::io::ErrorKind::Unsupported`] here.
     pub(crate) fn start(
         compaction_lock: Arc<parking_lot::RwLock<()>>,
         snapshot_registry: Arc<SnapshotRegistry>,
@@ -64,18 +70,20 @@ impl CompactionScheduler {
         cache: Arc<BlockCache>,
         opts: CompactionOptions,
         stall_signal: Arc<crate::engine::StallSignal>,
-    ) -> Self {
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let trigger = Arc::new((Mutex::new(false), Condvar::new()));
+    ) -> std::io::Result<Self> {
         let in_progress: Arc<parking_lot::Mutex<HashSet<u64>>> =
             Arc::new(parking_lot::Mutex::new(HashSet::new()));
 
         let worker_count = opts.max_background_compactions.max(1);
-        let mut handles = Vec::with_capacity(worker_count);
+        let mut scheduler = Self {
+            shutdown: Arc::new(AtomicBool::new(false)),
+            trigger: Arc::new((Mutex::new(false), Condvar::new())),
+            handles: Vec::with_capacity(worker_count),
+        };
 
         for i in 0..worker_count {
-            let shutdown_clone = Arc::clone(&shutdown);
-            let trigger_clone = Arc::clone(&trigger);
+            let shutdown_clone = Arc::clone(&scheduler.shutdown);
+            let trigger_clone = Arc::clone(&scheduler.trigger);
             let lock_clone = Arc::clone(&compaction_lock);
             let registry_clone = Arc::clone(&snapshot_registry);
             let versions_clone = Arc::clone(&versions);
@@ -85,45 +93,52 @@ impl CompactionScheduler {
             let stall_clone = Arc::clone(&stall_signal);
             let in_progress_clone = Arc::clone(&in_progress);
 
-            let handle = thread::Builder::new()
-                .name(format!("lark-compaction-{i}"))
-                .spawn(move || {
-                    compaction_loop(
-                        shutdown_clone,
-                        trigger_clone,
-                        lock_clone,
-                        registry_clone,
-                        versions_clone,
-                        sst_dir_clone,
-                        cache_clone,
-                        opts_clone,
-                        stall_clone,
-                        in_progress_clone,
-                    );
-                })
-                .expect("failed to spawn compaction thread");
-            handles.push(handle);
+            let spawned = spawn_worker(i, move || {
+                compaction_loop(
+                    shutdown_clone,
+                    trigger_clone,
+                    lock_clone,
+                    registry_clone,
+                    versions_clone,
+                    sst_dir_clone,
+                    cache_clone,
+                    opts_clone,
+                    stall_clone,
+                    in_progress_clone,
+                );
+            });
+
+            match spawned {
+                Ok(handle) => scheduler.handles.push(handle),
+                Err(e) => {
+                    // Dropping `scheduler` on the way out signals
+                    // shutdown and joins the workers already started,
+                    // which is the same path `shutdown` takes.
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        format!("failed to spawn compaction thread {i}: {e}"),
+                    ));
+                }
+            }
         }
 
-        Self {
-            shutdown,
-            trigger,
-            handles,
-        }
+        Ok(scheduler)
     }
 
     /// Notify the compaction thread that work may be available.
     pub(crate) fn notify(&self) {
-        let (lock, cvar) = &*self.trigger;
-        let mut triggered = lock.lock().unwrap();
-        *triggered = true;
-        cvar.notify_one();
+        notify_trigger(&self.trigger, false);
     }
 
     /// Shut down all compaction threads.
+    ///
+    /// Wakes every worker, not just one: `join` below waits for all of
+    /// them, so a `notify_one` here would leave the rest sleeping until
+    /// their condvar timeout and make close latency scale with
+    /// `max_background_compactions`.
     pub(crate) fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Release);
-        self.notify();
+        notify_trigger(&self.trigger, true);
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
@@ -133,6 +148,79 @@ impl CompactionScheduler {
 impl Drop for CompactionScheduler {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// Wake one compaction worker blocked on the trigger condvar.
+///
+/// The critical section is a single `bool` store, so it cannot unwind
+/// and the mutex cannot be poisoned; the `unwrap` is unreachable.
+fn notify_trigger(trigger: &(Mutex<bool>, Condvar), wake_all: bool) {
+    let (lock, cvar) = trigger;
+    // The critical section is a single `bool` store, so the guard
+    // cannot be poisoned by an unwinding writer; recovering the inner
+    // value keeps the wake-up path panic-free regardless.
+    let mut triggered = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *triggered = true;
+    if wake_all {
+        cvar.notify_all();
+    } else {
+        cvar.notify_one();
+    }
+}
+
+/// Spawn one named compaction worker.
+///
+/// Split out of [`CompactionScheduler::start`] so tests can force the
+/// spawn failure that a single-threaded target produces natively.
+fn spawn_worker<F>(index: usize, body: F) -> std::io::Result<thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    #[cfg(test)]
+    {
+        if SPAWN_FAILURE_AFTER.with(|limit| limit.get().is_some_and(|after| index >= after)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "test seam: compaction worker spawn disabled",
+            ));
+        }
+    }
+    thread::Builder::new()
+        .name(format!("lark-compaction-{index}"))
+        .spawn(body)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: index of the first compaction worker whose spawn
+    /// reports `Unsupported`, mirroring what a single-threaded target
+    /// does natively. `None` disables the seam. Thread-local because
+    /// `start` runs entirely on its caller's thread, so a parallel
+    /// test never observes another test's setting.
+    static SPAWN_FAILURE_AFTER: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only guard that makes compaction-worker spawning fail on the
+/// current thread for the guard's lifetime.
+#[cfg(test)]
+pub(crate) struct SpawnFailureGuard;
+
+#[cfg(test)]
+impl SpawnFailureGuard {
+    /// Let the first `after` workers spawn and fail every one past
+    /// them until the guard is dropped.
+    pub(crate) fn allowing(after: usize) -> Self {
+        SPAWN_FAILURE_AFTER.with(|limit| limit.set(Some(after)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for SpawnFailureGuard {
+    fn drop(&mut self) {
+        SPAWN_FAILURE_AFTER.with(|limit| limit.set(None));
     }
 }
 
@@ -214,13 +302,22 @@ fn compaction_loop(
     in_progress: Arc<parking_lot::Mutex<HashSet<u64>>>,
 ) {
     loop {
-        // Wait for trigger or periodic check
+        // Wait for a trigger, for the periodic check, or for shutdown.
+        //
+        // The trigger flag is consumed by whichever worker wakes
+        // first, so shutdown is re-checked here, under the same mutex
+        // the flag is set under. Without that check a second worker
+        // would find the flag already cleared and sleep out the full
+        // poll interval, making close latency scale with
+        // `max_background_compactions`.
         {
             let (lock, cvar) = &*trigger;
-            let mut triggered = lock.lock().unwrap();
-            if !*triggered {
-                let _ = cvar.wait_timeout(triggered, std::time::Duration::from_secs(1));
-                triggered = lock.lock().unwrap();
+            let mut triggered = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !*triggered && !shutdown.load(Ordering::Acquire) {
+                let (guard, _) = cvar
+                    .wait_timeout(triggered, std::time::Duration::from_secs(1))
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                triggered = guard;
             }
             *triggered = false;
         }
@@ -254,7 +351,7 @@ fn compaction_loop(
                         tracing::error!(error = %e, "Compaction failed");
                         // Surface the failure to any registered
                         // listeners so metrics pipelines and
-                        // debuggers notice it — the scheduler
+                        // debuggers notice it - the scheduler
                         // itself keeps running.
                         if !opts.listeners.is_empty() {
                             let err =
@@ -296,7 +393,7 @@ fn pick_and_run_compaction(
             pick_and_run_level_compaction(versions, sst_dir, cache, opts, pin_seq, in_progress)
         }
         crate::options::CompactionStyle::Fifo => {
-            // Skip if any file is already being compacted — with a
+            // Skip if any file is already being compacted - with a
             // single L0 pool there's nothing safe to pick in parallel.
             if !in_progress.lock().is_empty() {
                 return Ok(false);
@@ -349,7 +446,7 @@ fn pick_and_run_universal(
     let mut by_age: Vec<Arc<LiveSst>> = l0_files;
     by_age.sort_by_key(|f| std::cmp::Reverse(f.meta.file_id));
 
-    // Rule 1 — size ratio merge. Accumulate newest files into a
+    // Rule 1 - size ratio merge. Accumulate newest files into a
     // candidate group; keep adding until the group's total size
     // grows past `size_ratio` percent of the next file's size, at
     // which point the next file is too much larger to be worth
@@ -371,7 +468,7 @@ fn pick_and_run_universal(
         }
         // Does adding this file keep the "size-tier" invariant?
         // The rule: the running total must be within
-        // `size_ratio` percent of the new candidate — i.e. the
+        // `size_ratio` percent of the new candidate - i.e. the
         // candidate should not dwarf the accumulator.
         let candidate_size = file.meta.file_size as u128;
         if group_size * (100 + ratio) / 100 >= candidate_size {
@@ -389,7 +486,7 @@ fn pick_and_run_universal(
             .map(|_| true);
     }
 
-    // Rule 2 — size amplification. Compute the ratio of "all
+    // Rule 2 - size amplification. Compute the ratio of "all
     // files except the oldest" to "the oldest file". When it
     // exceeds the configured percent, fold everything into one
     // run so the database stops accumulating redundancy.
@@ -505,7 +602,7 @@ fn pick_and_run_level_compaction(
 /// merges in this style. After each pass, if the total bytes held
 /// across L0 exceed `max_table_files_size`, we unlink the oldest
 /// file (smallest `file_id`) and emit a `RemoveFile` edit. We stop
-/// when the cap is satisfied or only one file remains — a single
+/// when the cap is satisfied or only one file remains - a single
 /// oversized file is not worth deleting because that would lose
 /// data with no successor on disk.
 fn pick_and_run_fifo(
@@ -531,7 +628,7 @@ fn pick_and_run_fifo(
         return Ok(false);
     }
 
-    // Sort by file_id ascending — smaller id was allocated earlier,
+    // Sort by file_id ascending - smaller id was allocated earlier,
     // so it is the oldest file by construction.
     let mut by_age: Vec<Arc<crate::engine::sstable::LiveSst>> = l0_files;
     by_age.sort_by_key(|f| f.meta.file_id);
@@ -540,7 +637,7 @@ fn pick_and_run_fifo(
     let mut edits: Vec<VersionEdit> = Vec::new();
     let mut removed_paths: Vec<std::path::PathBuf> = Vec::new();
     for file in &by_age {
-        // Always keep at least one file alive — dropping the only
+        // Always keep at least one file alive - dropping the only
         // remaining file would delete every byte of user data the
         // database currently holds.
         if by_age.len() - edits.len() <= 1 {
@@ -567,7 +664,7 @@ fn pick_and_run_fifo(
     // versions (held by long-running snapshots / iterators) keep
     // file descriptors open, so the kernel preserves the inode
     // until those readers drop. A failure here doesn't corrupt the
-    // database — the manifest already reflects the removal.
+    // database - the manifest already reflects the removal.
     for path in &removed_paths {
         let _ = std::fs::remove_file(path);
     }
@@ -600,7 +697,7 @@ fn compact_l0(
     in_progress: &parking_lot::Mutex<HashSet<u64>>,
 ) -> std::io::Result<bool> {
     // If any L0 file is already being compacted by another worker,
-    // skip — L0 files may overlap so concurrent picks would produce
+    // skip - L0 files may overlap so concurrent picks would produce
     // conflicting output sets.
     {
         let ip = in_progress.lock();
@@ -733,7 +830,7 @@ pub(crate) fn run_compact_range(
 
             // At L0 files overlap each other, so picking any file that
             // intersects the range drags in every other L0 file it
-            // overlaps — simplest correct move: take every L0 file
+            // overlaps - simplest correct move: take every L0 file
             // that intersects the range in one shot.
             //
             // At L1+ files are non-overlapping, so we can pick them
@@ -884,7 +981,7 @@ fn perform_compaction_to(
         }
     }
 
-    // Dedup merged range tombstones by (start, end, seq) — a single
+    // Dedup merged range tombstones by (start, end, seq) - a single
     // logical RT may appear in multiple input files after previous
     // compactions carried it forward.
     let merged_range_tombstones = RangeTombstoneSet::from_vec(merged_range_tombstones);
@@ -928,7 +1025,7 @@ fn perform_compaction_to(
     }
 
     // Atomically apply the remove / add edits. `SetNextFileId` is not
-    // needed here — each output file already advanced it when it was
+    // needed here - each output file already advanced it when it was
     // allocated above.
     versions.lock().apply(&edits)?;
 
@@ -1012,13 +1109,13 @@ fn perform_compaction_to(
 /// 1. Keep every entry with `seq > pin_seq`. These are visible to
 ///    newer snapshots or to current reads.
 /// 2. For the stretch of entries with `seq <= pin_seq`, keep only
-///    the *first* one we see — that's the largest seq not exceeding
+///    the *first* one we see - that's the largest seq not exceeding
 ///    `pin_seq`, i.e. the version the oldest live snapshot actually
 ///    reads. Drop everything strictly older than that.
 ///
 /// When `pin_seq == u64::MAX` (no live snapshot), rule (1) vacuously
 /// keeps nothing and rule (2) keeps only the newest version of each
-/// user key — the aggressive GC case. When `pin_seq` is somewhere in
+/// user key - the aggressive GC case. When `pin_seq` is somewhere in
 /// the middle, older versions still visible to some snapshot are
 /// conservatively preserved.
 ///
@@ -1035,7 +1132,7 @@ fn gc_old_versions(entries: Vec<(Vec<u8>, Vec<u8>)>, pin_seq: u64) -> Vec<(Vec<u
     // Once set to `true`, every subsequent entry for the current
     // user key that sits at or below `pin_seq` is shadowed by an
     // already-emitted terminator and can be dropped. Merge
-    // operands do *not* set this flag — they form an open chain
+    // operands do *not* set this flag - they form an open chain
     // that must be preserved until a non-merge terminator arrives.
     let mut chain_terminated = false;
 
@@ -1053,7 +1150,7 @@ fn gc_old_versions(entries: Vec<(Vec<u8>, Vec<u8>)>, pin_seq: u64) -> Vec<(Vec<u
         }
 
         // `seq <= pin_seq` and we've already reached a terminator
-        // for this user key — the entry is strictly older and
+        // for this user key - the entry is strictly older and
         // shadowed. Drop it.
         if chain_terminated {
             continue;
@@ -1071,16 +1168,16 @@ fn gc_old_versions(entries: Vec<(Vec<u8>, Vec<u8>)>, pin_seq: u64) -> Vec<(Vec<u
 /// Run the user [`crate::options::CompactionFilter`] over every
 /// `Value` entry in `entries` and apply its decision:
 ///
-/// - [`CompactionDecision::Keep`] — pass the entry through unchanged.
-/// - [`CompactionDecision::Change`] — pass through with the filter's
+/// - [`CompactionDecision::Keep`] - pass the entry through unchanged.
+/// - [`CompactionDecision::Change`] - pass through with the filter's
 ///   new value (key and seq preserved).
-/// - [`CompactionDecision::Remove`] — replace the entry with a
+/// - [`CompactionDecision::Remove`] - replace the entry with a
 ///   deletion tombstone at the same seq. The tombstone prevents an
 ///   older version of the same user key (living deeper in the LSM)
 ///   from resurfacing after the filtered value disappears.
 ///
 /// Deletion internal keys are passed through without consulting the
-/// filter — the filter's contract is about the user's own values,
+/// filter - the filter's contract is about the user's own values,
 /// not about tombstones lark writes itself.
 fn apply_compaction_filter(
     entries: Vec<(Vec<u8>, Vec<u8>)>,
@@ -1122,7 +1219,7 @@ fn apply_compaction_filter(
 ///    layered on top of it, call `full_merge(base, operands)` and
 ///    replace the whole group with a single `Value` entry at the
 ///    newest merge's seq (or with the original terminator if
-///    `full_merge` fails — we conservatively keep the raw chain).
+///    `full_merge` fails - we conservatively keep the raw chain).
 ///
 /// 2. **Partial fold:** if a group is pure merges (no terminator in
 ///    the compaction's input set) and the operator's
@@ -1131,7 +1228,7 @@ fn apply_compaction_filter(
 ///    newest merge's seq.
 ///
 /// Anything the operator rejects (`None` return) is left intact so
-/// a compaction-time merge failure never loses data — the raw
+/// a compaction-time merge failure never loses data - the raw
 /// operands survive to be retried on the next compaction or
 /// materialized by a reader.
 fn collapse_merge_chains(
@@ -1190,7 +1287,7 @@ fn collapse_merge_chains(
 
         match (has_operands, &terminator) {
             (false, _) => {
-                // No merges in this group — nothing to collapse.
+                // No merges in this group - nothing to collapse.
                 out.extend(group.iter().cloned());
             }
             (true, Some((_term_seq, term_vt, term_value))) => {
@@ -1230,6 +1327,7 @@ fn collapse_merge_chains(
                 // merge to shrink the chain.
                 if everything_scanned && operands_newest_first.len() > 1 {
                     // Fold oldest→newest, carrying an accumulator.
+                    // The length check above guarantees a first item.
                     let mut iter = operands_newest_first.iter().rev();
                     let first = iter.next().unwrap();
                     let mut acc: Vec<u8> = first.1.clone();
@@ -1489,6 +1587,8 @@ impl<'a> StreamingCompactionWriter<'a> {
             self.finish_current()?;
         }
 
+        // `ensure_current` either installs an output or returns an
+        // error, so `current` is `Some` on this line.
         self.ensure_current()?;
         let current = self.current.as_mut().expect("current output is open");
         let user_key = user_key_of(&entries[0].0);
@@ -1877,6 +1977,62 @@ mod tests {
     }
 
     #[test]
+    fn db_open_returns_an_error_when_a_compaction_worker_cannot_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = {
+            let _guard = SpawnFailureGuard::allowing(0);
+            crate::Db::open(dir.path(), crate::Options::default()).unwrap_err()
+        };
+        match err {
+            crate::Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::Unsupported),
+            other => panic!("expected an I/O error, got {other:?}"),
+        }
+
+        // The failed open released the directory lock and left no
+        // half-built database behind.
+        let db = crate::Db::open(dir.path(), crate::Options::default()).unwrap();
+        db.put(b"k", b"v").unwrap();
+        assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+    }
+
+    #[test]
+    fn failed_start_joins_the_workers_it_already_spawned() {
+        let dir = tempfile::tempdir().unwrap();
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+
+        let versions = Arc::new(parking_lot::Mutex::new(
+            VersionSet::open(dir.path(), &sst_dir).unwrap(),
+        ));
+        let opts = CompactionOptions {
+            max_background_compactions: 3,
+            ..CompactionOptions::default()
+        };
+
+        let started = {
+            let _guard = SpawnFailureGuard::allowing(2);
+            CompactionScheduler::start(
+                Arc::new(parking_lot::RwLock::new(())),
+                Arc::new(SnapshotRegistry::new()),
+                Arc::clone(&versions),
+                Arc::from(sst_dir.as_path()),
+                Arc::new(BlockCache::new(4096)),
+                opts,
+                Arc::new(crate::engine::StallSignal::new()),
+            )
+        };
+
+        match started {
+            Ok(_) => panic!("expected the third worker spawn to fail"),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::Unsupported),
+        }
+        // Every worker that did start has exited and been joined, so
+        // its clone of the version set is gone.
+        assert_eq!(Arc::strong_count(&versions), 1);
+    }
+
+    #[test]
     fn uncovered_fragments_split_around_point_ranges() {
         let fragments = uncovered_range_tombstone_fragments(
             &[rt(b"a", b"z", 7)],
@@ -1912,5 +2068,62 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].len(), 2);
         assert_eq!(groups[1].len(), 1);
+    }
+
+    #[test]
+    fn failed_open_preserves_data_already_written() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = crate::Db::open(dir.path(), crate::Options::default()).unwrap();
+            for i in 0..300 {
+                db.put(format!("k{i:04}").as_bytes(), format!("v{i:04}").as_bytes())
+                    .unwrap();
+            }
+        }
+
+        for _ in 0..3 {
+            let _guard = SpawnFailureGuard::allowing(0);
+            assert!(crate::Db::open(dir.path(), crate::Options::default()).is_err());
+        }
+
+        let db = crate::Db::open(dir.path(), crate::Options::default()).unwrap();
+        for i in 0..300 {
+            assert_eq!(
+                db.get(format!("k{i:04}").as_bytes()).unwrap().as_deref(),
+                Some(format!("v{i:04}").as_bytes()),
+                "key {i} lost across failed opens"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_start_with_many_workers_returns_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+        let versions = Arc::new(parking_lot::Mutex::new(
+            VersionSet::open(dir.path(), &sst_dir).unwrap(),
+        ));
+        let opts = CompactionOptions {
+            max_background_compactions: 8,
+            ..CompactionOptions::default()
+        };
+        let start = std::time::Instant::now();
+        let started = {
+            let _guard = SpawnFailureGuard::allowing(7);
+            CompactionScheduler::start(
+                Arc::new(parking_lot::RwLock::new(())),
+                Arc::new(SnapshotRegistry::new()),
+                Arc::clone(&versions),
+                Arc::from(sst_dir.as_path()),
+                Arc::new(BlockCache::new(4096)),
+                opts,
+                Arc::new(crate::engine::StallSignal::new()),
+            )
+        };
+        let elapsed = start.elapsed();
+        assert!(started.is_err());
+        println!("failed start with 8 workers took {elapsed:?}");
+        assert_eq!(Arc::strong_count(&versions), 1);
     }
 }

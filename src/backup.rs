@@ -21,7 +21,7 @@
 //! ```
 //!
 //! The backup directory may live on a different filesystem from
-//! the source database — files are byte-copied, not hard-linked.
+//! the source database - files are byte-copied, not hard-linked.
 //! Restores stream bytes back out of `shared/` into a fresh
 //! target directory and write a new MANIFEST reflecting the
 //! captured version.
@@ -61,7 +61,7 @@ pub struct BackupInfo {
 /// Content-addressed backup repository for one or more databases.
 ///
 /// Multiple [`BackupEngine`] instances should not share a backup
-/// directory — there is no cross-process locking. A single process
+/// directory - there is no cross-process locking. A single process
 /// may reuse one instance for many backups.
 pub struct BackupEngine {
     root: PathBuf,
@@ -682,7 +682,7 @@ mod tests {
         let shared_bytes_1 = shared_bytes(bkp_dir.path());
         let shared_count_1 = shared_count(bkp_dir.path());
 
-        // No writes between backups — second backup must add no
+        // No writes between backups - second backup must add no
         // shared files.
         let _id2 = engine.create_backup(&db).unwrap();
         let shared_bytes_2 = shared_bytes(bkp_dir.path());
@@ -767,7 +767,7 @@ mod tests {
         let id2 = engine.create_backup(&db).unwrap();
         let shared_after_2 = shared_count(bkp_dir.path());
 
-        // Remove the first backup — any file it held that backup 2
+        // Remove the first backup - any file it held that backup 2
         // does not also reference should be gone.
         engine.delete_backup(id1).unwrap();
         let shared_after_delete = shared_count(bkp_dir.path());
