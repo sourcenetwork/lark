@@ -185,6 +185,16 @@ impl Journal {
         raw.sort_by_key(|r| r.seq);
 
         let mut fds: HashMap<i64, PathBuf> = HashMap::new();
+        // The shim reads a write's offset with a `SEEK_CUR` query, which is
+        // exact for a plain descriptor but reads 0 for the first write on an
+        // `O_APPEND` descriptor: the kernel only moves that descriptor to the
+        // end of the file at write time. Recording 0 would mark durable bytes
+        // at the start of an existing file as unsynced, and a power-loss
+        // reconstruction would then discard a whole file that survived. Every
+        // write on an appending descriptor is therefore normalised to `-1`,
+        // which is what `Record::a` documents and what the reconstruction
+        // already resolves against the running end of file.
+        let mut appending: HashMap<i64, bool> = HashMap::new();
         let mut records = Vec::with_capacity(raw.len());
         for Raw {
             seq,
@@ -204,19 +214,27 @@ impl Journal {
                     continue;
                 }
             };
+            let mut a = a;
             let resolved = match kind {
                 OpKind::Open => {
                     let p = PathBuf::from(&path);
                     if fd >= 0 {
                         fds.insert(fd, p.clone());
+                        appending.insert(fd, b & O_APPEND != 0);
                     }
                     p
                 }
                 OpKind::RenameFrom | OpKind::RenameTo | OpKind::Unlink => PathBuf::from(&path),
-                _ => fds.get(&fd).cloned().unwrap_or_default(),
+                _ => {
+                    if kind == OpKind::Write && appending.get(&fd).copied().unwrap_or(false) {
+                        a = -1;
+                    }
+                    fds.get(&fd).cloned().unwrap_or_default()
+                }
             };
             if kind == OpKind::Close {
                 fds.remove(&fd);
+                appending.remove(&fd);
             }
             records.push(Record {
                 seq,
