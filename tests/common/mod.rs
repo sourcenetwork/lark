@@ -83,3 +83,9 @@ fn count_with_extension(dir: &Path, ext: &str) -> usize {
 pub fn force_compaction(db: &Db) {
     db.compact_range(None, None).unwrap();
 }
+
+/// Fault injection: subprocess crash harness, power-loss simulation,
+/// the valid-prefix validator, and byte-level mutators. See
+/// [`fault`] for the full contract, including why a `kill -9` is not a
+/// power cut.
+pub mod fault;
