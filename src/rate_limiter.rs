@@ -103,17 +103,18 @@ pub struct TokenBucketRateLimiter {
 impl TokenBucketRateLimiter {
     /// Construct a new limiter.
     ///
-    /// * `bytes_per_second` — sustained refill rate. `0` disables the
+    /// * `bytes_per_second` - sustained refill rate. `0` disables the
     ///   limiter (every request is served instantly).
-    /// * `refill_period` — how often tokens are credited. Must be > 0.
-    /// * `burst_bytes` — maximum number of tokens the bucket can hold.
+    /// * `refill_period` - how often tokens are credited. A zero
+    ///   period credits tokens continuously: every request refills
+    ///   the bucket for exactly the time that has elapsed.
+    /// * `burst_bytes` - maximum number of tokens the bucket can hold.
     ///   A fresh bucket starts full so the first `burst_bytes` worth of
-    ///   work is served without blocking.
+    ///   work is served without blocking. Clamped to at least 1.
+    ///
+    /// Never panics: out-of-range arguments are clamped rather than
+    /// asserted, because this is a public constructor.
     pub fn new(bytes_per_second: u64, refill_period: Duration, burst_bytes: u64) -> Self {
-        assert!(
-            !refill_period.is_zero(),
-            "refill_period must be greater than zero"
-        );
         let burst_bytes = burst_bytes.max(1);
         Self {
             state: Mutex::new(State {
@@ -187,12 +188,9 @@ impl TokenBucketRateLimiter {
             let now = Instant::now();
             self.refill_locked(&mut state, now);
 
-            let front = state
-                .waiters
-                .iter()
-                .next()
-                .copied()
-                .expect("self is in waiters");
+            let Some(front) = state.waiters.iter().next().copied() else {
+                break false;
+            };
             if front == key && state.available >= bytes as i128 {
                 state.available -= bytes as i128;
                 break true;
@@ -200,7 +198,7 @@ impl TokenBucketRateLimiter {
 
             // Either we aren't at the front or tokens aren't ready.
             // Compute how long until the next refill and sleep that
-            // long — a spurious wakeup just re-enters the loop.
+            // long - a spurious wakeup just re-enters the loop.
             let wait = self
                 .refill_period
                 .saturating_sub(Instant::now().saturating_duration_since(state.last_refill));
@@ -303,7 +301,7 @@ mod tests {
     #[test]
     fn ten_mb_through_one_mbps_takes_at_least_nine_seconds() {
         // The bucket starts full (1 MB burst) so a 10 MB request
-        // sees 1 MB of free credit up front — expected wait is
+        // sees 1 MB of free credit up front - expected wait is
         // ~9 seconds, not 10. Assert >= 9 to match.
         let lim = TokenBucketRateLimiter::new(1_000_000, Duration::from_millis(100), 1_000_000);
         let start = Instant::now();

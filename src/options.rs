@@ -34,7 +34,7 @@ pub enum CompactionDecision {
 /// # Determinism
 ///
 /// Implementations must be deterministic functions of `(level, key,
-/// value)` — the same input should always yield the same decision.
+/// value)` - the same input should always yield the same decision.
 /// They must not read from the database (would deadlock) and should
 /// avoid blocking.
 ///
@@ -76,7 +76,7 @@ pub trait CompactionFilter: Send + Sync + 'static {
 /// # Determinism and safety
 ///
 /// Implementations must be deterministic functions of their inputs.
-/// They MUST NOT read from the database — doing so will deadlock —
+/// They MUST NOT read from the database - doing so will deadlock -
 /// and they should not block. Returning `None` from either method is
 /// interpreted as a merge failure: readers surface it as
 /// [`crate::Error::MergeFailed`], while compaction treats it
@@ -130,7 +130,7 @@ pub struct WriteOptions {
     /// queue. Currently accepted but ignored.
     pub low_pri: bool,
     /// Reserved for future use by the write-stall / rate-limiter
-    /// plumbing. Currently accepted but ignored — the engine never
+    /// plumbing. Currently accepted but ignored - the engine never
     /// actually stalls today, so this knob is a no-op.
     pub no_slowdown: bool,
 }
@@ -168,7 +168,7 @@ impl WriteOptions {
 /// range scans (`Iter::seek_prefix`) consult the prefix bloom and skip
 /// SSTables that demonstrably cannot contain the requested prefix.
 ///
-/// Point lookups are unaffected — they always consult the user-key
+/// Point lookups are unaffected - they always consult the user-key
 /// bloom filter and do not call the extractor.
 pub trait PrefixExtractor: Send + Sync + 'static {
     /// Return the portion of `key` that the prefix bloom should index,
@@ -337,7 +337,7 @@ pub enum DurabilityMode {
 /// block frame, so a single SSTable file can read blocks compressed
 /// with different codecs (and a database can mix codecs across levels).
 ///
-/// All variants are pure-Rust implementations — no C/C++ toolchain
+/// All variants are pure-Rust implementations - no C/C++ toolchain
 /// or system libraries required.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum CompressionType {
@@ -361,8 +361,14 @@ pub struct Options {
     /// Data block size in SSTables. Must be greater than zero.
     /// Default: 16 KB.
     pub block_size: usize,
-    /// Block cache size for decompressed blocks. Must be greater
-    /// than zero. Default: 512 MB.
+    /// Block cache size in bytes for decompressed data blocks.
+    /// `0` disables the block cache entirely: nothing is allocated
+    /// for it, no block is retained, every read goes to the file,
+    /// and the block-cache tickers stay at zero. Default: 512 MB.
+    ///
+    /// What the cache allocates tracks this budget, not the shard
+    /// count: shard maps start empty and each shard caps its entry
+    /// count at its share of the budget.
     pub block_cache_size: usize,
     /// Base-2 log of the block cache shard count. The block cache
     /// is split into `2^block_cache_num_shard_bits` shards keyed
@@ -370,7 +376,9 @@ pub struct Options {
     /// only with other readers that hash to the same shard.
     /// Must be <= [`MAX_BLOCK_CACHE_SHARD_BITS`]. Tiny cache budgets
     /// may use fewer effective shards so each shard has usable
-    /// capacity. Default: 6 (64 shards).
+    /// capacity, and a [`Options::block_cache_size`] of 0 makes this
+    /// setting irrelevant because no shard is allocated.
+    /// Default: 6 (64 shards).
     pub block_cache_num_shard_bits: u32,
     /// If `true`, the block cache refuses to admit a single entry
     /// that is larger than one shard's byte capacity; the caller
@@ -429,7 +437,7 @@ pub struct Options {
     pub atomic_flush: bool,
     /// Event listeners subscribed to engine lifecycle events
     /// (flush, compaction, ingest, background errors). Dispatch
-    /// is synchronous on the firing thread — listeners **must not
+    /// is synchronous on the firing thread - listeners **must not
     /// block or re-enter the database**. See
     /// [`crate::EventListener`] for the full contract.
     pub listeners: Vec<Arc<dyn crate::EventListener>>,
@@ -489,7 +497,7 @@ pub struct Options {
     /// When `> 1`, multiple non-overlapping compaction jobs can
     /// run concurrently (e.g. L1→L2 at key range `[a,m)` on one
     /// worker while L2→L3 at `[m,z)` runs on another). L0
-    /// compactions are exclusive — only one L0 job runs at a
+    /// compactions are exclusive - only one L0 job runs at a
     /// time because L0 files can overlap arbitrarily.
     ///
     /// Must be greater than zero. `1` (default) keeps compaction
@@ -513,7 +521,7 @@ pub struct Options {
     ///
     /// Currently implemented as `posix_fadvise(DONTNEED)` on
     /// Linux; on other targets the flag is accepted but the
-    /// hint is a no-op. `false` by default — callers who care
+    /// hint is a no-op. `false` by default - callers who care
     /// about foreground latency stability on Linux should turn
     /// it on.
     pub evict_compaction_data_from_page_cache: bool,
@@ -669,7 +677,6 @@ impl Options {
     pub fn validate(&self) -> crate::Result<()> {
         require_nonzero_usize("write_buffer_size", self.write_buffer_size)?;
         require_nonzero_usize("block_size", self.block_size)?;
-        require_nonzero_usize("block_cache_size", self.block_cache_size)?;
         require_nonzero_usize("l0_compaction_trigger", self.l0_compaction_trigger)?;
         require_nonzero_u64("level_base_bytes", self.level_base_bytes)?;
         require_nonzero_u64("level_size_multiplier", self.level_size_multiplier)?;
@@ -909,6 +916,46 @@ mod tests {
     }
 
     #[test]
+    fn options_validate_accepts_zero_block_cache_size() {
+        Options {
+            block_cache_size: 0,
+            ..Options::default()
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn zero_block_cache_db_opens_and_reads_correctly() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = crate::Db::open(
+            dir.path(),
+            Options {
+                block_cache_size: 0,
+                write_buffer_size: 4 * 1024,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        for i in 0..500u32 {
+            db.put(
+                format!("key{i:04}").as_bytes(),
+                format!("value{i}").as_bytes(),
+            )
+            .unwrap();
+        }
+        // Small write buffer forces flushes, so most of these reads
+        // come from SSTables and exercise the uncached block path.
+        for i in 0..500u32 {
+            assert_eq!(
+                db.get(format!("key{i:04}").as_bytes()).unwrap(),
+                Some(format!("value{i}").into_bytes())
+            );
+        }
+        assert!(db.get(b"absent").unwrap().is_none());
+    }
+
+    #[test]
     fn options_validate_rejects_zero_core_sizes() {
         assert_invalid_option(
             Options {
@@ -923,13 +970,6 @@ mod tests {
                 ..Options::default()
             },
             "block_size",
-        );
-        assert_invalid_option(
-            Options {
-                block_cache_size: 0,
-                ..Options::default()
-            },
-            "block_cache_size",
         );
         assert_invalid_option(
             Options {
@@ -1119,7 +1159,7 @@ mod tests {
     }
 
     /// Custom `PrefixExtractor` that returns everything before the
-    /// first `:` — proves the trait is user-implementable.
+    /// first `:` - proves the trait is user-implementable.
     #[test]
     fn custom_prefix_extractor_can_be_plugged_in() {
         struct UntilColon;

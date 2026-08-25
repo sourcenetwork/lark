@@ -1,7 +1,7 @@
 //! Platform-specific hints to the OS page cache.
 //!
 //! Background compaction reads and writes large SSTables
-//! sequentially and will not re-read them any time soon — they
+//! sequentially and will not re-read them any time soon - they
 //! get moved to the block cache on demand during subsequent
 //! foreground reads. Without a hint, the kernel keeps those
 //! pages resident and evicts hot foreground data, which is the
@@ -12,7 +12,7 @@
 //! [`drop_page_cache`] calls `posix_fadvise(fd, 0, 0, DONTNEED)`
 //! on Linux, which tells the kernel it can evict any cached
 //! pages backing the file. It is a hint, not a guarantee, and
-//! the return value is ignored on purpose — the engine is
+//! the return value is ignored on purpose - the engine is
 //! correct whether or not the hint is honored, and the only
 //! failure mode is "the cache stayed warmer than we wanted",
 //! which is harmless.
@@ -26,14 +26,14 @@
 //! # When to call
 //!
 //! The compaction path calls this after a background read or
-//! write completes. Foreground (user) reads are never hinted —
+//! write completes. Foreground (user) reads are never hinted -
 //! those are exactly the pages we want to keep warm.
 
 #[cfg(target_os = "linux")]
 pub(crate) fn drop_page_cache(file: &std::fs::File) {
     // `rustix::fs::fadvise` is a safe wrapper around
     // `posix_fadvise`; an offset of `0` with no length means
-    // "the whole file". We deliberately ignore the return — this is a
+    // "the whole file". We deliberately ignore the return - this is a
     // best-effort hint, and a failure (e.g. the file is backed
     // by a filesystem that doesn't implement the advice) is not
     // a correctness issue.
@@ -47,7 +47,7 @@ pub(crate) fn drop_page_cache(_file: &std::fs::File) {
 
 /// Convenience wrapper: open the file at `path` read-only and
 /// call [`drop_page_cache`] on the resulting handle. Silently
-/// ignores open errors — this is a best-effort hint on a file
+/// ignores open errors - this is a best-effort hint on a file
 /// that may already be gone by the time we reach it.
 pub(crate) fn drop_page_cache_by_path(path: &std::path::Path) {
     if let Ok(file) = std::fs::OpenOptions::new().read(true).open(path) {

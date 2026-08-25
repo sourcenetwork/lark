@@ -11,7 +11,7 @@
 //! refcount reaches zero.
 //!
 //! [`SnapshotRegistry::oldest_live_seq`] returns the smallest currently
-//! registered seq — or `u64::MAX` when no snapshot is live. Compaction
+//! registered seq - or `u64::MAX` when no snapshot is live. Compaction
 //! uses this as the **pin seq**: any version with a smaller seq than
 //! the largest visible version at `pin_seq` is invisible to every
 //! live snapshot and to current reads, and can be discarded.
@@ -47,7 +47,7 @@ impl SnapshotRegistry {
     }
 
     /// Register a new pin at `seq`. Must be balanced by a later
-    /// [`release`](Self::release) call — typically from the
+    /// [`release`](Self::release) call - typically from the
     /// `Drop` impl of the owning snapshot type.
     pub(crate) fn register(&self, seq: u64) {
         let now = SystemTime::now()
@@ -91,7 +91,7 @@ impl SnapshotRegistry {
     }
 
     /// Number of distinct live snapshots. Counts pins, not
-    /// distinct seqs — two snapshots taken at the same seq
+    /// distinct seqs - two snapshots taken at the same seq
     /// contribute two.
     pub(crate) fn live_count(&self) -> u64 {
         self.active

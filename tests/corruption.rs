@@ -5,7 +5,7 @@
 //! Each test writes data, closes the DB, mangles an on-disk file
 //! with raw `std::fs` ops, then re-opens and asserts that the
 //! engine either (a) surfaces a diagnostic error or (b) recovers
-//! gracefully with the expected partial data — never silent loss
+//! gracefully with the expected partial data - never silent loss
 //! of earlier, uncorrupted data.
 
 use std::fs::{self, OpenOptions};
@@ -83,7 +83,7 @@ fn torn_wal_tail_checksum_flip_fails_open_and_keeps_wal() {
     let wal = first_wal(dir.path());
     let wal_count = count_wal_files(dir.path());
     let size = fs::metadata(&wal).unwrap().len() as usize;
-    // Flip the last byte of the file — always part of the trailing
+    // Flip the last byte of the file - always part of the trailing
     // record's 4-byte checksum.
     flip_byte(&wal, size - 1);
 
@@ -141,7 +141,7 @@ fn wal_checksum_flip_in_final_record_fails_open() {
 
 #[test]
 fn manifest_deleted_prevents_reopen_of_nonempty_db() {
-    // corruption_test.cc::MissingDescriptor — once a DB has written
+    // corruption_test.cc::MissingDescriptor - once a DB has written
     // SSTables, deleting the manifest drops the pointer to them.
     // Opening without a manifest yields a fresh-looking DB (the
     // manifest is re-created empty), so the pre-existing files are
@@ -170,7 +170,7 @@ fn manifest_deleted_prevents_reopen_of_nonempty_db() {
 
 #[test]
 fn corrupted_manifest_record_stops_replay_but_opens() {
-    // corruption_test.cc::CorruptedDescriptor — a mid-file bad
+    // corruption_test.cc::CorruptedDescriptor - a mid-file bad
     // checksum in the manifest halts replay at the corruption but
     // leaves the pre-corruption state intact.
     let dir = TempDir::new().unwrap();
@@ -181,7 +181,7 @@ fn corrupted_manifest_record_stops_replay_but_opens() {
         db.put(b"k2", b"v2").unwrap();
         force_compaction(&db);
     }
-    // Flip a byte deep in the manifest — lands inside the second
+    // Flip a byte deep in the manifest - lands inside the second
     // record's payload or checksum, which the replay loop treats
     // as "stop here".
     let manifest = dir.path().join("MANIFEST");
@@ -200,7 +200,7 @@ fn corrupted_manifest_record_stops_replay_but_opens() {
 
 #[test]
 fn truncated_sst_file_to_below_footer_reports_error_on_open() {
-    // corruption_test.cc::CorruptedBlock — an SSTable smaller than
+    // corruption_test.cc::CorruptedBlock - an SSTable smaller than
     // its 64-byte footer cannot be opened. The engine must
     // surface the error rather than silently drop the file.
     let dir = TempDir::new().unwrap();
@@ -226,7 +226,7 @@ fn truncated_sst_file_to_below_footer_reports_error_on_open() {
 
 #[test]
 fn sst_footer_magic_byte_flip_detected_on_open() {
-    // corruption_test.cc::CorruptedBlock — the last 8 bytes of the
+    // corruption_test.cc::CorruptedBlock - the last 8 bytes of the
     // footer carry the magic number; flipping one byte must make
     // the engine refuse to trust the file.
     let dir = TempDir::new().unwrap();
@@ -244,7 +244,7 @@ fn sst_footer_magic_byte_flip_detected_on_open() {
     // Open attempt: we accept either Err OR Ok that errors on read.
     if let Ok(db) = Db::open(dir.path(), Default::default()) {
         // If open tolerates the file, the first read of a key
-        // inside that file must either error or return None —
+        // inside that file must either error or return None -
         // crucially, it must not panic.
         let _ = db.get(b"k_00");
     }

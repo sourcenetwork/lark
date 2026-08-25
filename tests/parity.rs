@@ -2,7 +2,7 @@
 //!
 //! Each test exercises a specific behavior that production
 //! storage engines are expected to satisfy. The scenarios are
-//! the valuable part — they encode 15+ years of bugs-found-the-
+//! the valuable part - they encode 15+ years of bugs-found-the-
 //! hard-way from LSM implementations. Cross-engine validation
 //! (running the same scenario against both lark and another
 //! engine) can be added as a follow-up.

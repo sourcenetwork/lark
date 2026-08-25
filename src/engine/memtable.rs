@@ -59,7 +59,7 @@ impl MemTable {
         self.approximate_size.fetch_add(size, Ordering::Relaxed);
     }
 
-    /// Record a range tombstone — every user key in `[start, end)`
+    /// Record a range tombstone - every user key in `[start, end)`
     /// is considered deleted as of `seq`.
     pub(crate) fn delete_range(&self, start: &[u8], end: &[u8], seq: u64) {
         let size = start.len() + end.len() + 8;
@@ -78,7 +78,7 @@ impl MemTable {
 
     /// Largest seq of any range tombstone covering `user_key` that is
     /// visible at `snapshot_seq`. Returns `0` if no such tombstone
-    /// exists — `0` is a safe sentinel because real seqs start at 1.
+    /// exists - `0` is a safe sentinel because real seqs start at 1.
     pub(crate) fn covering_range_tombstone_seq(&self, user_key: &[u8], snapshot_seq: u64) -> u64 {
         self.range_tombstones
             .lock()
@@ -86,8 +86,8 @@ impl MemTable {
     }
 
     /// Look up the newest point entry for `key` visible at
-    /// `snapshot_seq`. Returns `Some((seq, value_opt))` — `value_opt`
-    /// is `Some(..)` for a live value and `None` for a tombstone —
+    /// `snapshot_seq`. Returns `Some((seq, value_opt))` - `value_opt`
+    /// is `Some(..)` for a live value and `None` for a tombstone -
     /// or `None` if the memtable has no entry for `key` at or below
     /// `snapshot_seq`.
     ///
@@ -120,7 +120,7 @@ impl MemTable {
     /// newest-seq-first order, appending `(seq, value_type, bytes)`
     /// tuples onto `out` and stopping at (and including) the first
     /// terminator (`VALUE_TYPE_VALUE` or `VALUE_TYPE_DELETION`).
-    /// Returns `true` when a terminator was reached — callers walking
+    /// Returns `true` when a terminator was reached - callers walking
     /// multiple sources use this to decide whether to continue the
     /// walk into the next source.
     ///
@@ -164,7 +164,7 @@ impl MemTable {
     /// Walk every raw entry whose user key falls in `[start, end)` and
     /// return the count and approximate total size (sum of internal-key
     /// length + value length). Every version and every tombstone is
-    /// counted — this is a raw-entry stat, not a distinct-user-key stat.
+    /// counted - this is a raw-entry stat, not a distinct-user-key stat.
     ///
     /// Used by [`crate::Db::get_approximate_memtable_stats`] to give
     /// callers a cheap-ish estimate of how big a range is inside the
@@ -192,7 +192,7 @@ impl MemTable {
 
     /// Return the first `(internal_key, value)` pair whose key is in the
     /// half-open range `[lower, ..)`. Used by the streaming iterator to walk
-    /// the memtable statelessly — each call does a fresh `O(log N)` seek in
+    /// the memtable statelessly - each call does a fresh `O(log N)` seek in
     /// the skip list.
     pub(crate) fn first_entry_from(
         &self,
@@ -407,7 +407,7 @@ mod tests {
         assert_eq!(user_key_of_v(&first.0), b"b");
         assert_eq!(user_key_of_v(&last.0), b"y");
 
-        // Bounded from above "k" — first >= k is "m".
+        // Bounded from above "k" - first >= k is "m".
         let m_first = mt
             .first_entry_from(std::ops::Bound::Included(&encode_internal_key(
                 b"k",

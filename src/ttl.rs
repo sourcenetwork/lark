@@ -35,7 +35,7 @@ const TTL_SUFFIX_LEN: usize = TTL_MAGIC_LEN + 1 + TTL_TS_LEN;
 /// value. Entries whose embedded timestamp is older than `ttl_seconds`
 /// read as `None` and are physically reclaimed at the next compaction.
 ///
-/// `ttl_seconds == 0` disables expiration entirely — the wrapper still
+/// `ttl_seconds == 0` disables expiration entirely - the wrapper still
 /// appends the TTL suffix for format consistency, but the filter
 /// keeps every entry and reads never treat any value as expired.
 pub struct DbWithTtl {
@@ -87,7 +87,7 @@ impl DbWithTtl {
     }
 
     /// Delete `key`. Range deletes are delegated to the inner
-    /// [`Db::delete`] — tombstones don't carry timestamps.
+    /// [`Db::delete`] - tombstones don't carry timestamps.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         self.inner.delete(key)
     }
@@ -152,7 +152,7 @@ impl DbWithTtl {
     /// not wrap (streaming iterator, snapshots, compact_range).
     ///
     /// Values read through the inner `Db` still carry their trailing
-    /// TTL suffix — callers are responsible for stripping it via
+    /// TTL suffix - callers are responsible for stripping it via
     /// [`strip_timestamp`] if they want the user payload.
     pub fn inner(&self) -> &Db {
         &self.inner

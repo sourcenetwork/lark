@@ -1,4 +1,4 @@
-//! Concurrency scenarios — multiple threads driving reads and
+//! Concurrency scenarios - multiple threads driving reads and
 //! writes against a single `Db` handle.
 //!
 //! Scenarios ported from `db_test.cc` multi-threaded tests and
@@ -22,7 +22,7 @@ use common::{fill_sequential, force_compaction, open};
 
 #[test]
 fn parallel_writers_produce_durable_writes() {
-    // db_test.cc::MultiThreadedReadersWriters (writer half) — every
+    // db_test.cc::MultiThreadedReadersWriters (writer half) - every
     // write committed from any thread must be visible after a
     // `join()` barrier, regardless of which thread made it.
     let dir = TempDir::new().unwrap();
@@ -54,7 +54,7 @@ fn parallel_writers_produce_durable_writes() {
 
 #[test]
 fn concurrent_readers_during_flush_see_consistent_values() {
-    // db_test.cc::ReadsDuringFlush — reads must not observe a
+    // db_test.cc::ReadsDuringFlush - reads must not observe a
     // key that "disappears" because of a concurrent flush. The
     // shape of the test: seed a key with a value, spawn readers
     // that keep asserting "value is exactly X" while the main
@@ -92,7 +92,7 @@ fn concurrent_readers_during_flush_see_consistent_values() {
 
 #[test]
 fn snapshot_held_by_reader_outlives_writer_compaction() {
-    // db_test.cc::SnapshotHoldsBackGC — a snapshot captured before
+    // db_test.cc::SnapshotHoldsBackGC - a snapshot captured before
     // writer overwrites the key must remain observable through the
     // writer's updates plus a compaction.
     let dir = TempDir::new().unwrap();
@@ -123,7 +123,7 @@ fn snapshot_held_by_reader_outlives_writer_compaction() {
 
 #[test]
 fn concurrent_batch_writers_are_atomic() {
-    // db_test.cc::ConcurrentBatchWriters — each thread writes its
+    // db_test.cc::ConcurrentBatchWriters - each thread writes its
     // own batch; every batch's contents must be either fully
     // visible or fully absent when observed from another thread.
     use lark_kv::WriteBatch;
@@ -153,7 +153,7 @@ fn concurrent_batch_writers_are_atomic() {
         h.join().unwrap();
     }
 
-    // Every batch must have landed atomically — all three keys present.
+    // Every batch must have landed atomically - all three keys present.
     for t in 0..writer_count {
         for i in 0..batches_per_writer {
             let present = b"abc"
@@ -237,7 +237,7 @@ fn snapshot_never_observes_a_torn_batch() {
 
 #[test]
 fn reads_during_compaction_return_correct_values() {
-    // db_test.cc::ReadsDuringCompaction — reads issued in parallel
+    // db_test.cc::ReadsDuringCompaction - reads issued in parallel
     // with a compaction that moves files between levels must keep
     // returning the correct current-version value for every key.
     let dir = TempDir::new().unwrap();
@@ -276,7 +276,7 @@ fn reads_during_compaction_return_correct_values() {
 // ── long soak, gated behind --ignored ──────────────────────────
 
 #[test]
-#[ignore = "soak — runs for ~10s; unlocked by nightly-stress CI"]
+#[ignore = "soak - runs for ~10s; unlocked by nightly-stress CI"]
 fn writer_compactor_contention_soak() {
     // db_stress-style mixed workload soak: N threads each do a
     // random mix of put/delete/get over a 10-second window while

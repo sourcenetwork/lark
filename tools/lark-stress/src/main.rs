@@ -1,4 +1,4 @@
-//! `lark-stress` — random-op correctness harness that cross-checks
+//! `lark-stress` - random-op correctness harness that cross-checks
 //! lark against an in-memory `BTreeMap` reference.
 //!
 //! ```sh
@@ -132,7 +132,7 @@ fn main() {
 
     for op_idx in 0..args.num_ops {
         // Reopen path: close and reopen the db to exercise
-        // recovery. The reference stays in memory — every
+        // recovery. The reference stays in memory - every
         // committed write should survive the reopen.
         if args.reopen_every > 0 && op_idx > 0 && op_idx % args.reopen_every == 0 {
             drop(db);
@@ -178,7 +178,7 @@ fn main() {
                 if let Some(w) = shadow.as_mut() {
                     writeln!(w, "PUT {} {}", hex(&key), hex(&val)).unwrap();
                     // Flush every write so a SIGKILL can't lose the
-                    // tail — the shadow log must be a strict
+                    // tail - the shadow log must be a strict
                     // subset of what's durable in lark.
                     w.flush().unwrap();
                 }
