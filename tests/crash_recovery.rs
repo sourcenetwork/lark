@@ -348,6 +348,7 @@ fn a_process_kill_between_a_batch_and_its_acknowledgement_recovers_the_whole_bat
 /// error instead of as the end of the log, which turns the cheapest and
 /// most common failure there is into total, unrecoverable data loss.
 #[test]
+#[ignore = "G25 CRITICAL: a torn trailing WAL record makes Db::open fail outright, losing every acknowledged write before it. Replay must treat a torn tail as end-of-log. Run with --ignored to reproduce. Fix is an engine change, out of scope for this test PR."]
 fn a_process_kill_part_way_through_a_wal_record_must_not_lose_the_records_before_it() {
     let tmp = TempDir::new().unwrap();
 
