@@ -128,6 +128,7 @@ fn a_write_batch_around_the_lock_manager_is_detected() {
 }
 
 #[test]
+#[ignore = "Stress test, run deliberately with --ignored. It races a raw-put storm against transactional read-modify-writes, so the number that notice is purely scheduling-dependent: most of them in isolation, sometimes ZERO under a loaded runner. Even asserting > 0 flaked. The property itself is proven deterministically by a_raw_put_between_read_and_commit_is_detected, which forces the interleaving instead of racing for it."]
 fn a_raw_put_storm_aborts_the_read_modify_writes_it_races() {
     const ROUNDS: usize = 200;
     let dir = TempDir::new().unwrap();
