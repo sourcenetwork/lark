@@ -36,9 +36,12 @@
 //! is one forward seek to `W | key | 0x00 | !ts` and taking what it
 //! lands on, exactly as the engine resolves its own MVCC.
 
-/// Bytes a composed key occupies: prefix, key, separator, timestamp.
+/// Upper bound on the bytes a composed key occupies: prefix, the key
+/// with every `0x00` escaped to two bytes, the two-byte terminator and
+/// the timestamp. Used to size the scratch buffer, so an over-estimate
+/// costs nothing and an under-estimate would cost a reallocation.
 pub(crate) fn composed_len(key: &[u8]) -> usize {
-    2 + key.len() + 8
+    1 + 2 * key.len() + 2 + 8
 }
 
 /// Prefix for a write record.
@@ -46,21 +49,49 @@ pub(crate) const WRITE: u8 = b'W';
 /// Prefix for a data version.
 pub(crate) const DATA: u8 = b'D';
 
-/// Separator between the encoded key and the timestamp.
+/// Escape byte. A `0x00` inside a key is written as `SEP, ESCAPE`.
 ///
-/// The encoded key is a tagged UTF-8 string, and `0x00` cannot appear
-/// inside one: the text path carries UTF-8, whose only zero byte is a
-/// zero codepoint, and the hex path emits only `0-9a-f`. So no key can
-/// be a prefix of another once this byte is appended, and a timestamp
-/// can never be mistaken for the tail of a longer key.
+/// Keys are raw bytes: the tagged UTF-8 encoding this module used to
+/// assume was removed once kovan-mvcc took bytes directly, and with it
+/// the guarantee that `0x00` never appears inside a key. A bare `0x00`
+/// separator stopped separating at that point, and it was not
+/// theoretical: `write_prefix(b"a")` is `W a 0x00`, and the composed
+/// key for `b"a\0b"` begins with exactly those bytes, so a read of
+/// `a` could walk onto `a\0b`'s write record and return its value.
+///
+/// The fix is order-preserving escaping. Inside a key `0x00` becomes
+/// `0x00 0xFF`; the key is terminated by `0x00 0x00`. Ordering is
+/// unchanged because the terminator is smaller than both an escaped
+/// `0x00` (`0x00 0xFF`) and any non-zero byte, so a shorter key still
+/// sorts before every key it is a prefix of. No key can be a prefix of
+/// another once terminated, which is the property the seek relies on.
+pub(crate) const ESCAPE: u8 = 0xFF;
+
+/// Separator byte. Doubled it terminates a key; followed by [`ESCAPE`]
+/// it is a literal `0x00` within one.
 pub(crate) const SEP: u8 = 0x00;
+
+/// Append `key` with every `0x00` escaped, then the terminator.
+fn push_escaped(key: &[u8], out: &mut Vec<u8>) {
+    // The common case has no zero byte at all, so the whole key moves
+    // in one copy rather than a byte at a time.
+    let mut rest = key;
+    while let Some(at) = rest.iter().position(|&b| b == SEP) {
+        out.extend_from_slice(&rest[..at]);
+        out.push(SEP);
+        out.push(ESCAPE);
+        rest = &rest[at + 1..];
+    }
+    out.extend_from_slice(rest);
+    out.push(SEP);
+    out.push(SEP);
+}
 
 fn compose(prefix: u8, key: &[u8], ts_bytes: [u8; 8], out: &mut Vec<u8>) {
     out.clear();
-    out.reserve(2 + key.len() + 8);
+    out.reserve(composed_len(key));
     out.push(prefix);
-    out.extend_from_slice(key);
-    out.push(SEP);
+    push_escaped(key, out);
     out.extend_from_slice(&ts_bytes);
 }
 
@@ -78,10 +109,9 @@ pub(crate) fn write_seek(key: &[u8], ts: u64, out: &mut Vec<u8>) {
 /// for this key from the next key's records.
 pub(crate) fn write_prefix(key: &[u8], out: &mut Vec<u8>) {
     out.clear();
-    out.reserve(2 + key.len());
+    out.reserve(composed_len(key));
     out.push(WRITE);
-    out.extend_from_slice(key);
-    out.push(SEP);
+    push_escaped(key, out);
 }
 
 /// The key a data version is stored at.
@@ -169,5 +199,86 @@ mod tests {
             write_key(b"tk", ts, &mut buf);
         }
         assert_eq!(buf.capacity(), cap, "composing a key must not reallocate");
+    }
+}
+
+#[cfg(test)]
+mod nul_key_tests {
+    use super::*;
+
+    /// Keys chosen to sit on every boundary the escaping touches:
+    /// empty, bare separators, a separator next to the escape byte,
+    /// and ordinary bytes either side.
+    const AWKWARD: &[&[u8]] = &[
+        b"",
+        b"\x00",
+        b"\x00\x00",
+        b"\x00\xff",
+        b"\xff",
+        b"\xff\x00",
+        b"a",
+        b"a\x00",
+        b"a\x00b",
+        b"a\x00\x00b",
+        b"a\x00\xffb",
+        b"ab",
+        b"b",
+    ];
+
+    #[test]
+    fn escaping_preserves_the_order_of_the_raw_keys() {
+        // The seek depends on this: `write_seek` lands where it does
+        // only because composing a key keeps the ordering the raw
+        // bytes had. An escaping that reordered keys would send a read
+        // to the wrong place without ever tripping a prefix check.
+        for a in AWKWARD {
+            for b in AWKWARD {
+                let (mut ca, mut cb) = (Vec::new(), Vec::new());
+                write_key(a, 1, &mut ca);
+                write_key(b, 1, &mut cb);
+                assert_eq!(
+                    ca.cmp(&cb),
+                    a.cmp(b),
+                    "composed order disagrees with raw order for {a:?} vs {b:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_composed_key_is_a_prefix_of_another() {
+        for a in AWKWARD {
+            let mut prefix = Vec::new();
+            write_prefix(a, &mut prefix);
+            for b in AWKWARD {
+                if a == b {
+                    continue;
+                }
+                let mut cb = Vec::new();
+                write_key(b, 1, &mut cb);
+                assert!(
+                    !cb.starts_with(&prefix),
+                    "key {b:?} matches key {a:?}'s prefix, so a read of {a:?} \
+                     could return {b:?}'s value"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_key_containing_nul_is_not_confused_with_a_shorter_one() {
+        // Keys are raw bytes since the tagged encoding was dropped, so
+        // a key may contain the separator byte. `a` and `a\0b` must
+        // stay distinguishable, or a read of `a` can return `a\0b`.
+        let (mut short, mut long) = (Vec::new(), Vec::new());
+        write_key(b"a", 1, &mut short);
+        write_key(b"a\x00b", 1, &mut long);
+        let mut prefix = Vec::new();
+        write_prefix(b"a", &mut prefix);
+        assert!(short.starts_with(&prefix));
+        assert!(
+            !long.starts_with(&prefix),
+            "key a\\0b matched key a's prefix: a read of `a` would return `a\\0b`'s value"
+        );
     }
 }
