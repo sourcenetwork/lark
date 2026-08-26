@@ -140,6 +140,15 @@ impl<'a> Iter<'a> {
         self.inner.seek_to_last();
     }
 
+    /// Position the iterator at the last user key strictly below
+    /// `exclusive_upper`, and set the scan direction to reverse. Used
+    /// by the column-family iterator, whose upper bound is exclusive.
+    pub(crate) fn seek_to_last_before(&mut self, exclusive_upper: &[u8]) {
+        self.tick_seek();
+        let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterSeek);
+        self.inner.seek_to_last_before(exclusive_upper);
+    }
+
     /// Advance to the next user key alphabetically. If the iterator was
     /// walking backward, direction flips before the advance. A no-op if
     /// the iterator is not valid.

@@ -82,7 +82,7 @@ pub struct TailingIter {
 
 impl TailingIter {
     pub(crate) fn new(engine: Arc<LarkEngine>, cf_id: u32) -> Self {
-        let inner = engine.new_iter(u64::MAX);
+        let inner = engine.new_iter_at(u64::MAX);
         let stats = engine.statistics_arc();
         Self {
             engine,
@@ -194,7 +194,7 @@ impl TailingIter {
     fn refresh_and_reseek(&mut self) {
         // Rebuild the merging iterator against the engine's
         // latest `(active, frozen, version)` tuple.
-        self.inner = self.engine.new_iter(u64::MAX);
+        self.inner = self.engine.new_iter_at(u64::MAX);
 
         // Position strictly past the last key we already emitted.
         // If we haven't emitted anything yet, seek to the start

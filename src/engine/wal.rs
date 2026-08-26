@@ -1,5 +1,66 @@
-use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+//! The write-ahead log: the durable record of every write between one
+//! memtable flush and the next.
+//!
+//! # On-disk format
+//!
+//! A WAL file is a bare sequence of records with no file header and no
+//! framing above the record itself:
+//!
+//! ```text
+//! [len: u32 LE][type: u8][payload: len bytes][checksum: u32 LE]
+//! ```
+//!
+//! The checksum covers the length, the type byte and the payload, so the
+//! length field is both what finds the next record and part of what the
+//! checksum protects.
+//!
+//! # How replay tells a crash from corruption
+//!
+//! Replay runs after something has already gone wrong, so it has to
+//! separate the ordinary shape of a crash from real damage. The question
+//! it asks of each record is whether the record is *whole*: a record is
+//! whole when the file holds its five-byte header, the `len` payload
+//! bytes that header promises, and the four checksum bytes after them.
+//!
+//! * A record the file ends inside is not whole. That is what a process
+//!   killed part way through a `write` leaves behind, so replay stops
+//!   there, keeps every record before it, and reports the discarded tail
+//!   through `tracing`. No acknowledged write is lost by that: under
+//!   `DurabilityMode::Immediate` a write returns only once the `fsync` of
+//!   its own whole record has returned, and under `Eventual` no
+//!   durability was promised in the first place.
+//! * A whole record that fails its checksum, carries an unknown type, or
+//!   does not parse is corruption, and is an error. A torn write cannot
+//!   produce it: every byte the record claims is present, and they are
+//!   wrong.
+//! * An incomplete record from which the rest of the file still parses as
+//!   whole records, ending exactly at the last byte, is not a torn tail
+//!   either. A torn write leaves nothing behind it, so a remainder that
+//!   tiles that way means real records lie beyond the damage and the
+//!   length field was mangled; stopping there would discard them
+//!   silently. Replay refuses, naming the file and both offsets.
+//!
+//! Two limits of that rule are worth stating, because both are properties
+//! of the format rather than of this implementation.
+//!
+//! The checksum sits after the payload, so the length has to be trusted to
+//! find it. Damage to the length field of the *final* record is therefore
+//! indistinguishable from a torn tail and is treated as one. The blast
+//! radius is that one record, the discard is reported, and no partial or
+//! invented data is ever served.
+//!
+//! Damage in the middle of a log whose final record is *also* torn leaves
+//! a remainder that no longer tiles, so it reads as a torn tail starting
+//! at the earlier damage and the whole rest of the log is discarded. That
+//! needs bit rot and a crash in the same short-lived file, and the discard
+//! is reported with the offset and the byte count rather than passing
+//! silently.
+//!
+//! Closing either properly needs a self-checksummed header or fixed-size
+//! blocks, which is a format change.
+
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use super::{checksum, durability};
@@ -169,87 +230,60 @@ impl Wal {
         Ok(())
     }
 
-    /// Replay a WAL file and return all entries.
+    /// Replay a WAL file and return every whole record it holds.
+    ///
+    /// A record the file ends inside is the ordinary shape of a crash, and
+    /// is treated as the end of the log: the records before it come back
+    /// and the incomplete tail is reported through `tracing`. A whole
+    /// record that fails its checksum, carries an unknown type, or does
+    /// not parse is corruption and is an error, and so is an incomplete
+    /// record that still has whole records after it. The module
+    /// documentation says why those cases are told apart this way, and
+    /// names the one case the format cannot tell apart.
     pub(crate) fn replay(path: &Path) -> io::Result<Vec<WalEntry>> {
-        let file = File::open(path)?;
-        let file_len = file.metadata()?.len();
-        let mut reader = BufReader::new(file);
+        // Read the file whole: deciding whether an incomplete record is a
+        // torn tail or a mangled length field means looking at the bytes
+        // after it. A WAL is bounded by `write_buffer_size` plus the one
+        // record that crossed it, and the entries decoded out of it are
+        // larger than the file itself, so this bounds nothing new.
+        let bytes = fs::read(path)?;
         let mut entries = Vec::new();
-        let mut consumed: u64 = 0;
+        let mut pos = 0usize;
 
-        // Read record headers: length (4 bytes) + type (1 byte).
-        while let Some(header) = read_wal_header(&mut reader)? {
-            consumed += WAL_HEADER_LEN as u64;
-            let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
-            let record_type = header[4];
+        while pos < bytes.len() {
+            let Some(frame) = frame_at(&bytes, pos) else {
+                end_of_log_or_corruption(path, &bytes, pos)?;
+                break;
+            };
 
-            // A corrupt length field is untrusted input: reject it
-            // against the bytes actually left in the file before
-            // allocating, so a five-byte header cannot make recovery
-            // ask the allocator for 4 GiB.
-            let remaining = file_len.saturating_sub(consumed);
-            if len as u64 + CHECKSUM_LEN as u64 > remaining {
+            if !frame.checksum_matches() {
                 return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
+                    io::ErrorKind::InvalidData,
                     format!(
-                        "WAL record length {len} exceeds the {remaining} bytes left in {}",
+                        "WAL checksum mismatch in {} at offset {pos}",
                         path.display()
                     ),
                 ));
             }
 
-            // Read data
-            let mut data = vec![0u8; len];
-            read_exact_or_truncated(&mut reader, &mut data, "truncated WAL record data")?;
-            consumed += len as u64 + CHECKSUM_LEN as u64;
-
-            // Read and verify checksum
-            let mut checksum_bytes = [0u8; 4];
-            read_exact_or_truncated(
-                &mut reader,
-                &mut checksum_bytes,
-                "truncated WAL record checksum",
-            )?;
-            let stored_checksum = u32::from_le_bytes(checksum_bytes);
-            let computed_checksum = checksum::wal_record(len as u32, record_type, &data);
-
-            if stored_checksum != computed_checksum
-                && stored_checksum != checksum::legacy_payload_u32(&data)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("WAL checksum mismatch in {}", path.display()),
-                ));
-            }
-
-            match record_type {
-                RECORD_PUT => {
-                    let entry = parse_put_record(&data)?;
-                    entries.push(entry);
-                }
-                RECORD_DELETE => {
-                    let entry = parse_delete_record(&data)?;
-                    entries.push(entry);
-                }
-                RECORD_DELETE_RANGE => {
-                    let entry = parse_delete_range_record(&data)?;
-                    entries.push(entry);
-                }
-                RECORD_MERGE => {
-                    let entry = parse_merge_record(&data)?;
-                    entries.push(entry);
-                }
-                RECORD_BATCH => {
-                    let batch = parse_batch_record(&data)?;
-                    entries.extend(batch);
-                }
-                _ => {
+            match frame.record_type {
+                RECORD_PUT => entries.push(parse_put_record(frame.data)?),
+                RECORD_DELETE => entries.push(parse_delete_record(frame.data)?),
+                RECORD_DELETE_RANGE => entries.push(parse_delete_range_record(frame.data)?),
+                RECORD_MERGE => entries.push(parse_merge_record(frame.data)?),
+                RECORD_BATCH => entries.extend(parse_batch_record(frame.data)?),
+                other => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("unknown WAL record type {record_type}"),
+                        format!(
+                            "unknown WAL record type {other} in {} at offset {pos}",
+                            path.display()
+                        ),
                     ));
                 }
             }
+
+            pos = frame.end;
         }
 
         Ok(entries)
@@ -362,40 +396,127 @@ fn encode_batch_op(out: &mut Vec<u8>, op: &WriteBatchOp, seq: u64) {
     }
 }
 
-fn read_wal_header(reader: &mut impl Read) -> io::Result<Option<[u8; WAL_HEADER_LEN]>> {
-    let mut header = [0u8; 5];
-    let mut read = 0;
+/// One record framed inside a WAL file.
+struct Frame<'a> {
+    record_type: u8,
+    data: &'a [u8],
+    stored_checksum: u32,
+    /// Offset one past this record's checksum: where the next record
+    /// starts.
+    end: usize,
+}
 
-    while read < header.len() {
-        match reader.read(&mut header[read..]) {
-            Ok(0) if read == 0 => return Ok(None),
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "truncated WAL record header",
-                ));
-            }
-            Ok(n) => read += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
+impl Frame<'_> {
+    /// Whether the stored checksum matches the bytes of this record.
+    /// Logs written before the header joined the checksum's coverage
+    /// stored a payload-only checksum, which is still accepted.
+    fn checksum_matches(&self) -> bool {
+        let len = self.data.len() as u32;
+        self.stored_checksum == checksum::wal_record(len, self.record_type, self.data)
+            || self.stored_checksum == checksum::legacy_payload_u32(self.data)
+    }
+}
+
+/// Frame the record starting at `offset`, or `None` when the file ends
+/// inside it.
+///
+/// The length field is untrusted input, so nothing is sized from it until
+/// the bytes it promises are known to be present: a five-byte header left
+/// by a torn write cannot make recovery ask the allocator for 4 GiB.
+fn frame_at(bytes: &[u8], offset: usize) -> Option<Frame<'_>> {
+    let data_start = offset.checked_add(WAL_HEADER_LEN)?;
+    let header = bytes.get(offset..data_start)?;
+    let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    let data_end = data_start.checked_add(len)?;
+    let end = data_end.checked_add(CHECKSUM_LEN)?;
+    let data = bytes.get(data_start..data_end)?;
+    let stored = bytes.get(data_end..end)?;
+
+    Some(Frame {
+        record_type: header[4],
+        data,
+        stored_checksum: u32::from_le_bytes([stored[0], stored[1], stored[2], stored[3]]),
+        end,
+    })
+}
+
+/// Decide what the incomplete record at `pos` means, and say so.
+///
+/// `Ok(())` means the tail is a crash artifact and therefore the end of
+/// the log; the error means whole records still follow it, which no torn
+/// write can produce.
+fn end_of_log_or_corruption(path: &Path, bytes: &[u8], pos: usize) -> io::Result<()> {
+    let discarded_bytes = bytes.len() - pos;
+
+    if let Some(next) = resync_after(bytes, pos) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} is corrupt: the WAL record at offset {pos} runs past the end of the \
+                 file, but a whole record follows it at offset {next}, so the \
+                 {discarded_bytes} trailing byte(s) are damage rather than a torn write. \
+                 Refusing to open rather than discard them.",
+                path.display()
+            ),
+        ));
+    }
+
+    tracing::warn!(
+        path = %path.display(),
+        offset = pos,
+        discarded_bytes,
+        "discarded an incomplete trailing WAL record left by a crash"
+    );
+
+    Ok(())
+}
+
+/// Offset of the first whole, checksum-valid, known-type record after the
+/// incomplete one at `pos` from which the rest of the file parses as
+/// nothing but whole records, ending exactly at the last byte.
+///
+/// `Some` means real records lie beyond the damage, so the length field of
+/// the record at `pos` was mangled rather than its write being torn.
+///
+/// Requiring the whole remainder to tile is what makes this affordable.
+/// Testing each offset on its own would checksum every candidate payload,
+/// and a torn tail whose bytes read as plausible lengths (a large value of
+/// repeated `0x01` bytes, say) would put gigabytes through the hash per
+/// megabyte of tail. The tiling is computed once, backwards, in a single
+/// linear pass: each offset is `Some` frame plus one lookup of the answer
+/// already computed for the offset the frame ends at. Only the handful of
+/// offsets that survive that are ever checksummed. It also sharpens the
+/// evidence, because a chance 32-bit checksum match inside a partly
+/// written payload now has to land on a tiling as well before it can
+/// refuse an open.
+fn resync_after(bytes: &[u8], pos: usize) -> Option<usize> {
+    let scan_start = pos + 1;
+    if scan_start >= bytes.len() {
+        return None;
+    }
+
+    let mut tiles = vec![false; bytes.len() - scan_start];
+    let mut first = None;
+
+    for offset in (scan_start..bytes.len()).rev() {
+        let Some(frame) = frame_at(bytes, offset) else {
+            continue;
+        };
+        if frame.end != bytes.len() && !tiles[frame.end - scan_start] {
+            continue;
+        }
+        tiles[offset - scan_start] = true;
+
+        if matches!(
+            frame.record_type,
+            RECORD_PUT | RECORD_DELETE | RECORD_DELETE_RANGE | RECORD_MERGE | RECORD_BATCH
+        ) && frame.checksum_matches()
+        {
+            first = Some(offset);
         }
     }
 
-    Ok(Some(header))
-}
-
-fn read_exact_or_truncated(
-    reader: &mut impl Read,
-    buf: &mut [u8],
-    message: &'static str,
-) -> io::Result<()> {
-    reader.read_exact(buf).map_err(|e| {
-        if e.kind() == io::ErrorKind::UnexpectedEof {
-            io::Error::new(io::ErrorKind::UnexpectedEof, message)
-        } else {
-            e
-        }
-    })
+    first
 }
 
 fn parse_put_record(data: &[u8]) -> io::Result<WalEntry> {
@@ -1152,7 +1273,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_errors_on_truncated_trailing_header() {
+    fn replay_stops_at_a_truncated_trailing_header() {
         let dir = TempDir::new().unwrap();
         let (mut wal, path) = new_wal(&dir);
         wal.append_put(b"good", b"v", 1).unwrap();
@@ -1160,23 +1281,29 @@ mod tests {
         drop(wal);
 
         // Simulate a crash in the middle of writing the next record's
-        // 5-byte header by appending 2 stray bytes.
+        // 5-byte header by appending 2 stray bytes. Nothing acknowledged
+        // them, so they are the end of the log and the whole record
+        // before them must survive.
         let mut bytes = fs::read(&path).unwrap();
         bytes.extend_from_slice(&[0xFF, 0xFF]);
         fs::write(&path, &bytes).unwrap();
 
-        let kind = match Wal::replay(&path) {
-            Err(e) => e.kind(),
-            Ok(v) => panic!("expected truncated header error, got {} entries", v.len()),
-        };
-        assert_eq!(kind, io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            Wal::replay(&path).unwrap(),
+            vec![WalEntry::Put {
+                key: b"good".to_vec(),
+                value: b"v".to_vec(),
+                seq: 1,
+            }]
+        );
     }
 
     #[test]
-    fn replay_errors_when_length_header_exceeds_file() {
-        // Hand-craft a single record whose header claims 1000 bytes
-        // of data but the file actually contains none. Replay should
-        // surface an IO error rather than loop or silently truncate.
+    fn replay_treats_a_length_beyond_the_file_as_a_torn_tail() {
+        // A single record whose header claims 1000 bytes of payload that
+        // the file does not hold, and nothing after it: the signature of
+        // a write torn by a crash. Replay yields the records before it,
+        // of which there are none, rather than refusing the whole log.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("bad.wal");
         let mut f = File::create(&path).unwrap();
@@ -1184,11 +1311,111 @@ mod tests {
         f.write_all(&[RECORD_PUT]).unwrap(); // type
         f.sync_all().unwrap();
 
-        let kind = match Wal::replay(&path) {
-            Err(e) => e.kind(),
-            Ok(v) => panic!("expected error, got {} entries", v.len()),
+        assert!(Wal::replay(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn replay_rejects_a_length_beyond_the_file_when_whole_records_follow() {
+        // A mangled length field in the middle of the log is not a torn
+        // tail: the records after it are real and stopping there would
+        // discard them. Replay must refuse and name where it stopped.
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        for i in 0..4u64 {
+            wal.append_put(format!("k{i}").as_bytes(), b"v", i).unwrap();
+        }
+        wal.flush().unwrap();
+        drop(wal);
+
+        let mut bytes = fs::read(&path).unwrap();
+        let second = frame_at(&bytes, 0).unwrap().end;
+        bytes[second..second + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+
+        let err = match Wal::replay(&path) {
+            Err(e) => e,
+            Ok(v) => panic!("expected corruption, got {} entries", v.len()),
         };
-        assert_eq!(kind, io::ErrorKind::UnexpectedEof);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let message = err.to_string();
+        assert!(message.contains("test.wal"), "{message}");
+        assert!(message.contains(&second.to_string()), "{message}");
+    }
+
+    #[test]
+    fn replay_of_a_self_similar_torn_tail_stays_linear() {
+        // Every fifth offset of this tail frames as a record claiming a
+        // 1 MiB payload that fits, so checking each candidate on its own
+        // would put ~600 GiB through the checksum for a 4 MiB tail, and
+        // a real 64 MiB write buffer would wedge recovery for hours on a
+        // value a caller is free to write. Requiring the remainder to
+        // tile collapses it to one pass. The bound is wall clock because
+        // the defect is asymptotic; the margin over the ~50 ms this takes
+        // is wide enough that a loaded machine cannot trip it.
+        const TAIL: usize = 4 << 20;
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        wal.append_put(b"good", b"v", 1).unwrap();
+        wal.flush().unwrap();
+        drop(wal);
+
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.push(RECORD_PUT);
+        bytes.extend(
+            [0x00, 0x00, 0x10, 0x00, RECORD_PUT]
+                .iter()
+                .cycle()
+                .take(TAIL),
+        );
+        fs::write(&path, &bytes).unwrap();
+
+        let start = std::time::Instant::now();
+        let entries = Wal::replay(&path).unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            entries,
+            vec![WalEntry::Put {
+                key: b"good".to_vec(),
+                value: b"v".to_vec(),
+                seq: 1,
+            }]
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "replaying a {TAIL}-byte torn tail took {elapsed:?}, which is not one pass over it",
+        );
+    }
+
+    #[test]
+    fn replay_keeps_every_whole_record_before_a_cut_at_any_offset() {
+        // The G25 contract at unit scale: a crash costs at most the
+        // record it landed in. Cutting at every byte offset, including
+        // inside the first header and at zero, must always yield exactly
+        // the records that survived whole.
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        for i in 0..4u64 {
+            wal.append_put(format!("k{i}").as_bytes(), b"v", i).unwrap();
+        }
+        wal.flush().unwrap();
+        drop(wal);
+
+        let full = fs::read(&path).unwrap();
+        let mut boundaries = vec![0usize];
+        while let Some(frame) = frame_at(&full, *boundaries.last().unwrap()) {
+            boundaries.push(frame.end);
+        }
+        assert_eq!(boundaries.len(), 5, "four records tile the file");
+
+        for cut in 0..=full.len() {
+            fs::write(&path, &full[..cut]).unwrap();
+            let whole = boundaries.iter().filter(|b| **b <= cut).count() - 1;
+            let entries = Wal::replay(&path)
+                .unwrap_or_else(|e| panic!("a cut at {cut} is a torn tail, not corruption: {e}"));
+            assert_eq!(entries.len(), whole, "cut at {cut}");
+        }
     }
 
     #[test]

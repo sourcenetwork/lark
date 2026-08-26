@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use super::sstable::{sst_filename, LiveSst, SsTableMeta, SsTableReader};
+use super::sstable::{sst_filename, table_carries_data, LiveSst, SsTableMeta, SsTableReader};
 use super::{checksum, durability};
 
 /// Maximum number of levels in the LSM tree.
@@ -266,6 +266,39 @@ struct ManifestReplay {
     valid_len: usize,
 }
 
+/// An unreferenced `*.sst` file that the discarded-table guard could not
+/// dismiss as a crash artifact, with the reason it counts.
+struct SuspectTable {
+    path: PathBuf,
+    /// `None` when the file's metadata could not be read.
+    len: Option<u64>,
+    reason: String,
+}
+
+/// How many suspects the guard's error message names before summarising
+/// the rest. The cap is reported in the message so a long list never
+/// reads as a short one.
+const SUSPECTS_NAMED: usize = 8;
+
+fn describe_suspects(suspects: &[SuspectTable]) -> String {
+    let mut out = suspects
+        .iter()
+        .take(SUSPECTS_NAMED)
+        .map(|s| match s.len {
+            Some(len) => format!("{} ({len} bytes, {})", s.path.display(), s.reason),
+            None => format!("{} (size unknown, {})", s.path.display(), s.reason),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if suspects.len() > SUSPECTS_NAMED {
+        out.push_str(&format!(
+            ", and {} more not named here",
+            suspects.len() - SUSPECTS_NAMED
+        ));
+    }
+    out
+}
+
 impl VersionSet {
     /// Create or recover a VersionSet from the given directory. During
     /// recovery every SSTable referenced by the manifest is opened
@@ -440,7 +473,7 @@ impl VersionSet {
 
     /// Refuse to open when a manifest that did not replay cleanly ends up
     /// referencing no SSTable at all while the table directory still holds
-    /// some.
+    /// one that could carry data.
     ///
     /// Replay stops at the first unreadable record and the tail is
     /// discarded, which is correct for a record that a crash left half
@@ -448,6 +481,12 @@ impl VersionSet {
     /// silently turns a populated database into an empty one, so that
     /// combination is reported instead of served: the table files are
     /// still on disk and only the manifest needs repairing.
+    ///
+    /// A crash inside the very first flush leaves the opposite shape: a
+    /// table file that holds nothing, next to a WAL that holds every
+    /// acknowledged write. Refusing on that file would lose the writes
+    /// the WAL still has, so `suspect_tables` rules it out
+    /// before the count is taken.
     fn reject_discarded_tables(
         replay: &ManifestReplay,
         manifest_len: usize,
@@ -458,27 +497,94 @@ impl VersionSet {
         if replayed_cleanly || replay.version.levels.iter().any(|level| !level.is_empty()) {
             return Ok(());
         }
-        let tables = match fs::read_dir(sst_dir) {
-            Ok(entries) => entries
-                .flatten()
-                .filter(|entry| {
-                    entry.path().extension().and_then(|ext| ext.to_str()) == Some("sst")
-                })
-                .count(),
-            Err(_) => 0,
-        };
-        if tables == 0 {
+        let suspects = Self::suspect_tables(sst_dir);
+        if suspects.is_empty() {
             return Ok(());
         }
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "{} is corrupt: it references no SSTable, but {tables} table file(s) are present in {}. \
-                 Opening would discard them, so the database is left untouched.",
+                "{} is corrupt: it references no SSTable, but {} table file(s) in {} may still hold data. \
+                 Opening would discard them, so the database is left untouched. Suspect tables: {}",
                 manifest_path.display(),
-                sst_dir.display()
+                suspects.len(),
+                sst_dir.display(),
+                describe_suspects(&suspects),
             ),
         ))
+    }
+
+    /// The unreferenced `*.sst` files that could plausibly hold live data.
+    ///
+    /// A zero-length table, or one whose footer records no entry and no
+    /// range tombstone, is what a crash inside a flush leaves behind: the
+    /// directory entry reached the journal, the delayed-allocated data
+    /// blocks did not. Such a file cannot be a live table the manifest is
+    /// about to discard, so it is logged and skipped rather than counted.
+    ///
+    /// Everything else counts, including a file whose footer will not
+    /// parse. An unreadable file cannot be proved empty, and keeping the
+    /// database shut preserves it for repair.
+    ///
+    /// Nothing is deleted here, so a crash part way through recovery
+    /// leaves the directory exactly as this pass found it and the next
+    /// open reaches the same verdict.
+    fn suspect_tables(sst_dir: &Path) -> Vec<SuspectTable> {
+        let entries = match fs::read_dir(sst_dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!(
+                    dir = %sst_dir.display(),
+                    error = %e,
+                    "could not list the SSTable directory while checking for discarded tables"
+                );
+                return Vec::new();
+            }
+        };
+
+        let mut suspects = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("sst") {
+                continue;
+            }
+            let len = match entry.metadata() {
+                Ok(meta) => Some(meta.len()),
+                Err(e) => {
+                    suspects.push(SuspectTable {
+                        path,
+                        len: None,
+                        reason: format!("unreadable: {e}"),
+                    });
+                    continue;
+                }
+            };
+            if len == Some(0) {
+                tracing::warn!(
+                    path = %path.display(),
+                    "ignoring a zero-length orphan SSTable left by a crash inside a flush"
+                );
+                continue;
+            }
+            match table_carries_data(&path) {
+                Ok(true) => suspects.push(SuspectTable {
+                    path,
+                    len,
+                    reason: "carries data".to_string(),
+                }),
+                Ok(false) => tracing::warn!(
+                    path = %path.display(),
+                    "ignoring an orphan SSTable whose footer records no entry and no range tombstone"
+                ),
+                Err(e) => suspects.push(SuspectTable {
+                    path,
+                    len,
+                    reason: format!("unreadable footer: {e}"),
+                }),
+            }
+        }
+        suspects.sort_by(|a, b| a.path.cmp(&b.path));
+        suspects
     }
 
     fn replay_manifest(data: &[u8], sst_dir: &Path) -> io::Result<ManifestReplay> {

@@ -60,12 +60,14 @@ use harness::{
 // ─── WAL: truncation ────────────────────────────────────────────────────
 
 /// Truncating the WAL must leave the database holding the state after
-/// some whole number of the intended writes, or refuse to open. The exact
-/// boundary is asserted, not merely the absence of a panic: a cut on a
-/// record boundary must replay exactly the records before it, and a cut
-/// anywhere else must be refused, because a partial record cannot be
-/// proven to be anything. Catches a replay that swallows a torn tail as
-/// if it were data, and one that drops an intact earlier record.
+/// some whole number of the intended writes. A cut leaves every record
+/// before it byte-for-byte as the process wrote it and only the record it
+/// lands in incomplete, which is the shape of every crash, so the exact
+/// boundary is asserted rather than merely the absence of a panic: every
+/// cut must open and serve exactly the records that survived whole.
+/// Catches a replay that swallows a torn tail as if it were data, one
+/// that drops an intact earlier record, and one that refuses the whole
+/// log because of the incomplete record at the end of it.
 fn wal_truncation_sweep(cuts: &[u64], what: &str, progress: &AtomicU64) {
     let fixture = wal_fixture();
     let rel = fixture.only(".log");
@@ -86,28 +88,21 @@ fn wal_truncation_sweep(cuts: &[u64], what: &str, progress: &AtomicU64) {
         progress.fetch_add(1, Ordering::Relaxed);
         let label = format!("WAL truncated to {cut} of {}", fixture.bytes(&rel).len());
         let outcome = trial(fixture, &db, |db| truncate_at(&db.join(&rel), cut));
-        let on_boundary = boundaries.contains(&cut);
-        match (&outcome, on_boundary) {
-            (Recovered::Opened(state), true) => {
-                let records = boundaries.iter().filter(|b| **b <= cut).count() - 1;
-                match validate_prefix_of_state(state, &fixture.history) {
-                    Ok(report) if report.valid_ks.contains(&records) => tally.matched += 1,
-                    Ok(report) => tally.violation(format!(
-                        "{label}: {records} whole record(s) survived the cut but the state \
-                         matches prefix lengths {:?}",
-                        report.valid_ks
-                    )),
-                    Err(e) => tally.violation(format!("{label}: {e}")),
-                }
-            }
-            (Recovered::Refused(_), false) => tally.refused += 1,
-            (Recovered::Refused(e), true) => tally.violation(format!(
-                "{label}: the cut is on a record boundary, so every earlier record is intact, \
-                 yet open refused: {e}"
-            )),
-            (_, on_boundary) => tally.violation(format!(
-                "{label}: on a record boundary: {on_boundary}, outcome: {}",
-                outcome.why()
+        let records = boundaries.iter().filter(|b| **b <= cut).count() - 1;
+        match &outcome {
+            Recovered::Opened(state) => match validate_prefix_of_state(state, &fixture.history) {
+                Ok(report) if report.valid_ks.contains(&records) => tally.matched += 1,
+                Ok(report) => tally.violation(format!(
+                    "{label}: {records} whole record(s) survived the cut but the state \
+                     matches prefix lengths {:?}",
+                    report.valid_ks
+                )),
+                Err(e) => tally.violation(format!("{label}: {e}")),
+            },
+            other => tally.violation(format!(
+                "{label}: {records} whole record(s) survived the cut and every one of them is \
+                 intact, so open must serve exactly those, but the database {}",
+                other.why()
             )),
         }
     }
@@ -174,21 +169,52 @@ fn a_write_batch_record_cut_in_half_is_never_half_applied() {
 /// stored checksum is the last four bytes. So every single-bit flip must
 /// be caught and no flipped WAL may ever be replayed as data. A flip that
 /// opens is a hole in the checksum's coverage and is reported as one.
+///
+/// The four length bytes of the *last* record are the one exception, and
+/// it is inherent to the format rather than a hole: the checksum sits
+/// after the payload, so the length has to be trusted to find it, which
+/// makes a length inflated past the end of the file indistinguishable
+/// from the short trailing record every crash leaves behind. Replay is
+/// required to treat it as one, so either a refusal or an open serving
+/// exactly the records before that last one is correct there. Nothing
+/// else is: the blast radius stays that one record.
 fn wal_flip_sweep(positions: &[u64], what: &str, progress: &AtomicU64) {
     let fixture = wal_fixture();
     let rel = fixture.only(".log");
+    let frames = wal_frames(fixture.bytes(&rel));
+    let last = *frames.last().expect("at least one record");
+    let ambiguous = last.start..last.start + 4;
     let root = TempDir::new().expect("tempdir");
     let db = root.path().join("db");
     let mut tally = Tally::default();
+    assert_eq!(
+        frames.len(),
+        fixture.history.len(),
+        "this sweep maps one WAL record to one intended write; the fixture no longer does",
+    );
+
     for &offset in positions {
         for bit in 0..8u8 {
             progress.fetch_add(1, Ordering::Relaxed);
+            let label = format!("WAL byte {offset} bit {bit}");
             let outcome = trial(fixture, &db, |db| flip_bit(&db.join(&rel), offset, bit));
-            match outcome {
-                Recovered::Refused(_) => tally.refused += 1,
-                other => tally.violation(format!(
-                    "WAL byte {offset} bit {bit}: the record checksum did not catch the flip, \
-                     the database {}",
+            match (&outcome, ambiguous.contains(&offset)) {
+                (Recovered::Refused(_), _) => tally.refused += 1,
+                (Recovered::Opened(state), true) => {
+                    let before_last = frames.len() - 1;
+                    match validate_prefix_of_state(state, &fixture.history) {
+                        Ok(report) if report.valid_ks.contains(&before_last) => tally.matched += 1,
+                        Ok(report) => tally.violation(format!(
+                            "{label}: the flip is in the last record's length field, so at most \
+                             that record may be lost, but the state matches prefix lengths {:?} \
+                             rather than {before_last}",
+                            report.valid_ks
+                        )),
+                        Err(e) => tally.violation(format!("{label}: {e}")),
+                    }
+                }
+                (other, _) => tally.violation(format!(
+                    "{label}: the record checksum did not catch the flip, the database {}",
                     other.why()
                 )),
             }
@@ -224,31 +250,58 @@ fn every_bit_flip_in_the_wal_is_caught_by_the_record_checksum() {
 // ─── WAL: torn and trailing bytes ───────────────────────────────────────
 
 /// A record header that promises more payload than the file holds is the
-/// signature of a write torn by a crash. Replay must reject it against
-/// the bytes actually present rather than trusting the length, and must
-/// leave the WAL on disk for repair. Catches both a replay that reads
-/// past the record and one that quietly treats the tail as absent.
+/// signature of a write torn by a crash, and what replay owes depends on
+/// where it sits.
+///
+/// In the middle of the log it is not a torn write at all: whole records
+/// follow it, so the length field itself was damaged and discarding the
+/// rest would lose records that are intact. Replay must refuse and leave
+/// the WAL on disk for repair.
+///
+/// On the last record it is the ordinary end of a crashed log, and
+/// refusing there would throw away every acknowledged write before it.
+/// Replay must serve exactly the records ahead of it instead.
+///
+/// Catches a replay that reads past the record, one that quietly treats
+/// the middle of the log as absent, and one that turns the cheapest
+/// failure there is into total data loss.
 #[test]
-fn a_wal_record_header_promising_more_bytes_than_exist_is_refused() {
+fn a_wal_record_header_promising_more_bytes_than_exist_is_refused_unless_it_is_the_tail() {
     watch("wal torn header", |progress| {
         let fixture = wal_fixture();
         let rel = fixture.only(".log");
         let bytes = fixture.bytes(&rel).to_vec();
         let frames = wal_frames(&bytes);
+        let last = *frames.last().expect("non-empty");
         let root = TempDir::new().expect("tempdir");
         let db = root.path().join("db");
         let mut tally = Tally::default();
-        for frame in [frames[0], *frames.last().expect("non-empty")] {
+        assert!(
+            frames.len() >= 2,
+            "the two placements this test contrasts need more than one record",
+        );
+        assert_eq!(
+            frames.len(),
+            fixture.history.len(),
+            "this test maps one WAL record to one intended write; the fixture no longer does",
+        );
+
+        for frame in [frames[0], last] {
+            let is_tail = frame.start == last.start;
             let real = (frame.end - frame.start - 9) as u32;
             for extra in [1u32, 7, 64, 1 << 20, u32::MAX - real] {
                 progress.fetch_add(1, Ordering::Relaxed);
                 let claimed = real + extra;
+                let label = format!(
+                    "record at {} claiming {claimed} bytes instead of {real}",
+                    frame.start
+                );
                 let outcome = trial(fixture, &db, |db| {
                     overwrite_range(&db.join(&rel), frame.start, &claimed.to_le_bytes())
                 });
                 let kept = fs::metadata(db.join(&rel)).map(|m| m.len()).unwrap_or(0);
-                match outcome {
-                    Recovered::Refused(_) => {
+                match (&outcome, is_tail) {
+                    (Recovered::Refused(_), _) => {
                         assert_eq!(
                             kept,
                             bytes.len() as u64,
@@ -256,11 +309,22 @@ fn a_wal_record_header_promising_more_bytes_than_exist_is_refused() {
                         );
                         tally.refused += 1;
                     }
-                    other => tally.violation(format!(
-                        "record at {} claiming {claimed} bytes instead of {real}: {}",
-                        frame.start,
-                        other.why()
-                    )),
+                    (Recovered::Opened(state), true) => {
+                        let before_last = frames.len() - 1;
+                        match validate_prefix_of_state(state, &fixture.history) {
+                            Ok(report) if report.valid_ks.contains(&before_last) => {
+                                tally.matched += 1
+                            }
+                            Ok(report) => tally.violation(format!(
+                                "{label}: the damaged record is the last one, so the \
+                                 {before_last} before it are intact, but the state matches \
+                                 prefix lengths {:?}",
+                                report.valid_ks
+                            )),
+                            Err(e) => tally.violation(format!("{label}: {e}")),
+                        }
+                    }
+                    (other, _) => tally.violation(format!("{label}: {}", other.why())),
                 }
             }
         }
@@ -462,14 +526,12 @@ fn a_bit_flip_in_an_sstable_data_block_is_caught_by_the_block_checksum() {
     });
 }
 
-/// The index block is not checksummed, so a flip in it is caught only
-/// indirectly: a damaged block handle sends the reader to bytes whose own
-/// checksum then fails, and a damaged separator key sends a lookup to the
-/// wrong block. The first is loud; the second would silently answer "not
-/// found" for a key that is on disk. This test proves which of the two
-/// happens.
+/// The index block carries a checksum trailer counted inside the size the
+/// footer records for it, so a flip anywhere in the region is caught at
+/// open rather than indirectly. Without it a damaged separator key sends
+/// a lookup to the wrong block and the read silently answers "not found"
+/// for a key that is on disk, which is what this test used to record.
 #[test]
-#[ignore = "G24: SSTable footer, index block and bloom are not checksummed, so bit rot there yields silently wrong reads. Run with --ignored to see the violations. Fix is an engine change, out of scope for this test PR."]
 fn a_bit_flip_in_the_sstable_index_block_is_caught_or_harmless() {
     watch("sst index flips", |progress| {
         sst_region_sweep(
@@ -481,14 +543,11 @@ fn a_bit_flip_in_the_sstable_index_block_is_caught_or_harmless() {
     });
 }
 
-/// The bloom region is not checksummed either, and a point lookup trusts
-/// it: `may_contain` returning false short-circuits the read. Clearing a
-/// set bit therefore hides a key that is physically present, with no
-/// error anywhere. This test asserts the invariant that must hold, that a
-/// corrupt table is either detected or serves the data it was given, and
-/// so reports the hole if it is there.
+/// A point lookup trusts the bloom: `may_contain` returning false
+/// short-circuits the read, so clearing one set bit hides a key that is
+/// physically present. The region now carries a checksum trailer, so the
+/// table is refused at open instead of quietly answering "not found".
 #[test]
-#[ignore = "G24: SSTable footer, index block and bloom are not checksummed, so bit rot there yields silently wrong reads. Run with --ignored to see the violations. Fix is an engine change, out of scope for this test PR."]
 fn a_bit_flip_in_the_sstable_bloom_region_is_caught_or_harmless() {
     watch("sst bloom flips", |progress| {
         sst_region_sweep(
@@ -500,13 +559,12 @@ fn a_bit_flip_in_the_sstable_bloom_region_is_caught_or_harmless() {
     });
 }
 
-/// The 64-byte footer is the map of the file and is not checksummed; the
-/// magic number and the region bounds are validated against the file
-/// size instead. A flip must either fail that validation or leave every
-/// read correct. Catches a footer field that is trusted without being
+/// The footer is the map of the file: seven offsets and sizes plus the
+/// magic. A version-3 or version-4 footer covers those seven fields and
+/// its magic with a 64-bit checksum, so a flip in any of its 72 bytes is
+/// refused at open. Catches a footer field that is trusted without being
 /// checked.
 #[test]
-#[ignore = "G24: SSTable footer, index block and bloom are not checksummed, so bit rot there yields silently wrong reads. Run with --ignored to see the violations. Fix is an engine change, out of scope for this test PR."]
 fn a_bit_flip_in_the_sstable_footer_is_caught_or_harmless() {
     watch("sst footer flips", |progress| {
         sst_region_sweep(

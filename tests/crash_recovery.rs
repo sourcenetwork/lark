@@ -348,7 +348,6 @@ fn a_process_kill_between_a_batch_and_its_acknowledgement_recovers_the_whole_bat
 /// error instead of as the end of the log, which turns the cheapest and
 /// most common failure there is into total, unrecoverable data loss.
 #[test]
-#[ignore = "G25 CRITICAL: a torn trailing WAL record makes Db::open fail outright, losing every acknowledged write before it. Replay must treat a torn tail as end-of-log. Run with --ignored to reproduce. Fix is an engine change, out of scope for this test PR."]
 fn a_process_kill_part_way_through_a_wal_record_must_not_lose_the_records_before_it() {
     let tmp = TempDir::new().unwrap();
 
@@ -421,9 +420,8 @@ fn a_process_kill_part_way_through_a_wal_record_must_not_lose_the_records_before
          already acknowledged is gone:\n{}\n\
          Nothing here is corruption: the bytes on disk are exactly the bytes the process \
          wrote, and a short trailing record is what every crash leaves behind. `Wal::replay` \
-         (src/engine/wal.rs:191) returns `UnexpectedEof` for it and `LarkEngine::open` \
-         (src/engine/mod.rs:358) propagates it, so the whole database is unopenable and no \
-         option gets past it. Reproducer: this test.",
+         must treat a record the file ends inside as the end of the log and return every \
+         whole record before it.",
         lost.join("\n"),
     );
 }

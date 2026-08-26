@@ -408,7 +408,7 @@ impl Db {
         // Recover `next_id`. Absent on a fresh database.
         let next_id_raw = self
             .engine
-            .get(&meta::next_id_key(), self.engine.snapshot_seq())
+            .get_latest(&meta::next_id_key())
             .map_err(Error::from)?;
         let next_id = next_id_raw
             .and_then(|bytes| <[u8; 4]>::try_from(bytes.as_slice()).ok())
@@ -438,10 +438,9 @@ impl Db {
             s.add(Ticker::KeysRead, 1);
         }
         perf_context::record_get_call();
-        let seq = self.engine.snapshot_seq();
         let result = self
             .engine
-            .get(prefixed_key, seq)
+            .get_latest(prefixed_key)
             .map_err(|err| map_point_read_error(err, prefixed_key));
         if let (Some(s), Ok(Some(v))) = (stats, &result) {
             s.add(Ticker::BytesRead, v.len() as u64);
@@ -469,8 +468,7 @@ impl Db {
     pub fn multi_get(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
         let owned: Vec<Vec<u8>> = keys.iter().map(|k| prefix_key(DEFAULT_CF_ID, k)).collect();
         let refs: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
-        let seq = self.engine.snapshot_seq();
-        self.engine.multi_get(&refs, seq).map_err(Error::from)
+        self.engine.multi_get_latest(&refs).map_err(Error::from)
     }
 
     /// Set a key-value pair in the default column family using
@@ -576,12 +574,15 @@ impl Db {
 
     /// Delete every key in `[start, end)` in the default column
     /// family with an explicit [`WriteOptions`] override.
+    ///
+    /// An empty range is still a write: a read-only or closed handle
+    /// rejects it with [`Error::ReadOnly`] or [`Error::Closed`] rather
+    /// than returning `Ok`.
     pub fn delete_range_opt(&self, opts: &WriteOptions, start: &[u8], end: &[u8]) -> Result<()> {
-        self.ensure_open()?;
+        self.ensure_writable()?;
         if start >= end {
             return Ok(());
         }
-        self.ensure_writable()?;
         self.validate_key_size(start)?;
         self.validate_key_size(end)?;
         self.wait_for_write_capacity(opts)?;
@@ -611,12 +612,15 @@ impl Db {
 
     /// Apply a batch of writes atomically with an explicit
     /// [`WriteOptions`] override.
+    ///
+    /// An empty batch is still a write: a read-only or closed handle
+    /// rejects it with [`Error::ReadOnly`] or [`Error::Closed`] rather
+    /// than returning `Ok`.
     pub fn write_opt(&self, opts: &WriteOptions, batch: WriteBatch) -> Result<()> {
-        self.ensure_open()?;
+        self.ensure_writable()?;
         if batch.is_empty() {
             return Ok(());
         }
-        self.ensure_writable()?;
         self.validate_batch_cf_liveness(&batch)?;
         self.validate_batch_sizes(&batch)?;
         self.wait_for_write_capacity(opts)?;
@@ -832,8 +836,7 @@ impl Db {
     /// Dropping the returned `Snapshot` releases the pin and may
     /// allow subsequent compactions to reclaim space.
     pub fn snapshot(&self) -> Snapshot {
-        let seq = self.engine.snapshot_seq();
-        self.engine.register_snapshot(seq);
+        let seq = self.engine.register_snapshot_at_horizon();
         Snapshot {
             engine: Arc::clone(&self.engine),
             cfs: Arc::clone(&self.cfs),
@@ -912,8 +915,7 @@ impl Db {
     /// keyspace, including the reserved metadata CF. Internal -
     /// used by [`Db::iter_cf`] via `CfIter`.
     fn raw_iter(&self) -> Iter<'_> {
-        let seq = self.engine.snapshot_seq();
-        Iter::from_internal(self.engine.new_iter(seq)).with_stats(self.engine.statistics_arc())
+        Iter::from_internal(self.engine.new_iter_latest()).with_stats(self.engine.statistics_arc())
     }
 
     /// Delete all data in the database.
@@ -1318,8 +1320,7 @@ impl Db {
         self.validate_cf_handle(cf)?;
         let owned: Vec<Vec<u8>> = keys.iter().map(|k| prefix_key(cf.id(), k)).collect();
         let refs: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
-        let seq = self.engine.snapshot_seq();
-        self.engine.multi_get(&refs, seq).map_err(Error::from)
+        self.engine.multi_get_latest(&refs).map_err(Error::from)
     }
 
     /// Write `key → value` in column family `cf`.
@@ -1347,12 +1348,15 @@ impl Db {
     }
 
     /// Delete every key in `[start, end)` in column family `cf`.
+    ///
+    /// An empty range is still a write: a read-only or closed handle
+    /// rejects it with [`Error::ReadOnly`] or [`Error::Closed`] rather
+    /// than returning `Ok`.
     pub fn delete_range_cf(&self, cf: &ColumnFamilyHandle, start: &[u8], end: &[u8]) -> Result<()> {
-        self.ensure_open()?;
+        self.ensure_writable()?;
         if start >= end {
             return Ok(());
         }
-        self.ensure_writable()?;
         self.validate_cf_handle(cf)?;
         self.validate_key_size(start)?;
         self.validate_key_size(end)?;
@@ -1530,23 +1534,7 @@ impl<'a> CfIter<'a> {
         if !self.valid_cf {
             return;
         }
-        // `seek_for_prev(upper_bound - 1)` is the trick: seek to
-        // the largest key strictly less than `upper_bound`.
-        let mut probe = self.upper_bound.clone();
-        // Decrement by one - upper_bound is built by incrementing
-        // the CF id, so it's never all zeros; subtracting one byte
-        // gives a valid probe. Simpler: seek_for_prev(upper_bound)
-        // which lands on the last key < upper_bound.
-        if let Some(last) = probe.last_mut() {
-            if *last > 0 {
-                *last -= 1;
-                // Append 0xff bytes to get a probe strictly less
-                // than upper_bound but larger than every key in
-                // the CF.
-                probe.extend_from_slice(&[0xff; 8]);
-            }
-        }
-        self.inner.seek_for_prev(&probe);
+        self.inner.seek_to_last_before(&self.upper_bound);
     }
 
     /// Position the cursor at the first key `>= target` in the CF.
@@ -1645,7 +1633,7 @@ pub struct OwnedSnapshotIter {
 
 impl OwnedSnapshotIter {
     fn new(snapshot: Snapshot) -> Self {
-        let inner = Iter::<'static>::from_internal(snapshot.engine.new_iter(snapshot.seq))
+        let inner = Iter::<'static>::from_internal(snapshot.engine.new_iter_at(snapshot.seq))
             .with_stats(snapshot.engine.statistics_arc());
         Self {
             inner: CfIter::new(inner, DEFAULT_CF_ID),
@@ -1761,7 +1749,7 @@ impl Snapshot {
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         self.engine
-            .get(&prefixed, self.seq)
+            .get_at(&prefixed, self.seq)
             .map_err(|err| map_point_read_error(err, &prefixed))
     }
 
@@ -1769,7 +1757,9 @@ impl Snapshot {
     pub fn multi_get(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
         let owned: Vec<Vec<u8>> = keys.iter().map(|k| prefix_key(DEFAULT_CF_ID, k)).collect();
         let refs: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
-        self.engine.multi_get(&refs, self.seq).map_err(Error::from)
+        self.engine
+            .multi_get_at(&refs, self.seq)
+            .map_err(Error::from)
     }
 
     /// Scan a key range at this snapshot (default CF).
@@ -1821,7 +1811,7 @@ impl Snapshot {
     /// (default CF). Keys returned have the CF prefix stripped.
     pub fn iter(&self) -> CfIter<'_> {
         CfIter::new(
-            Iter::from_internal(self.engine.new_iter(self.seq))
+            Iter::from_internal(self.engine.new_iter_at(self.seq))
                 .with_stats(self.engine.statistics_arc()),
             DEFAULT_CF_ID,
         )
@@ -1847,7 +1837,7 @@ impl Snapshot {
         self.validate_cf_handle(cf)?;
         let prefixed = prefix_key(cf.id(), key);
         self.engine
-            .get(&prefixed, self.seq)
+            .get_at(&prefixed, self.seq)
             .map_err(|err| map_point_read_error(err, &prefixed))
     }
 
@@ -1860,7 +1850,9 @@ impl Snapshot {
         self.validate_cf_handle(cf)?;
         let owned: Vec<Vec<u8>> = keys.iter().map(|k| prefix_key(cf.id(), k)).collect();
         let refs: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
-        self.engine.multi_get(&refs, self.seq).map_err(Error::from)
+        self.engine
+            .multi_get_at(&refs, self.seq)
+            .map_err(Error::from)
     }
 
     /// CF-scoped scan at this snapshot.
@@ -1916,7 +1908,7 @@ impl Snapshot {
 
     /// CF-scoped streaming iterator at this snapshot.
     pub fn iter_cf<'a>(&'a self, cf: &ColumnFamilyHandle) -> CfIter<'a> {
-        let inner = Iter::from_internal(self.engine.new_iter(self.seq))
+        let inner = Iter::from_internal(self.engine.new_iter_at(self.seq))
             .with_stats(self.engine.statistics_arc());
         if self.is_live_cf_handle(cf) {
             CfIter::new(inner, cf.id())
@@ -1935,7 +1927,7 @@ fn collect_range(
     end: Option<&[u8]>,
     snapshot_seq: u64,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let mut iter = engine.new_iter(snapshot_seq);
+    let mut iter = engine.new_iter_at(snapshot_seq);
     match start {
         Some(s) => iter.seek(s),
         None => iter.seek_to_first(),
@@ -1972,7 +1964,7 @@ fn collect_page(
         ));
     }
 
-    let mut iter = engine.new_iter(snapshot_seq);
+    let mut iter = engine.new_iter_at(snapshot_seq);
     iter.seek(start);
     iter.status().map_err(Error::from)?;
 

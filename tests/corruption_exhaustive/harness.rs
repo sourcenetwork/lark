@@ -640,10 +640,27 @@ pub fn manifest_frames(bytes: &[u8]) -> Vec<Frame> {
 
 pub const TAG_ADD_FILE: u8 = 1;
 
-/// The SSTable trailer is a fixed 64 bytes of eight little-endian u64s:
+/// The SSTable trailer ends with the 8-byte magic, whose low byte is the
+/// format version. Versions 1 and 2 carry a 64-byte footer, versions 3
+/// and 4 a 72-byte one holding an extra metadata checksum ahead of the
+/// magic. Both layouts open with the same seven little-endian u64s:
 /// range-tombstone offset and size, bloom offset and size, index offset
-/// and size, entry count, magic. See `src/engine/sstable.rs`.
-const FOOTER_SIZE: u64 = 64;
+/// and size, entry count. See `src/engine/sstable.rs`.
+fn footer_size(bytes: &[u8]) -> u64 {
+    assert!(bytes.len() >= 8, "the SSTable fixture has no magic number");
+    let magic = u64::from_le_bytes(
+        bytes[bytes.len() - 8..]
+            .try_into()
+            .expect("the last 8 bytes"),
+    );
+    match magic & 0xFF {
+        1 | 2 => 64,
+        3 | 4 => 72,
+        other => panic!(
+            "the SSTable fixture carries format version {other}, which this harness does not know"
+        ),
+    }
+}
 
 pub const DATA: &str = "data blocks";
 pub const BLOOM: &str = "bloom region";
@@ -659,8 +676,9 @@ pub struct Region {
 
 pub fn sst_regions(bytes: &[u8]) -> Vec<Region> {
     let len = bytes.len() as u64;
-    assert!(len > FOOTER_SIZE, "the SSTable fixture is all footer");
-    let f = &bytes[bytes.len() - FOOTER_SIZE as usize..];
+    let footer_size = footer_size(bytes);
+    assert!(len > footer_size, "the SSTable fixture is all footer");
+    let f = &bytes[bytes.len() - footer_size as usize..];
     let word = |i: usize| u64::from_le_bytes(f[i * 8..i * 8 + 8].try_into().expect("8 bytes"));
     let (rt_offset, rt_size) = (word(0), word(1));
     let (bloom_offset, bloom_size) = (word(2), word(3));
@@ -689,7 +707,7 @@ pub fn sst_regions(bytes: &[u8]) -> Vec<Region> {
     });
     regions.push(Region {
         name: FOOTER,
-        start: len - FOOTER_SIZE,
+        start: len - footer_size,
         end: len,
     });
     for r in &regions {

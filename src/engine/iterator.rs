@@ -1139,6 +1139,53 @@ impl LarkIterator {
     /// files that demonstrably cannot contain `prefix` are skipped
     /// entirely; files built without a prefix bloom are consulted
     /// normally (safe superset).
+    /// Position the cursor at the newest visible entry whose user key
+    /// is strictly below `exclusive_upper`, and switch to reverse
+    /// iteration.
+    ///
+    /// This is the primitive a bounded reverse scan needs.
+    /// [`Self::seek_for_prev`] takes an **inclusive** bound, and a
+    /// caller holding an exclusive one cannot build an inclusive probe
+    /// from it: byte strings have no predecessor, so no suffix of
+    /// `0xff` bytes is an upper bound for user keys of every length.
+    pub(crate) fn seek_to_last_before(&mut self, exclusive_upper: &[u8]) {
+        if self.terminal_error {
+            return;
+        }
+        self.error = None;
+        self.valid_entry = false;
+        self.last_forward_user_key = None;
+        self.merge_result = None;
+        self.reverse_curr = None;
+        self.pending_consume = false;
+        self.upper_bound = None;
+        self.direction = Direction::Reverse;
+        // `lookup_key(bound, u64::MAX)` encodes as `bound || 00*8 ||
+        // 00`, the smallest internal key any entry for user key `bound`
+        // could carry. Every internal key strictly below it belongs to
+        // a user key strictly below `bound`, whatever its length.
+        let probe = lookup_key(exclusive_upper, u64::MAX);
+        if let Err(e) = self.inner.seek_for_prev(&probe) {
+            self.error = Some(e);
+            return;
+        }
+        // `seek_for_prev` is inclusive, so step back over the one entry
+        // shape that can equal the probe: user key `bound` at seq
+        // `u64::MAX`. The engine never allocates that sequence, so this
+        // normally runs zero times; the loop makes the bound exact
+        // rather than exact in practice.
+        while let Some(k) = self.inner.key() {
+            if user_key_of(k) < exclusive_upper {
+                break;
+            }
+            if let Err(e) = self.inner.advance_backward() {
+                self.error = Some(e);
+                return;
+            }
+        }
+        self.materialize_prev_visible();
+    }
+
     pub(crate) fn seek_prefix(&mut self, prefix: &[u8]) {
         if self.terminal_error {
             return;

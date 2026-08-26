@@ -2,7 +2,7 @@
 //!
 //! Layout:
 //! ```text
-//! [data block 0][data block 1]...[data block n][range_tombstone block][bloom region][index block][footer (64 B)]
+//! [data block 0][data block 1]...[data block n][range_tombstone block][bloom region][index block][footer]
 //! ```
 //!
 //! The bloom region is two blooms concatenated behind a length header:
@@ -15,6 +15,45 @@
 //! at or before `snapshot_seq` return "deleted" and suppress older versions
 //! in lower levels. The bloom filter is keyed on user keys so point lookups
 //! can short-circuit regardless of which seq a reader is asking for.
+//!
+//! # Format versions and compatibility
+//!
+//! The trailing 8 bytes of every SSTable are the magic number, so the
+//! footer's size is discoverable before anything else is parsed.
+//!
+//! ```text
+//! MAGIC_V1 (version byte 0x01) flat index,        64-byte footer, no metadata checksum
+//! MAGIC_V2 (version byte 0x02) partitioned index, 64-byte footer, no metadata checksum
+//! MAGIC_V3 (version byte 0x03) flat index,        72-byte footer, metadata checksummed
+//! MAGIC_V4 (version byte 0x04) partitioned index, 72-byte footer, metadata checksummed
+//! ```
+//!
+//! lark writes V3 or V4 and reads all four. A table written by an older
+//! lark keeps opening and keeps serving; it simply carries no metadata
+//! checksum, so bit rot in its footer, index, bloom or range-tombstone
+//! block is not detected there. Rewriting such a table (any compaction
+//! that touches it) upgrades it to the checksummed form. There is no
+//! migration step and no downgrade path: a V3/V4 table is rejected by an
+//! older lark with "invalid SSTable magic number", which is the correct
+//! loud failure.
+//!
+//! # What a checksum covers
+//!
+//! In a V3/V4 table every byte belongs to exactly one checksummed
+//! region. A data block is framed `[compression: u8][payload][checksum:
+//! u32]`. Each metadata region (range-tombstone block, bloom region,
+//! every partitioned index leaf, the index block) carries a 4-byte
+//! trailer counted inside the size the footer or the leaf handle records
+//! for it. The footer carries an 8-byte checksum over its seven fixed
+//! fields and its magic, so a damaged offset, size or entry count is
+//! caught before it is trusted.
+//!
+//! Two holes are deliberate and are not closed here. A V1/V2 table has
+//! no metadata checksum at all, which is the price of reading yesterday's
+//! files; it is protected only by the region-bound validation against the
+//! file size. And these are xxh3 checksums, an accidental-corruption
+//! guard and not a MAC: they catch bit rot and torn writes, not an
+//! attacker who can rewrite the file and its checksum together.
 
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
@@ -37,30 +76,66 @@ use super::internal_key::{
 use super::range_tombstone::{RangeTombstone, RangeTombstoneSet};
 use crate::options::{CompressionType, PrefixExtractor};
 
-/// SSTable magic number: "LARKSST\x01" - flat-index format.
+/// SSTable magic number: "LARKSST\x01" - flat-index format with the
+/// 64-byte footer and no metadata checksums. Legacy: read, never written.
 const MAGIC_V1: u64 = 0x4C41524B_53535401;
 
-/// SSTable magic number: "LARKSST\x02" - partitioned-index format. The
-/// footer's `index_offset/index_size` point to a compact top-level index
-/// whose entries each reference a leaf sub-block on disk.
+/// SSTable magic number: "LARKSST\x02" - partitioned-index format with
+/// the 64-byte footer and no metadata checksums. The footer's
+/// `index_offset/index_size` point to a compact top-level index whose
+/// entries each reference a leaf sub-block on disk. Legacy: read, never
+/// written.
 const MAGIC_V2: u64 = 0x4C41524B_53535402;
 
-/// Footer size in bytes.
-const FOOTER_SIZE: usize = 64;
+/// SSTable magic number: "LARKSST\x03" - flat index, 72-byte footer,
+/// metadata regions checksummed. Written by lark today.
+const MAGIC_V3: u64 = 0x4C41524B_53535403;
+
+/// SSTable magic number: "LARKSST\x04" - partitioned index, 72-byte
+/// footer, metadata regions checksummed. Written by lark today.
+const MAGIC_V4: u64 = 0x4C41524B_53535404;
+
+/// Footer size for [`MAGIC_V1`] and [`MAGIC_V2`].
+const FOOTER_SIZE_V1: usize = 64;
+
+/// Footer size for [`MAGIC_V3`] and [`MAGIC_V4`]: the V1 fields plus an
+/// 8-byte metadata checksum ahead of the magic.
+const FOOTER_SIZE_V2: usize = 72;
+
+/// Bytes a checksummed metadata region carries after its payload. The
+/// trailer is counted inside the region size the footer records, so a
+/// legacy reader's bounds arithmetic needs no special case.
+const META_CHECKSUM_LEN: usize = 4;
 
 const COMPRESSION_NONE: u8 = 0x00;
 const COMPRESSION_LZ4: u8 = 0x01;
 const COMPRESSION_SNAPPY: u8 = 0x02;
 
-/// SSTable footer (fixed 64 bytes, written at end of file).
+/// SSTable footer, written at the end of the file. Its length depends on
+/// the format version the magic names: 64 bytes for V1/V2, 72 for V3/V4.
 ///
 /// Layout on disk:
 /// ```text
-/// [data blocks][range_tombstone_block][bloom_block][index_block][footer]
+/// [data blocks][range_tombstone_block][bloom_region][index_block][footer]
 /// ```
 ///
-/// A `range_tombstone_size` of `0` means the SSTable has no range
-/// tombstones; readers skip loading the block in that case.
+/// Footer bytes, all little-endian:
+/// ```text
+/// [ 0.. 8) range_tombstone_offset
+/// [ 8..16) range_tombstone_size   (0 means no range tombstones)
+/// [16..24) bloom_offset
+/// [24..32) bloom_size
+/// [32..40) index_offset
+/// [40..48) index_size
+/// [48..56) num_entries
+/// V1/V2: [56..64) magic
+/// V3/V4: [56..64) checksum over bytes 0..56 and the magic
+///        [64..72) magic
+/// ```
+///
+/// The seven fixed fields sit at the same offsets from the footer's start
+/// in both layouts, and the magic is always the file's last 8 bytes, so
+/// the footer's length is discoverable before it is parsed.
 #[derive(Debug)]
 struct Footer {
     range_tombstone_offset: u64,
@@ -74,8 +149,44 @@ struct Footer {
 }
 
 impl Footer {
-    fn encode(&self) -> [u8; FOOTER_SIZE] {
-        let mut buf = [0u8; FOOTER_SIZE];
+    /// Whether a table carrying `magic` checksums its metadata regions.
+    fn magic_is_checksummed(magic: u64) -> bool {
+        magic == MAGIC_V3 || magic == MAGIC_V4
+    }
+
+    /// Whether `magic` names the partitioned index layout, where the
+    /// footer's index handle points at a top-level index of leaves.
+    fn magic_is_partitioned(magic: u64) -> bool {
+        magic == MAGIC_V2 || magic == MAGIC_V4
+    }
+
+    /// Footer byte length implied by `magic`, or an error naming the
+    /// magic when it is not one lark writes or reads.
+    fn size_for_magic(magic: u64) -> io::Result<usize> {
+        match magic {
+            MAGIC_V1 | MAGIC_V2 => Ok(FOOTER_SIZE_V1),
+            MAGIC_V3 | MAGIC_V4 => Ok(FOOTER_SIZE_V2),
+            other => Err(invalid_data(format!(
+                "invalid SSTable magic number: {other:#018x}"
+            ))),
+        }
+    }
+
+    fn checksummed(&self) -> bool {
+        Self::magic_is_checksummed(self.magic)
+    }
+
+    fn size(&self) -> usize {
+        if self.checksummed() {
+            FOOTER_SIZE_V2
+        } else {
+            FOOTER_SIZE_V1
+        }
+    }
+
+    /// Encode into the layout `self.magic` selects.
+    fn encode(&self) -> Vec<u8> {
+        let mut buf = vec![0u8; self.size()];
         buf[0..8].copy_from_slice(&self.range_tombstone_offset.to_le_bytes());
         buf[8..16].copy_from_slice(&self.range_tombstone_size.to_le_bytes());
         buf[16..24].copy_from_slice(&self.bloom_offset.to_le_bytes());
@@ -83,17 +194,38 @@ impl Footer {
         buf[32..40].copy_from_slice(&self.index_offset.to_le_bytes());
         buf[40..48].copy_from_slice(&self.index_size.to_le_bytes());
         buf[48..56].copy_from_slice(&self.num_entries.to_le_bytes());
-        buf[56..64].copy_from_slice(&self.magic.to_le_bytes());
+        if self.checksummed() {
+            let sum = checksum::sst_footer(&buf[0..56], self.magic).to_le_bytes();
+            buf[56..64].copy_from_slice(&sum);
+            buf[64..72].copy_from_slice(&self.magic.to_le_bytes());
+        } else {
+            buf[56..64].copy_from_slice(&self.magic.to_le_bytes());
+        }
         buf
     }
 
-    fn decode(buf: &[u8; FOOTER_SIZE]) -> io::Result<Self> {
-        let magic = u64::from_le_bytes(buf[56..64].try_into().unwrap());
-        if magic != MAGIC_V1 && magic != MAGIC_V2 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid SSTable magic number",
-            ));
+    /// Decode a footer whose length is exactly what its magic implies.
+    ///
+    /// The magic is validated first, so a table from a format version
+    /// lark does not implement is reported as a magic error rather than
+    /// as a checksum error.
+    fn decode(buf: &[u8]) -> io::Result<Self> {
+        if buf.len() < FOOTER_SIZE_V1 {
+            return Err(invalid_data("SSTable footer is truncated"));
+        }
+        let magic = u64::from_le_bytes(buf[buf.len() - 8..].try_into().unwrap());
+        let expected = Self::size_for_magic(magic)?;
+        if buf.len() != expected {
+            return Err(invalid_data(format!(
+                "SSTable footer is {} bytes but its format version needs {expected}",
+                buf.len()
+            )));
+        }
+        if Self::magic_is_checksummed(magic) {
+            let stored = u64::from_le_bytes(buf[56..64].try_into().unwrap());
+            if stored != checksum::sst_footer(&buf[0..56], magic) {
+                return Err(invalid_data("SSTable footer checksum mismatch"));
+            }
         }
         Ok(Self {
             range_tombstone_offset: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
@@ -106,6 +238,56 @@ impl Footer {
             magic,
         })
     }
+}
+
+/// Read the trailing footer of an SSTable. The magic is the file's last
+/// 8 bytes, so the footer's length is known before it is parsed and a
+/// legacy table needs no separate code path.
+fn read_footer(file: &mut File, file_size: u64) -> io::Result<Footer> {
+    if file_size < 8 {
+        return Err(invalid_data(
+            "SSTable file too small to carry a magic number",
+        ));
+    }
+    file.seek(SeekFrom::End(-8))?;
+    let mut magic_buf = [0u8; 8];
+    file.read_exact(&mut magic_buf)?;
+    let footer_size = Footer::size_for_magic(u64::from_le_bytes(magic_buf))?;
+    if file_size < footer_size as u64 {
+        return Err(invalid_data("SSTable file too small for its footer"));
+    }
+    file.seek(SeekFrom::Start(file_size - footer_size as u64))?;
+    let mut footer_buf = vec![0u8; footer_size];
+    file.read_exact(&mut footer_buf)?;
+    Footer::decode(&footer_buf)
+}
+
+/// Strip and verify a metadata region's checksum trailer, returning the
+/// payload the decoder should parse.
+///
+/// A `checksummed` of `false` returns the region unchanged, which is how
+/// a V1/V2 table keeps reading: those files carry no trailer, so there is
+/// nothing to strip and nothing to verify.
+fn verify_meta_region<'a>(
+    region: &'a [u8],
+    kind: u8,
+    checksummed: bool,
+    name: &'static str,
+) -> io::Result<&'a [u8]> {
+    if !checksummed {
+        return Ok(region);
+    }
+    if region.len() < META_CHECKSUM_LEN {
+        return Err(invalid_data(format!(
+            "{name} is too short to carry a checksum"
+        )));
+    }
+    let (payload, trailer) = region.split_at(region.len() - META_CHECKSUM_LEN);
+    let stored = u32::from_le_bytes(trailer.try_into().unwrap());
+    if stored != checksum::sst_meta(kind, payload) {
+        return Err(invalid_data(format!("{name} checksum mismatch")));
+    }
+    Ok(payload)
 }
 
 fn encode_range_tombstone_block(tombstones: &[RangeTombstone]) -> Vec<u8> {
@@ -286,6 +468,23 @@ fn decode_index_block(data: &[u8]) -> io::Result<Vec<IndexEntry>> {
     Ok(entries)
 }
 
+/// Append a metadata region followed by its checksum trailer, advancing
+/// `offset`. Returns the region's on-disk size, trailer included, which
+/// is what the footer or the leaf handle records for it.
+fn write_meta_region(
+    writer: &mut BufWriter<File>,
+    offset: &mut u64,
+    payload: &[u8],
+    kind: u8,
+) -> io::Result<u64> {
+    let trailer = checksum::sst_meta(kind, payload).to_le_bytes();
+    writer.write_all(payload)?;
+    writer.write_all(&trailer)?;
+    let size = (payload.len() + trailer.len()) as u64;
+    *offset += size;
+    Ok(size)
+}
+
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
@@ -349,33 +548,41 @@ fn read_bytes(
     Ok(bytes)
 }
 
-fn validate_footer_regions(footer: &Footer, file_size: u64) -> io::Result<()> {
-    if footer.bloom_size < 8 {
+/// Check every region the footer points at against `data_end`, the first
+/// byte past the region area (the file size less the footer). A
+/// checksummed region also has to be long enough to hold its trailer.
+fn validate_footer_regions(footer: &Footer, data_end: u64) -> io::Result<()> {
+    let trailer = if footer.checksummed() {
+        META_CHECKSUM_LEN as u64
+    } else {
+        0
+    };
+    if footer.bloom_size < 8 + trailer {
         return Err(invalid_data("bloom region too short"));
     }
-    if footer.index_size < 4 {
+    if footer.index_size < 4 + trailer {
         return Err(invalid_data("index block too short"));
     }
     validate_file_region(
         footer.bloom_offset,
         footer.bloom_size,
-        file_size,
+        data_end,
         "bloom region",
     )?;
     validate_file_region(
         footer.index_offset,
         footer.index_size,
-        file_size,
+        data_end,
         "index block",
     )?;
     if footer.range_tombstone_size > 0 {
-        if footer.range_tombstone_size < 4 {
+        if footer.range_tombstone_size < 4 + trailer {
             return Err(invalid_data("range tombstone block too short"));
         }
         validate_file_region(
             footer.range_tombstone_offset,
             footer.range_tombstone_size,
-            file_size,
+            data_end,
             "range tombstone block",
         )?;
     }
@@ -386,10 +593,10 @@ fn read_file_region(
     file: &mut File,
     offset: u64,
     size: u64,
-    file_size: u64,
+    data_end: u64,
     name: &'static str,
 ) -> io::Result<Vec<u8>> {
-    validate_file_region(offset, size, file_size, name)?;
+    validate_file_region(offset, size, data_end, name)?;
     let len = usize::try_from(size)
         .map_err(|_| invalid_data(format!("{name} is too large to address")))?;
     let mut buf = vec![0u8; len];
@@ -398,15 +605,14 @@ fn read_file_region(
     Ok(buf)
 }
 
+/// `data_end` is the first byte past the region area: the file size less
+/// the footer, whose length depends on the format version.
 fn validate_file_region(
     offset: u64,
     size: u64,
-    file_size: u64,
+    data_end: u64,
     name: &'static str,
 ) -> io::Result<()> {
-    let data_end = file_size
-        .checked_sub(FOOTER_SIZE as u64)
-        .ok_or_else(|| invalid_data("SSTable file too small"))?;
     let end = offset
         .checked_add(size)
         .ok_or_else(|| invalid_data(format!("{name} range overflows")))?;
@@ -566,8 +772,16 @@ impl SsTableWriter {
             encode_range_tombstone_block(range_tombstone_set.as_slice())
         };
         let range_tombstone_offset = self.current_offset;
-        self.writer.write_all(&range_tombstone_data)?;
-        self.current_offset += range_tombstone_data.len() as u64;
+        let range_tombstone_size = if range_tombstone_data.is_empty() {
+            0
+        } else {
+            write_meta_region(
+                &mut self.writer,
+                &mut self.current_offset,
+                &range_tombstone_data,
+                checksum::META_KIND_RANGE_TOMBSTONE,
+            )?
+        };
 
         // Bloom region layout:
         //   [prefix_bloom_len: u64 LE][prefix_bloom_bytes][user_key_bloom_bytes]
@@ -584,13 +798,18 @@ impl SsTableWriter {
         let user_bloom = self.bloom_builder.build();
         let user_bloom_data = encode_bloom_block(&user_bloom);
 
+        let mut bloom_region =
+            Vec::with_capacity(8 + prefix_bloom_data.len() + user_bloom_data.len());
+        bloom_region.extend_from_slice(&(prefix_bloom_data.len() as u64).to_le_bytes());
+        bloom_region.extend_from_slice(&prefix_bloom_data);
+        bloom_region.extend_from_slice(&user_bloom_data);
         let bloom_offset = self.current_offset;
-        let prefix_len_bytes = (prefix_bloom_data.len() as u64).to_le_bytes();
-        self.writer.write_all(&prefix_len_bytes)?;
-        self.writer.write_all(&prefix_bloom_data)?;
-        self.writer.write_all(&user_bloom_data)?;
-        let bloom_size = 8 + prefix_bloom_data.len() as u64 + user_bloom_data.len() as u64;
-        self.current_offset += bloom_size;
+        let bloom_size = write_meta_region(
+            &mut self.writer,
+            &mut self.current_offset,
+            &bloom_region,
+            checksum::META_KIND_BLOOM,
+        )?;
 
         let (index_offset, index_size, magic) = if self.partitioned_index {
             // Partition the flat index entries into leaf sub-blocks whose
@@ -611,36 +830,51 @@ impl SsTableWriter {
                 }
                 let chunk = &self.index_entries[chunk_start..chunk_end];
                 let leaf_data = encode_index_block(chunk);
+                let last_key = match chunk.last() {
+                    Some((key, _)) => key.clone(),
+                    None => return Err(invalid_data("index partitioning produced an empty leaf")),
+                };
                 let leaf_offset = self.current_offset;
-                self.writer.write_all(&leaf_data)?;
-                self.current_offset += leaf_data.len() as u64;
+                let leaf_size = write_meta_region(
+                    &mut self.writer,
+                    &mut self.current_offset,
+                    &leaf_data,
+                    checksum::META_KIND_INDEX_LEAF,
+                )?;
 
-                let last_key = chunk.last().unwrap().0.clone();
                 top_level.push((
                     last_key,
                     BlockHandle {
                         offset: leaf_offset,
-                        size: leaf_data.len() as u64,
+                        size: leaf_size,
                     },
                 ));
                 chunk_start = chunk_end;
             }
             let top_data = encode_index_block(&top_level);
             let top_offset = self.current_offset;
-            self.writer.write_all(&top_data)?;
-            self.current_offset += top_data.len() as u64;
-            (top_offset, top_data.len() as u64, MAGIC_V2)
+            let top_size = write_meta_region(
+                &mut self.writer,
+                &mut self.current_offset,
+                &top_data,
+                checksum::META_KIND_INDEX,
+            )?;
+            (top_offset, top_size, MAGIC_V4)
         } else {
             let index_data = encode_index_block(&self.index_entries);
             let idx_offset = self.current_offset;
-            self.writer.write_all(&index_data)?;
-            self.current_offset += index_data.len() as u64;
-            (idx_offset, index_data.len() as u64, MAGIC_V1)
+            let idx_size = write_meta_region(
+                &mut self.writer,
+                &mut self.current_offset,
+                &index_data,
+                checksum::META_KIND_INDEX,
+            )?;
+            (idx_offset, idx_size, MAGIC_V3)
         };
 
         let footer = Footer {
             range_tombstone_offset,
-            range_tombstone_size: range_tombstone_data.len() as u64,
+            range_tombstone_size,
             bloom_offset,
             bloom_size,
             index_offset,
@@ -733,7 +967,10 @@ impl SsTableWriter {
 /// keeps the bytes alive via file-descriptor refcounting).
 pub(crate) struct SsTableReader {
     file: Mutex<File>,
-    file_size: u64,
+    /// First byte past the region area: the file size less the footer.
+    /// Every region bound is checked against this, so a damaged offset
+    /// can never send a read into the footer or past the file.
+    data_end: u64,
     pub(crate) file_id: u64,
     index: Vec<IndexEntry>,
     bloom: BloomFilter,
@@ -748,6 +985,10 @@ pub(crate) struct SsTableReader {
     /// entries; each entry's `handle` points to a leaf sub-block that
     /// must be read via [`SsTableReader::read_index_leaf`].
     partitioned: bool,
+    /// Whether this file's metadata regions carry checksum trailers.
+    /// False for a legacy V1/V2 table, whose regions have no trailer to
+    /// strip and no checksum to verify.
+    meta_checksummed: bool,
     #[cfg(test)]
     index_leaf_reads: AtomicUsize,
 }
@@ -794,24 +1035,22 @@ impl SsTableReader {
         let mut file = File::open(path)?;
         let file_size = file.metadata()?.len();
 
-        if file_size < FOOTER_SIZE as u64 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "SSTable file too small",
-            ));
-        }
+        let footer = read_footer(&mut file, file_size)?;
+        let data_end = file_size - footer.size() as u64;
+        validate_footer_regions(&footer, data_end)?;
+        let meta_checksummed = footer.checksummed();
 
-        file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
-        let mut footer_buf = [0u8; FOOTER_SIZE];
-        file.read_exact(&mut footer_buf)?;
-        let footer = Footer::decode(&footer_buf)?;
-        validate_footer_regions(&footer, file_size)?;
-
-        let bloom_data = read_file_region(
+        let bloom_region = read_file_region(
             &mut file,
             footer.bloom_offset,
             footer.bloom_size,
-            file_size,
+            data_end,
+            "bloom region",
+        )?;
+        let bloom_data = verify_meta_region(
+            &bloom_region,
+            checksum::META_KIND_BLOOM,
+            meta_checksummed,
             "bloom region",
         )?;
         // Peel [prefix_bloom_len: u64 LE][prefix_bytes][user_bytes].
@@ -841,39 +1080,50 @@ impl SsTableReader {
         };
         let bloom = decode_bloom_block(&bloom_data[user_bloom_offset..]);
 
-        let index_data = read_file_region(
+        let index_region = read_file_region(
             &mut file,
             footer.index_offset,
             footer.index_size,
-            file_size,
+            data_end,
             "index block",
         )?;
-        let index = decode_index_block(&index_data)?;
+        let index = decode_index_block(verify_meta_region(
+            &index_region,
+            checksum::META_KIND_INDEX,
+            meta_checksummed,
+            "index block",
+        )?)?;
 
         let range_tombstones = if footer.range_tombstone_size == 0 {
             Vec::new()
         } else {
-            let rt_data = read_file_region(
+            let rt_region = read_file_region(
                 &mut file,
                 footer.range_tombstone_offset,
                 footer.range_tombstone_size,
-                file_size,
+                data_end,
                 "range tombstone block",
             )?;
-            decode_range_tombstone_block(&rt_data)?
+            decode_range_tombstone_block(verify_meta_region(
+                &rt_region,
+                checksum::META_KIND_RANGE_TOMBSTONE,
+                meta_checksummed,
+                "range tombstone block",
+            )?)?
         };
 
-        let partitioned = footer.magic == MAGIC_V2;
+        let partitioned = Footer::magic_is_partitioned(footer.magic);
 
         Ok(Self {
             file: Mutex::new(file),
-            file_size,
+            data_end,
             file_id,
             index,
             bloom,
             prefix_bloom,
             range_tombstones: RangeTombstoneSet::from_vec(range_tombstones),
             partitioned,
+            meta_checksummed,
             #[cfg(test)]
             index_leaf_reads: AtomicUsize::new(0),
         })
@@ -888,14 +1138,20 @@ impl SsTableReader {
         self.index_leaf_reads.fetch_add(1, Ordering::Relaxed);
 
         let mut file = self.file.lock();
-        let buf = read_file_region(
+        let region = read_file_region(
             &mut file,
             handle.offset,
             handle.size,
-            self.file_size,
+            self.data_end,
             "partitioned index leaf",
         )?;
-        decode_index_block(&buf)
+        drop(file);
+        decode_index_block(verify_meta_region(
+            &region,
+            checksum::META_KIND_INDEX_LEAF,
+            self.meta_checksummed,
+            "partitioned index leaf",
+        )?)
     }
 
     #[cfg(test)]
@@ -1291,7 +1547,7 @@ impl SsTableReader {
             &mut file,
             handle.offset,
             handle.size,
-            self.file_size,
+            self.data_end,
             "data block",
         )?;
         drop(file);
@@ -1351,6 +1607,37 @@ impl SsTableReader {
         cache.insert(self.file_id, handle.offset, Arc::clone(&block));
         Ok(block)
     }
+}
+
+/// Whether `path` is a complete SSTable that carries data: at least one
+/// point entry or one range tombstone.
+///
+/// Only the footer is read, so probing a whole table directory costs one
+/// small read per file rather than one index and bloom load per file. An
+/// `Err` means the file is not a readable SSTable at all, which the
+/// caller must not read as "holds nothing": a file whose footer will not
+/// parse cannot be proved empty.
+pub(crate) fn table_carries_data(path: &Path) -> io::Result<bool> {
+    let mut file = File::open(path)?;
+    let file_size = file.metadata()?.len();
+    if file_size < 8 {
+        return Err(invalid_data(
+            "SSTable file too small to carry a magic number",
+        ));
+    }
+    file.seek(SeekFrom::End(-8))?;
+    let mut magic_buf = [0u8; 8];
+    file.read_exact(&mut magic_buf)?;
+    let footer_size = Footer::size_for_magic(u64::from_le_bytes(magic_buf))?;
+    let data_end = file_size
+        .checked_sub(footer_size as u64)
+        .ok_or_else(|| invalid_data("SSTable file too small for its footer"))?;
+    file.seek(SeekFrom::Start(data_end))?;
+    let mut footer_buf = vec![0u8; footer_size];
+    file.read_exact(&mut footer_buf)?;
+    let footer = Footer::decode(&footer_buf)?;
+    validate_footer_regions(&footer, data_end)?;
+    Ok(footer.num_entries > 0 || footer.range_tombstone_size > 0)
 }
 
 /// Format an SSTable filename from a numeric ID.
@@ -1680,12 +1967,354 @@ mod tests {
     }
 
     #[test]
+    fn footer_round_trip_v3() {
+        let f = Footer {
+            range_tombstone_offset: 10,
+            range_tombstone_size: 20,
+            bloom_offset: 30,
+            bloom_size: 40,
+            index_offset: 70,
+            index_size: 80,
+            num_entries: 100,
+            magic: MAGIC_V3,
+        };
+        let buf = f.encode();
+        assert_eq!(buf.len(), FOOTER_SIZE_V2);
+        let got = Footer::decode(&buf).unwrap();
+        assert_eq!(got.range_tombstone_offset, 10);
+        assert_eq!(got.num_entries, 100);
+        assert_eq!(got.magic, MAGIC_V3);
+        assert!(got.checksummed());
+        assert!(!Footer::magic_is_partitioned(got.magic));
+    }
+
+    #[test]
+    fn footer_round_trip_v4() {
+        let f = Footer {
+            range_tombstone_offset: 0,
+            range_tombstone_size: 0,
+            bloom_offset: 1,
+            bloom_size: 2,
+            index_offset: 3,
+            index_size: 4,
+            num_entries: 5,
+            magic: MAGIC_V4,
+        };
+        let got = Footer::decode(&f.encode()).unwrap();
+        assert_eq!(got.magic, MAGIC_V4);
+        assert!(got.checksummed());
+        assert!(Footer::magic_is_partitioned(got.magic));
+    }
+
+    #[test]
     fn footer_decode_rejects_bad_magic() {
-        let mut buf = [0u8; FOOTER_SIZE];
-        // Leave magic at zero - any non-V1/V2 value should be rejected.
+        let mut buf = [0u8; FOOTER_SIZE_V1];
+        // Leave magic at zero - any unknown value should be rejected.
         buf[56..64].copy_from_slice(&0xDEAD_BEEF_u64.to_le_bytes());
         let err = Footer::decode(&buf).expect_err("should reject");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("magic"), "got: {err}");
+    }
+
+    #[test]
+    fn footer_decode_catches_a_flip_in_every_checksummed_field() {
+        let f = Footer {
+            range_tombstone_offset: 7,
+            range_tombstone_size: 11,
+            bloom_offset: 13,
+            bloom_size: 17,
+            index_offset: 19,
+            index_size: 23,
+            num_entries: 29,
+            magic: MAGIC_V3,
+        };
+        let clean = f.encode();
+        for byte in 0..clean.len() {
+            for bit in 0..8u8 {
+                let mut damaged = clean.clone();
+                damaged[byte] ^= 1 << bit;
+                assert!(
+                    Footer::decode(&damaged).is_err(),
+                    "byte {byte} bit {bit} of a V3 footer was not caught"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_legacy_footer_carries_no_checksum_and_still_decodes() {
+        let f = Footer {
+            range_tombstone_offset: 1,
+            range_tombstone_size: 0,
+            bloom_offset: 2,
+            bloom_size: 3,
+            index_offset: 4,
+            index_size: 5,
+            num_entries: 6,
+            magic: MAGIC_V1,
+        };
+        let buf = f.encode();
+        assert_eq!(buf.len(), FOOTER_SIZE_V1);
+        assert!(!Footer::decode(&buf).unwrap().checksummed());
+    }
+
+    #[test]
+    fn metadata_checksums_are_domain_separated_by_kind() {
+        let payload = b"the same bytes in two different regions";
+        let index = checksum::sst_meta(checksum::META_KIND_INDEX, payload);
+        assert_ne!(
+            index,
+            checksum::sst_meta(checksum::META_KIND_BLOOM, payload)
+        );
+        assert_ne!(
+            index,
+            checksum::sst_meta(checksum::META_KIND_INDEX_LEAF, payload)
+        );
+        assert_ne!(
+            index,
+            checksum::sst_meta(checksum::META_KIND_RANGE_TOMBSTONE, payload)
+        );
+    }
+
+    #[test]
+    fn verify_meta_region_passes_a_legacy_region_through_untouched() {
+        let region = b"no trailer here";
+        let got = verify_meta_region(region, checksum::META_KIND_INDEX, false, "index block")
+            .expect("a legacy region is never verified");
+        assert_eq!(got, region);
+    }
+
+    /// Write a table in the pre-checksum layout: no trailer on any
+    /// metadata region and a 64-byte footer carrying [`MAGIC_V1`] or
+    /// [`MAGIC_V2`]. This is the writer lark had before the metadata
+    /// checksums landed, kept here so the compatibility contract in the
+    /// module docs is tested rather than merely claimed.
+    fn write_legacy_table(
+        path: &Path,
+        entries: &[(Vec<u8>, Vec<u8>)],
+        partitioned: bool,
+    ) -> io::Result<()> {
+        let mut out: Vec<u8> = Vec::new();
+        let mut index_entries: Vec<(Vec<u8>, BlockHandle)> = Vec::new();
+        let mut bloom_builder = BloomFilterBuilder::new(10);
+
+        // One data block per two entries, so a partitioned layout has
+        // several index entries to spread over leaves.
+        for pair in entries.chunks(2) {
+            let mut block = BlockBuilder::new(RESTART_INTERVAL);
+            for (internal_key, value) in pair {
+                block.add(internal_key, value);
+                bloom_builder.add_key(user_key_of(internal_key));
+            }
+            let raw = block.finish();
+            let offset = out.len() as u64;
+            out.push(COMPRESSION_NONE);
+            out.extend_from_slice(&raw);
+            out.extend_from_slice(&checksum::sst_block(COMPRESSION_NONE, &raw).to_le_bytes());
+            let last_key = pair.last().expect("non-empty chunk").0.clone();
+            index_entries.push((
+                last_key,
+                BlockHandle {
+                    offset,
+                    size: out.len() as u64 - offset,
+                },
+            ));
+        }
+
+        let range_tombstone_offset = out.len() as u64;
+        let bloom_offset = out.len() as u64;
+        let user_bloom = encode_bloom_block(&bloom_builder.build());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        out.extend_from_slice(&user_bloom);
+        let bloom_size = out.len() as u64 - bloom_offset;
+
+        let (index_offset, index_size, magic) = if partitioned {
+            let mut top_level: Vec<(Vec<u8>, BlockHandle)> = Vec::new();
+            for chunk in index_entries.chunks(2) {
+                let leaf = encode_index_block(chunk);
+                let leaf_offset = out.len() as u64;
+                out.extend_from_slice(&leaf);
+                top_level.push((
+                    chunk.last().expect("non-empty chunk").0.clone(),
+                    BlockHandle {
+                        offset: leaf_offset,
+                        size: leaf.len() as u64,
+                    },
+                ));
+            }
+            let top = encode_index_block(&top_level);
+            let top_offset = out.len() as u64;
+            out.extend_from_slice(&top);
+            (top_offset, top.len() as u64, MAGIC_V2)
+        } else {
+            let index = encode_index_block(&index_entries);
+            let index_offset = out.len() as u64;
+            out.extend_from_slice(&index);
+            (index_offset, index.len() as u64, MAGIC_V1)
+        };
+
+        let footer = Footer {
+            range_tombstone_offset,
+            range_tombstone_size: 0,
+            bloom_offset,
+            bloom_size,
+            index_offset,
+            index_size,
+            num_entries: entries.len() as u64,
+            magic,
+        };
+        let encoded = footer.encode();
+        assert_eq!(encoded.len(), FOOTER_SIZE_V1);
+        out.extend_from_slice(&encoded);
+        fs::write(path, out)
+    }
+
+    fn legacy_entries() -> Vec<(Vec<u8>, Vec<u8>)> {
+        (0..40)
+            .map(|i| {
+                (
+                    ik(format!("key_{i:04}").as_bytes(), 1),
+                    format!("value_{i}").into_bytes(),
+                )
+            })
+            .collect()
+    }
+
+    fn assert_legacy_table_reads(path: &Path, partitioned: bool) {
+        let on_disk = fs::read(path).unwrap();
+        assert_eq!(
+            on_disk[on_disk.len() - 8],
+            if partitioned { 2 } else { 1 },
+            "the fixture must carry a legacy format version byte"
+        );
+
+        let reader = SsTableReader::open(path, 7).unwrap();
+        assert_eq!(reader.partitioned, partitioned);
+        assert!(
+            !reader.meta_checksummed,
+            "a legacy table has no metadata checksums to verify"
+        );
+
+        let cache = BlockCache::new(1024 * 1024);
+        for i in 0..40 {
+            let key = format!("key_{i:04}");
+            assert_eq!(
+                reader.get(key.as_bytes(), u64::MAX, &cache).unwrap(),
+                LookupResult::Found {
+                    seq: 1,
+                    value: format!("value_{i}").into_bytes(),
+                },
+                "legacy table lost {key}"
+            );
+        }
+        assert_eq!(
+            reader.get(b"key_9999", u64::MAX, &cache).unwrap(),
+            LookupResult::NotInTable
+        );
+        let scanned = reader.iter_internal(&cache).unwrap();
+        assert_eq!(scanned.len(), 40);
+    }
+
+    /// A table written before the metadata checksums landed must keep
+    /// opening and keep serving every key. A format change that cannot
+    /// read yesterday's files is a data-loss bug of its own.
+    #[test]
+    fn open_accepts_a_legacy_v1_footer() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy-v1.sst");
+        write_legacy_table(&path, &legacy_entries(), false).unwrap();
+        assert_legacy_table_reads(&path, false);
+    }
+
+    /// The same for the legacy partitioned layout, whose index leaves
+    /// also carry no checksum trailer.
+    #[test]
+    fn open_accepts_a_legacy_v2_footer() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy-v2.sst");
+        write_legacy_table(&path, &legacy_entries(), true).unwrap();
+        assert_legacy_table_reads(&path, true);
+    }
+
+    /// The writer emits the checksummed form, and the reader agrees with
+    /// the module docs about which magic means what.
+    #[test]
+    fn a_freshly_written_table_carries_the_checksummed_format() {
+        for partitioned in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("fresh.sst");
+            let mut writer = SsTableWriter::new(
+                &path,
+                256,
+                10,
+                CompressionType::None,
+                None,
+                partitioned,
+                256,
+            )
+            .unwrap();
+            for (internal_key, value) in legacy_entries() {
+                writer.add(&internal_key, &value).unwrap();
+            }
+            writer.finish().unwrap().unwrap();
+
+            let on_disk = fs::read(&path).unwrap();
+            assert_eq!(on_disk[on_disk.len() - 8], if partitioned { 4 } else { 3 });
+            let reader = SsTableReader::open(&path, 1).unwrap();
+            assert!(reader.meta_checksummed);
+            assert_eq!(reader.partitioned, partitioned);
+            assert!(table_carries_data(&path).unwrap());
+        }
+    }
+
+    /// Every byte of a partitioned table's index leaves and of its
+    /// range-tombstone block sits inside a checksummed region too. A leaf
+    /// is read lazily, so a flip there surfaces on the read that reaches
+    /// it rather than at open; either is loud, and neither serves an
+    /// answer the caller would believe.
+    #[test]
+    fn a_flip_in_an_index_leaf_or_a_range_tombstone_block_is_caught() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("partitioned-rt.sst");
+        let mut writer =
+            SsTableWriter::new(&path, 64, 10, CompressionType::None, None, true, 96).unwrap();
+        for i in 0..40 {
+            writer
+                .add(&ik(format!("key_{i:04}").as_bytes(), 1), b"value")
+                .unwrap();
+        }
+        writer.add_range_tombstone(b"key_0000", b"key_0005", 3);
+        writer.finish().unwrap().unwrap();
+
+        let clean = fs::read(&path).unwrap();
+        let f = &clean[clean.len() - FOOTER_SIZE_V2..];
+        let word = |i: usize| u64::from_le_bytes(f[i * 8..i * 8 + 8].try_into().unwrap());
+        let range_tombstones = word(0)..word(0) + word(1);
+        // Everything between the end of the bloom region and the
+        // top-level index is index leaves.
+        let leaves = word(2) + word(3)..word(4);
+        assert!(
+            !range_tombstones.is_empty(),
+            "the fixture has no range tombstones"
+        );
+        assert!(
+            leaves.end - leaves.start > 1,
+            "the fixture did not partition its index"
+        );
+
+        for offset in range_tombstones.chain(leaves) {
+            for bit in [0u8, 5] {
+                let mut damaged = clean.clone();
+                damaged[offset as usize] ^= 1 << bit;
+                fs::write(&path, &damaged).unwrap();
+                let cache = BlockCache::new(1024 * 1024);
+                let caught = match SsTableReader::open(&path, 1) {
+                    Err(_) => true,
+                    Ok(reader) => reader.iter_internal(&cache).is_err(),
+                };
+                assert!(caught, "byte {offset} bit {bit} was not caught");
+            }
+        }
     }
 
     fn expect_reader_open_err(path: &Path) -> io::Error {
@@ -1713,7 +2342,7 @@ mod tests {
     fn open_rejects_file_with_bogus_magic() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("bogus.sst");
-        fs::write(&path, vec![0u8; FOOTER_SIZE]).unwrap();
+        fs::write(&path, vec![0u8; FOOTER_SIZE_V1]).unwrap();
         let kind = match SsTableReader::open(&path, 1) {
             Err(e) => e.kind(),
             Ok(_) => panic!("expected InvalidData"),
@@ -1760,13 +2389,14 @@ mod tests {
         let file = File::open(&path).unwrap();
         let reader = SsTableReader {
             file: Mutex::new(file),
-            file_size: FOOTER_SIZE as u64 + 4,
+            data_end: 4,
             file_id: 1,
             index: Vec::new(),
             bloom: BloomFilter::new(Vec::new(), 0),
             prefix_bloom: None,
             range_tombstones: RangeTombstoneSet::default(),
             partitioned: false,
+            meta_checksummed: false,
             index_leaf_reads: AtomicUsize::new(0),
         };
         let cache = BlockCache::new(1024);

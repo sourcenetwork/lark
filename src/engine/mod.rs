@@ -10,6 +10,7 @@ pub(crate) mod iterator;
 pub(crate) mod manifest;
 pub(crate) mod memtable;
 pub(crate) mod range_tombstone;
+pub(crate) mod read_view;
 pub(crate) mod snapshot_registry;
 pub(crate) mod sstable;
 pub(crate) mod wal;
@@ -26,6 +27,7 @@ use compaction::{CompactionOptions, CompactionScheduler};
 use db_lock::DbDirectoryLock;
 use manifest::{VersionEdit, VersionSet};
 use memtable::MemTable;
+use read_view::{ReadView, ReadViewCell, VersionStore};
 use snapshot_registry::SnapshotRegistry;
 
 use crate::{event_listener, WriteBatchOp};
@@ -256,9 +258,15 @@ const CLOSE_STATE_CLOSED: u8 = 2;
 
 /// The core LSM-tree engine.
 pub(crate) struct LarkEngine {
-    active_memtable: RwLock<Arc<MemTable>>,
-    frozen_memtables: RwLock<Vec<Arc<MemTable>>>,
-    versions: Arc<Mutex<VersionSet>>,
+    /// The published read view: the active memtable, the frozen
+    /// memtables and the version every read resolves against. Loading
+    /// it is the whole of a read's source acquisition - one shared lock
+    /// acquisition and one `Arc` clone - and the three sources it hands
+    /// back are consistent with each other by construction.
+    view: Arc<ReadViewCell>,
+    /// The version set, together with the publication of every version
+    /// it installs into `view`.
+    versions: Arc<VersionStore>,
     cache: Arc<BlockCache>,
     /// Sequence-number allocator. Advanced up front (before a write's
     /// data lands) so WAL and memtable entries can be stamped, and used
@@ -343,7 +351,7 @@ impl LarkEngine {
         std::fs::create_dir_all(&sst_dir)?;
         std::fs::create_dir_all(&wal_dir)?;
 
-        let mut version_set = VersionSet::open(db_dir, &sst_dir)?;
+        let version_set = VersionSet::open(db_dir, &sst_dir)?;
         let version = version_set.current();
         let mut latest_seq = version.last_seq;
 
@@ -377,7 +385,17 @@ impl LarkEngine {
             }
         }
 
-        version_set.apply(&[VersionEdit::SetNextFileId(wal_id + 1)])?;
+        let versions = Arc::new(VersionStore::new(version_set));
+        let view = Arc::new(ReadViewCell::new(ReadView {
+            active: Arc::clone(&memtable),
+            frozen: Vec::new(),
+            version: versions.lock().current(),
+        }));
+        versions.attach_view(Arc::clone(&view));
+
+        versions
+            .lock()
+            .apply(&[VersionEdit::SetNextFileId(wal_id + 1)])?;
 
         let cache = Arc::new(
             BlockCache::with_config(
@@ -387,8 +405,6 @@ impl LarkEngine {
             )
             .with_stats(options.statistics.clone()),
         );
-        let versions = Arc::new(Mutex::new(version_set));
-
         let compaction_opts = CompactionOptions {
             l0_compaction_trigger: options.l0_compaction_trigger,
             level_base_bytes: options.level_base_bytes,
@@ -430,8 +446,7 @@ impl LarkEngine {
         )?;
 
         let engine = Arc::new(Self {
-            active_memtable: RwLock::new(memtable),
-            frozen_memtables: RwLock::new(Vec::new()),
+            view,
             versions,
             cache,
             latest_seq: AtomicU64::new(latest_seq),
@@ -510,15 +525,20 @@ impl LarkEngine {
             )
             .with_stats(options.statistics.clone()),
         );
-        let versions = Arc::new(Mutex::new(version_set));
+        let versions = Arc::new(VersionStore::new(version_set));
+        let view = Arc::new(ReadViewCell::new(ReadView {
+            active: Arc::clone(&memtable),
+            frozen: Vec::new(),
+            version: versions.lock().current(),
+        }));
+        versions.attach_view(Arc::clone(&view));
         let compaction_lock = Arc::new(RwLock::new(()));
         let snapshot_registry = Arc::new(SnapshotRegistry::new());
         let stall_signal = Arc::new(StallSignal::new());
         let wal_id = next_wal_id(version.next_file_id, &wal_files);
 
         Ok(Arc::new(Self {
-            active_memtable: RwLock::new(memtable),
-            frozen_memtables: RwLock::new(Vec::new()),
+            view,
             versions,
             cache,
             latest_seq: AtomicU64::new(latest_seq),
@@ -659,6 +679,23 @@ impl LarkEngine {
         }
     }
 
+    /// Pin a snapshot at the current read horizon, sampling the
+    /// horizon and registering the pin as one step so a concurrent
+    /// compaction cannot compute its GC bound from a registry that
+    /// does not yet contain this pin. Returns the pinned sequence.
+    pub(crate) fn register_snapshot_at_horizon(&self) -> u64 {
+        if self.is_closed() {
+            return self.visible_seq.load(Ordering::Acquire);
+        }
+        let seq = self
+            .snapshot_registry
+            .register_at(|| self.visible_seq.load(Ordering::Acquire));
+        if let Some(s) = self.statistics() {
+            s.add(crate::statistics::Ticker::SnapshotsRegistered, 1);
+        }
+        seq
+    }
+
     /// Release a snapshot pin previously taken via
     /// [`Self::register_snapshot`].
     pub(crate) fn release_snapshot(&self, seq: u64) {
@@ -674,24 +711,37 @@ impl LarkEngine {
         self.snapshot_registry.oldest_live_seq()
     }
 
-    /// Construct a streaming iterator rooted at `snapshot_seq`. Captures
-    /// the current memtable state and the current version; no filesystem
-    /// access happens here - file handles are already open in the
-    /// pinned `Arc<LiveSst>`s carried by the version.
-    pub(crate) fn new_iter(&self, snapshot_seq: u64) -> iterator::LarkIterator {
+    /// Construct a streaming iterator over the latest published read
+    /// horizon. The view is loaded before the horizon is sampled, for
+    /// the reason spelled out on [`Self::get_latest`].
+    pub(crate) fn new_iter_latest(&self) -> iterator::LarkIterator {
         let closed = self.is_closed();
-        let active = Arc::clone(&self.active_memtable.read());
-        let frozen: Vec<Arc<MemTable>> = self
-            .frozen_memtables
-            .read()
-            .iter()
-            .map(Arc::clone)
-            .collect();
-        let version = self.versions.lock().current();
+        let view = self.view.load();
+        let snapshot_seq = self.visible_seq.load(Ordering::Acquire);
+        self.iter_in_view(&view, snapshot_seq, closed)
+    }
+
+    /// Construct a streaming iterator rooted at a caller-pinned
+    /// `snapshot_seq`. Captures one published view of the memtables and
+    /// the version; no filesystem access happens here - file handles
+    /// are already open in the pinned `Arc<LiveSst>`s carried by the
+    /// version.
+    pub(crate) fn new_iter_at(&self, snapshot_seq: u64) -> iterator::LarkIterator {
+        let closed = self.is_closed();
+        let view = self.view.load();
+        self.iter_in_view(&view, snapshot_seq, closed)
+    }
+
+    fn iter_in_view(
+        &self,
+        view: &ReadView,
+        snapshot_seq: u64,
+        closed: bool,
+    ) -> iterator::LarkIterator {
         let mut iter = iterator::LarkIterator::new(
-            active,
-            frozen,
-            version,
+            Arc::clone(&view.active),
+            view.frozen.clone(),
+            Arc::clone(&view.version),
             Arc::clone(&self.cache),
             snapshot_seq,
             self.options.prefix_extractor.clone(),
@@ -703,7 +753,50 @@ impl LarkEngine {
         iter
     }
 
-    /// Point lookup at a given snapshot. Returns `Ok(Some(value))` or `Ok(None)`.
+    /// Point lookup at the latest published read horizon.
+    ///
+    /// The order of the first two statements is load-bearing: the view
+    /// is loaded FIRST and the horizon sampled SECOND. Sampling the
+    /// horizon first lets a compaction garbage-collect the newest
+    /// version at or below it - compaction's GC bound is
+    /// `oldest_live_seq()`, and a read without a `Snapshot` registers
+    /// nothing there - after which the key reads back as absent. A
+    /// version that compaction dropped was shadowed by a newer one
+    /// that had already been flushed into the version being published,
+    /// so a horizon sampled after the view is always at least that
+    /// newer version's sequence and the read finds it.
+    ///
+    /// The read linearizes at the moment it loads the view: a write
+    /// that lands between the load and the horizon sample is simply
+    /// not part of this read. Read-your-writes still holds, because a
+    /// write applies into the active memtable of the view current at
+    /// that moment and every later view still exposes that memtable's
+    /// data, as `active`, as `frozen`, or folded into the version.
+    pub(crate) fn get_latest(&self, key: &[u8]) -> std::io::Result<Option<Vec<u8>>> {
+        self.ensure_open()?;
+        let view = self.view.load();
+        let snapshot_seq = self.visible_seq.load(Ordering::Acquire);
+        if let Some(merge_op) = self.options.merge_operator.as_ref() {
+            return self.get_with_merge_in_view(key, snapshot_seq, merge_op, &view);
+        }
+        self.get_in_view(key, snapshot_seq, &view)
+    }
+
+    /// Point lookup at a caller-pinned snapshot sequence. The
+    /// snapshot's registration in [`SnapshotRegistry`] is what keeps
+    /// compaction from dropping the versions it needs, so the load
+    /// order does not matter here; the view is still loaded once so
+    /// every source the read walks agrees with every other.
+    pub(crate) fn get_at(&self, key: &[u8], snapshot_seq: u64) -> std::io::Result<Option<Vec<u8>>> {
+        self.ensure_open()?;
+        let view = self.view.load();
+        if let Some(merge_op) = self.options.merge_operator.as_ref() {
+            return self.get_with_merge_in_view(key, snapshot_seq, merge_op, &view);
+        }
+        self.get_in_view(key, snapshot_seq, &view)
+    }
+
+    /// Point lookup resolved against one already-loaded view.
     ///
     /// Walks sources newest→oldest (active memtable, frozen memtables
     /// newest first, L0 newest first, L1..Ln). At each source we check
@@ -718,11 +811,12 @@ impl LarkEngine {
     /// collects any merge operands that sit on top of the terminator
     /// and calls the operator to collapse the chain into a final
     /// value at visibility time.
-    pub(crate) fn get(&self, key: &[u8], snapshot_seq: u64) -> std::io::Result<Option<Vec<u8>>> {
-        self.ensure_open()?;
-        if let Some(merge_op) = self.options.merge_operator.as_ref() {
-            return self.get_with_merge(key, snapshot_seq, merge_op);
-        }
+    fn get_in_view(
+        &self,
+        key: &[u8],
+        snapshot_seq: u64,
+        view: &ReadView,
+    ) -> std::io::Result<Option<Vec<u8>>> {
         let mut max_rt_seq: u64 = 0;
 
         // Memtable phase - timed via `PerfContext` at
@@ -733,7 +827,7 @@ impl LarkEngine {
                 crate::perf_context::PerfTimerField::GetFromMemtable,
             );
             {
-                let active = self.active_memtable.read();
+                let active = &view.active;
                 let rt = active.covering_range_tombstone_seq(key, snapshot_seq);
                 if rt > max_rt_seq {
                     max_rt_seq = rt;
@@ -743,7 +837,7 @@ impl LarkEngine {
                 }
             }
             {
-                let frozen = self.frozen_memtables.read();
+                let frozen = &view.frozen;
                 for mt in frozen.iter().rev() {
                     let rt = mt.covering_range_tombstone_seq(key, snapshot_seq);
                     if rt > max_rt_seq {
@@ -761,7 +855,7 @@ impl LarkEngine {
         let _t_ssts = crate::perf_context::PerfTimer::new(
             crate::perf_context::PerfTimerField::GetFromOutputFiles,
         );
-        let version = self.versions.lock().current();
+        let version = &view.version;
 
         // L0: check all files (may overlap), newest first. Readers are
         // already open in the pinned `Version`, so no filesystem access
@@ -836,11 +930,12 @@ impl LarkEngine {
     /// `merge_op` is the operator the caller already resolved from
     /// the options, passed in so this helper cannot be reached
     /// without one.
-    fn get_with_merge(
+    fn get_with_merge_in_view(
         &self,
         key: &[u8],
         snapshot_seq: u64,
         merge_op: &Arc<dyn crate::options::MergeOperator>,
+        view: &ReadView,
     ) -> std::io::Result<Option<Vec<u8>>> {
         use internal_key::{VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE};
 
@@ -876,7 +971,7 @@ impl LarkEngine {
 
         // Walk sources newest → oldest.
         {
-            let active = self.active_memtable.read();
+            let active = &view.active;
             let rt = active.covering_range_tombstone_seq(key, snapshot_seq);
             if rt > max_rt_seq {
                 max_rt_seq = rt;
@@ -887,7 +982,7 @@ impl LarkEngine {
         }
 
         if !terminated {
-            let frozen = self.frozen_memtables.read();
+            let frozen = &view.frozen;
             for mt in frozen.iter().rev() {
                 let rt = mt.covering_range_tombstone_seq(key, snapshot_seq);
                 if rt > max_rt_seq {
@@ -903,7 +998,7 @@ impl LarkEngine {
         }
 
         if !terminated {
-            let version = self.versions.lock().current();
+            let version = &view.version;
 
             // L0: newest-first.
             for file in version.levels[0].iter().rev() {
@@ -1013,12 +1108,32 @@ impl LarkEngine {
     /// the source hierarchy - and short-circuits once every key has been
     /// resolved. All keys see the **same** consistent view, regardless of
     /// concurrent writers.
-    pub(crate) fn multi_get(
+    pub(crate) fn multi_get_latest(&self, keys: &[&[u8]]) -> std::io::Result<Vec<Option<Vec<u8>>>> {
+        self.ensure_open()?;
+        let view = self.view.load();
+        let snapshot_seq = self.visible_seq.load(Ordering::Acquire);
+        self.multi_get_in_view(keys, snapshot_seq, &view)
+    }
+
+    /// Batched point lookup at a caller-pinned snapshot sequence. See
+    /// [`Self::get_at`] for why the load order is free here.
+    pub(crate) fn multi_get_at(
         &self,
         keys: &[&[u8]],
         snapshot_seq: u64,
     ) -> std::io::Result<Vec<Option<Vec<u8>>>> {
         self.ensure_open()?;
+        let view = self.view.load();
+        self.multi_get_in_view(keys, snapshot_seq, &view)
+    }
+
+    /// Batched point lookup resolved against one already-loaded view.
+    fn multi_get_in_view(
+        &self,
+        keys: &[&[u8]],
+        snapshot_seq: u64,
+        view: &ReadView,
+    ) -> std::io::Result<Vec<Option<Vec<u8>>>> {
         // When a merge operator is configured, fall back to per-key
         // resolution - the batched walk's short-circuiting logic
         // doesn't compose cleanly with merge-chain collection, and
@@ -1027,7 +1142,7 @@ impl LarkEngine {
         if let Some(merge_op) = self.options.merge_operator.as_ref() {
             let mut out = Vec::with_capacity(keys.len());
             for key in keys {
-                out.push(self.get_with_merge(key, snapshot_seq, merge_op)?);
+                out.push(self.get_with_merge_in_view(key, snapshot_seq, merge_op, view)?);
             }
             return Ok(out);
         }
@@ -1041,7 +1156,7 @@ impl LarkEngine {
 
         // 1. Active memtable.
         {
-            let mt = self.active_memtable.read();
+            let mt = &view.active;
             for entry in &mut entries {
                 if entry.resolved {
                     continue;
@@ -1063,7 +1178,7 @@ impl LarkEngine {
 
         // 2. Frozen memtables, newest first.
         {
-            let frozen = self.frozen_memtables.read();
+            let frozen = &view.frozen;
             for mt in frozen.iter().rev() {
                 for entry in &mut entries {
                     if entry.resolved {
@@ -1085,7 +1200,7 @@ impl LarkEngine {
             }
         }
 
-        let version = self.versions.lock().current();
+        let version = &view.version;
 
         // 3. L0 SSTables, newest first.
         for file in version.levels[0].iter().rev() {
@@ -1177,18 +1292,41 @@ impl LarkEngine {
         Ok(results)
     }
 
+    /// The version the last applied edit published.
+    ///
+    /// Cheaper than `versions.lock().current()` - one shared lock
+    /// acquisition instead of the version set's exclusive one - and it
+    /// is the same version, because every [`VersionStore`] guard
+    /// publishes what its critical section installed before it
+    /// releases the mutex.
+    fn published_version(&self) -> Arc<manifest::Version> {
+        Arc::clone(&self.view.load().version)
+    }
+
+    /// Retire the oldest frozen memtable in one publication. Called
+    /// only once its contents are durable in an SSTable the published
+    /// version already references, or once they proved to be empty.
+    fn retire_oldest_frozen(&self) {
+        self.view.update_memtables(|active, frozen| {
+            let next = frozen.get(1..).map(<[_]>::to_vec).unwrap_or_default();
+            (Arc::clone(active), next, ())
+        });
+    }
+
     /// Snapshot the current write-stall inputs: L0 file count,
     /// in-memory memtable count (active + frozen), and total bytes
     /// across all L0 files (lark's approximation of pending
     /// compaction bytes).
     fn stall_snapshot(&self) -> (usize, usize, u64) {
-        let version = self.versions.lock().current();
-        let l0 = version.levels[0].len();
-        let pending_bytes: u64 = version.levels[0].iter().map(|f| f.meta.file_size).sum();
-        // `active_memtable` always counts as 1; frozen memtables
+        let view = self.view.load();
+        let l0 = view.version.levels[0].len();
+        let pending_bytes: u64 = view.version.levels[0]
+            .iter()
+            .map(|f| f.meta.file_size)
+            .sum();
+        // The active memtable always counts as 1; frozen memtables
         // are whatever is still waiting for the flush path.
-        let frozen = self.frozen_memtables.read().len();
-        let memtable_count = 1 + frozen;
+        let memtable_count = 1 + view.frozen.len();
         (l0, memtable_count, pending_bytes)
     }
 
@@ -1262,9 +1400,9 @@ impl LarkEngine {
             return Err(crate::Error::Closed);
         }
         // Fast path: if the cached stall level is 0, skip the
-        // expensive stall_state() call that locks versions +
-        // frozen_memtables. This saves ~2 lock round-trips per
-        // write in the common no-stall scenario.
+        // stall_state() call that loads the read view and walks L0.
+        // This saves a lock round-trip and a level scan per write in
+        // the common no-stall scenario.
         if self.cached_stall_level.load(Ordering::Acquire) == 0 {
             return Ok(0);
         }
@@ -1405,8 +1543,8 @@ impl LarkEngine {
             let _perf_mt = crate::perf_context::PerfTimer::new(
                 crate::perf_context::PerfTimerField::WriteMemtable,
             );
-            let memtable = self.active_memtable.read();
-            memtable.put(&key, &value, seq);
+            let view = self.view.load();
+            view.active.put(&key, &value, seq);
         }
 
         // Publish visibility only now that the write is WAL-durable and
@@ -1474,10 +1612,10 @@ impl LarkEngine {
             let _perf_mt = crate::perf_context::PerfTimer::new(
                 crate::perf_context::PerfTimerField::WriteMemtable,
             );
-            let memtable = self.active_memtable.read();
+            let view = self.view.load();
             for (i, op) in ops.iter().enumerate() {
                 let seq = base_seq + i as u64;
-                apply_batch_op_to_memtable(&memtable, op, seq);
+                apply_batch_op_to_memtable(&view.active, op, seq);
             }
         }
 
@@ -1523,8 +1661,9 @@ impl LarkEngine {
         // without a snapshot bound. If its seq is newer than the one
         // the transaction observed the key at, someone else wrote to
         // the key in between.
+        let view = self.view.load();
         for (key, observed_seq) in conflict_keys {
-            if let Some(latest_seq) = self.latest_version_seq(key)? {
+            if let Some(latest_seq) = self.latest_version_seq_in_view(key, &view)? {
                 if latest_seq > *observed_seq {
                     return Ok(CommitOutcome::Conflict {
                         key: key.clone(),
@@ -1551,19 +1690,23 @@ impl LarkEngine {
     /// is accumulated on the way down, mirroring the read path: a
     /// tombstone in a newer source outranks a point entry found in an
     /// older one.
-    fn latest_version_seq(&self, key: &[u8]) -> std::io::Result<Option<u64>> {
+    fn latest_version_seq_in_view(
+        &self,
+        key: &[u8],
+        view: &ReadView,
+    ) -> std::io::Result<Option<u64>> {
         let snap = u64::MAX;
         let mut max_rt_seq: u64 = 0;
         let newest = |point_seq: u64, max_rt_seq: u64| Some(point_seq.max(max_rt_seq));
         {
-            let active = self.active_memtable.read();
+            let active = &view.active;
             max_rt_seq = max_rt_seq.max(active.covering_range_tombstone_seq(key, snap));
             if let Some((seq, _)) = active.get(key, snap) {
                 return Ok(newest(seq, max_rt_seq));
             }
         }
         {
-            let frozen = self.frozen_memtables.read();
+            let frozen = &view.frozen;
             for mt in frozen.iter().rev() {
                 max_rt_seq = max_rt_seq.max(mt.covering_range_tombstone_seq(key, snap));
                 if let Some((seq, _)) = mt.get(key, snap) {
@@ -1571,7 +1714,7 @@ impl LarkEngine {
                 }
             }
         }
-        let version = self.versions.lock().current();
+        let version = &view.version;
         for file in version.levels[0].iter().rev() {
             max_rt_seq = max_rt_seq.max(file.reader.covering_range_tombstone_seq(key, snap));
             match file.reader.get(key, snap, &self.cache)? {
@@ -1623,7 +1766,7 @@ impl LarkEngine {
     /// the write did not land, never that it landed but a later step
     /// failed. Caller must hold `write_lock`.
     fn rotate_if_full(&self) -> std::io::Result<()> {
-        if self.active_memtable.read().approximate_size() >= self.options.write_buffer_size {
+        if self.view.load().active.approximate_size() >= self.options.write_buffer_size {
             self.rotate_memtable()?;
         }
         Ok(())
@@ -1631,12 +1774,14 @@ impl LarkEngine {
 
     fn rotate_memtable(&self) -> std::io::Result<()> {
         self.ensure_writable()?;
-        {
-            let mut active = self.active_memtable.write();
-            let old = Arc::clone(&active);
-            self.frozen_memtables.write().push(Arc::clone(&old));
-            *active = Arc::new(MemTable::new());
-        }
+        // One publication: the sealed memtable joins `frozen` in the
+        // same view that hands writers the fresh active one, so no
+        // reader can catch it in neither.
+        self.view.update_memtables(|active, frozen| {
+            let mut next_frozen = frozen.to_vec();
+            next_frozen.push(Arc::clone(active));
+            (Arc::new(MemTable::new()), next_frozen, ())
+        });
 
         let new_wal_id = {
             let mut versions = self.versions.lock();
@@ -1663,18 +1808,15 @@ impl LarkEngine {
 
     fn flush_frozen_memtable(&self, old_wal: Wal) -> std::io::Result<()> {
         let flush_start = std::time::Instant::now();
-        let memtable = {
-            let frozen = self.frozen_memtables.read();
-            if frozen.is_empty() {
-                return Ok(());
-            }
-            Arc::clone(&frozen[0])
+        let memtable = match self.view.load().frozen.first() {
+            Some(mt) => Arc::clone(mt),
+            None => return Ok(()),
         };
 
         let range_tombstones = memtable.clone_range_tombstones();
 
         if memtable.is_empty() && range_tombstones.is_empty() {
-            self.frozen_memtables.write().remove(0);
+            self.retire_oldest_frozen();
             let _ = Wal::remove(old_wal.path());
             return Ok(());
         }
@@ -1715,7 +1857,7 @@ impl LarkEngine {
         let summary = match writer.finish()? {
             Some(s) => s,
             None => {
-                self.frozen_memtables.write().remove(0);
+                self.retire_oldest_frozen();
                 let _ = Wal::remove(old_wal.path());
                 let _ = std::fs::remove_file(&sst_path);
                 return Ok(());
@@ -1751,7 +1893,9 @@ impl LarkEngine {
         ];
         self.versions.lock().apply(&edits)?;
 
-        self.frozen_memtables.write().remove(0);
+        // Retired only now: until the `AddFile` above is published, the
+        // flushed data lives in this memtable alone.
+        self.retire_oldest_frozen();
         let _ = Wal::remove(old_wal.path());
         self.compaction.lock().notify();
 
@@ -1842,9 +1986,9 @@ impl LarkEngine {
         //    the write lock if there's actually data to flush. "Data"
         //    here includes range tombstones, not just point entries.
         let needs_flush = |mt: &MemTable| !mt.is_empty() || !mt.clone_range_tombstones().is_empty();
-        if needs_flush(&self.active_memtable.read()) {
+        if needs_flush(&self.view.load().active) {
             let _write_guard = self.write_lock.lock();
-            if needs_flush(&self.active_memtable.read()) {
+            if needs_flush(&self.view.load().active) {
                 self.rotate_memtable()?;
             }
         }
@@ -2099,20 +2243,20 @@ impl LarkEngine {
         // which is the only level where a concurrent memtable could
         // shadow the ingested keys.
         let needs_flush = {
-            let mt = self.active_memtable.read();
-            !mt.is_empty() || !mt.clone_range_tombstones().is_empty()
+            let view = self.view.load();
+            !view.active.is_empty() || !view.active.clone_range_tombstones().is_empty()
         };
         if needs_flush {
             let _write_guard = self.write_lock.lock();
-            let mt = self.active_memtable.read();
-            if !mt.is_empty() || !mt.clone_range_tombstones().is_empty() {
-                drop(mt);
+            let view = self.view.load();
+            if !view.active.is_empty() || !view.active.clone_range_tombstones().is_empty() {
+                drop(view);
                 self.rotate_memtable()?;
             }
         }
 
         // Compute the target level from the current version.
-        let version = self.versions.lock().current();
+        let version = self.published_version();
         let target_level = compute_target_level(
             &version,
             &source.smallest,
@@ -2257,14 +2401,14 @@ impl LarkEngine {
         self.ensure_writable()?;
         {
             let has_any = {
-                let mt = self.active_memtable.read();
-                !mt.is_empty() || !mt.clone_range_tombstones().is_empty()
+                let view = self.view.load();
+                !view.active.is_empty() || !view.active.clone_range_tombstones().is_empty()
             };
             if has_any {
                 let _write_guard = self.write_lock.lock();
                 let still_has_any = {
-                    let mt = self.active_memtable.read();
-                    !mt.is_empty() || !mt.clone_range_tombstones().is_empty()
+                    let view = self.view.load();
+                    !view.active.is_empty() || !view.active.clone_range_tombstones().is_empty()
                 };
                 if still_has_any {
                     self.rotate_memtable()?;
@@ -2312,7 +2456,7 @@ impl LarkEngine {
         if start >= end {
             return 0;
         }
-        let version = self.versions.lock().current();
+        let version = self.published_version();
         let mut total: u64 = 0;
         for level in &version.levels {
             for file in level {
@@ -2334,8 +2478,9 @@ impl LarkEngine {
     /// should call this and also walk the frozen memtables
     /// separately.
     pub(crate) fn approximate_memtable_stats(&self, start: &[u8], end: &[u8]) -> (u64, u64) {
-        self.active_memtable
-            .read()
+        self.view
+            .load()
+            .active
             .approximate_stats_for_range(start, end)
     }
 
@@ -2351,7 +2496,7 @@ impl LarkEngine {
     /// `lark.num-files-at-level<N>` for unknown levels reads
     /// cleanly as `Some(0)`.
     pub(crate) fn num_files_at_level(&self, level: usize) -> u64 {
-        let version = self.versions.lock().current();
+        let version = self.published_version();
         version
             .levels
             .get(level)
@@ -2362,7 +2507,7 @@ impl LarkEngine {
     /// Total size in bytes across every level of the current
     /// version - sum of every `LiveSst::meta.file_size`.
     pub(crate) fn total_sst_size(&self) -> u64 {
-        let version = self.versions.lock().current();
+        let version = self.published_version();
         version
             .levels
             .iter()
@@ -2375,7 +2520,7 @@ impl LarkEngine {
     /// manifest tracks this per file at ingest / flush /
     /// compaction time, so the sum is free to compute.
     pub(crate) fn total_sst_num_entries(&self) -> u64 {
-        let version = self.versions.lock().current();
+        let version = self.published_version();
         version
             .levels
             .iter()
@@ -2388,13 +2533,14 @@ impl LarkEngine {
     /// inserted internal key + value length seen so far; tracked
     /// by the memtable itself).
     pub(crate) fn active_memtable_size(&self) -> u64 {
-        self.active_memtable.read().approximate_size() as u64
+        self.view.load().active.approximate_size() as u64
     }
 
     /// Total approximate size of every frozen memtable.
     pub(crate) fn frozen_memtables_size(&self) -> u64 {
-        self.frozen_memtables
-            .read()
+        self.view
+            .load()
+            .frozen
             .iter()
             .map(|mt| mt.approximate_size() as u64)
             .sum()
@@ -2428,7 +2574,7 @@ impl LarkEngine {
     /// Borrow the current version so a caller can walk every
     /// SSTable's metadata - used by `lark.sstables` formatter.
     pub(crate) fn current_version(&self) -> Arc<manifest::Version> {
-        self.versions.lock().current()
+        self.published_version()
     }
 
     /// Drop all data in the engine.
@@ -2436,6 +2582,14 @@ impl LarkEngine {
         self.ensure_writable()?;
         let _write_guard = self.write_lock.lock();
         self.ensure_writable()?;
+
+        // Published before the version `Reset` below, so no reader can
+        // see the pre-drop memtables against the post-drop version.
+        // `drop_all` holds `write_lock`, which excludes writers but not
+        // readers: a concurrent reader may still briefly observe
+        // pre-drop SSTable data, exactly as before this view existed.
+        self.view
+            .update_memtables(|_, _| (Arc::new(MemTable::new()), Vec::new(), ()));
 
         let (old_version, wal_id, wal_path, new_wal) = {
             let mut versions = self.versions.lock();
@@ -2450,8 +2604,6 @@ impl LarkEngine {
             (old_version, id, wal_path, new_wal)
         };
 
-        *self.active_memtable.write() = Arc::new(MemTable::new());
-        self.frozen_memtables.write().clear();
         self.cache.clear();
         let _old_wal = self.active_wal.lock().replace(new_wal);
         self.wal_id.store(wal_id, Ordering::Release);
@@ -2471,25 +2623,21 @@ impl LarkEngine {
     /// memtable was flushed to L0 as part of the range walk.
     #[cfg(test)]
     pub(crate) fn active_memtable_is_empty(&self) -> bool {
-        self.active_memtable.read().is_empty()
-            && self
-                .active_memtable
-                .read()
-                .clone_range_tombstones()
-                .is_empty()
+        let view = self.view.load();
+        view.active.is_empty() && view.active.clone_range_tombstones().is_empty()
     }
 
     /// Test-only: number of SSTable files at `level` in the current
     /// version.
     #[cfg(test)]
     pub(crate) fn level_file_count(&self, level: usize) -> usize {
-        self.versions.lock().current().levels[level].len()
+        self.published_version().levels[level].len()
     }
 
     /// Test-only: total number of SSTable files across every level.
     #[cfg(test)]
     pub(crate) fn total_file_count(&self) -> usize {
-        let v = self.versions.lock().current();
+        let v = self.published_version();
         v.levels.iter().map(|level| level.len()).sum()
     }
 
@@ -2504,7 +2652,7 @@ impl LarkEngine {
     ) -> std::io::Result<Vec<(u64, u8)>> {
         use internal_key::decode_internal_key;
 
-        let version = self.versions.lock().current();
+        let version = self.published_version();
         let mut out = Vec::new();
         for level in &version.levels {
             for file in level {
@@ -2568,8 +2716,8 @@ impl LarkEngine {
     fn flush_memtables_for_close(&self) -> std::io::Result<()> {
         loop {
             let should_flush = {
-                let active = self.active_memtable.read();
-                memtable_needs_flush(&active) || !self.frozen_memtables.read().is_empty()
+                let view = self.view.load();
+                memtable_needs_flush(&view.active) || !view.frozen.is_empty()
             };
             if !should_flush {
                 return Ok(());
@@ -2577,11 +2725,10 @@ impl LarkEngine {
 
             let old_wal = {
                 let _write_guard = self.write_lock.lock();
-                let active_needs_flush = {
-                    let active = self.active_memtable.read();
-                    memtable_needs_flush(&active)
-                };
-                let has_frozen = !self.frozen_memtables.read().is_empty();
+                let view = self.view.load();
+                let active_needs_flush = memtable_needs_flush(&view.active);
+                let has_frozen = !view.frozen.is_empty();
+                drop(view);
                 if !active_needs_flush && !has_frozen {
                     continue;
                 }
@@ -2596,15 +2743,17 @@ impl LarkEngine {
                 let wal_for_flush = Wal::create(&self.wal_dir.join(wal_filename(new_wal_id)))?;
 
                 if active_needs_flush {
-                    let old_memtable = {
-                        let mut active = self.active_memtable.write();
-                        let old = Arc::clone(&active);
-                        *active = Arc::new(MemTable::new());
-                        old
-                    };
-                    if memtable_needs_flush(&old_memtable) {
-                        self.frozen_memtables.write().push(old_memtable);
-                    }
+                    // One publication for the seal and the enqueue: two
+                    // would leave a window where the sealed memtable is
+                    // in neither the active slot nor the frozen list.
+                    self.view.update_memtables(|active, frozen| {
+                        let sealed = Arc::clone(active);
+                        let mut next_frozen = frozen.to_vec();
+                        if memtable_needs_flush(&sealed) {
+                            next_frozen.push(sealed);
+                        }
+                        (Arc::new(MemTable::new()), next_frozen, ())
+                    });
                 }
 
                 let old_wal = self

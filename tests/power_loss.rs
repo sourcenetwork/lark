@@ -443,12 +443,11 @@ fn a_power_cut_during_a_memtable_flush_keeps_every_acknowledged_write() {
     }
 }
 
-/// FAILING: this test reports a real defect and is deliberately not
-/// weakened. A power cut inside the *first* memtable flush of a newly
-/// created database leaves lark unable to open at all, so every write that
-/// returned `Ok` under `DurabilityMode::Immediate` becomes unreachable.
+/// Proves a power cut inside the *first* memtable flush of a newly created
+/// database cannot lose an acknowledged write, which is the one window the
+/// sibling third-flush test cannot reach.
 ///
-/// The mechanism, all of it observed rather than assumed:
+/// The shape of that window, all of it observed rather than assumed:
 ///
 /// 1. `VersionSet::open` creates the MANIFEST, `fsync`s it while it is still
 ///    zero bytes, and appends `VersionEdit`s afterwards. Only edits for
@@ -460,25 +459,24 @@ fn a_power_cut_during_a_memtable_flush_keeps_every_acknowledged_write() {
 ///    This is the classic ext4 outcome: the directory entry reaches the
 ///    journal on a periodic commit while the delayed-allocated data blocks
 ///    do not.
-/// 3. `VersionSet::reject_discarded_tables` then sees a MANIFEST that
-///    references no SSTable while a `.sst` file exists, and refuses to open
-///    so as not to discard live tables.
+/// 3. `VersionSet::reject_discarded_tables` sees a MANIFEST that references
+///    no SSTable while a `.sst` file exists on disk.
 ///
 /// The guard is right in general (`tests/open_and_corruption.rs`
-/// deliberately locks it in) but wrong here: the SSTable it is protecting is
-/// zero bytes and holds nothing, and every one of the acknowledged writes is
-/// intact in the `fsync`ed WAL. The test proves that last point rather than
-/// asserting it, by salvaging a copy: with the empty orphan removed, the
-/// same directory opens and every acknowledged write is recovered.
+/// deliberately locks it in: a wiped MANIFEST next to real tables must
+/// still refuse) and it stays right here, because it now counts tables that
+/// could hold data rather than files. A zero-length orphan, or one whose
+/// footer records no entry and no range tombstone, is logged and skipped;
+/// anything else, including a table whose footer will not parse, still
+/// refuses the open. Every acknowledged write is intact in the `fsync`ed
+/// WAL, so once the orphan is dismissed the recovery finds all of them.
 ///
-/// The window closes once one `AddFile` has been `fsync`ed, so
-/// [`a_power_cut_during_a_memtable_flush_keeps_every_acknowledged_write`]
-/// (third flush) passes. It is open for every database between creation and
-/// its first completed flush, in both durability modes.
+/// Catches a regression in either direction: a guard that counts files
+/// again and loses the WAL's writes, or one relaxed far enough to open on a
+/// real unreferenced table and discard it.
 ///
-/// Runtime: measured at 0.02s; it spawns one child process.
+/// Runtime: measured at 0.03s; it spawns one child process.
 #[test]
-#[ignore = "G28 CRITICAL: a power cut inside the first flush leaves a zero-length orphan SSTable; VersionSet::reject_discarded_tables then refuses to open and loses acknowledged Immediate-durability writes. The data IS durable: deleting the empty orphan lets the same directory recover every write. The open guard, not the WAL, loses them. Run with --ignored. Fix is an engine change, out of scope for this test PR."]
 fn a_power_cut_during_the_first_memtable_flush_keeps_every_acknowledged_write() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("db");
@@ -798,17 +796,18 @@ fn a_power_cut_during_recovery_from_an_earlier_cut_loses_nothing_more() {
 /// rejected outright for [`TearMode::Truncate`], the common filesystem
 /// outcome, which must always recover.
 ///
-/// The per-cut outcome is printed, because it records a real durability
-/// trade-off rather than a defect. lark deliberately fails closed on a WAL
-/// tail whose damage does not land exactly on a record boundary
-/// (`tests/corruption.rs::torn_wal_tail_checksum_flip_fails_open_and_keeps_wal`
-/// locks that policy in: "replay cannot prove which committed records are
-/// safe"). Measured consequence, from this test: with the tail truncated at
-/// a record boundary all 192 acknowledged writes come back, while with a
-/// torn sector the database refuses to open and all 192 need manual repair.
-/// Whether an acknowledged write survives a power cut under `Immediate`
-/// therefore depends on which tear the filesystem produces, and that belongs
-/// in the README next to the "crash recovery" claim.
+/// The per-cut outcome is printed, because it records what a power cut
+/// actually costs. Replay treats a trailing record the file ends inside as
+/// the end of the log and keeps every whole record before it, so both
+/// tears recover. Measured consequence, from this test at `CutPoint::End`:
+/// `Truncate` and `TornSector` each come back with all 192 acknowledged
+/// writes. What still fails closed is damage the record checksum can
+/// prove, which
+/// `tests/corruption.rs::torn_wal_tail_checksum_flip_fails_open_and_keeps_wal`
+/// locks in: a *whole* record whose bytes are wrong cannot be proven to be
+/// anything, so open refuses rather than serve it. A refusal therefore
+/// stays a legal outcome for a tear that rewrites bytes, and is rejected
+/// outright only for `TearMode::Truncate`.
 ///
 /// Catches: a WAL batch record applied operation by operation as it decodes
 /// rather than validated whole first, and a `visible_seq` published before

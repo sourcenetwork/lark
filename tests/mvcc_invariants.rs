@@ -142,8 +142,14 @@ fn snapshot_stability_at_full_scale() {
 /// required, a `multi_get` that captures a fresh seq per key instead
 /// of one for the call, and a scan that disagrees with the point reads
 /// taken from the same snapshot.
+///
+/// This was red before the read view landed (measured 2 of 8 runs),
+/// through `multi_get` and through snapshot point reads. It gates two
+/// fixes now: reads resolve against one published, immutable view of
+/// the sources, and `Db::snapshot` samples the read horizon and
+/// registers its pin as a single step, so a compaction cannot compute
+/// its GC bound from a registry that does not yet hold the pin.
 #[test]
-#[ignore = "G27 CRITICAL: same root cause as a_repeated_read_of_one_key_never_travels_backwards. A key that is only ever overwritten momentarily reads back as ABSENT, here surfacing through multi_get. Pre-existing, not a PR2 regression. Run with --ignored."]
 fn a_reader_never_observes_a_write_batch_half_applied() {
     let (checks, generations) = run_batch_atomicity(&AtomicityScale {
         width: 12,
@@ -185,8 +191,13 @@ fn batch_atomicity_at_full_scale() {
 /// the memtable it replaces is retired, a compaction that installs a
 /// version whose newest entry lost to an older one in the merge, and a
 /// block-cache entry served after its file was rewritten.
+///
+/// This was red before the read view landed (measured 4 of 6 runs on
+/// the same box): a read sampled the horizon first and captured its
+/// sources second, so a compaction was free to drop the newest version
+/// at or below that horizon. It gates the ordering that replaced it -
+/// load the view, then sample the horizon - and stays a gate for it.
 #[test]
-#[ignore = "G27 CRITICAL: a key that is only ever overwritten, never deleted, can momentarily read back as ABSENT. Reproduced deterministically 3/3, and verified PRE-EXISTING: it fails identically on the pre-PR2 engine, so it is not a regression. Run with --ignored to reproduce. Fix is an engine change, out of scope for this test PR."]
 fn a_repeated_read_of_one_key_never_travels_backwards() {
     let outcome = run_monotonic_reads(&MonotonicScale {
         writers: 4,
@@ -203,11 +214,11 @@ fn a_repeated_read_of_one_key_never_travels_backwards() {
 /// Full-scale version of
 /// [`a_repeated_read_of_one_key_never_travels_backwards`].
 ///
-/// This test currently **fails intermittently** against the engine, and
-/// the failure is real, not a test defect: see
+/// This was red intermittently before the read view landed (measured 2
+/// of 16 runs at this scale); see
 /// [`a_user_thread_compact_range_never_makes_a_read_travel_backwards`]
-/// for the measured reproduction and the mechanism. Measured red in 2
-/// of 16 runs at this scale, which is why the focused gate exists.
+/// for the mechanism. Measured clean 3 of 3 runs after, at about 1M
+/// reads across 192k writes per run.
 ///
 /// Measured runtime is in the `#[ignore]` reason. Run with
 /// `just mvcc-slow`.
@@ -233,32 +244,34 @@ fn monotonic_reads_at_full_scale() {
 /// A `compact_range` driven from a user thread never makes a
 /// concurrent read travel backwards.
 ///
-/// This test currently **fails** against the engine. The failure is a
-/// real defect, and this test is the focused gate for it. It runs the
+/// The focused gate for a defect that is now fixed. It runs the
 /// minimal reproducing shape on 60 databases, 4 at a time, because the
-/// window is short and only opens under real contention.
+/// window was short and only opened under real contention.
 ///
 /// Property: with writers overwriting their own keys, readers polling
 /// them, and one thread calling `Db::compact_range`, no reader may see
 /// a key move backwards in version or read back as absent.
 ///
-/// The defect: `LarkEngine::get` (`src/engine/mod.rs`) takes the active
+/// The defect was in the read path: `LarkEngine::get` took the active
 /// memtable, the frozen memtable list and the version under three
-/// separate lock acquisitions, releasing each before taking the next,
-/// so no reader ever observes a consistent set of sources. A reader can
-/// miss a key's newest version in every source it looks at and fall
-/// through to an older one, or briefly find it in none of them.
+/// separate lock acquisitions, and sampled the read horizon before any
+/// of them, so a compaction that no snapshot pinned was free to drop
+/// the newest version at or below that horizon. A read then found only
+/// a version it had to filter out, and returned absent.
 ///
-/// Measured: 11 violating instances out of 300, over five independent
-/// 60-instance batches (4, 3, 3, 1, 0), so about 4 runs in 5 are red.
-/// The same workload with the user-thread `compact_range` removed gave
-/// 0/60, and the same workload with a live `Snapshot` pinning the GC
-/// horizon also gave 0/60. That pair is what narrows the cause to the
-/// read path racing a compaction that is free to drop versions, rather
-/// than to the flush path, which installs the new L0 file *before* it
-/// removes the memtable and so leaves no gap.
+/// Measured before the fix: 11 violating instances out of 300, over
+/// five independent 60-instance batches (4, 3, 3, 1, 0), so about 4
+/// runs in 5 were red. The same workload with the user-thread
+/// `compact_range` removed gave 0/60, and the same workload with a live
+/// `Snapshot` pinning the GC horizon also gave 0/60. That pair is what
+/// narrowed the cause to the read path racing a compaction free to drop
+/// versions, rather than to the flush path, which installs the new L0
+/// file *before* it removes the memtable and so leaves no gap.
+///
+/// Measured after: 0 of 60 instances on two consecutive runs, over
+/// about 24M reads each.
 #[test]
-#[ignore = "focused regression gate for the user-thread compact_range read race, measured at 26s; currently red, see the doc comment; run with `just mvcc-slow`"]
+#[ignore = "focused regression gate for the user-thread compact_range read race, measured at 14s; run with `just mvcc-slow`"]
 fn a_user_thread_compact_range_never_makes_a_read_travel_backwards() {
     // 15 rounds of 4 concurrent databases: the exact shape the defect
     // was measured on, so the rate this prints is comparable with the

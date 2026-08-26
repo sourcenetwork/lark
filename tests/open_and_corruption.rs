@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use lark_kv::{Db, Options, RateLimiter};
+use lark_kv::{Db, DurabilityMode, Options, RateLimiter};
 use tempfile::TempDir;
 
 fn opts() -> Options {
@@ -169,6 +169,83 @@ fn a_manifest_that_would_discard_live_tables_refuses_to_open() {
     }
 }
 
+/// A database whose WAL holds every acknowledged write, copied while it
+/// is still live so nothing has been flushed and the MANIFEST is still
+/// at its durable length of zero.
+fn wal_only_copy(keys: usize) -> TempDir {
+    let live = TempDir::new().unwrap();
+    let db = Db::open(
+        live.path(),
+        Options {
+            write_buffer_size: 8 * 1024 * 1024,
+            durability: DurabilityMode::Immediate,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    fill(&db, keys);
+
+    let copy = TempDir::new().unwrap();
+    copy_tree(live.path(), copy.path());
+    db.close().unwrap();
+
+    // What a power cut before the first `AddFile` leaves: the MANIFEST was
+    // `fsync`ed empty and every edit since is still in the page cache.
+    fs::write(copy.path().join("MANIFEST"), b"").unwrap();
+    copy
+}
+
+/// Property: the discarded-table guard counts tables that could hold
+/// data, not `.sst` files. A crash inside the first flush leaves a
+/// zero-length table file next to a MANIFEST whose durable length is
+/// zero; that file holds nothing, while the `fsync`ed WAL holds every
+/// acknowledged write. Refusing on it would lose them all.
+///
+/// Catches a guard that goes back to counting directory entries.
+#[test]
+fn a_wiped_manifest_next_to_an_empty_orphan_table_still_opens_and_keeps_the_wal() {
+    let dir = wal_only_copy(100);
+    let orphan = dir.path().join("sst").join("000003.sst");
+    fs::write(&orphan, b"").unwrap();
+
+    let db = Db::open(dir.path(), opts()).expect("an empty orphan table must not block the open");
+    for i in 0..100 {
+        assert_eq!(
+            db.get(format!("key_{i:06}").as_bytes()).unwrap(),
+            Some(format!("val_{i:06}").into_bytes()),
+            "key_{i:06} was acknowledged and must come back from the WAL",
+        );
+    }
+}
+
+/// Property: only a file that can be *proved* to hold nothing is
+/// dismissed. A non-empty unreferenced table whose footer will not parse
+/// cannot be proved empty, so the guard still refuses and leaves the file
+/// on disk for repair rather than opening on top of it.
+///
+/// Catches the over-correction: relaxing the guard until any damaged
+/// table is stepped over, which would let a wiped MANIFEST quietly
+/// present a database missing everything those tables held.
+#[test]
+fn a_wiped_manifest_next_to_an_unreadable_orphan_table_refuses_to_open() {
+    let dir = wal_only_copy(20);
+    let orphan = dir.path().join("sst").join("000004.sst");
+    fs::write(&orphan, vec![0xABu8; 4096]).unwrap();
+
+    let err = match Db::open(dir.path(), opts()) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("an unreadable non-empty orphan table must refuse the open"),
+    };
+    assert!(
+        err.contains("000004.sst"),
+        "the refusal must name the file that caused it, got: {err}",
+    );
+    assert!(
+        orphan.exists(),
+        "a refused open must leave the suspect table on disk",
+    );
+}
+
 #[test]
 fn a_manifest_with_a_huge_length_prefix_does_not_panic() {
     let dir = seeded_db(200);
@@ -210,21 +287,41 @@ fn vm_peak_kib() -> u64 {
 
 #[test]
 fn a_wal_claiming_a_huge_record_does_not_allocate_it() {
+    // The real record is captured while the database is still open: a
+    // clean close flushes the memtable and leaves the WAL empty, and this
+    // test needs a whole record to sit *after* the damage. That placement
+    // is what makes a bogus length corruption rather than the short
+    // trailing record every crash leaves behind, which replay is required
+    // to accept as the end of the log.
     let dir = TempDir::new().unwrap();
-    {
-        let db = Db::open(dir.path(), opts()).unwrap();
+    let record = {
+        let db = Db::open(
+            dir.path(),
+            Options {
+                durability: DurabilityMode::Immediate,
+                ..opts()
+            },
+        )
+        .unwrap();
         db.put(b"k", b"v").unwrap();
+        let wal = files_with_ext(&dir.path().join("wal"), "log")
+            .pop()
+            .expect("a wal file");
+        let bytes = fs::read(&wal).unwrap();
         db.close().unwrap();
-    }
+        bytes
+    };
+    assert!(!record.is_empty(), "the put must have reached the WAL");
+
     let wal = files_with_ext(&dir.path().join("wal"), "log")
         .pop()
         .expect("a wal file");
-    // A record header claiming u32::MAX bytes of payload, followed by
-    // a few real bytes: replay must reject it against the file size
+    // A record header claiming u32::MAX bytes of payload, with a whole
+    // record behind it: replay must reject it against the file size
     // rather than reserving 4 GiB for it.
     let mut bytes = u32::MAX.to_le_bytes().to_vec();
     bytes.push(0x01);
-    bytes.extend_from_slice(&[0u8; 16]);
+    bytes.extend_from_slice(&record);
     fs::write(&wal, &bytes).unwrap();
 
     let before = vm_peak_kib();

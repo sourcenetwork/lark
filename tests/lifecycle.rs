@@ -330,14 +330,13 @@ fn a_read_only_handle_refuses_every_mutation_and_still_reads() {
 /// read-only handle with an empty batch, get `Ok(())`, and conclude the
 /// handle is writable.
 ///
-/// This test currently FAILS. `src/lib.rs` checks `ensure_open` before
-/// the no-op short-circuit and `ensure_writable` after it, in
-/// `write_opt` (lines 614-619), `delete_range_opt` (579-584) and
-/// `delete_range_cf` (1350-1355), so all three answer `Ok(())` on a
-/// read-only handle. Moving `ensure_writable` above the short-circuit
-/// in those three functions is the fix.
+/// Regression gate for G26. `write_opt`, `delete_range_opt` and
+/// `delete_range_cf` each used to check `ensure_open` before their
+/// no-op short-circuit and `ensure_writable` after it, so all three
+/// answered `Ok(())` on a read-only handle. They now check
+/// `ensure_writable` first, which subsumes `ensure_open`, so the
+/// `Error::Closed` precedence on a closed handle is unchanged.
 #[test]
-#[ignore = "G26 minor: a read-only handle returns Ok(()) for an EMPTY WriteBatch instead of Error::ReadOnly. Harmless (it is a no-op) but an inconsistent contract: whether a write is rejected should not depend on whether it happens to be empty. Open API question, not a defect."]
 fn a_read_only_handle_refuses_a_write_that_carries_no_work() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), opts()).unwrap();
@@ -761,13 +760,15 @@ fn an_sstable_from_an_unknown_format_version_is_rejected_with_a_clear_error() {
     let offset = sst_version_byte_offset(&sst);
     let known = read_byte(&sst, offset);
     assert!(
-        known == 1 || known == 2,
-        "expected a known SSTable format version (1 = flat index, 2 = partitioned), \
-         found {known} at offset {offset} of {} - this test targets the wrong byte",
+        known == 3 || known == 4,
+        "expected a version lark writes today (3 = flat index, 4 = partitioned; \
+         1 and 2 are the legacy unchecksummed layouts, still read but never \
+         written), found {known} at offset {offset} of {} - this test targets \
+         the wrong byte",
         sst.display()
     );
 
-    for future_version in [0x03u8, 0x7F, 0xFF] {
+    for future_version in [0x05u8, 0x7F, 0xFF] {
         overwrite_range(&sst, offset, &[future_version]);
         match Db::open(dir.path(), opts()) {
             Ok(_) => panic!(

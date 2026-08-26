@@ -93,27 +93,38 @@ fn torn_wal_tail_checksum_flip_fails_open_and_keeps_wal() {
 }
 
 #[test]
-fn wal_truncated_at_arbitrary_offset_fails_open_and_keeps_wal() {
-    // Robustness check: truncate the WAL at every byte offset from
-    // one past the first record up to the end. The engine must fail
-    // closed and keep the WAL rather than silently prefix-replay.
-    let dir = TempDir::new().unwrap();
-    {
-        let db = open(&dir);
-        db.put(b"a", b"1").unwrap();
-        db.put(b"b", b"2").unwrap();
-    }
-    let wal = first_wal(dir.path());
-    let wal_count = count_wal_files(dir.path());
-    let full = fs::read(&wal).unwrap();
+fn wal_truncated_at_arbitrary_offset_replays_the_whole_records_before_the_cut() {
+    // Truncation is what a crash leaves behind: the records before the
+    // cut are byte-for-byte what the process wrote, and only the one the
+    // cut lands in is incomplete. Every cut below lands inside the second
+    // record, so the first must always come back and the second never
+    // may. Failing the open here instead would throw away a write that
+    // was acknowledged and fsynced.
     for trim in [1u64, 3, 5, 9, 11, 15, 20] {
-        if (full.len() as u64) <= trim {
-            continue;
+        let dir = TempDir::new().unwrap();
+        {
+            let db = open(&dir);
+            db.put(b"a", b"1").unwrap();
+            db.put(b"b", b"2").unwrap();
         }
-        fs::write(&wal, &full).unwrap();
-        truncate(&wal, full.len() as u64 - trim);
-        assert_open_fails_with_kind(&dir, io::ErrorKind::UnexpectedEof);
-        assert!(wal.exists());
+        let wal = first_wal(dir.path());
+        let wal_count = count_wal_files(dir.path());
+        let full = fs::read(&wal).unwrap();
+        // `[len: u32 LE][type: u8][payload][crc: u32 LE]`, so this is
+        // where the first record ends.
+        let first_end = 9 + u32::from_le_bytes(full[0..4].try_into().unwrap()) as u64;
+        let cut = full.len() as u64 - trim;
+        assert!(
+            cut > first_end && cut < full.len() as u64,
+            "a cut of {trim} must land inside the second record",
+        );
+
+        truncate(&wal, cut);
+        let db = Db::open(dir.path(), Default::default())
+            .unwrap_or_else(|e| panic!("cut at {cut}: {e}"));
+        assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()), "cut at {cut}");
+        assert_eq!(db.get(b"b").unwrap(), None, "cut at {cut}");
+        db.close().unwrap();
         assert_eq!(count_wal_files(dir.path()), wal_count);
     }
 }

@@ -64,6 +64,31 @@ impl SnapshotRegistry {
             .refcount += 1;
     }
 
+    /// Register a pin at the sequence `sample` returns, reading that
+    /// sequence while the registry mutex is held.
+    ///
+    /// Sampling the read horizon and registering the pin have to be one
+    /// step. If they are two, a compaction that reads
+    /// [`oldest_live_seq`](Self::oldest_live_seq) in between sees no
+    /// pin at all, computes its GC horizon as `u64::MAX`, and is free
+    /// to drop the very version the new snapshot was about to read.
+    pub(crate) fn register_at(&self, sample: impl FnOnce() -> u64) -> u64 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut active = self.active.lock();
+        let seq = sample();
+        active
+            .entry(seq)
+            .or_insert(SlotState {
+                refcount: 0,
+                registered_at_unix: now,
+            })
+            .refcount += 1;
+        seq
+    }
+
     /// Release one pin at `seq`. A no-op if no pin at that seq is
     /// currently registered, which should only happen in test
     /// teardown races.

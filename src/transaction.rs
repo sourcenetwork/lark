@@ -200,8 +200,7 @@ impl OptimisticTransactionDb {
     /// that seq; writes buffer in memory until [`Transaction::commit`].
     pub fn begin_transaction(&self) -> Transaction<'_> {
         let engine = self.inner.engine_arc();
-        let snapshot_seq = engine.snapshot_seq();
-        engine.register_snapshot(snapshot_seq);
+        let snapshot_seq = engine.register_snapshot_at_horizon();
         Transaction::new(
             engine,
             snapshot_seq,
@@ -266,8 +265,7 @@ impl TransactionDb {
     /// the caller retains until commit or rollback.
     pub fn begin_transaction(&self) -> Transaction<'_> {
         let engine = self.inner.engine_arc();
-        let snapshot_seq = engine.snapshot_seq();
-        engine.register_snapshot(snapshot_seq);
+        let snapshot_seq = engine.register_snapshot_at_horizon();
         let id = self.tx_id.fetch_add(1, Ordering::Relaxed);
         Transaction::new(
             engine,
@@ -405,7 +403,7 @@ impl<'db> Transaction<'db> {
         }
         let read_seq = self.observe(&prefixed, self.snapshot_seq, false);
         self.engine
-            .get(&prefixed, read_seq)
+            .get_at(&prefixed, read_seq)
             .map_err(TransactionError::Io)
     }
 
@@ -428,7 +426,7 @@ impl<'db> Transaction<'db> {
             return Ok(buffered.clone());
         }
         self.engine
-            .get(&prefixed, read_seq)
+            .get_at(&prefixed, read_seq)
             .map_err(TransactionError::Io)
     }
 

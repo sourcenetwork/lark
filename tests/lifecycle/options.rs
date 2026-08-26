@@ -166,8 +166,8 @@ fn reopening_under_a_different_compaction_style_keeps_every_key() {
     assert_option_change_preserves_data("fifo -> level", fifo, leveled);
 }
 
-/// Property: the footer magic distinguishes the flat index (version 1)
-/// from the partitioned one (version 2), so toggling `partitioned_index`
+/// Property: the footer magic distinguishes the flat index (version 3)
+/// from the partitioned one (version 4), so toggling `partitioned_index`
 /// leaves a directory holding both layouts and every file is read with
 /// the layout it was written in. The mix is asserted from the bytes on
 /// disk, and `l0_compaction_trigger` is raised out of reach so no
@@ -184,8 +184,8 @@ fn reopening_that_toggles_the_partitioned_index_reads_both_layouts() {
     });
 
     for (label, from, to, new_version) in [
-        ("flat -> partitioned", &flat, &partitioned, 2u8),
-        ("partitioned -> flat", &partitioned, &flat, 1u8),
+        ("flat -> partitioned", &flat, &partitioned, 4u8),
+        ("partitioned -> flat", &partitioned, &flat, 3u8),
     ] {
         let stage = |s: &str| format!("{label}: {s}");
         let dir = seeded_dir(400, from);

@@ -7,10 +7,11 @@ use std::thread;
 
 use super::block_cache::BlockCache;
 use super::internal_key::{compare_internal_keys, decode_internal_key, user_key_of};
-use super::manifest::{VersionEdit, VersionSet, MAX_LEVELS};
+use super::manifest::{VersionEdit, MAX_LEVELS};
 use super::range_tombstone::{
     exclusive_successor, sort_dedup_tombstones, RangeTombstone, RangeTombstoneSet,
 };
+use super::read_view::VersionStore;
 use super::snapshot_registry::SnapshotRegistry;
 use super::sstable::{
     remove_sst, sst_filename, LiveSst, SsTableInternalIter, SsTableMeta, SsTableReader,
@@ -65,7 +66,7 @@ impl CompactionScheduler {
     pub(crate) fn start(
         compaction_lock: Arc<parking_lot::RwLock<()>>,
         snapshot_registry: Arc<SnapshotRegistry>,
-        versions: Arc<parking_lot::Mutex<VersionSet>>,
+        versions: Arc<VersionStore>,
         sst_dir: Arc<Path>,
         cache: Arc<BlockCache>,
         opts: CompactionOptions,
@@ -294,7 +295,7 @@ fn compaction_loop(
     trigger: Arc<(Mutex<bool>, Condvar)>,
     compaction_lock: Arc<parking_lot::RwLock<()>>,
     snapshot_registry: Arc<SnapshotRegistry>,
-    versions: Arc<parking_lot::Mutex<VersionSet>>,
+    versions: Arc<VersionStore>,
     sst_dir: Arc<Path>,
     cache: Arc<BlockCache>,
     opts: CompactionOptions,
@@ -381,7 +382,7 @@ fn compaction_loop(
 }
 
 fn pick_and_run_compaction(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
@@ -421,7 +422,7 @@ fn pick_and_run_compaction(
 /// background compaction loop re-invokes it until there's nothing
 /// left to do.
 fn pick_and_run_universal(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
@@ -515,7 +516,7 @@ fn pick_and_run_universal(
 /// id (so it sorts as the newest L0 file under the picker's
 /// age-by-file_id ordering).
 fn perform_universal_merge(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
@@ -543,7 +544,7 @@ fn perform_universal_merge(
 /// `compact_range` path so callers can trigger a deterministic
 /// drop of over-cap files.
 pub(crate) fn run_fifo_pass(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     opts: &CompactionOptions,
 ) -> std::io::Result<bool> {
@@ -556,7 +557,7 @@ pub(crate) fn run_fifo_pass(
 /// caller asking for a manual compaction gets full deduplication
 /// across every live file regardless of the picker's ratio rules.
 pub(crate) fn run_universal_full_compaction(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
@@ -573,7 +574,7 @@ pub(crate) fn run_universal_full_compaction(
 }
 
 fn pick_and_run_level_compaction(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
@@ -606,7 +607,7 @@ fn pick_and_run_level_compaction(
 /// oversized file is not worth deleting because that would lose
 /// data with no successor on disk.
 fn pick_and_run_fifo(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     opts: &CompactionOptions,
 ) -> std::io::Result<bool> {
@@ -689,7 +690,7 @@ fn level_target_size(level: usize, opts: &CompactionOptions) -> u64 {
 
 /// Compact all L0 SSTables into L1.
 fn compact_l0(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
@@ -716,7 +717,7 @@ fn compact_l0(
 /// heuristic (all L0 files, or the first file of L1+). Used by the
 /// background scheduler.
 fn compact_level(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
@@ -812,7 +813,7 @@ fn compact_level(
 /// Callers must hold the engine-wide compaction lock so the background
 /// scheduler can't pick an overlapping input set concurrently.
 pub(crate) fn run_compact_range(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
@@ -893,7 +894,7 @@ pub(crate) fn run_compact_range(
 /// newest version of each user key is retained.
 #[allow(clippy::too_many_arguments)]
 fn perform_compaction(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
@@ -924,7 +925,7 @@ fn perform_compaction(
 /// `input_level`.
 #[allow(clippy::too_many_arguments)]
 fn perform_compaction_to(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
@@ -1426,7 +1427,7 @@ struct CompactionInputStream<'a> {
 
 #[allow(clippy::too_many_arguments)]
 fn stream_compaction_outputs(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
@@ -1542,7 +1543,7 @@ struct StreamingOutputBuilder {
 }
 
 struct StreamingCompactionWriter<'a> {
-    versions: &'a Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &'a Arc<VersionStore>,
     sst_dir: &'a Path,
     opts: &'a CompactionOptions,
     target_level: usize,
@@ -1555,7 +1556,7 @@ struct StreamingCompactionWriter<'a> {
 
 impl<'a> StreamingCompactionWriter<'a> {
     fn new(
-        versions: &'a Arc<parking_lot::Mutex<VersionSet>>,
+        versions: &'a Arc<VersionStore>,
         sst_dir: &'a Path,
         opts: &'a CompactionOptions,
         target_level: usize,
@@ -2002,8 +2003,8 @@ mod tests {
         let sst_dir = dir.path().join("sst");
         std::fs::create_dir_all(&sst_dir).unwrap();
 
-        let versions = Arc::new(parking_lot::Mutex::new(
-            VersionSet::open(dir.path(), &sst_dir).unwrap(),
+        let versions = Arc::new(VersionStore::new(
+            super::super::manifest::VersionSet::open(dir.path(), &sst_dir).unwrap(),
         ));
         let opts = CompactionOptions {
             max_background_compactions: 3,
@@ -2101,8 +2102,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sst_dir = dir.path().join("sst");
         std::fs::create_dir_all(&sst_dir).unwrap();
-        let versions = Arc::new(parking_lot::Mutex::new(
-            VersionSet::open(dir.path(), &sst_dir).unwrap(),
+        let versions = Arc::new(VersionStore::new(
+            super::super::manifest::VersionSet::open(dir.path(), &sst_dir).unwrap(),
         ));
         let opts = CompactionOptions {
             max_background_compactions: 8,

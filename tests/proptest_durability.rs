@@ -380,15 +380,13 @@ proptest! {
     /// SSTable index whose block boundaries disagree with the block
     /// contents, and a `prev` path that skips or repeats an entry.
     ///
-    /// STATUS: this test FAILS against the engine as it stands. It
-    /// shrinks to the single key `ff ff ff ff ff ff ff ff 01`, which a
-    /// forward scan returns and a backward walk cannot reach; see
+    /// This was red before `seek_to_last` took an exclusive upper
+    /// bound: it shrank to the single key `ff ff ff ff ff ff ff ff 01`,
+    /// which a forward scan returned and a backward walk could not
+    /// reach. See
     /// `reverse_iteration_reaches_a_key_above_the_seek_to_last_probe`
-    /// below for the deterministic form and the diagnosis. With that one
-    /// key shape filtered out, 400 cases pass in 1.9s, so it is the only
-    /// ordering failure this test finds today.
+    /// below for the deterministic form and the diagnosis.
     #[test]
-#[ignore = "G29: reverse iteration is broken for keys longer than 8 bytes that start with eight 0xff bytes. seek_to_last() builds an upper-bound probe valid only for user keys of 8 bytes or fewer, so such keys are unreachable backwards and reverse iteration yields fewer entries than forward. Run with --ignored."]
     fn iteration_is_in_strict_user_key_order(
         keys in prop::collection::vec(adversarial_key(), 1..=64),
     ) {
@@ -538,24 +536,21 @@ fn check_order(
 /// to. Deterministic, so it stays a reproducer no matter what the
 /// property test's RNG does next.
 ///
-/// `CfIter::seek_to_last` (`src/lib.rs:1529`) positions the cursor with
-/// `seek_for_prev(cf_upper_bound - 1 || [0xff; 8])`, and that probe is
-/// an upper bound only for user keys of at most eight bytes. The default
-/// column family is id 1, so the probe is
-/// `00 00 00 01 || ff ff ff ff ff ff ff ff`, while the key below encodes
-/// as `00 00 00 01 || ff ff ff ff ff ff ff ff || 01` and sorts *above*
-/// it. `seek_to_last` lands before the key and the reverse walk misses
-/// it entirely.
+/// `CfIter::seek_to_last` used to position the cursor with
+/// `seek_for_prev(cf_upper_bound - 1 || [0xff; 8])`, a probe that is an
+/// upper bound only for user keys of at most eight bytes. The default
+/// column family is id 1, so the probe was
+/// `00 00 00 01 || ff ff ff ff ff ff ff ff`, while the key below
+/// encodes as `00 00 00 01 || ff ff ff ff ff ff ff ff || 01` and sorts
+/// *above* it: `seek_to_last` landed before the key and the reverse
+/// walk missed it entirely. No suffix of `0xff` bytes fixes that, since
+/// byte strings have no predecessor, so `seek_to_last` now takes the
+/// exclusive bound directly (`LarkIterator::seek_to_last_before`).
 ///
 /// Catches: exactly that. The key is written, `get` returns it and a
-/// forward scan returns it; only the backward walk drops it, and the
+/// forward scan returns it; only the backward walk dropped it, and the
 /// same probe is used by `Snapshot::iter` and the tailing iterator.
-///
-/// STATUS: this test FAILS against the engine as it stands. It is a
-/// reproducer for a live bug, not a regression guard, and it is left
-/// failing deliberately rather than trimmed to something that passes.
 #[test]
-#[ignore = "G29: reverse iteration is broken for keys longer than 8 bytes that start with eight 0xff bytes. seek_to_last() builds an upper-bound probe valid only for user keys of 8 bytes or fewer, so such keys are unreachable backwards and reverse iteration yields fewer entries than forward. Run with --ignored."]
 fn reverse_iteration_reaches_a_key_above_the_seek_to_last_probe() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), opts(WRITE_BUFFER, DurabilityMode::Eventual)).unwrap();
@@ -579,6 +574,47 @@ fn reverse_iteration_reaches_a_key_above_the_seek_to_last_probe() {
         show(&key),
     );
     assert_eq!(it.key(), Some(&key[..]));
+}
+
+/// A full backward walk over the two keys that sit either side of the
+/// old probe returns the exact reverse of the forward walk.
+///
+/// `ff*8 || 00` sorted below the old probe and `ff*8 || 01` above it,
+/// so the pair pins both halves of the boundary: a reverse walk that
+/// starts too low loses the second key, and one that starts too high
+/// loses the first.
+#[test]
+fn reverse_iteration_over_the_probe_boundary_mirrors_the_forward_walk() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open(dir.path(), opts(WRITE_BUFFER, DurabilityMode::Eventual)).unwrap();
+    let low = [0xffu8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00];
+    let high = [0xffu8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+    db.put(&low, b"l").unwrap();
+    db.put(&high, b"h").unwrap();
+
+    let mut forward = Vec::new();
+    let mut it = db.iter();
+    it.seek_to_first();
+    while it.valid() {
+        forward.push(it.key().unwrap().to_vec());
+        it.next();
+    }
+    it.status().unwrap();
+    assert_eq!(forward, vec![low.to_vec(), high.to_vec()]);
+
+    let mut backward = Vec::new();
+    let mut it = db.iter();
+    it.seek_to_last();
+    while it.valid() {
+        backward.push(it.key().unwrap().to_vec());
+        it.prev();
+    }
+    it.status().unwrap();
+    backward.reverse();
+    assert_eq!(
+        backward, forward,
+        "the reverse walk must mirror the forward one"
+    );
 }
 
 /// The child-side workload. Applies the regenerated sequence and kills
