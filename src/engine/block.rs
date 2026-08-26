@@ -202,35 +202,6 @@ impl Block {
     }
 
     /// Return the first `(key, value)` entry with `key >= target`, if any.
-    ///
-    /// This is the primitive SSTable readers use for MVCC point lookups: the
-    /// caller constructs a search key from `(user_key, snapshot_seq)` and
-    /// inspects the returned entry to decide whether it satisfies the query.
-    ///
-    /// Retained for tests and for the iterator's `seek` path even
-    /// though the merge-aware SSTable reader walks blocks manually
-    /// to skip past `Merge` entries.
-    #[allow(dead_code)]
-    pub(crate) fn seek_ge(&self, target: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
-        let start = self.restart_start_for(target);
-
-        let mut pos = start;
-        let mut current_key = Vec::new();
-        let data = self.entry_data();
-        while pos < data.len() {
-            let (key, value) = decode_block_entry(data, pos, &current_key);
-            let entry_size = encoded_entry_size(data, pos);
-            pos += entry_size;
-            current_key = key;
-
-            if compare_internal_keys(&current_key, target).is_ge() {
-                return Some((current_key, value));
-            }
-        }
-
-        None
-    }
-
     /// Binary-search restart points for the first entry whose key could be
     /// `>= target`; returns the byte offset to start the linear walk from.
     fn restart_start_for(&self, target: &[u8]) -> usize {
@@ -382,13 +353,6 @@ pub(crate) fn decode_entry_at(
     (header.consumed, key_end, header.value_len)
 }
 
-fn decode_block_entry(data: &[u8], pos: usize, prev_key: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let decoded =
-        decode_block_entry_checked(data, pos, prev_key).expect("block entry validated at decode");
-    let value = data[decoded.value_offset..decoded.value_offset + decoded.value_len].to_vec();
-    (decoded.key, value)
-}
-
 pub(crate) fn encoded_entry_size(data: &[u8], pos: usize) -> usize {
     decode_entry_header(data, pos)
         .expect("block entry validated at decode")
@@ -423,8 +387,6 @@ fn invalid_data(message: &'static str) -> io::Error {
 struct DecodedEntry {
     key: Vec<u8>,
     consumed: usize,
-    value_offset: usize,
-    value_len: usize,
 }
 
 struct EntryHeader {
@@ -509,13 +471,10 @@ fn decode_block_entry_checked(
     let mut key = Vec::with_capacity(key_len);
     key.extend_from_slice(&prev_key[..header.shared]);
     key.extend_from_slice(&data[header.key_offset..header.key_offset + header.unshared]);
-    let value_offset = header.key_offset + header.unshared;
 
     Ok(DecodedEntry {
         key,
         consumed: header.consumed,
-        value_offset,
-        value_len: header.value_len,
     })
 }
 
@@ -706,29 +665,6 @@ mod tests {
     // ── block encode/decode ─────────────────────────────────────
 
     #[test]
-    fn test_block_seek_ge() {
-        let block = build_block(&[
-            (b"apple", b"red"),
-            (b"application", b"software"),
-            (b"banana", b"yellow"),
-        ]);
-
-        assert_eq!(
-            block.seek_ge(b"apple"),
-            Some((b"apple".to_vec(), b"red".to_vec()))
-        );
-        assert_eq!(
-            block.seek_ge(b"applicatio"),
-            Some((b"application".to_vec(), b"software".to_vec()))
-        );
-        assert_eq!(
-            block.seek_ge(b"b"),
-            Some((b"banana".to_vec(), b"yellow".to_vec()))
-        );
-        assert_eq!(block.seek_ge(b"cherry"), None);
-    }
-
-    #[test]
     fn empty_block_iterates_nothing() {
         let builder = BlockBuilder::new(16);
         let block = Block::decode(builder.finish()).unwrap();
@@ -893,32 +829,6 @@ mod tests {
     }
 
     // ── seek_ge edge cases ──────────────────────────────────────
-
-    #[test]
-    fn seek_ge_before_first_key_returns_first() {
-        let block = build_block(&[(b"b", b"2"), (b"c", b"3")]);
-        // Empty target sorts before every key - the ordering function
-        // short-circuits on suffix-length so any user key > "" wins.
-        assert_eq!(block.seek_ge(b""), Some((b"b".to_vec(), b"2".to_vec())));
-    }
-
-    #[test]
-    fn seek_ge_matches_every_key_after_binary_search() {
-        // 100 sorted keys with restart interval 4 exercises the
-        // binary-search path over ~25 restart points.
-        let keys: Vec<Vec<u8>> = (0..100)
-            .map(|i| format!("key_{:05}", i).into_bytes())
-            .collect();
-        let mut b = BlockBuilder::new(4);
-        for k in &keys {
-            b.add(k, b"v");
-        }
-        let block = Block::decode(b.finish()).unwrap();
-
-        for k in &keys {
-            assert_eq!(block.seek_ge(k), Some((k.clone(), b"v".to_vec())));
-        }
-    }
 
     // ── cache accounting / builder internals ───────────────────
 

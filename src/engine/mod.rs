@@ -3031,11 +3031,6 @@ impl LarkEngine {
     }
 
     #[cfg(test)]
-    pub(crate) fn frozen_depth(&self) -> usize {
-        self.view.load().frozen.len()
-    }
-
-    #[cfg(test)]
     pub(crate) fn memtables_hold_no_data(&self) -> bool {
         let view = self.view.load();
         view.frozen.is_empty()

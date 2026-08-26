@@ -181,7 +181,7 @@ pub fn median(v: &mut Vec<f64>) -> f64 {
     assert!(!v.is_empty(), "median of an empty sample");
     v.sort_by(|a, b| a.total_cmp(b));
     let mid = v.len() / 2;
-    if v.len() % 2 == 0 {
+    if v.len().is_multiple_of(2) {
         (v[mid - 1] + v[mid]) / 2.0
     } else {
         v[mid]

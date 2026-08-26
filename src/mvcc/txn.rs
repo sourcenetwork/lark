@@ -1,16 +1,22 @@
 //! The transaction surface, driven by kovan-mvcc.
 //!
+//! Not yet reachable from the public API: `OptimisticTransactionDb` and
+//! `TransactionDb` still run the native path. The allow below goes when
+//! the default flips, and not before, so a genuinely unused item here is
+//! still caught then.
+//!
 //! Everything about isolation, conflict detection, timestamps and the
 //! two-phase commit belongs to kovan-mvcc. This module is the adapter:
-//! byte keys in, `&str` out, `MvccError` mapped onto regolith's error
+//! byte keys straight through, `MvccError` mapped onto regolith's error
 //! type, and the storage layer's out-of-band I/O failure checked before
 //! a commit is reported as successful.
+
+#![allow(dead_code)]
 
 use std::sync::Arc;
 
 use kovan_mvcc::{IsolationLevel as MvccIsolation, KovanMVCC, MvccError};
 
-use super::key;
 use super::storage::LarkStorage;
 use crate::engine::{DurabilityMode, LarkEngine};
 use crate::transaction::{IsolationLevel, TransactionError, TxResult};
@@ -34,7 +40,6 @@ impl MvccTransactions {
         MvccTxn {
             inner: self.mvcc.begin_with_isolation(map_isolation(isolation)),
             storage: &self.storage,
-            scratch: String::new(),
         }
     }
 }
@@ -51,15 +56,11 @@ fn map_isolation(level: IsolationLevel) -> MvccIsolation {
 pub(crate) struct MvccTxn<'db> {
     inner: kovan_mvcc::Txn,
     storage: &'db Arc<LarkStorage>,
-    /// Reused across operations so encoding a key does not allocate a
-    /// `String` per call on the hot path.
-    scratch: String,
 }
 
 impl MvccTxn<'_> {
     pub(crate) fn get(&mut self, k: &[u8]) -> TxResult<Option<Vec<u8>>> {
-        key::encode_into(k, &mut self.scratch);
-        let value = self.inner.read(&self.scratch);
+        let value = self.inner.read(k);
         // `read` cannot report an I/O error through its signature, so a
         // miss might be a failure. Checking here turns a wrong answer
         // into a reported one.
@@ -70,15 +71,11 @@ impl MvccTxn<'_> {
     }
 
     pub(crate) fn put(&mut self, k: &[u8], value: &[u8]) -> TxResult<()> {
-        key::encode_into(k, &mut self.scratch);
-        self.inner
-            .write(&self.scratch, value.to_vec())
-            .map_err(map_error)
+        self.inner.write(k, value.to_vec()).map_err(map_error)
     }
 
     pub(crate) fn delete(&mut self, k: &[u8]) -> TxResult<()> {
-        key::encode_into(k, &mut self.scratch);
-        self.inner.delete(&self.scratch).map_err(map_error)
+        self.inner.delete(k).map_err(map_error)
     }
 
     /// Commit, reporting the sequence the transaction committed at.
@@ -101,7 +98,7 @@ impl MvccTxn<'_> {
 /// so it is a conflict the caller may retry. Anything structural is not.
 fn map_error(err: MvccError) -> TransactionError {
     match err {
-        MvccError::LockConflict { key, .. } => TransactionError::Busy(decoded(&key)),
+        MvccError::LockConflict { key, .. } => TransactionError::Busy(key),
         MvccError::WriteConflict {
             key,
             conflicting_ts,
@@ -110,12 +107,12 @@ fn map_error(err: MvccError) -> TransactionError {
             key,
             conflicting_ts,
         } => TransactionError::Conflict {
-            key: decoded(&key),
+            key,
             observed_seq: 0,
             latest_seq: conflicting_ts,
         },
         MvccError::RollbackRecord { key } => TransactionError::Conflict {
-            key: decoded(&key),
+            key,
             observed_seq: 0,
             latest_seq: 0,
         },
@@ -127,13 +124,6 @@ fn map_error(err: MvccError) -> TransactionError {
         }
         MvccError::StorageError(msg) => TransactionError::Io(std::io::Error::other(msg)),
     }
-}
-
-/// Recover the caller's key for an error message. A key that will not
-/// decode is reported as it stands rather than dropped, because the
-/// error is more useful naming something than nothing.
-fn decoded(encoded: &str) -> Vec<u8> {
-    key::decode(encoded).unwrap_or_else(|| encoded.as_bytes().to_vec())
 }
 
 #[cfg(test)]

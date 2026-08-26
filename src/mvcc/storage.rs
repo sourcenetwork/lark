@@ -28,7 +28,7 @@ use crate::WriteBatchOp;
 use crate::engine::{DurabilityMode, LarkEngine};
 
 /// Locks live here rather than on disk. See [`super::layout`].
-type LockTable = kovan_map::HashMap<String, LockInfo>;
+type LockTable = kovan_map::HashMap<Vec<u8>, LockInfo>;
 
 pub(crate) struct LarkStorage {
     engine: Arc<LarkEngine>,
@@ -45,6 +45,30 @@ pub(crate) struct LarkStorage {
     /// because [`Self::flush_staged`] runs before any write record is
     /// recorded.
     staged: Mutex<Vec<WriteBatchOp>>,
+}
+
+thread_local! {
+    /// Scratch buffers for composing engine keys.
+    ///
+    /// Every `Storage` call builds a key from a prefix, the user key and
+    /// a timestamp. Allocating a fresh `Vec` for each one puts a malloc
+    /// and a free on the critical path of every read and every write; a
+    /// per-thread buffer that grows once and is reused puts none there.
+    /// Thread-local rather than shared so reuse costs no synchronisation
+    /// between the very threads the engine exists to run concurrently.
+    static KEY_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PREFIX_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Compose a key into the thread's scratch buffer and hand it to `f`.
+///
+/// The buffer never escapes, so it can be reused for the next call.
+fn with_key<R>(compose: impl FnOnce(&mut Vec<u8>), f: impl FnOnce(&[u8]) -> R) -> R {
+    KEY_BUF.with(|b| {
+        let mut buf = b.borrow_mut();
+        compose(&mut buf);
+        f(&buf)
+    })
 }
 
 impl LarkStorage {
@@ -109,7 +133,7 @@ impl LarkStorage {
 }
 
 impl Storage for LarkStorage {
-    fn get_lock(&self, key: &str) -> Option<LockInfo> {
+    fn get_lock(&self, key: &[u8]) -> Option<LockInfo> {
         self.locks.get(key)
     }
 
@@ -121,18 +145,18 @@ impl Storage for LarkStorage {
     /// and the protocol would lose a write with no error anywhere. The
     /// concurrent map supplies the atomicity, which is the reason locks
     /// live here rather than in the engine, which has no CAS.
-    fn put_lock(&self, key: &str, lock: LockInfo) -> Result<(), kovan_mvcc::MvccError> {
-        match self.locks.insert_if_absent(key.to_string(), lock.clone()) {
+    fn put_lock(&self, key: &[u8], lock: LockInfo) -> Result<(), kovan_mvcc::MvccError> {
+        match self.locks.insert_if_absent(key.to_vec(), lock.clone()) {
             None => Ok(()),
             Some(existing) => {
                 if existing.txn_id == lock.txn_id {
                     // Already ours: re-prewriting the same key is allowed
                     // and refreshes the entry.
-                    self.locks.insert(key.to_string(), lock);
+                    self.locks.insert(key.to_vec(), lock);
                     Ok(())
                 } else {
                     Err(kovan_mvcc::MvccError::LockConflict {
-                        key: key.to_string(),
+                        key: key.to_vec(),
                         holder_txn: existing.txn_id,
                     })
                 }
@@ -140,22 +164,22 @@ impl Storage for LarkStorage {
         }
     }
 
-    fn delete_lock(&self, key: &str) {
+    fn delete_lock(&self, key: &[u8]) {
         self.locks.remove(key);
     }
 
-    fn get_latest_write(&self, key: &str, ts: u64) -> Option<(u64, WriteInfo)> {
+    fn get_latest_write(&self, key: &[u8], ts: u64) -> Option<(u64, WriteInfo)> {
         self.seek_write(key, ts, false)
     }
 
-    fn get_latest_commit(&self, key: &str, ts: u64) -> Option<(u64, WriteInfo)> {
+    fn get_latest_commit(&self, key: &[u8], ts: u64) -> Option<(u64, WriteInfo)> {
         self.seek_write(key, ts, true)
     }
 
-    fn put_write(&self, key: &str, commit_ts: u64, info: WriteInfo) {
+    fn put_write(&self, key: &[u8], commit_ts: u64, info: WriteInfo) {
         // The data this record points at has to be durable first.
         self.flush_staged();
-        let mut k = Vec::new();
+        let mut k = Vec::with_capacity(layout::composed_len(key));
         layout::write_key(key, commit_ts, &mut k);
         self.stage(WriteBatchOp::Put {
             key: k,
@@ -166,17 +190,20 @@ impl Storage for LarkStorage {
         self.flush_staged();
     }
 
-    fn get_data(&self, key: &str, start_ts: u64) -> Option<Value> {
-        let mut k = Vec::new();
-        layout::data_key(key, start_ts, &mut k);
+    fn get_data(&self, key: &[u8], start_ts: u64) -> Option<Value> {
         // A staged write is this transaction's own and is not yet
         // durable; the protocol reads its own writes from its local
         // buffer, so only durable versions are consulted here.
-        self.get(&k).map(Arc::new)
+        with_key(
+            |b| layout::data_key(key, start_ts, b),
+            |k| self.get(k).map(Arc::new),
+        )
     }
 
-    fn put_data(&self, key: &str, start_ts: u64, value: Value) {
-        let mut k = Vec::new();
+    fn put_data(&self, key: &[u8], start_ts: u64, value: Value) {
+        // This one has to own its key: the op is staged until the batch
+        // is flushed, so it outlives any scratch buffer.
+        let mut k = Vec::with_capacity(layout::composed_len(key));
         layout::data_key(key, start_ts, &mut k);
         self.stage(WriteBatchOp::Put {
             key: k,
@@ -184,8 +211,8 @@ impl Storage for LarkStorage {
         });
     }
 
-    fn delete_data(&self, key: &str, start_ts: u64) {
-        let mut k = Vec::new();
+    fn delete_data(&self, key: &[u8], start_ts: u64) {
+        let mut k = Vec::with_capacity(layout::composed_len(key));
         layout::data_key(key, start_ts, &mut k);
         self.stage(WriteBatchOp::Delete { key: k });
     }
@@ -197,17 +224,29 @@ impl LarkStorage {
     /// `skip_rollbacks` is the difference between `get_latest_write` and
     /// `get_latest_commit`: the first reports a rollback record, the
     /// second walks past it to the commit it superseded.
-    fn seek_write(&self, key: &str, ts: u64, skip_rollbacks: bool) -> Option<(u64, WriteInfo)> {
-        let mut target = Vec::new();
-        layout::write_seek(key, ts, &mut target);
-        let mut prefix = Vec::new();
-        layout::write_prefix(key, &mut prefix);
-
+    fn seek_write(&self, key: &[u8], ts: u64, skip_rollbacks: bool) -> Option<(u64, WriteInfo)> {
         let mut iter = self.engine.new_iter_latest();
-        iter.seek(&target);
+        with_key(
+            |b| layout::write_seek(key, ts, b),
+            |target| iter.seek(target),
+        );
+        PREFIX_BUF.with(|b| {
+            let mut prefix = b.borrow_mut();
+            layout::write_prefix(key, &mut prefix);
+            self.walk_writes(&mut iter, &prefix, skip_rollbacks)
+        })
+    }
+
+    /// Walk write records for one key, newest first.
+    fn walk_writes(
+        &self,
+        iter: &mut crate::engine::iterator::LarkIterator,
+        prefix: &[u8],
+        skip_rollbacks: bool,
+    ) -> Option<(u64, WriteInfo)> {
         while iter.valid() {
             let k = iter.key()?;
-            if !k.starts_with(&prefix) {
+            if !k.starts_with(prefix) {
                 return None;
             }
             let commit_ts = layout::commit_ts_of(k)?;
@@ -269,7 +308,7 @@ mod tests {
         LockInfo {
             txn_id,
             start_ts,
-            primary_key: "tprimary".into(),
+            primary_key: std::sync::Arc::from(&b"tprimary"[..]),
             lock_type: LockType::Put,
             short_value: None,
         }
@@ -281,9 +320,9 @@ mod tests {
     #[test]
     fn a_second_transaction_cannot_take_a_held_lock() {
         let (_d, s) = storage();
-        s.put_lock("tk", lock(1, 10)).expect("first acquires");
+        s.put_lock(b"tk", lock(1, 10)).expect("first acquires");
         let err = s
-            .put_lock("tk", lock(2, 11))
+            .put_lock(b"tk", lock(2, 11))
             .expect_err("a second transaction must be refused");
         match err {
             kovan_mvcc::MvccError::LockConflict { holder_txn, .. } => {
@@ -291,29 +330,29 @@ mod tests {
             }
             other => panic!("expected LockConflict, got {other:?}"),
         }
-        assert_eq!(s.get_lock("tk").map(|l| l.txn_id), Some(1));
+        assert_eq!(s.get_lock(b"tk").map(|l| l.txn_id), Some(1));
     }
 
     #[test]
     fn a_transaction_may_re_lock_its_own_key() {
         let (_d, s) = storage();
-        s.put_lock("tk", lock(1, 10)).unwrap();
-        s.put_lock("tk", lock(1, 10))
+        s.put_lock(b"tk", lock(1, 10)).unwrap();
+        s.put_lock(b"tk", lock(1, 10))
             .expect("re-prewriting our own key is allowed");
-        s.delete_lock("tk");
-        assert!(s.get_lock("tk").is_none());
-        s.put_lock("tk", lock(2, 11))
+        s.delete_lock(b"tk");
+        assert!(s.get_lock(b"tk").is_none());
+        s.put_lock(b"tk", lock(2, 11))
             .expect("released, so another may take it");
     }
 
     #[test]
     fn data_round_trips_at_its_start_timestamp() {
         let (_d, s) = storage();
-        s.put_data("tk", 7, Arc::new(b"seven".to_vec()));
+        s.put_data(b"tk", 7, Arc::new(b"seven".to_vec()));
         s.flush_staged();
-        assert_eq!(s.get_data("tk", 7).as_deref(), Some(&b"seven".to_vec()));
+        assert_eq!(s.get_data(b"tk", 7).as_deref(), Some(&b"seven".to_vec()));
         assert_eq!(
-            s.get_data("tk", 8),
+            s.get_data(b"tk", 8),
             None,
             "a different version must not answer"
         );
@@ -327,7 +366,7 @@ mod tests {
         let (_d, s) = storage();
         for (commit_ts, start_ts) in [(10u64, 9u64), (20, 19), (30, 29)] {
             s.put_write(
-                "tk",
+                b"tk",
                 commit_ts,
                 WriteInfo {
                     start_ts,
@@ -335,10 +374,10 @@ mod tests {
                 },
             );
         }
-        assert_eq!(s.get_latest_write("tk", 25).map(|(ts, _)| ts), Some(20));
-        assert_eq!(s.get_latest_write("tk", 30).map(|(ts, _)| ts), Some(30));
+        assert_eq!(s.get_latest_write(b"tk", 25).map(|(ts, _)| ts), Some(20));
+        assert_eq!(s.get_latest_write(b"tk", 30).map(|(ts, _)| ts), Some(30));
         assert!(
-            s.get_latest_write("tk", 5).is_none(),
+            s.get_latest_write(b"tk", 5).is_none(),
             "nothing committed that early"
         );
     }
@@ -350,7 +389,7 @@ mod tests {
     fn a_rollback_is_reported_by_one_query_and_skipped_by_the_other() {
         let (_d, s) = storage();
         s.put_write(
-            "tk",
+            b"tk",
             10,
             WriteInfo {
                 start_ts: 9,
@@ -358,7 +397,7 @@ mod tests {
             },
         );
         s.put_write(
-            "tk",
+            b"tk",
             20,
             WriteInfo {
                 start_ts: 19,
@@ -366,9 +405,9 @@ mod tests {
             },
         );
 
-        assert_eq!(s.get_latest_write("tk", 25).map(|(ts, _)| ts), Some(20));
+        assert_eq!(s.get_latest_write(b"tk", 25).map(|(ts, _)| ts), Some(20));
         assert_eq!(
-            s.get_latest_commit("tk", 25).map(|(ts, _)| ts),
+            s.get_latest_commit(b"tk", 25).map(|(ts, _)| ts),
             Some(10),
             "get_latest_commit must walk past the rollback"
         );
@@ -378,7 +417,7 @@ mod tests {
     fn one_keys_writes_do_not_answer_for_another() {
         let (_d, s) = storage();
         s.put_write(
-            "tk",
+            b"tk",
             10,
             WriteInfo {
                 start_ts: 9,
@@ -386,11 +425,11 @@ mod tests {
             },
         );
         assert!(
-            s.get_latest_write("tkk", 99).is_none(),
+            s.get_latest_write(b"tkk", 99).is_none(),
             "a longer key must not match"
         );
         assert!(
-            s.get_latest_write("t", 99).is_none(),
+            s.get_latest_write(b"t", 99).is_none(),
             "a shorter key must not match"
         );
     }
@@ -401,9 +440,9 @@ mod tests {
         {
             let db = crate::Db::open(dir.path(), crate::Options::default()).unwrap();
             let s = LarkStorage::new(db.engine_arc(), DurabilityMode::Immediate);
-            s.put_data("tk", 9, Arc::new(b"v".to_vec()));
+            s.put_data(b"tk", 9, Arc::new(b"v".to_vec()));
             s.put_write(
-                "tk",
+                b"tk",
                 10,
                 WriteInfo {
                     start_ts: 9,
@@ -414,11 +453,11 @@ mod tests {
         }
         let db = crate::Db::open(dir.path(), crate::Options::default()).unwrap();
         let s = LarkStorage::new(db.engine_arc(), DurabilityMode::Immediate);
-        assert_eq!(s.get_latest_write("tk", 99).map(|(ts, _)| ts), Some(10));
-        assert_eq!(s.get_data("tk", 9).as_deref(), Some(&b"v".to_vec()));
+        assert_eq!(s.get_latest_write(b"tk", 99).map(|(ts, _)| ts), Some(10));
+        assert_eq!(s.get_data(b"tk", 9).as_deref(), Some(&b"v".to_vec()));
         // Locks are deliberately not durable.
         assert!(
-            s.get_lock("tk").is_none(),
+            s.get_lock(b"tk").is_none(),
             "locks must not survive a reopen"
         );
     }

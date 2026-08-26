@@ -459,9 +459,9 @@ dependencies = [
 
 [[package]]
 name = "kovan"
-version = "0.1.19"
+version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c140456f1fc2406f9218629ba654ae2f036a3e203eede77ef7ecd5342faecdc"
+checksum = "069314825b47e60f2882bf6fc90ab66e3eb37ee5e4407de6357a124842fc3b26"
 dependencies = [
  "once_cell",
  "portable-atomic",
@@ -469,9 +469,9 @@ dependencies = [
 
 [[package]]
 name = "kovan-channel"
-version = "0.1.19"
+version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7680bd3185bff7523acb534cd228db7072025510e56fc8917b453da00c0fd083"
+checksum = "0d105d382f56b3e8ece40ef1de7246205a419513333ac71e42832766240d8a47"
 dependencies = [
  "crossbeam-utils",
  "kovan",
@@ -480,9 +480,9 @@ dependencies = [
 
 [[package]]
 name = "kovan-map"
-version = "0.1.19"
+version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b60bb6145728c18ed9e1f8aa87941d634a52ce4d30106f906ef33280e304d10"
+checksum = "aaba93d80fa57cdb3525198c0b61abeeb689ec0ac346b6d8da6a7c108bf608d4"
 dependencies = [
  "foldhash",
  "kovan",
@@ -490,9 +490,9 @@ dependencies = [
 
 [[package]]
 name = "kovan-mvcc"
-version = "0.1.19"
+version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68ddee5bae9752106b9b782861903a9c8d3cf6c10bb8d8128892f2c388a06472"
+checksum = "43bda37cfe1a4e6a1cf6737aaab3f601b0a245098beaa2c278630beadb8eec5b"
 dependencies = [
  "kovan",
  "kovan-map",
@@ -502,9 +502,9 @@ dependencies = [
 
 [[package]]
 name = "kovan-queue"
-version = "0.1.19"
+version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f65d628b7fbb4bc0b6b82f3915c21f586f87bd4cbde9960fe69e21f07a52b089"
+checksum = "f1f72e2bdab247e2f7d53e41bcd2abd6a53daac69727511d1223abf41f0c9b7f"
 dependencies = [
  "crossbeam-utils",
  "kovan",
@@ -1088,7 +1088,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys",

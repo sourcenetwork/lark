@@ -39,7 +39,7 @@ fn a_checkpoint_holds_every_write_acknowledged_before_its_capture() {
     let mut acked: Vec<(u64, u64)> = Vec::new();
     for i in 0..600u64 {
         let mut batch = WriteBatch::new();
-        batch.put(&key(i), &vec![b'v'; 128]);
+        batch.put(&key(i), &[b'v'; 128]);
         let seq = db.write_sequenced(batch).expect("write");
         acked.push((i, seq));
     }
@@ -111,7 +111,7 @@ fn a_checkpoint_under_concurrent_writers_holds_its_acknowledged_prefix() {
             while !stop.load(Ordering::Relaxed) {
                 let k = w * 1_000_000 + i;
                 let mut batch = WriteBatch::new();
-                batch.put(&key(k), &vec![b'v'; 96]);
+                batch.put(&key(k), &[b'v'; 96]);
                 match db.write_sequenced(batch) {
                     Ok(seq) => acked.lock().expect("lock").push((k, seq)),
                     Err(e) => panic!("write failed: {e}"),

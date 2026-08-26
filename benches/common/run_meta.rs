@@ -137,10 +137,10 @@ pub fn host() -> Json {
 fn proc_field(path: &str, field: &str) -> Option<String> {
     let text = fs::read_to_string(path).ok()?;
     for line in text.lines() {
-        if let Some(rest) = line.strip_prefix(field) {
-            if let Some(v) = rest.trim_start().strip_prefix(':') {
-                return Some(v.trim().to_string());
-            }
+        if let Some(rest) = line.strip_prefix(field)
+            && let Some(v) = rest.trim_start().strip_prefix(':')
+        {
+            return Some(v.trim().to_string());
         }
     }
     None
@@ -210,11 +210,10 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 /// A run file is append-only once published, so an existing path is an error
 /// rather than an overwrite.
 pub fn write_new(path: &Path, body: &str) {
-    if let Some(dir) = path.parent() {
-        if !dir.as_os_str().is_empty() {
-            fs::create_dir_all(dir)
-                .unwrap_or_else(|e| die(&format!("create {}: {e}", dir.display())));
-        }
+    if let Some(dir) = path.parent()
+        && !dir.as_os_str().is_empty()
+    {
+        fs::create_dir_all(dir).unwrap_or_else(|e| die(&format!("create {}: {e}", dir.display())));
     }
     let mut f = match fs::OpenOptions::new()
         .write(true)

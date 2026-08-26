@@ -41,10 +41,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 # arena skip list (`src/engine/skiplist.rs`).
 crossbeam-epoch = "0.9"
 crossbeam-skiplist = "0.1"
-kovan-map = "0.1.19"
-kovan-mvcc = "0.1.19"
-kovan-queue = "0.1.19"
-kovan-channel = "0.1.19"
+kovan-map = "0.1.20"
+kovan-mvcc = "0.1.20"
+kovan-queue = "0.1.20"
+kovan-channel = "0.1.20"
 
 # `fallback` supplies `AtomicU64` on 32-bit targets that have no
 # 64-bit atomic instruction; `require-cas` turns a target with no

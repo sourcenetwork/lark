@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::options::{CompactionDecision, CompactionFilter};
-use crate::{Db, DbSlice, Error, Options, Result, WriteBatch, WriteBatchOp};
+use crate::{Db, DbSlice, Options, Result, WriteBatch, WriteBatchOp};
 
 const LEGACY_TS_LEN: usize = 4;
 /// Identifier stamped into a TTL-carrying value. Values written by an
@@ -388,9 +388,6 @@ impl WriteBatch {
 }
 
 // `Error` is plumbed via `crate::Result`; silence unused-import lint
-// in case Error becomes unreferenced after a future refactor.
-#[allow(dead_code)]
-type _ErrorAlias = Error;
 
 #[cfg(test)]
 mod tests {

@@ -83,14 +83,6 @@ impl InlineBuf {
         }
     }
 
-    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
-        if self.spilled {
-            &mut self.spill
-        } else {
-            &mut self.inline[..self.len]
-        }
-    }
-
     pub(crate) fn len(&self) -> usize {
         self.len
     }
@@ -164,19 +156,6 @@ impl LookupKey {
 
     pub(crate) fn snapshot_seq(&self) -> u64 {
         self.snapshot_seq
-    }
-
-    /// Overwrite the 8-byte sequence trailer in place, so moving a probe
-    /// to a different snapshot costs a store rather than a re-encode.
-    ///
-    /// Part of the read-path key contract and exercised by this module's
-    /// tests; the seek paths that probe at `u64::MAX` and then at a real
-    /// snapshot are the callers it exists for.
-    #[allow(dead_code)]
-    pub(crate) fn set_snapshot_seq(&mut self, seq: u64) {
-        let user_end = self.user_end;
-        self.buf.as_mut_slice()[user_end..user_end + 8].copy_from_slice(&(!seq).to_be_bytes());
-        self.snapshot_seq = seq;
     }
 
     /// Re-point at a different user key, reusing the buffer.
@@ -311,20 +290,6 @@ mod tests {
             prop_assert_eq!(lk.internal(), expected_internal.as_slice());
             prop_assert_eq!(lk.prefixed_user_key(), expected_prefixed.as_slice());
             prop_assert_eq!(lk.snapshot_seq(), seq);
-        }
-
-        #[test]
-        fn set_snapshot_seq_equals_rebuild(
-            cf_id in any::<u32>(),
-            key in proptest::collection::vec(any::<u8>(), 0..512),
-            first in any::<u64>(),
-            second in any::<u64>(),
-        ) {
-            let mut lk = LookupKey::new(cf_id, &key, first);
-            lk.set_snapshot_seq(second);
-            let rebuilt = LookupKey::new(cf_id, &key, second);
-            prop_assert_eq!(lk.internal(), rebuilt.internal());
-            prop_assert_eq!(lk.snapshot_seq(), second);
         }
 
         #[test]
