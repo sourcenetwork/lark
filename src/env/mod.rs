@@ -246,6 +246,26 @@ pub trait WriteFile: Send {
     /// Append every byte of `buf`.
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()>;
 
+    /// Append every byte of every slice, in order, as one operation where
+    /// the host supports it.
+    ///
+    /// The default implementation writes the slices one at a time, which is
+    /// always correct. An environment backed by a POSIX file overrides this
+    /// with `writev` so a record assembled from a header, a payload and a
+    /// trailer costs one syscall rather than one per piece. That matters on
+    /// the WAL path, where a payload at or above the buffer capacity would
+    /// otherwise force the 5-byte header out in a syscall of its own.
+    ///
+    /// This is a throughput and syscall-count optimization, NOT an atomicity
+    /// guarantee: a vectored write can still be torn by a crash, exactly as a
+    /// sequential one can. Recovery must still tolerate a torn tail.
+    fn write_all_vectored(&mut self, slices: &[&[u8]]) -> io::Result<()> {
+        for slice in slices {
+            self.write_all(slice)?;
+        }
+        Ok(())
+    }
+
     /// Push buffered bytes to the host. Does not imply durability.
     fn flush(&mut self) -> io::Result<()>;
 

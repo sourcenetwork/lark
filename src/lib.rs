@@ -611,6 +611,7 @@ impl Db {
                 disable_wal,
             )
             .map_err(Error::from)
+            .map(|_| ())
     }
 
     /// Delete a key from the default column family using the
@@ -633,6 +634,7 @@ impl Db {
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
             .apply_grouped_batch(batch, Vec::new(), Vec::new(), dm, disable_wal)
+            .map(|_| ())
             .map_err(Error::from)
     }
 
@@ -664,6 +666,7 @@ impl Db {
                 dm,
                 disable_wal,
             )
+            .map(|_| ())
             .map_err(Error::from)
     }
 
@@ -710,6 +713,7 @@ impl Db {
                 dm,
                 disable_wal,
             )
+            .map(|_| ())
             .map_err(Error::from)
     }
 
@@ -722,13 +726,49 @@ impl Db {
     /// Apply a batch of writes atomically with an explicit
     /// [`WriteOptions`] override.
     ///
-    /// An empty batch is still a write: a read-only or closed handle
-    /// rejects it with [`Error::ReadOnly`] or [`Error::Closed`] rather
-    /// than returning `Ok`.
+    /// Apply a batch and return the sequence it committed at.
+    ///
+    /// The returned sequence is the engine's visibility horizon once the batch
+    /// is durable and applied: a [`Snapshot`] taken afterwards reports at least
+    /// this value from [`Snapshot::sequence`], and one taken before reports
+    /// less. An upper layer can therefore order its own versions against lark's
+    /// without holding a lock across the write, because the horizon publishes
+    /// atomically inside this call.
+    ///
+    /// An empty batch commits nothing and returns the current horizon.
+    pub fn write_sequenced(&self, batch: WriteBatch) -> Result<u64> {
+        self.write_sequenced_opt(&WriteOptions::default(), batch)
+    }
+
+    /// [`Db::write_sequenced`] with explicit [`WriteOptions`].
+    pub fn write_sequenced_opt(&self, opts: &WriteOptions, batch: WriteBatch) -> Result<u64> {
+        self.write_opt_inner(opts, batch)
+    }
+
+    /// The newest sequence visible to a snapshot taken now.
+    ///
+    /// Monotonic and never decreasing for an open database.
+    pub fn latest_sequence(&self) -> u64 {
+        self.engine.snapshot_seq()
+    }
+
+    /// Apply a batch of writes atomically with explicit [`WriteOptions`].
+    ///
+    /// Use [`Db::write_sequenced_opt`] instead when the caller needs the
+    /// sequence the batch committed at.
     pub fn write_opt(&self, opts: &WriteOptions, batch: WriteBatch) -> Result<()> {
+        self.write_opt_inner(opts, batch).map(|_| ())
+    }
+
+    fn write_opt_inner(&self, opts: &WriteOptions, batch: WriteBatch) -> Result<u64> {
+        // Checked before the empty-batch shortcut: an empty batch is
+        // still a write, so a read-only or closed handle rejects it
+        // rather than reporting a horizon it could not have advanced.
         self.ensure_writable()?;
         if batch.is_empty() {
-            return Ok(());
+            // Nothing committed: report the current horizon, which is what a
+            // snapshot taken now would read at.
+            return Ok(self.engine.snapshot_seq());
         }
         self.validate_batch_cf_liveness(&batch)?;
         self.validate_batch_sizes(&batch)?;
@@ -1436,6 +1476,7 @@ impl Db {
         batch.insert(meta::next_id_key(), Some(next_id.to_be_bytes().to_vec()));
         self.engine
             .apply_grouped_batch(batch, Vec::new(), Vec::new(), self.durability, false)
+            .map(|_| ())
             .map_err(Error::from)?;
         Ok(handle)
     }
@@ -1471,6 +1512,7 @@ impl Db {
         let range_deletes = vec![(lo, hi)];
         self.engine
             .apply_grouped_batch(point_ops, range_deletes, Vec::new(), self.durability, false)
+            .map(|_| ())
             .map_err(Error::from)?;
         self.cfs.remove(cf.name());
         Ok(())
@@ -1503,6 +1545,7 @@ impl Db {
         batch.insert(prefix_key(cf.id(), key), Some(value.to_vec()));
         self.engine
             .apply_grouped_batch(batch, Vec::new(), Vec::new(), self.durability, false)
+            .map(|_| ())
             .map_err(Error::from)
     }
 
@@ -1515,6 +1558,7 @@ impl Db {
         batch.insert(prefix_key(cf.id(), key), None);
         self.engine
             .apply_grouped_batch(batch, Vec::new(), Vec::new(), self.durability, false)
+            .map(|_| ())
             .map_err(Error::from)
     }
 
@@ -1539,6 +1583,7 @@ impl Db {
                 self.durability,
                 false,
             )
+            .map(|_| ())
             .map_err(Error::from)
     }
 
@@ -1556,6 +1601,7 @@ impl Db {
                 self.durability,
                 false,
             )
+            .map(|_| ())
             .map_err(Error::from)
     }
 
@@ -1929,6 +1975,18 @@ impl Snapshot {
 
     fn is_live_cf_handle(&self, cf: &ColumnFamilyHandle) -> bool {
         self.cfs.is_live_handle(cf)
+    }
+
+    /// The engine sequence this snapshot reads at.
+    ///
+    /// Every write with a sequence at or below this value is visible here, and
+    /// every later write is not. Pairs with [`Db::write_sequenced`], which
+    /// returns the sequence a batch committed at, so an upper layer can order
+    /// its own versions against lark's without serializing commits behind a
+    /// lock of its own: the horizon publishes atomically inside the write, and
+    /// a snapshot captures it atomically here.
+    pub fn sequence(&self) -> u64 {
+        self.seq
     }
 
     /// Get the value for a key at this snapshot (default CF).

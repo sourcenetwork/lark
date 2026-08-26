@@ -255,6 +255,34 @@ struct StdWriteFile {
 }
 
 impl WriteFile for StdWriteFile {
+    /// One `writev` for the whole record. `write_all_vectored` on a POSIX file
+    /// is the syscall this exists for: without it, a WAL payload at or above
+    /// the buffer capacity forces the 5-byte header out in a syscall of its
+    /// own, so one record costs two writes and leaves a wider window between
+    /// the header and the payload.
+    fn write_all_vectored(&mut self, slices: &[&[u8]]) -> io::Result<()> {
+        use std::io::IoSlice;
+        let mut bufs: Vec<IoSlice<'_>> = slices
+            .iter()
+            .filter(|s| !s.is_empty())
+            .map(|s| IoSlice::new(s))
+            .collect();
+        let mut rest = &mut bufs[..];
+        while !rest.is_empty() {
+            let n = self.file.write_vectored(rest)?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "vectored write made no progress",
+                ));
+            }
+            // A short vectored write is normal: advance past the slices it
+            // consumed and re-issue the remainder.
+            IoSlice::advance_slices(&mut rest, n);
+        }
+        Ok(())
+    }
+
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         self.file.write_all(buf)
     }

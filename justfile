@@ -199,6 +199,10 @@ stress secs="600":
 
 # ---------- consistency ----------
 
+# Elle consistency checking. NOT WIRED UP YET: needs `harness/elle`, a
+# history generator that drives lark and emits an Elle history, plus
+# `elle-cli.jar` beside it. Neither is in the tree, so this recipe fails
+# until they are added; it is here as the interface they must satisfy.
 elle model="list-append":
     cargo run --release --manifest-path harness/elle/Cargo.toml -- \
         --model {{model}} --out /tmp/lark-history.json

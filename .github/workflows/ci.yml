@@ -311,3 +311,86 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run ignored tests (stress / soak / concurrency)
         run: cargo test --workspace --release -- --ignored --nocapture
+
+  # Durability, split out from `test` because it fails for different
+  # reasons and is worth reading on its own: crash recovery, power loss,
+  # the fault shim, the lifecycle sweep and the MVCC invariants.
+  durability:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Crash recovery
+        run: cargo test --test crash_recovery
+      - name: Power loss
+        run: cargo test --test power_loss -- --skip crash_child --nocapture
+      - name: Fault injection smoke
+        run: cargo test --test fault_smoke
+      - name: Lifecycle
+        run: cargo test --test lifecycle -- --skip crash_child
+      - name: MVCC invariants
+        run: cargo test --test mvcc_invariants -- --skip crash_child
+
+  # The exhaustive halves of the same families. Every truncation offset
+  # and every bit flip is a large cross product, so these run nightly
+  # rather than on every PR.
+  durability-exhaustive:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Exhaustive corruption sweep
+        run: cargo test --release --test corruption_exhaustive -- --ignored --skip crash_child --nocapture
+      - name: Model-based durability proptest
+        run: cargo test --release --test proptest_durability -- --ignored --skip crash_child --nocapture
+      - name: Resource limits
+        run: cargo test --release --test resource_limits -- --ignored --nocapture --test-threads=1
+
+  # Browser wasm. `wasm-wasip1` above covers the wasi target, which has a
+  # real `std::fs`; this covers `wasm32-unknown-unknown`, which has no
+  # filesystem at all and reaches storage through OPFS. OPFS's
+  # `createSyncAccessHandle` only exists inside a Web Worker, so there is
+  # no way to exercise it without a real browser.
+  wasm-browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: jetli/wasm-pack-action@v0.4.0
+      - name: OPFS round trip in headless Firefox
+        run: wasm-pack test --headless --firefox
+
+  # Fuzz targets, smoke-run for a bounded time so a harness that stopped
+  # building is caught. Finding new crashes is the nightly job's work,
+  # not a gate on a PR.
+  fuzz:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_wal_decoder
+          - fuzz_sst_decoder
+          - fuzz_block_decoder
+          - fuzz_manifest_decoder
+          - fuzz_range_tombstone_decoder
+          - fuzz_writebatch
+          - fuzz_api_ops
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-fuzz --locked
+      - name: Fuzz ${{ matrix.target }}
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300

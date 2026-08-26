@@ -110,13 +110,6 @@ fn clone_io_error(err: &io::Error) -> io::Error {
     io::Error::new(err.kind(), err.to_string())
 }
 
-fn clone_result(result: &io::Result<()>) -> io::Result<()> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(err) => Err(clone_io_error(err)),
-    }
-}
-
 /// Empty a staged group, telling anyone still in it that their write did
 /// not land.
 ///
@@ -158,10 +151,10 @@ impl LarkEngine {
         ops: Vec<WriteBatchOp>,
         durability: DurabilityMode,
         disable_wal: bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<u64> {
         self.ensure_writable()?;
         if ops.is_empty() {
-            return Ok(());
+            return Ok(self.visible_seq.visible());
         }
         self.validate_ops_sizes(&ops)?;
         self.submit(WriteRequest::Batch {
@@ -180,7 +173,7 @@ impl LarkEngine {
         merges: Vec<(Vec<u8>, Vec<u8>)>,
         durability: DurabilityMode,
         disable_wal: bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<u64> {
         let ops = grouped_batch_ops(point_ops, range_deletes, merges);
         self.apply_batch(ops, durability, disable_wal)
     }
@@ -194,7 +187,7 @@ impl LarkEngine {
         value: Vec<u8>,
         durability: DurabilityMode,
         disable_wal: bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<u64> {
         self.ensure_writable()?;
         self.validate_prefixed_key_size(&key)?;
         self.validate_value_size(&value)?;
@@ -261,12 +254,12 @@ impl LarkEngine {
         });
         let result = self.run_and_complete(&mut pipe);
         self.drain_locked(&mut pipe);
-        result.map(|()| CommitOutcome::Ok)
+        result.map(|_| CommitOutcome::Ok)
     }
 
     /// Hand `request` to the commit pipeline and block until its group is
     /// durable and applied, or until that group fails.
-    fn submit(&self, request: WriteRequest) -> io::Result<()> {
+    fn submit(&self, request: WriteRequest) -> io::Result<u64> {
         // Uncontended path: nobody is committing, so lead a group carrying
         // this request plus anything already queued behind it. One fsync
         // covers all of it.
@@ -309,7 +302,7 @@ impl LarkEngine {
     /// Lead a group whose first member is the caller's own `request`, then
     /// drain anything that arrived while it ran. Returns that request's
     /// outcome.
-    pub(super) fn lead_with(&self, pipe: &mut Pipeline, request: WriteRequest) -> io::Result<()> {
+    pub(super) fn lead_with(&self, pipe: &mut Pipeline, request: WriteRequest) -> io::Result<u64> {
         release_stranded(&mut pipe.group);
         pipe.group.push(GroupTicket {
             slot: None,
@@ -400,13 +393,24 @@ impl LarkEngine {
     ///
     /// Completion happens after [`Self::run_group`] has published the read
     /// horizon (G1) and hands the same outcome to every member (G2).
-    fn run_and_complete(&self, pipe: &mut Pipeline) -> io::Result<()> {
+    fn run_and_complete(&self, pipe: &mut Pipeline) -> io::Result<u64> {
         let Pipeline { stage, group } = pipe;
         let result = self.run_group(stage, group);
+        // Each ticket learns the sequence *its own* operations were
+        // assigned, not the group's maximum. An upper layer ordering its
+        // versions against lark's needs the sequence of the write it
+        // made, and a group can carry many writers' batches.
+        let mut seq = result.as_ref().ok().copied().unwrap_or(0);
         for ticket in group.drain(..) {
+            let ops = ticket.request.op_count();
+            let last = seq.saturating_add(ops).saturating_sub(1);
             if let Some(slot) = ticket.slot {
-                slot.complete(clone_result(&result));
+                slot.complete(match &result {
+                    Ok(_) => Ok(last),
+                    Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
+                });
             }
+            seq = last.saturating_add(1);
         }
         // The staging buffer is reused, never reallocated, but a request
         // larger than a whole group's cap would otherwise park its peak
@@ -420,7 +424,7 @@ impl LarkEngine {
     }
 
     /// Write, sync and apply one group.
-    fn run_group(&self, stage: &mut Vec<u8>, group: &[GroupTicket]) -> io::Result<()> {
+    fn run_group(&self, stage: &mut Vec<u8>, group: &[GroupTicket]) -> io::Result<u64> {
         self.ensure_writable()?;
         // Ahead of the WAL append on purpose: a rotation swaps the WAL as
         // well as the memtable, so rotating after this group's records
@@ -431,7 +435,7 @@ impl LarkEngine {
 
         let total_ops: u64 = group.iter().map(|t| t.request.op_count()).sum();
         if total_ops == 0 {
-            return Ok(());
+            return Ok(self.visible_seq.visible());
         }
 
         // The whole group's sequence range is allocated here, in group
@@ -503,8 +507,7 @@ impl LarkEngine {
         // every operation is applied, and `run_and_complete` releases the
         // followers only after this returns.
         self.visible_seq.publish(base_seq + total_ops - 1);
-
-        Ok(())
+        Ok(base_seq)
     }
 
     /// Discard a group whose WAL work failed.

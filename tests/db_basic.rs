@@ -465,3 +465,72 @@ fn write_batch_range_delete_hides_every_key_in_range() {
     assert_eq!(db.get(b"e").unwrap(), None);
     assert_eq!(db.get(b"z").unwrap(), Some(b"keep_after".to_vec()));
 }
+
+/// The sequence API is what lets an upper layer order its own versions against
+/// lark's without holding a lock across a commit: the horizon publishes inside
+/// the write, and a snapshot captures it atomically.
+#[test]
+fn sequences_order_snapshots_against_commits() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open(dir.path(), Options::default()).unwrap();
+
+    let before = db.latest_sequence();
+    let snap_before = db.snapshot();
+    assert_eq!(snap_before.sequence(), before);
+
+    let mut batch = WriteBatch::new();
+    batch.put(b"a", b"1");
+    batch.put(b"b", b"2");
+    let commit = db.write_sequenced(batch).unwrap();
+    assert!(commit > before, "a commit must advance the horizon");
+
+    // The snapshot taken before the commit must not see it, and must still
+    // report its own older sequence.
+    assert_eq!(snap_before.sequence(), before);
+    assert_eq!(snap_before.get(b"a").unwrap(), None);
+
+    // One taken after sees it, and reports at least the commit sequence.
+    let snap_after = db.snapshot();
+    assert!(snap_after.sequence() >= commit);
+    assert_eq!(snap_after.get(b"a").unwrap(), Some(b"1".to_vec()));
+
+    // An empty batch commits nothing and reports the current horizon.
+    let idle = db.write_sequenced(WriteBatch::new()).unwrap();
+    assert_eq!(idle, db.latest_sequence());
+}
+
+/// Concurrent writers must each learn the sequence their own batch landed at,
+/// and those sequences must be distinct: that is what removes the need for an
+/// external commit lock.
+#[test]
+fn concurrent_commits_report_distinct_sequences() {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    let db = Arc::new(Db::open(dir.path(), Options::default()).unwrap());
+    let mut handles = Vec::new();
+    for t in 0..8u32 {
+        let db = Arc::clone(&db);
+        handles.push(std::thread::spawn(move || {
+            let mut seqs = Vec::new();
+            for i in 0..50u32 {
+                let mut batch = WriteBatch::new();
+                batch.put(format!("k{t}_{i}").as_bytes(), b"v");
+                seqs.push(db.write_sequenced(batch).unwrap());
+            }
+            seqs
+        }));
+    }
+    let all: Vec<u64> = handles
+        .into_iter()
+        .flat_map(|h| h.join().unwrap())
+        .collect();
+    let unique: HashSet<u64> = all.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        all.len(),
+        "every commit must get its own sequence"
+    );
+    assert_eq!(db.latest_sequence(), *all.iter().max().unwrap());
+}

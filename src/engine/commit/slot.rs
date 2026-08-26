@@ -21,7 +21,7 @@ const SLOT_DONE: u8 = 2;
 
 struct SlotPayload {
     request: WriteRequest,
-    outcome: Option<io::Result<()>>,
+    outcome: Option<io::Result<u64>>,
 }
 
 /// One writer thread's handoff slot, created once and reused for every
@@ -75,7 +75,7 @@ impl WriteSlot {
     }
 
     /// Leader side: record the group's outcome and release the writer.
-    pub(super) fn complete(&self, outcome: io::Result<()>) {
+    pub(super) fn complete(&self, outcome: io::Result<u64>) {
         self.payload.lock().outcome = Some(outcome);
         self.state.store(SLOT_DONE, Ordering::Release);
         self.thread.unpark();
@@ -86,7 +86,7 @@ impl WriteSlot {
     }
 
     /// Writer side: collect the outcome and return the slot to service.
-    pub(super) fn finish(&self) -> io::Result<()> {
+    pub(super) fn finish(&self) -> io::Result<u64> {
         let outcome = self.payload.lock().outcome.take();
         self.state.store(SLOT_IDLE, Ordering::Release);
         outcome.unwrap_or_else(|| Err(io::Error::other("commit slot completed with no outcome")))
@@ -128,7 +128,7 @@ mod tests {
         let taken = slot.take_request();
         assert_eq!(taken.op_count(), 1);
 
-        slot.complete(Ok(()));
+        slot.complete(Ok(7));
         assert!(slot.is_done());
         assert!(slot.finish().is_ok());
         // Back in service for the next write on this thread.
