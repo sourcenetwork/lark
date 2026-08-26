@@ -151,8 +151,10 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
     let bad: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let mask = env("LARK_CHAOS_MASK", 0b1111);
     let enabled = |bit: u64| mask & bit != 0;
+    // `1 +` is the stall probe below, which is spawned unconditionally.
     let chaos_threads = 1 + [1u64, 2, 4, 8].iter().filter(|b| enabled(**b)).count();
-    let gate = Arc::new(Barrier::new(WRITERS + readers() + chaos_threads + 1));
+    let gate_participants = WRITERS + readers() + chaos_threads + 1;
+    let gate = Arc::new(Barrier::new(gate_participants));
     let mut handles = Vec::new();
 
     for w in 0..WRITERS {
@@ -325,7 +327,12 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
     {
         let (db, stop) = (Arc::clone(&db), Arc::clone(&stop));
         let live = Arc::clone(&live);
+        let gate = Arc::clone(&gate);
         handles.push(thread::spawn(move || {
+            // Counted by the `1 +` in `chaos_threads`, so it must reach
+            // the gate: a participant the barrier is sized for but that
+            // never arrives wedges every other thread forever.
+            gate.wait();
             let mut ticks = 0u32;
             while !stop.load(Ordering::Relaxed) && live.load(Ordering::Acquire) > 0 {
                 thread::sleep(Duration::from_secs(5));
@@ -371,6 +378,20 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
             None
         })
     };
+
+    // Every gate participant is also pushed into `handles`, and the
+    // watchdog is not, so this is the whole invariant. A barrier sized
+    // for a thread that never arrives is a permanent, silent wedge -
+    // exactly what happened when the stall probe was added and counted
+    // here without being given a `gate.wait()`. Fail loudly here
+    // instead, before anything blocks.
+    assert_eq!(
+        handles.len() + 1,
+        gate_participants,
+        "barrier is sized for {gate_participants} threads but {} will reach it \
+         (+1 coordinator); every thread counted by the gate must call gate.wait()",
+        handles.len(),
+    );
 
     gate.wait();
     for h in handles.drain(..) {
