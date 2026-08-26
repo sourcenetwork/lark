@@ -1412,17 +1412,6 @@ impl SsTableReader {
         Ok(leaf)
     }
 
-    /// Open an SSTable file through the standard environment.
-    #[cfg(test)]
-    pub(crate) fn open(path: &Path, file_id: u64) -> io::Result<Self> {
-        Self::open_with(
-            &crate::env::std_env(),
-            path,
-            file_id,
-            MetadataPolicy::Pinned,
-        )
-    }
-
     #[cfg(test)]
     fn index_leaf_read_count(&self) -> usize {
         self.index_leaf_reads.load(Ordering::Relaxed)
@@ -2704,7 +2693,7 @@ mod tests {
             let reader = SsTableReader::open(&path, 1).unwrap();
             assert!(reader.meta_checksummed);
             assert_eq!(reader.partitioned, partitioned);
-            assert!(table_carries_data(&path).unwrap());
+            assert!(table_carries_data(&*crate::env::std_env(), &path).unwrap());
         }
     }
 
@@ -2829,7 +2818,7 @@ mod tests {
         fs::write(&path, [0u8; 4]).unwrap();
         let reader = SsTableReader {
             file: crate::env::std_env().open_read(&path).unwrap(),
-            file_size: FOOTER_SIZE as u64 + 4,
+            data_end: 4,
             file_id: 1,
             index: MetaSlot::Pinned(Arc::new(
                 IndexBlock::decode(0u32.to_le_bytes().to_vec()).unwrap(),
@@ -3456,8 +3445,8 @@ mod tests {
 
             let pinned_cache = BlockCache::new(1024 * 1024);
             let cached_cache = BlockCache::new(1024 * 1024);
-            let pinned = SsTableReader::open_with(&path, 1, MetadataPolicy::Pinned).unwrap();
-            let cached = SsTableReader::open_with(&path, 1, MetadataPolicy::Cached).unwrap();
+            let pinned = SsTableReader::open_with(&crate::env::std_env(), &path, 1, MetadataPolicy::Pinned).unwrap();
+            let cached = SsTableReader::open_with(&crate::env::std_env(), &path, 1, MetadataPolicy::Cached).unwrap();
 
             for probe in ["k_0000", "k_0123", "k_0299", "k_9999"] {
                 let a = probe_get(&pinned, probe.as_bytes(), u64::MAX, &pinned_cache).unwrap();
@@ -3477,8 +3466,8 @@ mod tests {
         let path = dir.path().join("charge.sst");
         write_flat_fixture(&path);
 
-        let pinned = SsTableReader::open_with(&path, 1, MetadataPolicy::Pinned).unwrap();
-        let cached = SsTableReader::open_with(&path, 2, MetadataPolicy::Cached).unwrap();
+        let pinned = SsTableReader::open_with(&crate::env::std_env(), &path, 1, MetadataPolicy::Pinned).unwrap();
+        let cached = SsTableReader::open_with(&crate::env::std_env(), &path, 2, MetadataPolicy::Cached).unwrap();
         assert!(
             pinned.pinned_metadata_bytes() > cached.pinned_metadata_bytes(),
             "the cached reader must hold less outside the budget"
@@ -3510,7 +3499,7 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
 
         for policy in [MetadataPolicy::Pinned, MetadataPolicy::Cached] {
-            let err = match SsTableReader::open_with(&path, 1, policy) {
+            let err = match SsTableReader::open_with(&crate::env::std_env(), &path, 1, policy) {
                 Err(e) => e,
                 Ok(_) => panic!("a corrupt index must fail the open under either policy"),
             };
@@ -3528,7 +3517,7 @@ mod tests {
         // region of a 500-entry file are both larger than that, so both
         // inserts are refused.
         let cache = BlockCache::with_config(512, 0, true);
-        let reader = SsTableReader::open_with(&path, 1, MetadataPolicy::Cached).unwrap();
+        let reader = SsTableReader::open_with(&crate::env::std_env(), &path, 1, MetadataPolicy::Cached).unwrap();
         assert_eq!(reader.pinned_metadata_bytes(), 0);
 
         for i in 0..64 {

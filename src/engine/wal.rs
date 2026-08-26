@@ -181,6 +181,12 @@ impl Wal {
         })
     }
 
+    /// Create a WAL through the standard environment.
+    #[cfg(test)]
+    pub(crate) fn create(path: &Path) -> io::Result<Self> {
+        Self::create_in(&crate::env::std_env(), path)
+    }
+
     /// Append one fully-formed group of records with a single
     /// `write_all`, and advance the tracked offset.
     ///
@@ -322,12 +328,6 @@ impl Wal {
             entries.push(entry);
         }
         Ok(entries)
-    }
-
-    /// Replay a WAL file through the standard environment.
-    #[cfg(test)]
-    pub(crate) fn replay(path: &Path) -> io::Result<Vec<WalEntry>> {
-        Self::replay_in(&*crate::env::std_env(), path)
     }
 
     /// Delete a WAL file from `env`.

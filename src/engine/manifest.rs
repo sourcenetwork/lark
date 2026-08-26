@@ -344,10 +344,6 @@ impl VersionSet {
     /// recovery every SSTable referenced by the manifest is opened
     /// eagerly so the returned version is fully populated with live
     /// readers.
-    #[cfg(any(test, feature = "fuzzing"))]
-    pub(crate) fn open(db_dir: &Path, sst_dir: &Path) -> io::Result<Self> {
-        Self::open_with_policy(db_dir, sst_dir, MetadataPolicy::Pinned)
-    }
 
     /// [`VersionSet::open`] with an explicit policy for how the readers
     /// it opens hold their index and filter blocks.
@@ -398,7 +394,7 @@ impl VersionSet {
 
     /// Create or recover a VersionSet through the standard
     /// environment.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzzing"))]
     pub(crate) fn open(db_dir: &Path, sst_dir: &Path) -> io::Result<Self> {
         Self::open_with_policy(
             &crate::env::std_env(),
@@ -845,11 +841,6 @@ impl VersionSet {
         Ok(ManifestReplay { version, valid_len })
     }
 
-    /// Replay manifest bytes through the standard environment.
-    #[cfg(test)]
-    fn replay_manifest(data: &[u8], sst_dir: &Path) -> io::Result<ManifestReplay> {
-        Self::replay_manifest_in(&crate::env::std_env(), data, sst_dir)
-    }
 }
 
 #[cfg(test)]
@@ -935,7 +926,7 @@ mod tests {
         data.extend_from_slice(&checksum::legacy_payload_u32(&record).to_le_bytes());
 
         let replay =
-            VersionSet::replay_manifest(&data, dir.path(), MetadataPolicy::Pinned).unwrap();
+            VersionSet::replay_manifest(&crate::env::std_env(), &data, dir.path(), MetadataPolicy::Pinned).unwrap();
         assert_eq!(replay.version.last_seq, 7);
         assert_eq!(replay.valid_len, data.len());
     }

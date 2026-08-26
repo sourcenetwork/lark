@@ -12,7 +12,6 @@
 // suite lives in tests/wasm_opfs*.rs.
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
