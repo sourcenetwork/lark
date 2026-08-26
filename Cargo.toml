@@ -78,6 +78,7 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3.8"
 
 # tokio carries its own `cfg(loom)` arms and does not build under this
@@ -113,4 +114,48 @@ opt-level = 3
 
 [[bench]]
 name = "allocs"
+harness = false
+
+[[bench]]
+name = "point_read"
+harness = false
+
+[[bench]]
+name = "write_durable"
+harness = false
+
+[[bench]]
+name = "write_buffered"
+harness = false
+
+[[bench]]
+name = "scan"
+harness = false
+
+[[bench]]
+name = "batch"
+harness = false
+
+[[bench]]
+name = "transaction"
+harness = false
+
+[[bench]]
+name = "large_value"
+harness = false
+
+[[bench]]
+name = "memory"
+harness = false
+
+[[bench]]
+name = "soak"
+harness = false
+
+[[bench]]
+name = "size"
+harness = false
+
+[[bench]]
+name = "collect"
 harness = false
