@@ -5,7 +5,7 @@
 //! match the ones in the completion record even when an optimistic
 //! transaction has to be replayed.
 
-use lark_kv::{
+use lark_kv::{IsolationLevel, 
     Db, OptimisticTransactionDb, Options, Transaction, TransactionDb, TransactionError, TxResult,
 };
 use std::path::Path;
@@ -157,9 +157,17 @@ impl TxDb {
     pub fn open(path: &Path, isolation: Isolation, opts: Options) -> lark_kv::Result<Self> {
         match isolation {
             Isolation::ReadCommitted => Ok(TxDb::Pessimistic(TransactionDb::open(path, opts)?)),
-            Isolation::RepeatableRead | Isolation::Serializable => {
-                Ok(TxDb::Optimistic(OptimisticTransactionDb::open(path, opts)?))
-            }
+            // Both run the optimistic engine; they differ in how much of
+            // the read set the commit validates, which is what separates
+            // snapshot isolation from serializability.
+            Isolation::RepeatableRead => Ok(TxDb::Optimistic(
+                OptimisticTransactionDb::open(path, opts)?
+                    .with_isolation(IsolationLevel::SnapshotIsolation),
+            )),
+            Isolation::Serializable => Ok(TxDb::Optimistic(
+                OptimisticTransactionDb::open(path, opts)?
+                    .with_isolation(IsolationLevel::Serializable),
+            )),
         }
     }
 

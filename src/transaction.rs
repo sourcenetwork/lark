@@ -170,6 +170,7 @@ impl From<Error> for TransactionError {
 /// proceed in parallel. Conflicts surface as
 /// [`TransactionError::Conflict`].
 pub struct OptimisticTransactionDb {
+    isolation: IsolationLevel,
     inner: Db,
 }
 
@@ -185,6 +186,7 @@ impl OptimisticTransactionDb {
     pub fn open<P: AsRef<Path>>(path: P, opts: Options) -> Result<Self> {
         Ok(Self {
             inner: Db::open(path, opts)?,
+            isolation: IsolationLevel::default(),
         })
     }
 
@@ -199,6 +201,18 @@ impl OptimisticTransactionDb {
     /// current sequence number. Reads see a consistent view as of
     /// that seq; writes buffer in memory until [`Transaction::commit`].
     pub fn begin_transaction(&self) -> Transaction<'_> {
+        self.begin_transaction_with(self.isolation)
+    }
+
+    /// Begin a transaction at an explicit [`IsolationLevel`], whatever
+    /// the database default is.
+    ///
+    /// Per transaction rather than per database because the level is a
+    /// property of what a unit of work needs: a read-mostly query and a
+    /// read-modify-write against the same database want different
+    /// answers, and paying serializable validation for the former is
+    /// waste.
+    pub fn begin_transaction_with(&self, isolation: IsolationLevel) -> Transaction<'_> {
         let engine = self.inner.engine_arc();
         let snapshot_seq = engine.register_snapshot_at_horizon();
         Transaction::new(
@@ -208,7 +222,20 @@ impl OptimisticTransactionDb {
             TxMode::Optimistic,
             None,
             DEFAULT_LOCK_TIMEOUT,
+            isolation,
         )
+    }
+
+    /// Set the default [`IsolationLevel`] for transactions this database
+    /// begins. Defaults to [`IsolationLevel::SnapshotIsolation`].
+    pub fn with_isolation(mut self, isolation: IsolationLevel) -> Self {
+        self.isolation = isolation;
+        self
+    }
+
+    /// The default level [`Self::begin_transaction`] uses.
+    pub fn isolation(&self) -> IsolationLevel {
+        self.isolation
     }
 }
 
@@ -221,6 +248,7 @@ impl OptimisticTransactionDb {
 /// surfaces as [`TransactionError::Busy`] when a lock cannot be
 /// acquired in time.
 pub struct TransactionDb {
+    isolation: IsolationLevel,
     inner: Db,
     lock_manager: Arc<LockManager>,
     tx_id: AtomicU64,
@@ -242,6 +270,7 @@ impl TransactionDb {
     pub fn open<P: AsRef<Path>>(path: P, opts: Options) -> Result<Self> {
         Ok(Self {
             inner: Db::open(path, opts)?,
+            isolation: IsolationLevel::default(),
             lock_manager: Arc::new(LockManager::new()),
             tx_id: AtomicU64::new(1),
             lock_timeout: DEFAULT_LOCK_TIMEOUT,
@@ -264,6 +293,11 @@ impl TransactionDb {
     /// state as of the current seq; writes acquire key locks that
     /// the caller retains until commit or rollback.
     pub fn begin_transaction(&self) -> Transaction<'_> {
+        self.begin_transaction_with(self.isolation)
+    }
+
+    /// Begin a transaction at an explicit [`IsolationLevel`].
+    pub fn begin_transaction_with(&self, isolation: IsolationLevel) -> Transaction<'_> {
         let engine = self.inner.engine_arc();
         let snapshot_seq = engine.register_snapshot_at_horizon();
         let id = self.tx_id.fetch_add(1, Ordering::Relaxed);
@@ -274,8 +308,74 @@ impl TransactionDb {
             TxMode::Pessimistic { tx_id: id },
             Some(Arc::clone(&self.lock_manager)),
             self.lock_timeout,
+            isolation,
         )
     }
+
+    /// Set the default [`IsolationLevel`] for transactions this database
+    /// begins. Defaults to [`IsolationLevel::SnapshotIsolation`].
+    pub fn with_isolation(mut self, isolation: IsolationLevel) -> Self {
+        self.isolation = isolation;
+        self
+    }
+
+    /// The default level [`Self::begin_transaction`] uses.
+    pub fn isolation(&self) -> IsolationLevel {
+        self.isolation
+    }
+}
+
+/// How much a transaction is protected against concurrent commits.
+///
+/// The level decides what the commit-time validation covers, so it
+/// decides which anomalies are reachable.
+///
+/// # What each level admits
+///
+/// | Level | Dirty read | Non-repeatable read | Lost update | Write skew |
+/// |---|---|---|---|---|
+/// | [`IsolationLevel::ReadCommitted`] | no | possible | possible | possible |
+/// | [`IsolationLevel::SnapshotIsolation`] | no | no | no | **possible** |
+/// | [`IsolationLevel::Serializable`] | no | no | no | no |
+///
+/// Every level reads from a snapshot captured when the transaction
+/// began, so none of them can observe a dirty read. What changes is the
+/// size of the read set validated at commit.
+///
+/// # Why write skew survives snapshot isolation
+///
+/// Under [`IsolationLevel::SnapshotIsolation`] a key is validated only
+/// if the transaction wrote it, or read it through
+/// [`Transaction::get_for_update`]. Two transactions can therefore each
+/// read what the other is about to overwrite, write disjoint keys, and
+/// both commit - a schedule no serial order produces. Elle reports it as
+/// a G2 anti-dependency cycle.
+///
+/// [`IsolationLevel::Serializable`] validates *every* key the
+/// transaction read. A concurrent commit to any of them aborts it, so
+/// the anti-dependency edge that would close the cycle cannot form.
+/// This is backward validation: the cost is paid by the transaction
+/// committing second, and it is proportional to its read set.
+///
+/// # The one thing to know before relying on it
+///
+/// Serializability here covers point reads, which is all a transaction
+/// can do: there is no transactional range scan, and
+/// [`Transaction::delete_range`] is rejected. A read set is therefore a
+/// set of keys rather than a predicate, and a phantom - a key that did
+/// not exist to be read - is not reachable through this API. Adding a
+/// transactional scan would change that, and such a scan has to record
+/// the range it walked, not the keys it happened to return.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IsolationLevel {
+    /// Validate nothing beyond what the transaction wrote.
+    ReadCommitted,
+    /// Validate writes and keys read through
+    /// [`Transaction::get_for_update`]. lark's default.
+    #[default]
+    SnapshotIsolation,
+    /// Validate the entire read set.
+    Serializable,
 }
 
 #[derive(Clone, Copy)]
@@ -298,6 +398,8 @@ enum TxMode {
 /// discarded and any held locks are released.
 pub struct Transaction<'db> {
     engine: Arc<LarkEngine>,
+    /// What the commit-time validation covers. See [`IsolationLevel`].
+    isolation: IsolationLevel,
     snapshot_seq: u64,
     durability: crate::engine::DurabilityMode,
     mode: TxMode,
@@ -362,12 +464,14 @@ impl<'db> Transaction<'db> {
         mode: TxMode,
         lock_manager: Option<Arc<LockManager>>,
         lock_timeout: Duration,
+        isolation: IsolationLevel,
     ) -> Self {
         Self {
             engine,
             snapshot_seq,
             durability,
             mode,
+            isolation,
             writes: BTreeMap::new(),
             range_deletes: Vec::new(),
             merges: Vec::new(),
@@ -579,13 +683,36 @@ impl<'db> Transaction<'db> {
     /// left out: its lock already orders it against the other
     /// transactions, and there is no read for a concurrent writer to
     /// invalidate.
+    /// The keys whose versions must be unchanged for this transaction to
+    /// commit, each with the sequence it was first observed at.
+    ///
+    /// The size of this set *is* the isolation level:
+    ///
+    /// * [`IsolationLevel::ReadCommitted`] validates only what the
+    ///   transaction wrote, so a read it did not write is never checked.
+    /// * [`IsolationLevel::SnapshotIsolation`] adds keys read through
+    ///   `get_for_update`, which is what stops a lost update. A plain
+    ///   read is still unvalidated, which is what leaves write skew
+    ///   reachable.
+    /// * [`IsolationLevel::Serializable`] adds every remaining read, so
+    ///   no anti-dependency edge can form unseen.
     fn validation_set(&mut self) -> Vec<(Vec<u8>, u64)> {
         let optimistic = matches!(self.mode, TxMode::Optimistic);
+        let serializable = self.isolation == IsolationLevel::Serializable;
+        let read_committed = self.isolation == IsolationLevel::ReadCommitted;
         let mut checks: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
         for (key, state) in std::mem::take(&mut self.tracked) {
             let written = self.writes.contains_key(&key)
                 || self.merges.iter().any(|(merged, _)| *merged == key);
-            if state.for_update || written {
+            let validate = if serializable {
+                // Every read, whether or not the transaction wrote it.
+                true
+            } else if read_committed {
+                written
+            } else {
+                state.for_update || written
+            };
+            if validate {
                 checks.insert(key, state.first_read_seq);
             }
         }

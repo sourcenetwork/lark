@@ -258,6 +258,10 @@ elle-matrix:
     # Pessimistic transactions are checked at the level they request.
     check pessimistic-rc      list-append read-committed     --isolation read-committed --threads 8 --txns 50 --keys 4 --seed 2
     check pessimistic-hotkey  list-append read-committed     --isolation read-committed --threads 8 --txns 50 --keys 1 --seed 1
+    # Serializable validates the whole read set, so the strongest model
+    # Elle offers must hold.
+    check serializable        list-append strict-serializable --isolation serializable --threads 8 --txns 60 --keys 4 --seed 11
+    check serializable-rw     rw-register strict-serializable --isolation serializable --threads 8 --txns 60 --keys 4 --seed 12
     exit $fail
 
 # ---------- portability ----------
