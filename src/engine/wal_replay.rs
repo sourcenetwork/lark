@@ -14,6 +14,23 @@ use std::path::{Path, PathBuf};
 
 use crate::env::{Env, ReadFile, ReadFileCursor};
 
+/// Where a WAL file sits in the recovery order.
+///
+/// The torn-tail rule is only sound for the newest file. An earlier
+/// file was completed and closed before the rotation that created its
+/// successor, so no crash can leave a record in it half-written: a
+/// partial record there is media rot, and discarding it as a tail
+/// would drop acknowledged writes while still serving the records of
+/// every later file, leaving recovery on a state matching no prefix of
+/// the write history.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WalPosition {
+    /// The file the database was writing to when it stopped.
+    Newest,
+    /// A file a rotation already closed.
+    Earlier,
+}
+
 use super::checksum;
 use super::wal::{
     RECORD_BATCH, RECORD_DELETE, RECORD_DELETE_RANGE, RECORD_MERGE, RECORD_PUT, TailVerdict,
@@ -47,6 +64,8 @@ pub(crate) struct WalReplayIter {
     /// the rest as a crash artifact. Recovery reads it to tell a torn
     /// tail in the newest WAL from damage earlier in the history.
     tail: Option<TailVerdict>,
+    /// Whether the torn-tail rule applies to this file at all.
+    position: WalPosition,
 }
 
 /// Read up to `buf.len()` bytes, returning how many were available.
@@ -72,7 +91,11 @@ impl WalReplayIter {
     /// same filesystem the database was written to, and for an OPFS
     /// database in a browser `std::fs` is not merely the wrong file,
     /// it reports `Unsupported` and no reopen can ever replay.
-    pub(crate) fn open(env: &dyn Env, path: &Path) -> io::Result<Self> {
+    pub(crate) fn open(
+        env: &dyn Env,
+        path: &Path,
+        position: WalPosition,
+    ) -> io::Result<Self> {
         let cursor = ReadFileCursor::new(env.open_read(path)?)?;
         let file_len = cursor.len();
         let mut reader = BufReader::new(cursor);
@@ -102,6 +125,7 @@ impl WalReplayIter {
             payload: Vec::new(),
             pending: VecDeque::new(),
             tail: None,
+            position,
         })
     }
 
@@ -118,6 +142,9 @@ impl WalReplayIter {
             // the decision is delegated to the same discriminator the
             // whole-file replay uses.
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                if self.position == WalPosition::Earlier {
+                    return Err(self.damage_in_a_closed_file(record_start, "ends inside a record"));
+                }
                 self.tail = Some(classify_incomplete_record(&self.path, record_start)?);
                 Ok(None)
             }
@@ -126,11 +153,27 @@ impl WalReplayIter {
             // it on is zeros, which is how an unwritten or power-zeroed
             // tail reads back.
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                if self.position == WalPosition::Earlier {
+                    return Err(self.damage_in_a_closed_file(record_start, "carries an unusable record"));
+                }
                 self.tail = Some(classify_unusable_record(&self.path, record_start)?);
                 Ok(None)
             }
             other => other,
         }
+    }
+
+    fn damage_in_a_closed_file(&self, record_start: u64, what: &str) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} {what} at offset {record_start}, but a rotation already closed it, \
+                 so no crash could have left it partial. Discarding it as a tail would \
+                 drop acknowledged writes while later WAL files are still replayed, \
+                 leaving recovery on no prefix of the write history",
+                self.path.display()
+            ),
+        )
     }
 
     /// Where this replay stopped short, if it did.
@@ -237,7 +280,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn drain(path: &Path) -> io::Result<Vec<WalEntry>> {
-        let mut iter = WalReplayIter::open(&*crate::env::std_env(), path)?;
+        let mut iter = WalReplayIter::open(&*crate::env::std_env(), path, WalPosition::Newest)?;
         let mut out = Vec::new();
         while let Some(entry) = iter.next_entry()? {
             out.push(entry);
@@ -344,7 +387,7 @@ mod tests {
         bytes.truncate(bytes.len() - 3);
         std::fs::write(&path, &bytes).unwrap();
 
-        let mut iter = WalReplayIter::open(&*crate::env::std_env(), &path).unwrap();
+        let mut iter = WalReplayIter::open(&*crate::env::std_env(), &path, WalPosition::Newest).unwrap();
         assert!(
             iter.next_entry().unwrap().is_some(),
             "first record is whole"
@@ -373,7 +416,7 @@ mod tests {
         bytes[last] ^= 0xFF;
         std::fs::write(&path, &bytes).unwrap();
 
-        let mut iter = WalReplayIter::open(&*crate::env::std_env(), &path).unwrap();
+        let mut iter = WalReplayIter::open(&*crate::env::std_env(), &path, WalPosition::Newest).unwrap();
         let err = iter.next_entry().expect_err("checksum must not pass");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
@@ -387,7 +430,7 @@ mod tests {
         bytes.push(RECORD_PUT);
         std::fs::write(&path, &bytes).unwrap();
 
-        let mut iter = WalReplayIter::open(&*crate::env::std_env(), &path).unwrap();
+        let mut iter = WalReplayIter::open(&*crate::env::std_env(), &path, WalPosition::Newest).unwrap();
         // Nothing follows the bogus length, so it reads as a torn tail.
         // The point of the test is the allocation, not the verdict.
         assert!(iter.next_entry().unwrap().is_none());
@@ -409,7 +452,7 @@ mod tests {
             }
             wal.sync_data().unwrap();
         }
-        let mut iter = WalReplayIter::open(&*crate::env::std_env(), &path).unwrap();
+        let mut iter = WalReplayIter::open(&*crate::env::std_env(), &path, WalPosition::Newest).unwrap();
         let mut count = 0;
         while iter.next_entry().unwrap().is_some() {
             count += 1;

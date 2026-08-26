@@ -242,7 +242,7 @@ fn overwrite(path: &Path, offset: usize, patch: &[u8]) {
 /// Record boundaries in a WAL, derived from the on-disk framing.
 fn frames(bytes: &[u8]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
-    let mut pos = 0usize;
+    let mut pos = STAMP;
     while pos + 5 <= bytes.len() {
         let len = u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
             as usize;
@@ -255,6 +255,10 @@ fn frames(bytes: &[u8]) -> Vec<(usize, usize)> {
     }
     out
 }
+
+/// Matches `WAL_STAMP_LEN` in `src/engine/wal.rs`. Records begin after
+/// the format stamp, not at byte zero.
+const STAMP: usize = 12;
 
 // --- the attacks -------------------------------------------------------
 
@@ -546,11 +550,11 @@ fn plant_split(fx: &Fixture, db: &Path, split_at: usize, cut_first_to: Option<us
         None => &bytes[..split_at],
     };
     fs::write(dir.join(format!("wal_{id:06}.log")), head).expect("write first wal");
-    fs::write(
-        dir.join(format!("wal_{:06}.log", id + 1)),
-        &bytes[split_at..],
-    )
-    .expect("write second wal");
+    // The tail is a fresh file, so it needs its own stamp: the split
+    // point is inside the record stream, past the original one.
+    let mut tail = bytes[..STAMP].to_vec();
+    tail.extend_from_slice(&bytes[split_at..]);
+    fs::write(dir.join(format!("wal_{:06}.log", id + 1)), &tail).expect("write second wal");
 }
 
 /// A torn record at the end of a WAL file that is **not** the last WAL
@@ -559,10 +563,22 @@ fn plant_split(fx: &Fixture, db: &Path, split_at: usize, cut_first_to: Option<us
 /// out of the middle of the history and serves a state that never
 /// existed.
 ///
-/// **Currently FAILS.** `Wal::replay` judges each file on its own bytes,
-/// so the torn-tail rule, which is only sound for the newest WAL file,
-/// is applied to every one of them. `LarkEngine::open` replays the files
-/// in id order and has the evidence the rule needs, but does not use it.
+/// `Wal::replay` used to judge each file on its own bytes, applying the
+/// torn-tail rule, which is only sound for the newest WAL file, to
+/// every one of them. Replay now takes a `WalPosition`, and
+/// `LarkEngine::open` passes it from the id order it already walks, so
+/// damage in a file a rotation already closed is refused instead of
+/// being discarded as a tail.
+///
+/// **This test does not currently demonstrate that.** It reports 54
+/// cuts and 0 violations, and it reports 0 with the `WalPosition`
+/// check forced off as well, so it does not discriminate between the
+/// two behaviours. The "54 of 54" figure in the plan was measured
+/// before the WAL carried a format stamp, and the stamp changed what
+/// this split reaches. The change above is justified by the argument,
+/// not by this run: an earlier file was closed by a rotation, so no
+/// crash can have left a record in it half-written. Treat this as a
+/// gate that is currently green rather than as proof.
 ///
 /// Measured: 54 cut offsets inside the earlier file's last record, 54 of
 /// them opened on a state matching no prefix of the write history. The
@@ -576,7 +592,6 @@ fn plant_split(fx: &Fixture, db: &Path, split_at: usize, cut_first_to: Option<us
 /// media rot rather than a torn write: exactly the class the
 /// benign/malignant split exists to refuse.
 #[test]
-#[ignore = "records the unfixed cross-WAL-file half of G25; un-ignore when replay knows whether the file it is reading is the newest one"]
 fn a_torn_tail_in_an_earlier_wal_file_is_not_the_end_of_the_log() {
     let fx = fixture();
     let bytes = fx

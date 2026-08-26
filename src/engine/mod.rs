@@ -49,7 +49,7 @@ use sstable::{
     sst_filename,
 };
 use wal::{Wal, WalEntry, wal_filename};
-use wal_replay::WalReplayIter;
+use wal_replay::{WalPosition, WalReplayIter};
 
 /// Controls when data is flushed to disk after a commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -464,9 +464,16 @@ impl LarkEngine {
 
         let mut discarded_tails = Vec::new();
         let mut entries_per_file = Vec::with_capacity(wal_files.len());
-        for wal_path in &wal_files {
+        for (i, wal_path) in wal_files.iter().enumerate() {
             tracing::info!(path = %wal_path.display(), "Replaying WAL");
-            let mut replay = WalReplayIter::open(&*env, wal_path)?;
+            // `wal_files` is in id order, so only the last one can hold
+            // a record a crash left half-written.
+            let position = if i + 1 == wal_files.len() {
+                WalPosition::Newest
+            } else {
+                WalPosition::Earlier
+            };
+            let mut replay = WalReplayIter::open(&*env, wal_path, position)?;
             let mut entries = 0usize;
             while let Some(entry) = replay.next_entry()? {
                 entries += 1;
@@ -631,9 +638,14 @@ impl LarkEngine {
 
         let mut discarded_tails = Vec::new();
         let mut entries_per_file = Vec::with_capacity(wal_files.len());
-        for wal_path in &wal_files {
+        for (i, wal_path) in wal_files.iter().enumerate() {
             tracing::info!(path = %wal_path.display(), "Replaying WAL for read-only open");
-            let mut replay = WalReplayIter::open(&*env, wal_path)?;
+            let position = if i + 1 == wal_files.len() {
+                WalPosition::Newest
+            } else {
+                WalPosition::Earlier
+            };
+            let mut replay = WalReplayIter::open(&*env, wal_path, position)?;
             let mut entries = 0usize;
             while let Some(entry) = replay.next_entry()? {
                 entries += 1;

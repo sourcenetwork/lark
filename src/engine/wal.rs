@@ -329,7 +329,7 @@ impl Wal {
     /// [`WalReplayIter`]: super::wal_replay::WalReplayIter
     #[cfg(test)]
     pub(crate) fn replay(path: &Path) -> io::Result<Vec<WalEntry>> {
-        let mut iter = super::wal_replay::WalReplayIter::open(&*crate::env::std_env(), path)?;
+        let mut iter = super::wal_replay::WalReplayIter::open(&*crate::env::std_env(), path, super::wal_replay::WalPosition::Newest)?;
         let mut entries = Vec::new();
         while let Some(entry) = iter.next_entry()? {
             entries.push(entry);
