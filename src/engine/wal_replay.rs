@@ -9,9 +9,10 @@
 //! behaviour.
 
 use std::collections::VecDeque;
-use std::fs::File;
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
+
+use crate::env::{Env, ReadFile, ReadFileCursor};
 
 use super::checksum;
 use super::wal::{
@@ -29,7 +30,7 @@ use super::wal::{
 /// entry. A commit never writes a record larger than one batch, so the
 /// bound is "one batch", not "one log".
 pub(crate) struct WalReplayIter {
-    reader: BufReader<File>,
+    reader: BufReader<ReadFileCursor<Box<dyn ReadFile>>>,
     path: PathBuf,
     /// Total file length, used to reject a length header that claims
     /// more bytes than the file holds *before* allocating for it. A
@@ -65,11 +66,16 @@ fn read_full(reader: &mut impl io::Read, buf: &mut [u8]) -> io::Result<usize> {
 }
 
 impl WalReplayIter {
-    /// Open a WAL file for streaming replay.
-    pub(crate) fn open(path: &Path) -> io::Result<Self> {
-        let file = File::open(path)?;
-        let file_len = file.metadata()?.len();
-        let mut reader = BufReader::new(file);
+    /// Open a WAL file for streaming replay, through `env`.
+    ///
+    /// Through `Env` rather than `std::fs`: recovery has to read the
+    /// same filesystem the database was written to, and for an OPFS
+    /// database in a browser `std::fs` is not merely the wrong file,
+    /// it reports `Unsupported` and no reopen can ever replay.
+    pub(crate) fn open(env: &dyn Env, path: &Path) -> io::Result<Self> {
+        let cursor = ReadFileCursor::new(env.open_read(path)?)?;
+        let file_len = cursor.len();
+        let mut reader = BufReader::new(cursor);
 
         // Consume the stamp before any record is read. A log the stamp
         // never reached reads back as empty; anything else that is not a
@@ -231,7 +237,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn drain(path: &Path) -> io::Result<Vec<WalEntry>> {
-        let mut iter = WalReplayIter::open(path)?;
+        let mut iter = WalReplayIter::open(&*crate::env::std_env(), path)?;
         let mut out = Vec::new();
         while let Some(entry) = iter.next_entry()? {
             out.push(entry);
@@ -338,7 +344,7 @@ mod tests {
         bytes.truncate(bytes.len() - 3);
         std::fs::write(&path, &bytes).unwrap();
 
-        let mut iter = WalReplayIter::open(&path).unwrap();
+        let mut iter = WalReplayIter::open(&*crate::env::std_env(), &path).unwrap();
         assert!(
             iter.next_entry().unwrap().is_some(),
             "first record is whole"
@@ -367,7 +373,7 @@ mod tests {
         bytes[last] ^= 0xFF;
         std::fs::write(&path, &bytes).unwrap();
 
-        let mut iter = WalReplayIter::open(&path).unwrap();
+        let mut iter = WalReplayIter::open(&*crate::env::std_env(), &path).unwrap();
         let err = iter.next_entry().expect_err("checksum must not pass");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
@@ -381,7 +387,7 @@ mod tests {
         bytes.push(RECORD_PUT);
         std::fs::write(&path, &bytes).unwrap();
 
-        let mut iter = WalReplayIter::open(&path).unwrap();
+        let mut iter = WalReplayIter::open(&*crate::env::std_env(), &path).unwrap();
         // Nothing follows the bogus length, so it reads as a torn tail.
         // The point of the test is the allocation, not the verdict.
         assert!(iter.next_entry().unwrap().is_none());
@@ -403,7 +409,7 @@ mod tests {
             }
             wal.sync_data().unwrap();
         }
-        let mut iter = WalReplayIter::open(&path).unwrap();
+        let mut iter = WalReplayIter::open(&*crate::env::std_env(), &path).unwrap();
         let mut count = 0;
         while iter.next_entry().unwrap().is_some() {
             count += 1;

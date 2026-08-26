@@ -408,16 +408,23 @@ pub(crate) fn remove_file_and_sync_parent(env: &dyn Env, path: &Path) -> io::Res
 /// A sequential [`std::io::Read`] cursor over a [`ReadFile`].
 ///
 /// Bridges the positional read model to the byte-stream helpers that
-/// hash and copy whole files.
-pub(crate) struct ReadFileCursor<'a> {
-    file: &'a dyn ReadFile,
+/// hash and copy whole files, and to WAL replay.
+///
+/// Generic over how the file is held rather than fixed to a borrow, so
+/// a caller that must outlive the borrow (WAL replay owns its file for
+/// the life of the iterator) uses `ReadFileCursor<Box<dyn ReadFile>>`
+/// and a caller that has one to hand uses `ReadFileCursor<&dyn
+/// ReadFile>`. One implementation serves both, so the two cannot
+/// disagree about what a short read means.
+pub(crate) struct ReadFileCursor<F> {
+    file: F,
     offset: u64,
     end: u64,
 }
 
-impl<'a> ReadFileCursor<'a> {
+impl<F: std::ops::Deref<Target = dyn ReadFile>> ReadFileCursor<F> {
     /// Read the whole file, from byte zero.
-    pub(crate) fn new(file: &'a dyn ReadFile) -> io::Result<Self> {
+    pub(crate) fn new(file: F) -> io::Result<Self> {
         let end = file.len()?;
         Ok(Self {
             file,
@@ -425,9 +432,17 @@ impl<'a> ReadFileCursor<'a> {
             end,
         })
     }
+
+    /// Length of the underlying file, read once at construction.
+    ///
+    /// Lets a caller that also needs the length avoid a second
+    /// `ReadFile::len` call, which for OPFS is a call into JS.
+    pub(crate) fn len(&self) -> u64 {
+        self.end
+    }
 }
 
-impl io::Read for ReadFileCursor<'_> {
+impl<F: std::ops::Deref<Target = dyn ReadFile>> io::Read for ReadFileCursor<F> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let remaining = self.end.saturating_sub(self.offset);
         if remaining == 0 || buf.is_empty() {
