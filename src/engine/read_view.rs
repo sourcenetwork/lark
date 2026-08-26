@@ -273,6 +273,8 @@ impl VersionStore {
     /// [`VersionSet`] and publishes the resulting version on drop when
     /// the critical section changed it.
     pub(crate) fn lock(&self) -> VersionGuard<'_> {
+        #[cfg(test)]
+        VERSION_LOCKS.with(|n| n.set(n.get() + 1));
         let guard = self.inner.lock();
         let entry_version = guard.current();
         VersionGuard {
@@ -281,6 +283,25 @@ impl VersionStore {
             view: self.view.get(),
         }
     }
+}
+
+// Times this thread locked the version set. The read path must never
+// appear here: an exclusive mutex on the version set serializes every
+// reader against every other reader and against every compaction, and
+// removing it from the read path is the whole point of publishing the
+// version into the view. A thread-local makes the count exact per test
+// even though the harness runs tests in parallel and a compaction
+// worker locks the same store, and `#[cfg(test)]` keeps every trace of
+// it out of the shipped library.
+#[cfg(test)]
+thread_local! {
+    static VERSION_LOCKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Take and reset this thread's version-set lock count.
+#[cfg(test)]
+fn take_version_locks() -> u64 {
+    VERSION_LOCKS.with(|n| n.replace(0))
 }
 
 /// Exclusive access to the [`VersionSet`], publishing on release.
@@ -638,6 +659,69 @@ mod tests {
     // runs 500+ tests in parallel threads that are themselves idle
     // pinners. Both are asserted in `tests/adv_atom_reclaim.rs`, which
     // runs sequentially and observes the descriptors directly.
+
+    /// Reading never touches the version-set mutex.
+    ///
+    /// This is the mechanism behind the read path's concurrency, stated
+    /// as a count rather than as a throughput number: before the view
+    /// existed every `get`, `multi_get` and iterator construction ended
+    /// in `versions.lock().current()`, an exclusive acquisition that
+    /// serialized readers against each other and against the compaction
+    /// worker. The version now rides in the published view, so a read
+    /// resolves against it with one shared acquisition and none of the
+    /// exclusive one. A count is used deliberately: it is the same on a
+    /// loaded machine as on an idle one, so it cannot rot into a
+    /// misleading measurement the way a timing figure can.
+    #[test]
+    fn a_read_never_acquires_the_version_set_mutex() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::Db::open(dir.path(), crate::Options::default()).unwrap();
+        for i in 0..256u32 {
+            db.put(&i.to_be_bytes(), b"v").unwrap();
+        }
+
+        // The writes above lock the version set legitimately (WAL
+        // rotation, flush installs). Only the reads below are counted.
+        // Asserting the write path did lock it proves the counter is
+        // live, so the zeros below are a real result and not a dead
+        // instrument reading zero because it never fires.
+        assert!(
+            take_version_locks() > 0,
+            "the counter never fired, so the zeros below would prove nothing",
+        );
+
+        for i in 0..256u32 {
+            assert!(db.get(&i.to_be_bytes()).unwrap().is_some());
+        }
+        assert_eq!(
+            take_version_locks(),
+            0,
+            "point reads locked the version set"
+        );
+
+        let keys: Vec<Vec<u8>> = (0..256u32).map(|i| i.to_be_bytes().to_vec()).collect();
+        let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        assert_eq!(db.multi_get(&refs).unwrap().len(), 256);
+        assert_eq!(take_version_locks(), 0, "multi_get locked the version set");
+
+        let mut it = db.iter();
+        it.seek_to_first();
+        let mut seen = 0;
+        while it.valid() {
+            seen += 1;
+            it.next();
+        }
+        assert_eq!(seen, 256);
+        assert_eq!(take_version_locks(), 0, "iteration locked the version set");
+
+        let snap = db.snapshot();
+        assert!(snap.get(&0u32.to_be_bytes()).unwrap().is_some());
+        assert_eq!(
+            take_version_locks(),
+            0,
+            "a snapshot read locked the version set"
+        );
+    }
 
     #[test]
     fn a_critical_section_that_changes_no_version_publishes_nothing() {

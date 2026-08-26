@@ -1,10 +1,15 @@
-//! Cross-fix probe: G28's "an orphan table that records no entry is a
-//! crash artifact" rule reads the footer's `num_entries` and
+//! Cross-fix regression gate: G28's "an orphan table that records no
+//! entry is a crash artifact" rule reads the footer's `num_entries` and
 //! `range_tombstone_size`. A V3/V4 footer is checksummed, so a damaged
 //! one is refused. A V1/V2 footer is not, which is G24's stated
-//! deliberate hole, and here that hole feeds the G28 guard: two zeroed
-//! `u64`s in a legacy footer make a table that holds 200 keys claim to
-//! hold none, and the guard then lets the open discard it.
+//! deliberate hole, and that hole used to feed the G28 guard: two zeroed
+//! `u64`s in a legacy footer made a table holding 200 keys claim to hold
+//! none, and the guard let the open discard it.
+//!
+//! `table_carries_data` no longer takes the footer's word for it. When
+//! the footer claims nothing, it decodes the index block and requires
+//! that to be empty too, so a legacy table with data blocks in it is
+//! counted whatever its `num_entries` says.
 //!
 //! Both halves are exercised so the difference is the format version and
 //! nothing else.

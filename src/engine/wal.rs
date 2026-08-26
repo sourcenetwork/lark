@@ -30,9 +30,23 @@
 //!   its own whole record has returned, and under `Eventual` no
 //!   durability was promised in the first place.
 //! * A whole record that fails its checksum, carries an unknown type, or
-//!   does not parse is corruption, and is an error. A torn write cannot
-//!   produce it: every byte the record claims is present, and they are
-//!   wrong.
+//!   does not parse is corruption, and is an error, with one proven
+//!   exception below. Damage that leaves every byte the record claims
+//!   present, and wrong, is what bit rot looks like, not what a torn
+//!   write looks like.
+//! * The exception: a run of zero bytes reaching end-of-file is
+//!   unwritten space, not a damaged record. A filesystem that allocates
+//!   blocks and does not write them (ext4 with delayed allocation, after
+//!   a power cut) reads the tail back as zeros at full length rather
+//!   than short, so the tail frames as a whole record: `len` 0, type
+//!   `0x00`, checksum 0. lark never writes that shape - it emits no
+//!   record of type `0x00`, and the checksum of the empty type-`0x00`
+//!   record is not zero - and no bit flip in a written record can
+//!   produce it either, because flipping a bit inside real bytes leaves
+//!   at least one non-zero byte behind. Replay therefore stops at the
+//!   first byte of an all-zero tail and reports it exactly as it reports
+//!   a short one. Nothing weaker is accepted: a tail with a single
+//!   non-zero byte in it is corruption again.
 //! * An incomplete record from which the rest of the file still parses as
 //!   whole records, ending exactly at the last byte, is not a torn tail
 //!   either. A torn write leaves nothing behind it, so a remainder that
@@ -56,8 +70,26 @@
 //! is reported with the offset and the byte count rather than passing
 //! silently.
 //!
-//! Closing either properly needs a self-checksummed header or fixed-size
-//! blocks, which is a format change.
+//! A *partly* zeroed final record - real header, payload zeroed from a
+//! block boundary inside it - is neither short nor all-zero, so it still
+//! refuses. Under `DurabilityMode::Immediate` that shape is unreachable,
+//! because every acknowledged record is fsynced whole before the next one
+//! starts, so the zero-fill boundary is always a record boundary. Under
+//! `Eventual` it is reachable and costs the open; nothing acknowledged is
+//! lost by it, because `Eventual` acknowledges no durability.
+//!
+//! Closing any of these properly needs a self-checksummed header or
+//! fixed-size blocks, which is a format change.
+//!
+//! # Which file the torn-tail rule may be applied to
+//!
+//! The rule is only sound for the newest WAL file that contributes to
+//! replay. A torn write leaves nothing after it *anywhere*, so an earlier
+//! file that ends inside a record while a later file still holds records
+//! is damage in the middle of the history, not a crash artifact.
+//! [`Wal::replay`] reports its truncation rather than deciding, because
+//! only the caller knows the file order; `LarkEngine::open` refuses when
+//! a truncated file is followed by one that yielded records.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
@@ -230,33 +262,64 @@ impl Wal {
         Ok(())
     }
 
-    /// Replay a WAL file and return every whole record it holds.
+    /// Replay a WAL file and return every whole record it holds, plus
+    /// what, if anything, was discarded from the tail.
     ///
-    /// A record the file ends inside is the ordinary shape of a crash, and
-    /// is treated as the end of the log: the records before it come back
-    /// and the incomplete tail is reported through `tracing`. A whole
-    /// record that fails its checksum, carries an unknown type, or does
-    /// not parse is corruption and is an error, and so is an incomplete
-    /// record that still has whole records after it. The module
-    /// documentation says why those cases are told apart this way, and
-    /// names the one case the format cannot tell apart.
-    pub(crate) fn replay(path: &Path) -> io::Result<Vec<WalEntry>> {
+    /// A record the file ends inside, and a run of zero bytes reaching
+    /// end-of-file, are both the ordinary shape of a crash and are
+    /// treated as the end of the log: the records before come back and
+    /// the discarded tail is reported in the returned [`WalReplay`] and
+    /// through `tracing`. Any other whole record that fails its
+    /// checksum, carries an unknown type, or does not parse is
+    /// corruption and is an error, and so is an incomplete record that
+    /// still has whole records after it. The module documentation says
+    /// why those cases are told apart this way, and names the cases the
+    /// format cannot tell apart.
+    ///
+    /// The caller owns one further decision this function cannot make:
+    /// a discarded tail is only a crash artifact in the newest WAL file
+    /// that contributes to replay. See the module docs.
+    pub(crate) fn replay(path: &Path) -> io::Result<WalReplay> {
         // Read the file whole: deciding whether an incomplete record is a
         // torn tail or a mangled length field means looking at the bytes
-        // after it. A WAL is bounded by `write_buffer_size` plus the one
-        // record that crossed it, and the entries decoded out of it are
-        // larger than the file itself, so this bounds nothing new.
+        // after it, and deciding whether a tail was ever written means
+        // looking at all of it. A WAL is bounded by `write_buffer_size`
+        // plus the one record that crossed it. The decoded entries are
+        // already larger than the file, and this holds the file bytes
+        // alongside them, so recovery's peak is about twice the WAL
+        // rather than about once it: bounded by the same option, at a
+        // constant factor.
         let bytes = fs::read(path)?;
         let mut entries = Vec::new();
+        let mut truncated_at = None;
         let mut pos = 0usize;
 
         while pos < bytes.len() {
             let Some(frame) = frame_at(&bytes, pos) else {
                 end_of_log_or_corruption(path, &bytes, pos)?;
+                truncated_at = Some(pos);
                 break;
             };
 
-            if !frame.checksum_matches() {
+            let usable_type = matches!(
+                frame.record_type,
+                RECORD_PUT | RECORD_DELETE | RECORD_DELETE_RANGE | RECORD_MERGE | RECORD_BATCH
+            );
+
+            // Hashing the record is the expensive part of replay, so the
+            // verdict is computed once here and reused by both the
+            // torn-tail check and the corruption check below. Computing it
+            // per use hashes every byte of the log twice on the ordinary
+            // recovery path, where every record is whole and valid.
+            let checksum_ok = frame.checksum_matches();
+
+            if (!usable_type || !checksum_ok) && tail_is_unwritten(&bytes, pos) {
+                report_discarded_tail(path, bytes.len() - pos, pos);
+                truncated_at = Some(pos);
+                break;
+            }
+
+            if !checksum_ok {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -286,13 +349,30 @@ impl Wal {
             pos = frame.end;
         }
 
-        Ok(entries)
+        let discarded_bytes = truncated_at.map_or(0, |at| (bytes.len() - at) as u64);
+        Ok(WalReplay {
+            entries,
+            truncated_at: truncated_at.map(|at| at as u64),
+            discarded_bytes,
+        })
     }
 
     /// Delete a WAL file.
     pub(crate) fn remove(path: &Path) -> io::Result<()> {
         durability::remove_file_and_sync_parent(path)
     }
+}
+
+/// What one [`Wal::replay`] produced.
+pub(crate) struct WalReplay {
+    /// Every whole record decoded, in file order.
+    pub(crate) entries: Vec<WalEntry>,
+    /// `Some(offset)` when a trailing record was incomplete or unwritten
+    /// and the bytes from `offset` to end-of-file were discarded as a
+    /// crash artifact. `None` when the file replayed to its last byte.
+    pub(crate) truncated_at: Option<u64>,
+    /// How many bytes `truncated_at` discarded. Zero when `None`.
+    pub(crate) discarded_bytes: u64,
 }
 
 /// Format a WAL filename from a numeric ID.
@@ -406,11 +486,31 @@ struct Frame<'a> {
     end: usize,
 }
 
+// Payload bytes this thread has fed to the record checksum since the
+// counter was last taken. Replay's cost is dominated by hashing, and the
+// guard against a quadratic resync scan has to be a number that does not
+// move with machine load. A thread-local makes the count exact per test
+// even though the harness runs tests in parallel, and `#[cfg(test)]`
+// keeps every trace of it out of the shipped library.
+#[cfg(test)]
+thread_local! {
+    static CHECKSUM_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Take and reset this thread's checksummed-byte count.
+#[cfg(test)]
+fn take_checksum_bytes() -> u64 {
+    CHECKSUM_BYTES.with(|c| c.replace(0))
+}
+
 impl Frame<'_> {
     /// Whether the stored checksum matches the bytes of this record.
     /// Logs written before the header joined the checksum's coverage
     /// stored a payload-only checksum, which is still accepted.
     fn checksum_matches(&self) -> bool {
+        #[cfg(test)]
+        CHECKSUM_BYTES.with(|c| c.set(c.get() + self.data.len() as u64));
+
         let len = self.data.len() as u32;
         self.stored_checksum == checksum::wal_record(len, self.record_type, self.data)
             || self.stored_checksum == checksum::legacy_payload_u32(self.data)
@@ -461,14 +561,31 @@ fn end_of_log_or_corruption(path: &Path, bytes: &[u8], pos: usize) -> io::Result
         ));
     }
 
+    report_discarded_tail(path, discarded_bytes, pos);
+    Ok(())
+}
+
+/// Log one discarded WAL tail. The single place that phrases it, so the
+/// short-tail and the zero-tail paths cannot drift apart.
+fn report_discarded_tail(path: &Path, discarded_bytes: usize, pos: usize) {
     tracing::warn!(
         path = %path.display(),
         offset = pos,
         discarded_bytes,
         "discarded an incomplete trailing WAL record left by a crash"
     );
+}
 
-    Ok(())
+/// Whether everything from `pos` to end-of-file is zero bytes.
+///
+/// A zero run reaching end-of-file is space the filesystem allocated and
+/// never wrote, which is what ext4 leaves after a power cut when the
+/// inode's new length reached the journal and the data blocks did not.
+/// It is not a record lark ever emitted: every record type lark writes is
+/// non-zero, so a zero run can only frame as `len` 0 with type `0x00`,
+/// and no bit flip in a written record can turn its whole tail to zeros.
+fn tail_is_unwritten(bytes: &[u8], pos: usize) -> bool {
+    bytes[pos..].iter().all(|b| *b == 0)
 }
 
 /// Offset of the first whole, checksum-valid, known-type record after the
@@ -741,6 +858,13 @@ mod tests {
         (wal, path)
     }
 
+    /// Every whole record a replay produced, with the tail report
+    /// dropped. Most tests here assert on the entries alone; the ones
+    /// that assert on a discarded tail call [`Wal::replay`] directly.
+    fn replay(path: &Path) -> io::Result<Vec<WalEntry>> {
+        Ok(Wal::replay(path)?.entries)
+    }
+
     fn flip_byte(path: &Path, offset: usize) {
         let mut bytes = fs::read(path).unwrap();
         bytes[offset] ^= 0xFF;
@@ -792,7 +916,7 @@ mod tests {
             wal.flush().unwrap();
         }
 
-        let entries = Wal::replay(&path).unwrap();
+        let entries = replay(&path).unwrap();
         assert_eq!(entries.len(), 3);
 
         match &entries[0] {
@@ -829,7 +953,7 @@ mod tests {
         wal.flush().unwrap();
         drop(wal);
 
-        let entries = Wal::replay(&path).unwrap();
+        let entries = replay(&path).unwrap();
         match entries.as_slice() {
             [WalEntry::Put { key, value, seq: 7 }] => {
                 assert_eq!(key, b"k");
@@ -847,7 +971,7 @@ mod tests {
         wal.flush().unwrap();
         drop(wal);
 
-        let entries = Wal::replay(&path).unwrap();
+        let entries = replay(&path).unwrap();
         match entries.as_slice() {
             [WalEntry::Delete { key, seq: 11 }] => assert_eq!(key, b"gone"),
             _ => panic!("expected a single delete"),
@@ -862,7 +986,7 @@ mod tests {
         wal.flush().unwrap();
         drop(wal);
 
-        let entries = Wal::replay(&path).unwrap();
+        let entries = replay(&path).unwrap();
         match entries.as_slice() {
             [WalEntry::DeleteRange { start, end, seq: 5 }] => {
                 assert_eq!(start, b"aaa");
@@ -880,7 +1004,7 @@ mod tests {
         wal.flush().unwrap();
         drop(wal);
 
-        let entries = Wal::replay(&path).unwrap();
+        let entries = replay(&path).unwrap();
         match entries.as_slice() {
             [
                 WalEntry::Merge {
@@ -907,7 +1031,7 @@ mod tests {
         wal.flush().unwrap();
         drop(wal);
 
-        let entries = Wal::replay(&path).unwrap();
+        let entries = replay(&path).unwrap();
         assert_eq!(entries.len(), 4);
         assert!(matches!(entries[0], WalEntry::Put { seq: 1, .. }));
         assert!(matches!(entries[1], WalEntry::Delete { seq: 2, .. }));
@@ -939,7 +1063,7 @@ mod tests {
         drop(wal);
 
         assert_eq!(
-            Wal::replay(&path).unwrap(),
+            replay(&path).unwrap(),
             vec![
                 WalEntry::Put {
                     key: b"p".to_vec(),
@@ -972,7 +1096,7 @@ mod tests {
         wal.flush().unwrap();
         drop(wal);
 
-        assert!(Wal::replay(&path).unwrap().is_empty());
+        assert!(replay(&path).unwrap().is_empty());
     }
 
     // ── edge cases ───────────────────────────────────────────────
@@ -984,7 +1108,7 @@ mod tests {
         wal.flush().unwrap();
         drop(wal);
 
-        assert!(Wal::replay(&path).unwrap().is_empty());
+        assert!(replay(&path).unwrap().is_empty());
     }
 
     #[test]
@@ -995,7 +1119,7 @@ mod tests {
         wal.flush().unwrap();
         drop(wal);
 
-        match Wal::replay(&path).unwrap().as_slice() {
+        match replay(&path).unwrap().as_slice() {
             [WalEntry::Put { key, value, seq: 0 }] => {
                 assert!(key.is_empty());
                 assert!(value.is_empty());
@@ -1015,7 +1139,7 @@ mod tests {
         wal.flush().unwrap();
         drop(wal);
 
-        match Wal::replay(&path).unwrap().as_slice() {
+        match replay(&path).unwrap().as_slice() {
             [WalEntry::Put { key, value, seq: 1 }] => {
                 assert_eq!(key, b"k");
                 assert_eq!(value.len(), 1 << 20);
@@ -1034,7 +1158,7 @@ mod tests {
         wal.flush().unwrap();
         drop(wal);
 
-        let entries = Wal::replay(&path).unwrap();
+        let entries = replay(&path).unwrap();
         assert_eq!(entries.len(), 2);
         let seqs: Vec<u64> = entries
             .iter()
@@ -1057,7 +1181,7 @@ mod tests {
         wal.flush().unwrap();
         drop(wal);
 
-        let entries = Wal::replay(&path).unwrap();
+        let entries = replay(&path).unwrap();
         assert_eq!(entries.len(), 1000);
         for (i, entry) in entries.iter().enumerate() {
             match entry {
@@ -1081,7 +1205,7 @@ mod tests {
             wal.append_put(b"k", b"v", 1).unwrap();
             wal.sync().unwrap();
         }
-        let entries = Wal::replay(&path).unwrap();
+        let entries = replay(&path).unwrap();
         assert_eq!(entries.len(), 1);
     }
 
@@ -1153,7 +1277,7 @@ mod tests {
             wal.flush().unwrap();
         }
 
-        match Wal::replay(&path).unwrap().as_slice() {
+        match replay(&path).unwrap().as_slice() {
             [WalEntry::Put { key, seq: 2, .. }] => assert_eq!(key, b"new"),
             other => panic!("old contents leaked: got {} entries", other.len()),
         }
@@ -1196,7 +1320,7 @@ mod tests {
         let len = fs::metadata(&path).unwrap().len() as usize;
         flip_byte(&path, len - 1);
 
-        let kind = match Wal::replay(&path) {
+        let kind = match replay(&path) {
             Err(e) => e.kind(),
             Ok(v) => panic!("expected checksum error, got {} entries", v.len()),
         };
@@ -1217,7 +1341,7 @@ mod tests {
         let len = fs::metadata(&path).unwrap().len() as usize;
         flip_byte(&path, len - 6);
 
-        let kind = match Wal::replay(&path) {
+        let kind = match replay(&path) {
             Err(e) => e.kind(),
             Ok(v) => panic!("expected checksum error, got {} entries", v.len()),
         };
@@ -1243,7 +1367,7 @@ mod tests {
 
         flip_byte(&path, 4);
 
-        let kind = match Wal::replay(&path) {
+        let kind = match replay(&path) {
             Err(e) => e.kind(),
             Ok(v) => panic!("expected checksum error, got {} entries", v.len()),
         };
@@ -1265,7 +1389,7 @@ mod tests {
         f.sync_all().unwrap();
 
         assert_eq!(
-            Wal::replay(&path).unwrap(),
+            replay(&path).unwrap(),
             vec![WalEntry::Put {
                 key: b"k".to_vec(),
                 value: b"v".to_vec(),
@@ -1291,7 +1415,7 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
 
         assert_eq!(
-            Wal::replay(&path).unwrap(),
+            replay(&path).unwrap(),
             vec![WalEntry::Put {
                 key: b"good".to_vec(),
                 value: b"v".to_vec(),
@@ -1313,7 +1437,129 @@ mod tests {
         f.write_all(&[RECORD_PUT]).unwrap(); // type
         f.sync_all().unwrap();
 
-        assert!(Wal::replay(&path).unwrap().is_empty());
+        assert!(replay(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_empty_type_zero_record_never_checksums_as_valid() {
+        // The zero-tail rule leans on this: a run of zeros frames as
+        // `len` 0, type 0x00, checksum 0, and that shape must never be
+        // mistakable for a record lark wrote.
+        assert_ne!(checksum::wal_record(0, 0, &[]), 0);
+        assert_ne!(checksum::legacy_payload_u32(&[]), 0);
+    }
+
+    #[test]
+    fn replay_stops_at_a_zero_filled_tail() {
+        // ext4 with delayed allocation: the inode's new length reached
+        // the journal, the data blocks did not, so the tail reads back
+        // at full length as zeros rather than short.
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        wal.append_put(b"good", b"v", 1).unwrap();
+        wal.flush().unwrap();
+        drop(wal);
+
+        let durable = fs::metadata(&path).unwrap().len() as usize;
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.resize(durable + 4096, 0);
+        fs::write(&path, &bytes).unwrap();
+
+        let report = Wal::replay(&path).unwrap();
+        assert_eq!(
+            report.entries,
+            vec![WalEntry::Put {
+                key: b"good".to_vec(),
+                value: b"v".to_vec(),
+                seq: 1,
+            }]
+        );
+        assert_eq!(report.truncated_at, Some(durable as u64));
+        assert_eq!(report.discarded_bytes, 4096);
+    }
+
+    #[test]
+    fn replay_rejects_a_zero_filled_region_that_still_has_records_after_it() {
+        // Zeros in the middle of the log are damage, not unwritten
+        // space: whole records follow them.
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        wal.append_put(b"good", b"v", 1).unwrap();
+        wal.flush().unwrap();
+        drop(wal);
+
+        let durable = fs::metadata(&path).unwrap().len() as usize;
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.resize(durable + 64, 0);
+        let mut trailer = Vec::new();
+        let pd = put_data(b"after", b"ok", 2);
+        append_raw_record(&mut trailer, RECORD_PUT, &pd, None);
+        bytes.extend_from_slice(&trailer);
+        fs::write(&path, &bytes).unwrap();
+
+        let err = match Wal::replay(&path) {
+            Err(e) => e,
+            Ok(r) => panic!("expected corruption, got {} entries", r.entries.len()),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn replay_still_rejects_a_tail_with_one_non_zero_byte_in_it() {
+        // The zero-tail rule is exact. One stray non-zero byte and the
+        // tail is corruption again, which is what keeps a bit flip in
+        // the final record from being discarded as a crash artifact.
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        wal.append_put(b"good", b"v", 1).unwrap();
+        wal.flush().unwrap();
+        drop(wal);
+
+        let durable = fs::metadata(&path).unwrap().len() as usize;
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.resize(durable + 64, 0);
+        bytes[durable + 40] = 0x01;
+        fs::write(&path, &bytes).unwrap();
+
+        let err = match Wal::replay(&path) {
+            Err(e) => e,
+            Ok(r) => panic!("expected corruption, got {} entries", r.entries.len()),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn replay_reports_the_bytes_a_torn_tail_discarded() {
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        wal.append_put(b"good", b"v", 1).unwrap();
+        wal.flush().unwrap();
+        drop(wal);
+
+        let durable = fs::metadata(&path).unwrap().len() as usize;
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
+        fs::write(&path, &bytes).unwrap();
+
+        let report = Wal::replay(&path).unwrap();
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.truncated_at, Some(durable as u64));
+        assert_eq!(report.discarded_bytes, 3);
+    }
+
+    #[test]
+    fn replay_of_a_whole_log_reports_no_discard() {
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        wal.append_put(b"a", b"v", 1).unwrap();
+        wal.append_put(b"b", b"v", 2).unwrap();
+        wal.flush().unwrap();
+        drop(wal);
+
+        let report = Wal::replay(&path).unwrap();
+        assert_eq!(report.entries.len(), 2);
+        assert_eq!(report.truncated_at, None);
+        assert_eq!(report.discarded_bytes, 0);
     }
 
     #[test]
@@ -1334,7 +1580,7 @@ mod tests {
         bytes[second..second + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         fs::write(&path, &bytes).unwrap();
 
-        let err = match Wal::replay(&path) {
+        let err = match replay(&path) {
             Err(e) => e,
             Ok(v) => panic!("expected corruption, got {} entries", v.len()),
         };
@@ -1345,15 +1591,46 @@ mod tests {
     }
 
     #[test]
-    fn replay_of_a_self_similar_torn_tail_stays_linear() {
+    fn replay_hashes_each_whole_record_exactly_once() {
+        // Recovery's cost is dominated by hashing the log. Deriving the
+        // checksum verdict once and reusing it, rather than recomputing
+        // it for the torn-tail check and again for the corruption check,
+        // is the difference between one pass over the WAL and two.
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        let value = vec![0xCD; 4096];
+        for i in 0..16u64 {
+            wal.append_put(format!("k{i}").as_bytes(), &value, i)
+                .unwrap();
+        }
+        wal.flush().unwrap();
+        drop(wal);
+
+        let payload_bytes: u64 =
+            fs::read(&path).unwrap().len() as u64 - 16 * (WAL_HEADER_LEN + CHECKSUM_LEN) as u64;
+
+        take_checksum_bytes();
+        assert_eq!(replay(&path).unwrap().len(), 16);
+        let hashed = take_checksum_bytes();
+
+        assert_eq!(
+            hashed, payload_bytes,
+            "a clean replay must hash each record's payload once and no more",
+        );
+    }
+
+    #[test]
+    fn replay_of_a_self_similar_torn_tail_hashes_the_file_about_once() {
         // Every fifth offset of this tail frames as a record claiming a
         // 1 MiB payload that fits, so checking each candidate on its own
-        // would put ~600 GiB through the checksum for a 4 MiB tail, and
-        // a real 64 MiB write buffer would wedge recovery for hours on a
+        // would put ~600 GiB through the checksum for a 4 MiB tail, and a
+        // real 64 MiB write buffer would wedge recovery for hours on a
         // value a caller is free to write. Requiring the remainder to
-        // tile collapses it to one pass. The bound is wall clock because
-        // the defect is asymptotic; the margin over the ~50 ms this takes
-        // is wide enough that a loaded machine cannot trip it.
+        // tile collapses it to one pass.
+        //
+        // The bound is a byte count rather than a duration: it is exactly
+        // the quantity the defect blows up, and unlike wall-clock time it
+        // does not move with machine load.
         const TAIL: usize = 4 << 20;
         let dir = TempDir::new().unwrap();
         let (mut wal, path) = new_wal(&dir);
@@ -1371,10 +1648,11 @@ mod tests {
                 .take(TAIL),
         );
         fs::write(&path, &bytes).unwrap();
+        let file_len = bytes.len() as u64;
 
-        let start = std::time::Instant::now();
-        let entries = Wal::replay(&path).unwrap();
-        let elapsed = start.elapsed();
+        take_checksum_bytes();
+        let entries = replay(&path).unwrap();
+        let hashed = take_checksum_bytes();
 
         assert_eq!(
             entries,
@@ -1385,8 +1663,9 @@ mod tests {
             }]
         );
         assert!(
-            elapsed < std::time::Duration::from_secs(20),
-            "replaying a {TAIL}-byte torn tail took {elapsed:?}, which is not one pass over it",
+            hashed <= file_len,
+            "replaying a {TAIL}-byte torn tail hashed {hashed} bytes of a {file_len}-byte \
+             file, which is not one pass over it",
         );
     }
 
@@ -1414,7 +1693,7 @@ mod tests {
         for cut in 0..=full.len() {
             fs::write(&path, &full[..cut]).unwrap();
             let whole = boundaries.iter().filter(|b| **b <= cut).count() - 1;
-            let entries = Wal::replay(&path)
+            let entries = replay(&path)
                 .unwrap_or_else(|e| panic!("a cut at {cut} is a torn tail, not corruption: {e}"));
             assert_eq!(entries.len(), whole, "cut at {cut}");
         }
@@ -1433,7 +1712,7 @@ mod tests {
         append_raw_record(&mut f, RECORD_PUT, &pd, None);
         f.sync_all().unwrap();
 
-        let kind = match Wal::replay(&path) {
+        let kind = match replay(&path) {
             Err(e) => e.kind(),
             Ok(v) => panic!("expected unknown-type error, got {} entries", v.len()),
         };
@@ -1454,7 +1733,7 @@ mod tests {
         append_raw_record(&mut f, RECORD_BATCH, &data, None);
         f.sync_all().unwrap();
 
-        let kind = match Wal::replay(&path) {
+        let kind = match replay(&path) {
             Err(e) => e.kind(),
             Ok(v) => panic!("expected malformed-batch error, got {} entries", v.len()),
         };
@@ -1473,7 +1752,7 @@ mod tests {
         append_raw_record(&mut f, RECORD_BATCH, &data, None);
         f.sync_all().unwrap();
 
-        let kind = match Wal::replay(&path) {
+        let kind = match replay(&path) {
             Err(e) => e.kind(),
             Ok(v) => panic!(
                 "expected batch trailing-byte error, got {} entries",
@@ -1487,7 +1766,7 @@ mod tests {
     fn replay_of_nonexistent_path_errors() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("never_created.wal");
-        let kind = match Wal::replay(&path) {
+        let kind = match replay(&path) {
             Err(e) => e.kind(),
             Ok(v) => panic!("expected error, got {} entries", v.len()),
         };

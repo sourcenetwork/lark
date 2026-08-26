@@ -1251,7 +1251,11 @@ impl Db {
             return Ok(existing);
         }
         self.validate_prefixed_key_size(&meta::name_key(name))?;
-        let (handle, next_id) = self.cfs.allocate(name);
+        let Some((handle, next_id)) = self.cfs.allocate(name) else {
+            return Err(Error::invalid_argument(
+                "the column-family id space is exhausted",
+            ));
+        };
         let mut batch = BTreeMap::new();
         batch.insert(
             meta::name_key(name),
@@ -1917,6 +1921,15 @@ impl Snapshot {
 /// Collect a bounded range of `(user_key, value)` pairs via the streaming
 /// iterator. This is the engine of `Db::scan` / `Snapshot::scan`; the
 /// dedicated method exists so both callers share one merge implementation.
+/// Materialize `[start, end)` from an already-constructed iterator.
+///
+/// The iterator is the caller's choice, and that choice is the read's
+/// consistency contract: `LarkEngine::new_iter_latest` loads the read
+/// view before it samples the horizon (see `LarkEngine::get_latest`),
+/// while `LarkEngine::new_iter_at` carries a sequence a `Snapshot` has
+/// pinned in the registry. Taking the iterator rather than an engine
+/// and a sequence is what keeps a scan from re-introducing the
+/// sample-then-load order the point-read path was fixed to avoid.
 fn collect_range(
     mut iter: crate::engine::iterator::LarkIterator,
     start: Option<&[u8]>,
@@ -1945,6 +1958,9 @@ fn collect_range(
     Ok(out)
 }
 
+/// Materialize at most `limit` entries of `[start, end)` from an
+/// already-constructed iterator. See [`collect_range`] for why the
+/// iterator, and not an engine plus a sequence, is the parameter.
 fn collect_page(
     mut iter: crate::engine::iterator::LarkIterator,
     start: &[u8],

@@ -516,15 +516,38 @@ impl VersionSet {
 
     /// The unreferenced `*.sst` files that could plausibly hold live data.
     ///
-    /// A zero-length table, or one whose footer records no entry and no
-    /// range tombstone, is what a crash inside a flush leaves behind: the
-    /// directory entry reached the journal, the delayed-allocated data
-    /// blocks did not. Such a file cannot be a live table the manifest is
-    /// about to discard, so it is logged and skipped rather than counted.
+    /// Two shapes are skipped, because neither can be a live table the
+    /// manifest is about to discard:
     ///
-    /// Everything else counts, including a file whose footer will not
-    /// parse. An unreadable file cannot be proved empty, and keeping the
-    /// database shut preserves it for repair.
+    /// * a zero-length file: it holds no byte, so it can hold no entry.
+    ///   This is what a crash inside the very first flush leaves once
+    ///   the directory entry reached the journal and the
+    ///   delayed-allocated data blocks did not;
+    /// * a file whose footer parses and whose index block is empty: it
+    ///   provably holds nothing.
+    ///
+    /// Everything else counts, including a file whose footer or index
+    /// will not parse. Such a file may be a real table with damage in
+    /// it, cannot be proved empty, and keeping the database shut
+    /// preserves it for repair.
+    ///
+    /// The line is deliberately drawn at proof rather than at
+    /// plausibility. An earlier revision also skipped a file whose last
+    /// 64 bytes were all zero, reasoning that a footer ends in a
+    /// non-zero magic so a footer's worth of zeros meant the flush never
+    /// finished. That inference does not hold: a lost or misdirected
+    /// write on an otherwise complete table zeroes a whole sector or
+    /// block, which satisfies the same test, and the file's absence from
+    /// the manifest cannot be used as corroboration inside the one
+    /// branch that runs only when the manifest is already known corrupt.
+    /// Skipping such a file opens the database silently without
+    /// everything that table held; counting it refuses loudly, names the
+    /// file, deletes nothing, and leaves the operator able to move it
+    /// aside and recover.
+    /// `adv_g28_tears::a_first_flush_cut_that_leaves_an_unprovable_orphan_refuses_and_salvages`
+    /// measures the cost of that refusal rather than hiding it: 61
+    /// acknowledged writes behind a loud error, all of them recovered
+    /// once the orphan is moved aside.
     ///
     /// Nothing is deleted here, so a crash part way through recovery
     /// leaves the directory exactly as this pass found it and the next
@@ -574,7 +597,7 @@ impl VersionSet {
                 }),
                 Ok(false) => tracing::warn!(
                     path = %path.display(),
-                    "ignoring an orphan SSTable whose footer records no entry and no range tombstone"
+                    "ignoring an orphan SSTable whose footer and index both record nothing"
                 ),
                 Err(e) => suspects.push(SuspectTable {
                     path,

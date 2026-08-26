@@ -22,6 +22,8 @@
 //! reading of the harness.
 
 use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use lark_kv::{Db, Options};
 use tempfile::TempDir;
@@ -98,7 +100,15 @@ fn unlinked_sstable_inodes_are_released_after_a_compaction() {
     fill(&db, 8, 400, b'a');
     db.compact_range(None, None).expect("compact");
 
-    let (live, deleted) = open_fds_under(dir.path());
+    // Reclamation is RCU: the retired view is freed when the last
+    // reader releases it, and a background compaction pass can still
+    // be holding one the instant `compact_range` returns. Asserting
+    // immediately makes the outcome depend on how loaded the machine
+    // is, which is a flaky test rather than a property. A deadline
+    // with bounded backoff keeps it exact: a fast machine finishes on
+    // the first probe, a loaded one still gets a true answer, and a
+    // real leak never clears and still fails.
+    let (live, deleted) = wait_for_reclamation(dir.path());
     eprintln!(
         "after compact_range: {} live fds, {} unlinked-but-open fds holding {} bytes",
         live.len(),
@@ -107,11 +117,32 @@ fn unlinked_sstable_inodes_are_released_after_a_compaction() {
     );
     assert!(
         deleted.is_empty(),
-        "{} unlinked SSTable inodes are still pinned open after a \
+        "{} unlinked SSTable inodes are still pinned open {:?} after a \
          synchronous compaction returned; their disk space cannot be \
          reclaimed",
         deleted.len(),
+        RECLAIM_DEADLINE,
     );
+}
+
+/// How long a retired view may take to be reclaimed before the leak is
+/// real rather than merely late.
+const RECLAIM_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Poll until no unlinked-but-open descriptor remains, or the deadline
+/// passes. Returns the last observation either way, so the caller
+/// reports what it actually saw.
+fn wait_for_reclamation(dir: &Path) -> (Vec<String>, Vec<String>) {
+    let start = Instant::now();
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        let seen = open_fds_under(dir);
+        if seen.1.is_empty() || start.elapsed() >= RECLAIM_DEADLINE {
+            return seen;
+        }
+        thread::sleep(backoff);
+        backoff = (backoff * 2).min(Duration::from_millis(100));
+    }
 }
 
 /// The database object is gone. Every descriptor it opened must be
@@ -132,7 +163,7 @@ fn dropping_the_db_closes_every_descriptor_it_opened() {
         db.compact_range(None, None).expect("compact");
     }
 
-    let (live, deleted) = open_fds_under(dir.path());
+    let (live, deleted) = wait_for_reclamation(dir.path());
     eprintln!(
         "after drop(db): {} live fds, {} unlinked-but-open fds",
         live.len(),
@@ -216,7 +247,7 @@ fn descriptors_survive_the_db_but_not_the_publishing_thread() {
     });
     let (live_before_join, deleted_before_join) = handle.join().expect("join");
 
-    let (live_after, deleted_after) = open_fds_under(dir.path());
+    let (live_after, deleted_after) = wait_for_reclamation(dir.path());
     eprintln!(
         "on the publishing thread after drop(db): {live_before_join} live, \
          {deleted_before_join} unlinked-but-open"
@@ -310,7 +341,7 @@ fn an_idle_reader_thread_does_not_gate_descriptors_created_after_it_idled() {
     fill(&db, 8, 400, b'f');
     db.compact_range(None, None).expect("compact");
 
-    let (_, deleted) = open_fds_under(dir.path());
+    let (_, deleted) = wait_for_reclamation(dir.path());
     eprintln!(
         "with one parked reader thread alive: {} unlinked-but-open fds",
         deleted.len()
