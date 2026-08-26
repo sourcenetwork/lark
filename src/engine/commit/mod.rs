@@ -33,7 +33,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use kovan_queue::array_queue::ArrayQueue;
 
@@ -461,7 +461,13 @@ impl LarkEngine {
             // work. A follower's own perf context records no WAL time
             // because it did none.
             let _perf_wal = PerfTimer::new(PerfTimerField::WriteWal);
-            let wal_start = Instant::now();
+            // Through `Env`, not `std::time::Instant`: browsers have a
+            // clock but `Instant::now` panics on
+            // `wasm32-unknown-unknown`, and `OpfsEnv` reads
+            // `performance.now()` instead. Read only when statistics
+            // are on, so a write with them off pays no clock read at
+            // all.
+            let wal_start = self.statistics().and_then(|_| self.env.now_micros());
             let mut guard = self.active_wal.lock();
             let wal = guard.as_mut().ok_or_else(Self::read_only_error)?;
             let start_offset = wal.offset();
@@ -486,10 +492,12 @@ impl LarkEngine {
                 if synced > 0 {
                     s.add(Ticker::WalSyncCount, synced);
                 }
-                s.record(
-                    Histogram::WalWriteTime,
-                    wal_start.elapsed().as_micros() as u64,
-                );
+                // `None` means the platform has no clock. Skip the
+                // recording rather than publishing a zero that reads
+                // like a measurement.
+                if let Some(micros) = self.elapsed_micros(wal_start) {
+                    s.record(Histogram::WalWriteTime, micros);
+                }
             }
         }
 
