@@ -50,7 +50,7 @@ pub const CHILD_ENV: &str = "LARK_CRASH_CHILD";
 pub const CHILD_TEST: &str = "crash_child";
 
 #[cfg(unix)]
-extern "C" {
+unsafe extern "C" {
     fn getpid() -> i32;
     fn kill(pid: i32, sig: i32) -> i32;
 }

@@ -1,21 +1,25 @@
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
+
+use kovan_channel::RecvDeadline;
+use kovan_channel::unbounded::{Receiver, Sender};
 
 use super::block_cache::BlockCache;
 use super::internal_key::{compare_internal_keys, decode_internal_key, user_key_of};
-use super::manifest::{VersionEdit, MAX_LEVELS};
+use super::manifest::{MAX_LEVELS, VersionEdit};
 use super::range_tombstone::{
-    exclusive_successor, sort_dedup_tombstones, RangeTombstone, RangeTombstoneSet,
+    RangeTombstone, RangeTombstoneSet, exclusive_successor, sort_dedup_tombstones,
 };
 use super::read_view::VersionStore;
 use super::snapshot_registry::SnapshotRegistry;
 use super::sstable::{
-    remove_sst, sst_filename, LiveSst, SsTableInternalIter, SsTableMeta, SsTableReader,
-    SsTableWriter,
+    LiveSst, MetadataPolicy, SsTableInternalIter, SsTableMeta, SsTableReader, SsTableWriter,
+    remove_sst, sst_filename,
 };
 
 /// Default compaction trigger: flush L0 → L1 when L0 has this many SSTables.
@@ -30,19 +34,31 @@ pub(crate) const DEFAULT_LEVEL_BASE_BYTES: u64 = 256 * 1024 * 1024;
 /// Default target SSTable file size (64 MB).
 pub(crate) const DEFAULT_TARGET_FILE_SIZE: u64 = 64 * 1024 * 1024;
 
+/// How long a worker sleeps between periodic checks when no wake-up
+/// arrives. The backstop that keeps compaction live if a coalesced
+/// notification is ever dropped.
+const WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Manages background compaction on one or more dedicated OS threads.
 pub(crate) struct CompactionScheduler {
     shutdown: Arc<AtomicBool>,
-    trigger: Arc<(Mutex<bool>, Condvar)>,
+    /// Wake-up channel. One token wakes one idle worker.
+    trigger: Sender<()>,
+    /// Coalescing gate: at most one unconsumed token is ever in flight,
+    /// so a flush storm cannot queue thousands of wake-ups for work a
+    /// single pass already covers.
+    pending: Arc<AtomicBool>,
     handles: Vec<thread::JoinHandle<()>>,
 }
 
 impl CompactionScheduler {
     /// Construct a scheduler with no background workers.
     pub(crate) fn disabled() -> Self {
+        let (trigger, _rx) = kovan_channel::unbounded();
         Self {
             shutdown: Arc::new(AtomicBool::new(true)),
-            trigger: Arc::new((Mutex::new(false), Condvar::new())),
+            trigger,
+            pending: Arc::new(AtomicBool::new(false)),
             handles: Vec::new(),
         }
     }
@@ -72,19 +88,24 @@ impl CompactionScheduler {
         opts: CompactionOptions,
         stall_signal: Arc<crate::engine::StallSignal>,
     ) -> std::io::Result<Self> {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (trigger, receiver) = kovan_channel::unbounded();
+        let pending = Arc::new(AtomicBool::new(false));
         let in_progress: Arc<parking_lot::Mutex<HashSet<u64>>> =
             Arc::new(parking_lot::Mutex::new(HashSet::new()));
 
         let worker_count = opts.max_background_compactions.max(1);
         let mut scheduler = Self {
-            shutdown: Arc::new(AtomicBool::new(false)),
-            trigger: Arc::new((Mutex::new(false), Condvar::new())),
+            shutdown: Arc::clone(&shutdown),
+            trigger,
+            pending: Arc::clone(&pending),
             handles: Vec::with_capacity(worker_count),
         };
 
         for i in 0..worker_count {
-            let shutdown_clone = Arc::clone(&scheduler.shutdown);
-            let trigger_clone = Arc::clone(&scheduler.trigger);
+            let shutdown_clone = Arc::clone(&shutdown);
+            let receiver_clone = receiver.clone();
+            let pending_clone = Arc::clone(&pending);
             let lock_clone = Arc::clone(&compaction_lock);
             let registry_clone = Arc::clone(&snapshot_registry);
             let versions_clone = Arc::clone(&versions);
@@ -97,7 +118,8 @@ impl CompactionScheduler {
             let spawned = spawn_worker(i, move || {
                 compaction_loop(
                     shutdown_clone,
-                    trigger_clone,
+                    receiver_clone,
+                    pending_clone,
                     lock_clone,
                     registry_clone,
                     versions_clone,
@@ -126,9 +148,16 @@ impl CompactionScheduler {
         Ok(scheduler)
     }
 
-    /// Notify the compaction thread that work may be available.
+    /// Notify the compaction workers that work may be available.
+    ///
+    /// Coalesced: a notification arriving while one is still unconsumed
+    /// is dropped, because the worker that picks the outstanding token up
+    /// re-checks the whole version before it decides there is nothing to
+    /// do. Send is non-blocking, so this never stalls a flush.
     pub(crate) fn notify(&self) {
-        notify_trigger(&self.trigger, false);
+        if !self.pending.swap(true, Ordering::AcqRel) {
+            self.trigger.send(());
+        }
     }
 
     /// Shut down all compaction threads.
@@ -139,7 +168,11 @@ impl CompactionScheduler {
     /// `max_background_compactions`.
     pub(crate) fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Release);
-        notify_trigger(&self.trigger, true);
+        // One token per worker, bypassing the coalescing gate, so every
+        // thread wakes now instead of waiting out its periodic poll.
+        for _ in 0..self.handles.len() {
+            self.trigger.send(());
+        }
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
@@ -152,23 +185,6 @@ impl Drop for CompactionScheduler {
     }
 }
 
-/// Wake one compaction worker blocked on the trigger condvar.
-///
-/// The critical section is a single `bool` store, so it cannot unwind
-/// and the mutex cannot be poisoned; the `unwrap` is unreachable.
-fn notify_trigger(trigger: &(Mutex<bool>, Condvar), wake_all: bool) {
-    let (lock, cvar) = trigger;
-    // The critical section is a single `bool` store, so the guard
-    // cannot be poisoned by an unwinding writer; recovering the inner
-    // value keeps the wake-up path panic-free regardless.
-    let mut triggered = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    *triggered = true;
-    if wake_all {
-        cvar.notify_all();
-    } else {
-        cvar.notify_one();
-    }
-}
 
 /// Spawn one named compaction worker.
 ///
@@ -248,9 +264,20 @@ pub(crate) struct CompactionOptions {
     pub(crate) max_background_compactions: usize,
     pub(crate) partitioned_index: bool,
     pub(crate) metadata_block_size: usize,
+    pub(crate) cache_index_and_filter_blocks: bool,
 }
 
 impl CompactionOptions {
+    /// How readers opened by compaction should hold their index and
+    /// filter blocks. Mirrors `EngineOptions::metadata_policy`.
+    pub(crate) fn metadata_policy(&self) -> MetadataPolicy {
+        if self.cache_index_and_filter_blocks {
+            MetadataPolicy::Cached
+        } else {
+            MetadataPolicy::Pinned
+        }
+    }
+
     /// Resolve the codec used when writing an output SSTable destined
     /// for `level`. Mirrors `EngineOptions::compression_for_level`.
     pub(crate) fn compression_for_level(&self, level: usize) -> crate::options::CompressionType {
@@ -285,6 +312,7 @@ impl Default for CompactionOptions {
             max_background_compactions: 1,
             partitioned_index: false,
             metadata_block_size: 4096,
+            cache_index_and_filter_blocks: false,
         }
     }
 }
@@ -292,7 +320,8 @@ impl Default for CompactionOptions {
 #[allow(clippy::too_many_arguments)]
 fn compaction_loop(
     shutdown: Arc<AtomicBool>,
-    trigger: Arc<(Mutex<bool>, Condvar)>,
+    trigger: Receiver<()>,
+    pending: Arc<AtomicBool>,
     compaction_lock: Arc<parking_lot::RwLock<()>>,
     snapshot_registry: Arc<SnapshotRegistry>,
     versions: Arc<VersionStore>,
@@ -303,24 +332,13 @@ fn compaction_loop(
     in_progress: Arc<parking_lot::Mutex<HashSet<u64>>>,
 ) {
     loop {
-        // Wait for a trigger, for the periodic check, or for shutdown.
-        //
-        // The trigger flag is consumed by whichever worker wakes
-        // first, so shutdown is re-checked here, under the same mutex
-        // the flag is set under. Without that check a second worker
-        // would find the flag already cleared and sleep out the full
-        // poll interval, making close latency scale with
-        // `max_background_compactions`.
-        {
-            let (lock, cvar) = &*trigger;
-            let mut triggered = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !*triggered && !shutdown.load(Ordering::Acquire) {
-                let (guard, _) = cvar
-                    .wait_timeout(triggered, std::time::Duration::from_secs(1))
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                triggered = guard;
-            }
-            *triggered = false;
+        // Wait for a trigger, or fall through on the periodic poll.
+        // The gate is reopened before the pass runs, so a notification
+        // that lands mid-pass queues a token instead of being swallowed.
+        match trigger.recv_deadline(Instant::now() + WORKER_POLL_INTERVAL) {
+            RecvDeadline::Msg(()) => pending.store(false, Ordering::Release),
+            RecvDeadline::Timeout => {}
+            RecvDeadline::Disconnected => break,
         }
 
         if shutdown.load(Ordering::Acquire) {
@@ -971,15 +989,15 @@ fn perform_compaction_to(
     // the point-entry RT shadow pass so a filter that drops a range
     // tombstone doesn't leave orphaned point entries already wiped
     // out by that same RT. Only runs when no snapshot is pinned.
-    if pin_seq == u64::MAX {
-        if let Some(filter) = opts.compaction_filter.as_ref() {
-            merged_range_tombstones.retain(|rt| {
-                !matches!(
-                    filter.filter_range_delete(target_level, &rt.start, &rt.end),
-                    crate::options::CompactionDecision::Remove
-                )
-            });
-        }
+    if pin_seq == u64::MAX
+        && let Some(filter) = opts.compaction_filter.as_ref()
+    {
+        merged_range_tombstones.retain(|rt| {
+            !matches!(
+                filter.filter_range_delete(target_level, &rt.start, &rt.end),
+                crate::options::CompactionDecision::Remove
+            )
+        });
     }
 
     // Dedup merged range tombstones by (start, end, seq) - a single
@@ -1185,7 +1203,7 @@ fn apply_compaction_filter(
     filter: &dyn crate::options::CompactionFilter,
     level: usize,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
-    use super::internal_key::{encode_internal_key, VALUE_TYPE_DELETION, VALUE_TYPE_VALUE};
+    use super::internal_key::{VALUE_TYPE_DELETION, VALUE_TYPE_VALUE, encode_internal_key};
 
     let mut out = Vec::with_capacity(entries.len());
     for (ik, value) in entries {
@@ -1237,7 +1255,7 @@ fn collapse_merge_chains(
     op: &dyn crate::options::MergeOperator,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
     use super::internal_key::{
-        encode_internal_key, VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE,
+        VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE, encode_internal_key,
     };
 
     let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(entries.len());
@@ -1368,15 +1386,15 @@ fn collapse_merge_chains(
 /// Whether a file's user-key range intersects `[start, end)`. `None`
 /// bounds are treated as unbounded.
 fn file_overlaps_range(file: &Arc<LiveSst>, start: Option<&[u8]>, end: Option<&[u8]>) -> bool {
-    if let Some(s) = start {
-        if file.meta.largest_key.as_slice() < s {
-            return false;
-        }
+    if let Some(s) = start
+        && file.meta.largest_key.as_slice() < s
+    {
+        return false;
     }
-    if let Some(e) = end {
-        if file.meta.smallest_key.as_slice() >= e {
-            return false;
-        }
+    if let Some(e) = end
+        && file.meta.smallest_key.as_slice() >= e
+    {
+        return false;
     }
     true
 }
@@ -1683,7 +1701,11 @@ impl<'a> StreamingCompactionWriter<'a> {
             crate::os_hint::drop_page_cache_by_path(&current.path);
         }
 
-        let reader = Arc::new(SsTableReader::open(&current.path, current.file_id)?);
+        let reader = Arc::new(SsTableReader::open_with(
+            &current.path,
+            current.file_id,
+            self.opts.metadata_policy(),
+        )?);
         let (smallest_key, largest_key) = match (
             current.smallest_user_key.take(),
             current.largest_user_key.take(),
@@ -1787,7 +1809,11 @@ impl<'a> StreamingCompactionWriter<'a> {
             crate::os_hint::drop_page_cache_by_path(&path);
         }
 
-        let reader = Arc::new(SsTableReader::open(&path, file_id)?);
+        let reader = Arc::new(SsTableReader::open_with(
+            &path,
+            file_id,
+            self.opts.metadata_policy(),
+        )?);
         let new_file = LiveSst::new(
             SsTableMeta {
                 file_id,
@@ -1863,11 +1889,11 @@ fn group_range_tombstone_fragments(mut fragments: Vec<RangeTombstone>) -> Vec<Ve
     let mut current_end: Option<Vec<u8>> = None;
 
     for rt in fragments {
-        if let Some(end) = &current_end {
-            if rt.start.as_slice() > end.as_slice() {
-                groups.push(std::mem::take(&mut current));
-                current_end = None;
-            }
+        if let Some(end) = &current_end
+            && rt.start.as_slice() > end.as_slice()
+        {
+            groups.push(std::mem::take(&mut current));
+            current_end = None;
         }
 
         if current_end
@@ -1909,19 +1935,11 @@ fn merge_key_ranges(ranges: &[(Vec<u8>, Vec<u8>)]) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 fn min_key(a: &[u8], b: &[u8]) -> Vec<u8> {
-    if a <= b {
-        a.to_vec()
-    } else {
-        b.to_vec()
-    }
+    if a <= b { a.to_vec() } else { b.to_vec() }
 }
 
 fn max_key(a: &[u8], b: &[u8]) -> Vec<u8> {
-    if a >= b {
-        a.to_vec()
-    } else {
-        b.to_vec()
-    }
+    if a >= b { a.to_vec() } else { b.to_vec() }
 }
 
 fn key_range(files: &[Arc<LiveSst>]) -> (Vec<u8>, Vec<u8>) {

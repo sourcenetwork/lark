@@ -60,18 +60,18 @@
 //! blocks, which is a format change.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::{checksum, durability};
 use crate::WriteBatchOp;
 
 /// Record types in the WAL.
-const RECORD_PUT: u8 = 0x01;
-const RECORD_DELETE: u8 = 0x02;
-const RECORD_DELETE_RANGE: u8 = 0x03;
-const RECORD_MERGE: u8 = 0x04;
-const RECORD_BATCH: u8 = 0x05;
+pub(super) const RECORD_PUT: u8 = 0x01;
+pub(super) const RECORD_DELETE: u8 = 0x02;
+pub(super) const RECORD_DELETE_RANGE: u8 = 0x03;
+pub(super) const RECORD_MERGE: u8 = 0x04;
+pub(super) const RECORD_BATCH: u8 = 0x05;
 
 /// On-disk record header: 4-byte little-endian payload length plus a
 /// one-byte record type.
@@ -85,7 +85,11 @@ const CHECKSUM_LEN: usize = 4;
 /// torn-write and bit-rot detection. On crash recovery, WAL files are
 /// replayed to reconstruct memtable state.
 pub(crate) struct Wal {
-    writer: BufWriter<File>,
+    file: File,
+    /// Bytes appended so far, tracked in memory rather than queried so
+    /// [`Wal::rollback_to`] can discard a failed group without a metadata
+    /// syscall on the write path.
+    offset: u64,
     path: PathBuf,
     parent_synced: bool,
 }
@@ -123,37 +127,71 @@ impl Wal {
             .truncate(true)
             .open(path)?;
         Ok(Self {
-            writer: BufWriter::new(file),
+            file,
+            offset: 0,
             path: path.to_path_buf(),
             parent_synced: false,
         })
     }
 
+    /// Append one fully-formed group of records with a single
+    /// `write_all`, and advance the tracked offset.
+    ///
+    /// `bytes` must already be framed by [`encode_op_record`] or
+    /// [`encode_ops_batch_record`]; this function adds no framing of its
+    /// own. On failure the tracked offset is left at the pre-call value
+    /// so [`Wal::rollback_to`] can discard whatever prefix reached the
+    /// file.
+    pub(crate) fn append_group(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.file.write_all(bytes)?;
+        self.offset += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Byte offset one past the last successfully appended record.
+    pub(crate) fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Truncate back to `offset` and reposition the write cursor there.
+    ///
+    /// Called when a group's append or sync failed, so a partially
+    /// written group never survives as a torn record that replay would
+    /// have to reason about.
+    pub(crate) fn rollback_to(&mut self, offset: u64) -> io::Result<()> {
+        self.file.set_len(offset)?;
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.offset = offset;
+        Ok(())
+    }
+
     /// Append a put record.
     pub(crate) fn append_put(&mut self, key: &[u8], value: &[u8], seq: u64) -> io::Result<()> {
-        let data_len = 4 + key.len() + 4 + value.len() + 8;
-        let mut data = Vec::with_capacity(data_len);
-
-        encode_put_payload(&mut data, key, value, seq);
-
-        self.write_record(RECORD_PUT, &data)
+        let mut record = Vec::with_capacity(record_len(put_payload_len(key, value)));
+        encode_put_record(&mut record, key, value, seq);
+        self.append_group(&record)
     }
 
     /// Append a delete record.
     pub(crate) fn append_delete(&mut self, key: &[u8], seq: u64) -> io::Result<()> {
-        let mut data = Vec::with_capacity(4 + key.len() + 8);
-
-        encode_delete_payload(&mut data, key, seq);
-
-        self.write_record(RECORD_DELETE, &data)
+        let mut record = Vec::with_capacity(record_len(delete_payload_len(key)));
+        encode_record(&mut record, RECORD_DELETE, |out| {
+            encode_delete_payload(out, key, seq)
+        });
+        self.append_group(&record)
     }
 
     /// Append a merge record - an operand layered on top of any
     /// existing value/merge chain for `key`.
     pub(crate) fn append_merge(&mut self, key: &[u8], operand: &[u8], seq: u64) -> io::Result<()> {
-        let mut data = Vec::with_capacity(4 + key.len() + 4 + operand.len() + 8);
-        encode_merge_payload(&mut data, key, operand, seq);
-        self.write_record(RECORD_MERGE, &data)
+        let mut record = Vec::with_capacity(record_len(merge_payload_len(key, operand)));
+        encode_record(&mut record, RECORD_MERGE, |out| {
+            encode_merge_payload(out, key, operand, seq)
+        });
+        self.append_group(&record)
     }
 
     /// Append a range-delete record covering `[start, end)`.
@@ -163,35 +201,26 @@ impl Wal {
         end: &[u8],
         seq: u64,
     ) -> io::Result<()> {
-        let mut data = Vec::with_capacity(4 + start.len() + 4 + end.len() + 8);
-        encode_delete_range_payload(&mut data, start, end, seq);
-
-        self.write_record(RECORD_DELETE_RANGE, &data)
+        let mut record = Vec::with_capacity(record_len(delete_range_payload_len(start, end)));
+        encode_record(&mut record, RECORD_DELETE_RANGE, |out| {
+            encode_delete_range_payload(out, start, end, seq)
+        });
+        self.append_group(&record)
     }
 
-    /// Append a batch record from write-batch operations without first
-    /// cloning them into replay entries.
-    pub(crate) fn append_ops_batch(
-        &mut self,
-        ops: &[WriteBatchOp],
-        base_seq: u64,
-    ) -> io::Result<()> {
-        if ops.is_empty() {
-            return Ok(());
-        }
-
-        let mut data = Vec::with_capacity(batch_ops_payload_len(ops));
-        data.extend_from_slice(&(ops.len() as u32).to_le_bytes());
-
-        for (i, op) in ops.iter().enumerate() {
-            encode_batch_op(&mut data, op, base_seq + i as u64);
-        }
-
-        self.write_record(RECORD_BATCH, &data)
-    }
-
-    /// Flush and fsync the WAL to disk.
-    pub(crate) fn sync(&mut self) -> io::Result<()> {
+    /// Flush the appended bytes to stable storage.
+    ///
+    /// `sync_data` (`fdatasync`), not `sync_all` (`fsync`): the WAL is
+    /// append-only, and `fdatasync` already flushes the metadata a later
+    /// read needs, which includes the file size. Inode timestamps are not
+    /// needed to replay the log, so flushing them is work no reader will
+    /// ever benefit from. How much latency that saves is filesystem
+    /// dependent and can be nil.
+    ///
+    /// The directory entry naming the file is a separate durability
+    /// concern that no `fdatasync` on the file itself can cover, so the
+    /// parent directory is fsynced once per WAL file on first sync.
+    pub(crate) fn sync_data(&mut self) -> io::Result<()> {
         self.sync_with_parent_sync(durability::sync_parent_dir)
     }
 
@@ -199,8 +228,11 @@ impl Wal {
         &mut self,
         mut sync_parent: impl FnMut(&Path) -> io::Result<()>,
     ) -> io::Result<()> {
-        self.writer.flush()?;
-        self.writer.get_ref().sync_all()?;
+        #[cfg(test)]
+        if fault::should_fail_sync(&self.path) {
+            return Err(io::Error::other("injected WAL sync failure"));
+        }
+        self.file.sync_data()?;
         if !self.parent_synced {
             sync_parent(&self.path)?;
             self.parent_synced = true;
@@ -208,84 +240,27 @@ impl Wal {
         Ok(())
     }
 
-    /// Flush the buffer (without fsync).
-    pub(crate) fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
-    }
-
     /// Get the path to this WAL file.
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
-    fn write_record(&mut self, record_type: u8, data: &[u8]) -> io::Result<()> {
-        let len = data.len() as u32;
-        let checksum = checksum::wal_record(len, record_type, data);
-
-        self.writer.write_all(&len.to_le_bytes())?;
-        self.writer.write_all(&[record_type])?;
-        self.writer.write_all(data)?;
-        self.writer.write_all(&checksum.to_le_bytes())?;
-
-        Ok(())
-    }
-
-    /// Replay a WAL file and return every whole record it holds.
+    /// Replay a WAL file and collect every entry.
     ///
-    /// A record the file ends inside is the ordinary shape of a crash, and
-    /// is treated as the end of the log: the records before it come back
-    /// and the incomplete tail is reported through `tracing`. A whole
-    /// record that fails its checksum, carries an unknown type, or does
-    /// not parse is corruption and is an error, and so is an incomplete
-    /// record that still has whole records after it. The module
-    /// documentation says why those cases are told apart this way, and
-    /// names the one case the format cannot tell apart.
+    /// Test-only reference implementation: recovery streams the log
+    /// through [`WalReplayIter`] instead, so it never holds more than
+    /// one record. This wrapper drains that same iterator, which is
+    /// what makes the WAL tests below a check on the streaming reader
+    /// rather than on a second, divergent parser.
+    ///
+    /// [`WalReplayIter`]: super::wal_replay::WalReplayIter
+    #[cfg(test)]
     pub(crate) fn replay(path: &Path) -> io::Result<Vec<WalEntry>> {
-        // Read the file whole: deciding whether an incomplete record is a
-        // torn tail or a mangled length field means looking at the bytes
-        // after it. A WAL is bounded by `write_buffer_size` plus the one
-        // record that crossed it, and the entries decoded out of it are
-        // larger than the file itself, so this bounds nothing new.
-        let bytes = fs::read(path)?;
+        let mut iter = super::wal_replay::WalReplayIter::open(path)?;
         let mut entries = Vec::new();
-        let mut pos = 0usize;
-
-        while pos < bytes.len() {
-            let Some(frame) = frame_at(&bytes, pos) else {
-                end_of_log_or_corruption(path, &bytes, pos)?;
-                break;
-            };
-
-            if !frame.checksum_matches() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "WAL checksum mismatch in {} at offset {pos}",
-                        path.display()
-                    ),
-                ));
-            }
-
-            match frame.record_type {
-                RECORD_PUT => entries.push(parse_put_record(frame.data)?),
-                RECORD_DELETE => entries.push(parse_delete_record(frame.data)?),
-                RECORD_DELETE_RANGE => entries.push(parse_delete_range_record(frame.data)?),
-                RECORD_MERGE => entries.push(parse_merge_record(frame.data)?),
-                RECORD_BATCH => entries.extend(parse_batch_record(frame.data)?),
-                other => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "unknown WAL record type {other} in {} at offset {pos}",
-                            path.display()
-                        ),
-                    ));
-                }
-            }
-
-            pos = frame.end;
+        while let Some(entry) = iter.next_entry()? {
+            entries.push(entry);
         }
-
         Ok(entries)
     }
 
@@ -295,9 +270,140 @@ impl Wal {
     }
 }
 
+/// Test-only fault injection for the commit path.
+///
+/// Scoped to a directory rather than armed globally so two tests running
+/// in parallel in one process cannot trip each other's injection.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::path::{Path, PathBuf};
+
+    use parking_lot::Mutex;
+
+    /// Every directory currently armed. A list rather than a single
+    /// slot because tests run in parallel in one process: with one slot,
+    /// arming for a second directory silently disarms the first and
+    /// disarming from either clears both, which makes both tests flaky.
+    static ARMED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// Make every `sync_data` on a WAL under `dir` fail until disarmed.
+    pub(crate) fn arm_sync_failure(dir: &Path) {
+        ARMED.lock().push(dir.to_path_buf());
+    }
+
+    /// Stop failing syncs under `dir`, leaving any other test's arming
+    /// in place.
+    pub(crate) fn disarm_sync_failure(dir: &Path) {
+        let mut armed = ARMED.lock();
+        if let Some(at) = armed.iter().rposition(|d| d == dir) {
+            armed.remove(at);
+        }
+    }
+
+    pub(super) fn should_fail_sync(path: &Path) -> bool {
+        ARMED.lock().iter().any(|dir| path.starts_with(dir))
+    }
+}
+
 /// Format a WAL filename from a numeric ID.
 pub(crate) fn wal_filename(id: u64) -> String {
     format!("wal_{:06}.log", id)
+}
+
+/// Framing overhead every record carries: a 4-byte little-endian payload
+/// length, a 1-byte record type, and a trailing 4-byte checksum.
+const RECORD_HEADER_LEN: usize = 5;
+const RECORD_CHECKSUM_LEN: usize = 4;
+
+/// Total on-disk size of a record with a payload of `payload_len` bytes.
+fn record_len(payload_len: usize) -> usize {
+    RECORD_HEADER_LEN + payload_len + RECORD_CHECKSUM_LEN
+}
+
+/// Frame one record into `out`.
+///
+/// On-disk record format, unchanged since the first release:
+/// `[payload_len u32 LE][record_type u8][payload][checksum u32 LE]`,
+/// where the checksum covers the length and type fields as well as the
+/// payload (see [`checksum::wal_record`]).
+///
+/// The length is backfilled after `encode_payload` runs so a payload can
+/// be written straight into the group buffer with no intermediate copy.
+fn encode_record(out: &mut Vec<u8>, record_type: u8, encode_payload: impl FnOnce(&mut Vec<u8>)) {
+    let header = out.len();
+    out.extend_from_slice(&[0u8; RECORD_HEADER_LEN]);
+    encode_payload(out);
+
+    let payload_start = header + RECORD_HEADER_LEN;
+    let len = (out.len() - payload_start) as u32;
+    out[header..payload_start - 1].copy_from_slice(&len.to_le_bytes());
+    out[payload_start - 1] = record_type;
+
+    let checksum = checksum::wal_record(len, record_type, &out[payload_start..]);
+    out.extend_from_slice(&checksum.to_le_bytes());
+}
+
+/// On-disk size of the record [`encode_put_record`] emits.
+pub(crate) fn put_record_len(key: &[u8], value: &[u8]) -> usize {
+    record_len(put_payload_len(key, value))
+}
+
+/// Encode a single put as one framed record.
+pub(crate) fn encode_put_record(out: &mut Vec<u8>, key: &[u8], value: &[u8], seq: u64) {
+    encode_record(out, RECORD_PUT, |o| encode_put_payload(o, key, value, seq));
+}
+
+/// Encode one write-batch operation as one framed record at `seq`.
+pub(crate) fn encode_op_record(out: &mut Vec<u8>, op: &WriteBatchOp, seq: u64) {
+    match op {
+        WriteBatchOp::Put { key, value } => encode_put_record(out, key, value, seq),
+        WriteBatchOp::Delete { key } => {
+            encode_record(out, RECORD_DELETE, |o| encode_delete_payload(o, key, seq));
+        }
+        WriteBatchOp::DeleteRange { start, end } => {
+            encode_record(out, RECORD_DELETE_RANGE, |o| {
+                encode_delete_range_payload(o, start, end, seq)
+            });
+        }
+        WriteBatchOp::Merge { key, operand } => {
+            encode_record(out, RECORD_MERGE, |o| {
+                encode_merge_payload(o, key, operand, seq)
+            });
+        }
+    }
+}
+
+/// Encode `ops` as one framed `RECORD_BATCH`, the unit replay restores
+/// atomically. `ops` must not be empty.
+pub(crate) fn encode_ops_batch_record(out: &mut Vec<u8>, ops: &[WriteBatchOp], base_seq: u64) {
+    encode_record(out, RECORD_BATCH, |o| {
+        o.extend_from_slice(&(ops.len() as u32).to_le_bytes());
+        for (i, op) in ops.iter().enumerate() {
+            encode_batch_op(o, op, base_seq + i as u64);
+        }
+    });
+}
+
+/// On-disk size of the record `encode_ops_record` would emit for `ops` at
+/// one sequence base: one framed record per op when there is exactly one,
+/// a single framed batch record otherwise.
+pub(crate) fn ops_record_len(ops: &[WriteBatchOp]) -> usize {
+    match ops {
+        [] => 0,
+        [op] => record_len(batch_op_payload_len(op)),
+        _ => record_len(batch_ops_payload_len(ops)),
+    }
+}
+
+/// Encode `ops` into `out` the way the engine writes them: a lone
+/// operation becomes its own record, several become one atomic batch
+/// record, so replay restores a multi-op write as a unit.
+pub(crate) fn encode_ops_record(out: &mut Vec<u8>, ops: &[WriteBatchOp], base_seq: u64) {
+    match ops {
+        [] => {}
+        [op] => encode_op_record(out, op, base_seq),
+        _ => encode_ops_batch_record(out, ops, base_seq),
+    }
 }
 
 fn encode_put_payload(out: &mut Vec<u8>, key: &[u8], value: &[u8], seq: u64) {
@@ -445,6 +551,87 @@ fn frame_at(bytes: &[u8], offset: usize) -> Option<Frame<'_>> {
 /// `Ok(())` means the tail is a crash artifact and therefore the end of
 /// the log; the error means whole records still follow it, which no torn
 /// write can produce.
+/// Decide whether the incomplete record beginning at `record_start` is a
+/// torn tail or real damage, for a reader that streams and therefore
+/// cannot see the bytes past it.
+///
+/// Reached at most once per file, and only when the log is already
+/// damaged, so the whole-file read it needs is not on any healthy path.
+/// A WAL is bounded by `write_buffer_size` plus the one record that
+/// crossed it, so this bounds nothing the engine did not already hold.
+///
+/// `Ok(())` means torn: the records before it stand and the tail is
+/// discarded, with the offset and byte count logged. `Err` means whole
+/// records follow the damage, so the tail is loss rather than a torn
+/// write, and the open is refused.
+pub(super) fn classify_incomplete_record(path: &Path, record_start: u64) -> io::Result<TailVerdict> {
+    let bytes = fs::read(path)?;
+    let pos = usize::try_from(record_start)
+        .unwrap_or(usize::MAX)
+        .min(bytes.len());
+    end_of_log_or_corruption(path, &bytes, pos)?;
+    Ok(TailVerdict::discarded(&bytes, pos))
+}
+
+/// Decide a record that framed cleanly but carries an unusable type or a
+/// failing checksum.
+///
+/// Bytes a crash never wrote read back as zeros, and a power cut can
+/// zero a region that was already written. Either way an all-zero tail
+/// is the end of the log, not damage: there is nothing after it to lose.
+/// A bad record with anything non-zero behind it is real corruption and
+/// refuses the open.
+pub(super) fn classify_unusable_record(path: &Path, record_start: u64) -> io::Result<TailVerdict> {
+    let bytes = fs::read(path)?;
+    let pos = usize::try_from(record_start)
+        .unwrap_or(usize::MAX)
+        .min(bytes.len());
+    if !tail_is_unwritten(&bytes, pos) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "WAL checksum mismatch in {} at offset {pos}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(TailVerdict::discarded(&bytes, pos))
+}
+
+/// Where a replay stopped short of the last byte, and how much it threw
+/// away. Recovery needs both to tell a torn tail in the newest WAL from
+/// damage sitting in the middle of the history.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TailVerdict {
+    pub(crate) offset: u64,
+    pub(crate) discarded_bytes: u64,
+}
+
+impl TailVerdict {
+    fn discarded(bytes: &[u8], pos: usize) -> Self {
+        let discarded_bytes = (bytes.len() - pos) as u64;
+        report_discarded_tail(bytes, discarded_bytes, pos);
+        Self {
+            offset: pos as u64,
+            discarded_bytes,
+        }
+    }
+}
+
+/// Whether every byte from `pos` on is zero, which is how both a crash
+/// that never wrote them and a power cut that zeroed them read back.
+fn tail_is_unwritten(bytes: &[u8], pos: usize) -> bool {
+    bytes[pos..].iter().all(|b| *b == 0)
+}
+
+fn report_discarded_tail(_bytes: &[u8], discarded_bytes: u64, pos: usize) {
+    tracing::warn!(
+        offset = pos,
+        discarded_bytes,
+        "discarded an incomplete trailing WAL record left by a crash"
+    );
+}
+
 fn end_of_log_or_corruption(path: &Path, bytes: &[u8], pos: usize) -> io::Result<()> {
     let discarded_bytes = bytes.len() - pos;
 
@@ -519,7 +706,43 @@ fn resync_after(bytes: &[u8], pos: usize) -> Option<usize> {
     first
 }
 
-fn parse_put_record(data: &[u8]) -> io::Result<WalEntry> {
+pub(super) fn read_wal_header(reader: &mut impl Read) -> io::Result<Option<[u8; 5]>> {
+    let mut header = [0u8; 5];
+    let mut read = 0;
+
+    while read < header.len() {
+        match reader.read(&mut header[read..]) {
+            Ok(0) if read == 0 => return Ok(None),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated WAL record header",
+                ));
+            }
+            Ok(n) => read += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(Some(header))
+}
+
+pub(super) fn read_exact_or_truncated(
+    reader: &mut impl Read,
+    buf: &mut [u8],
+    message: &'static str,
+) -> io::Result<()> {
+    reader.read_exact(buf).map_err(|e| {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            io::Error::new(io::ErrorKind::UnexpectedEof, message)
+        } else {
+            e
+        }
+    })
+}
+
+pub(super) fn parse_put_record(data: &[u8]) -> io::Result<WalEntry> {
     if data.len() < 16 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -559,7 +782,7 @@ fn parse_put_record(data: &[u8]) -> io::Result<WalEntry> {
     Ok(WalEntry::Put { key, value, seq })
 }
 
-fn parse_delete_record(data: &[u8]) -> io::Result<WalEntry> {
+pub(super) fn parse_delete_record(data: &[u8]) -> io::Result<WalEntry> {
     if data.len() < 12 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -581,7 +804,7 @@ fn parse_delete_record(data: &[u8]) -> io::Result<WalEntry> {
     Ok(WalEntry::Delete { key, seq })
 }
 
-fn parse_delete_range_record(data: &[u8]) -> io::Result<WalEntry> {
+pub(super) fn parse_delete_range_record(data: &[u8]) -> io::Result<WalEntry> {
     if data.len() < 16 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -619,7 +842,7 @@ fn parse_delete_range_record(data: &[u8]) -> io::Result<WalEntry> {
     Ok(WalEntry::DeleteRange { start, end, seq })
 }
 
-fn parse_merge_record(data: &[u8]) -> io::Result<WalEntry> {
+pub(super) fn parse_merge_record(data: &[u8]) -> io::Result<WalEntry> {
     if data.len() < 16 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -659,7 +882,7 @@ fn parse_merge_record(data: &[u8]) -> io::Result<WalEntry> {
     Ok(WalEntry::Merge { key, operand, seq })
 }
 
-fn parse_batch_record(data: &[u8]) -> io::Result<Vec<WalEntry>> {
+pub(super) fn parse_batch_record(data: &[u8]) -> io::Result<Vec<WalEntry>> {
     if data.len() < 4 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -789,7 +1012,6 @@ mod tests {
             wal.append_put(b"key1", b"value1", 1).unwrap();
             wal.append_delete(b"key2", 2).unwrap();
             wal.append_put(b"key3", b"value3", 3).unwrap();
-            wal.flush().unwrap();
         }
 
         let entries = Wal::replay(&path).unwrap();
@@ -826,7 +1048,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (mut wal, path) = new_wal(&dir);
         wal.append_put(b"k", b"v", 7).unwrap();
-        wal.flush().unwrap();
         drop(wal);
 
         let entries = Wal::replay(&path).unwrap();
@@ -844,7 +1065,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (mut wal, path) = new_wal(&dir);
         wal.append_delete(b"gone", 11).unwrap();
-        wal.flush().unwrap();
         drop(wal);
 
         let entries = Wal::replay(&path).unwrap();
@@ -859,7 +1079,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (mut wal, path) = new_wal(&dir);
         wal.append_delete_range(b"aaa", b"zzz", 5).unwrap();
-        wal.flush().unwrap();
         drop(wal);
 
         let entries = Wal::replay(&path).unwrap();
@@ -877,16 +1096,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (mut wal, path) = new_wal(&dir);
         wal.append_merge(b"counter", b"+3", 99).unwrap();
-        wal.flush().unwrap();
         drop(wal);
 
         let entries = Wal::replay(&path).unwrap();
         match entries.as_slice() {
-            [WalEntry::Merge {
-                key,
-                operand,
-                seq: 99,
-            }] => {
+            [
+                WalEntry::Merge {
+                    key,
+                    operand,
+                    seq: 99,
+                },
+            ] => {
                 assert_eq!(key, b"counter");
                 assert_eq!(operand, b"+3");
             }
@@ -902,7 +1122,6 @@ mod tests {
         wal.append_delete(b"d", 2).unwrap();
         wal.append_delete_range(b"ra", b"rb", 3).unwrap();
         wal.append_merge(b"m", b"op", 4).unwrap();
-        wal.flush().unwrap();
         drop(wal);
 
         let entries = Wal::replay(&path).unwrap();
@@ -932,8 +1151,9 @@ mod tests {
                 operand: b"op".to_vec(),
             },
         ];
-        wal.append_ops_batch(&ops, 10).unwrap();
-        wal.flush().unwrap();
+        let mut record = Vec::new();
+        encode_ops_batch_record(&mut record, &ops, 10);
+        wal.append_group(&record).unwrap();
         drop(wal);
 
         assert_eq!(
@@ -963,11 +1183,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_ops_batch_append_is_noop() {
+    fn empty_ops_encodes_and_appends_nothing() {
         let dir = TempDir::new().unwrap();
         let (mut wal, path) = new_wal(&dir);
-        wal.append_ops_batch(&[], 1).unwrap();
-        wal.flush().unwrap();
+        let mut record = Vec::new();
+        encode_ops_record(&mut record, &[], 1);
+        assert!(record.is_empty());
+        wal.append_group(&record).unwrap();
+        assert_eq!(wal.offset(), 0);
         drop(wal);
 
         assert!(Wal::replay(&path).unwrap().is_empty());
@@ -978,8 +1201,7 @@ mod tests {
     #[test]
     fn replay_empty_file_returns_no_entries() {
         let dir = TempDir::new().unwrap();
-        let (mut wal, path) = new_wal(&dir);
-        wal.flush().unwrap();
+        let (wal, path) = new_wal(&dir);
         drop(wal);
 
         assert!(Wal::replay(&path).unwrap().is_empty());
@@ -990,7 +1212,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (mut wal, path) = new_wal(&dir);
         wal.append_put(b"", b"", 0).unwrap();
-        wal.flush().unwrap();
         drop(wal);
 
         match Wal::replay(&path).unwrap().as_slice() {
@@ -1010,7 +1231,6 @@ mod tests {
         // forcing multiple writes to the underlying file.
         let big = vec![0xAB; 1 << 20];
         wal.append_put(b"k", &big, 1).unwrap();
-        wal.flush().unwrap();
         drop(wal);
 
         match Wal::replay(&path).unwrap().as_slice() {
@@ -1029,7 +1249,6 @@ mod tests {
         let (mut wal, path) = new_wal(&dir);
         wal.append_put(b"a", b"1", 0).unwrap();
         wal.append_put(b"b", b"2", u64::MAX).unwrap();
-        wal.flush().unwrap();
         drop(wal);
 
         let entries = Wal::replay(&path).unwrap();
@@ -1052,7 +1271,6 @@ mod tests {
             wal.append_put(format!("k{:06}", i).as_bytes(), b"v", i)
                 .unwrap();
         }
-        wal.flush().unwrap();
         drop(wal);
 
         let entries = Wal::replay(&path).unwrap();
@@ -1077,7 +1295,7 @@ mod tests {
         {
             let mut wal = Wal::create(&path).unwrap();
             wal.append_put(b"k", b"v", 1).unwrap();
-            wal.sync().unwrap();
+            wal.sync_data().unwrap();
         }
         let entries = Wal::replay(&path).unwrap();
         assert_eq!(entries.len(), 1);
@@ -1143,12 +1361,10 @@ mod tests {
         {
             let mut wal = Wal::create(&path).unwrap();
             wal.append_put(b"old", b"v", 1).unwrap();
-            wal.flush().unwrap();
         }
         {
             let mut wal = Wal::create(&path).unwrap();
             wal.append_put(b"new", b"v", 2).unwrap();
-            wal.flush().unwrap();
         }
 
         match Wal::replay(&path).unwrap().as_slice() {
@@ -1162,7 +1378,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (mut wal, path) = new_wal(&dir);
         wal.append_put(b"k", b"v", 1).unwrap();
-        wal.flush().unwrap();
         drop(wal);
 
         assert!(path.exists());
@@ -1177,6 +1392,159 @@ mod tests {
         assert_eq!(wal.path(), path);
     }
 
+    // ── group append and rollback ───────────────────────────────
+
+    #[test]
+    fn offset_tracks_every_appended_byte() {
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        assert_eq!(wal.offset(), 0);
+
+        wal.append_put(b"k", b"v", 1).unwrap();
+        let after_one = wal.offset();
+        assert_eq!(after_one as usize, put_record_len(b"k", b"v"));
+
+        wal.append_put(b"k2", b"v2", 2).unwrap();
+        assert_eq!(
+            wal.offset() as usize,
+            after_one as usize + put_record_len(b"k2", b"v2")
+        );
+
+        wal.sync_data().unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), wal.offset());
+    }
+
+    #[test]
+    fn a_group_of_records_replays_exactly_like_individual_appends() {
+        let dir = TempDir::new().unwrap();
+        let grouped_path = dir.path().join("grouped.wal");
+        let individual_path = dir.path().join("individual.wal");
+
+        let ops = vec![
+            WriteBatchOp::Put {
+                key: b"a".to_vec(),
+                value: b"1".to_vec(),
+            },
+            WriteBatchOp::Delete { key: b"b".to_vec() },
+        ];
+
+        {
+            let mut wal = Wal::create(&grouped_path).unwrap();
+            let mut group = Vec::new();
+            encode_put_record(&mut group, b"solo", b"v", 1);
+            encode_ops_record(&mut group, &ops, 2);
+            wal.append_group(&group).unwrap();
+        }
+        {
+            let mut wal = Wal::create(&individual_path).unwrap();
+            wal.append_put(b"solo", b"v", 1).unwrap();
+            let mut record = Vec::new();
+            encode_ops_batch_record(&mut record, &ops, 2);
+            wal.append_group(&record).unwrap();
+        }
+
+        assert_eq!(
+            fs::read(&grouped_path).unwrap(),
+            fs::read(&individual_path).unwrap(),
+            "grouping must not change a single on-disk byte"
+        );
+        assert_eq!(
+            Wal::replay(&grouped_path).unwrap(),
+            Wal::replay(&individual_path).unwrap()
+        );
+        assert_eq!(Wal::replay(&grouped_path).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn rollback_discards_a_group_and_leaves_the_log_replayable() {
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        wal.append_put(b"keep", b"v", 1).unwrap();
+        let good = wal.offset();
+
+        let mut group = Vec::new();
+        encode_put_record(&mut group, b"discard", b"v", 2);
+        wal.append_group(&group).unwrap();
+        assert!(wal.offset() > good);
+
+        wal.rollback_to(good).unwrap();
+        assert_eq!(wal.offset(), good);
+
+        // The cursor moved back with the length, so the next append lands
+        // at the boundary rather than past a hole.
+        wal.append_put(b"after", b"v", 3).unwrap();
+        wal.sync_data().unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), wal.offset());
+
+        let entries = Wal::replay(&path).unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                WalEntry::Put {
+                    key: b"keep".to_vec(),
+                    value: b"v".to_vec(),
+                    seq: 1,
+                },
+                WalEntry::Put {
+                    key: b"after".to_vec(),
+                    value: b"v".to_vec(),
+                    seq: 3,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rollback_of_a_torn_partial_group_leaves_no_record_behind() {
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        let good = wal.offset();
+
+        // Simulate a group whose write reached the file only partially.
+        let mut group = Vec::new();
+        encode_put_record(&mut group, b"torn", b"value", 7);
+        wal.append_group(&group[..group.len() - 3]).unwrap();
+        // The partial record is a torn tail, so it is discarded rather
+        // than replayed: what must never happen is the half-written
+        // entry surfacing as a committed one.
+        assert!(
+            Wal::replay(&path).unwrap().is_empty(),
+            "a torn tail must not replay as an entry"
+        );
+
+        wal.rollback_to(good).unwrap();
+        assert!(Wal::replay(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_len_matches_the_bytes_each_encoder_emits() {
+        let mut out = Vec::new();
+        encode_put_record(&mut out, b"key", b"value", 4);
+        assert_eq!(out.len(), put_record_len(b"key", b"value"));
+
+        let ops = vec![
+            WriteBatchOp::Merge {
+                key: b"m".to_vec(),
+                operand: b"o".to_vec(),
+            },
+            WriteBatchOp::DeleteRange {
+                start: b"s".to_vec(),
+                end: b"e".to_vec(),
+            },
+        ];
+        let mut out = Vec::new();
+        encode_ops_record(&mut out, &ops, 9);
+        assert_eq!(out.len(), ops_record_len(&ops));
+
+        let single = vec![WriteBatchOp::Merge {
+            key: b"m".to_vec(),
+            operand: b"o".to_vec(),
+        }];
+        let mut out = Vec::new();
+        encode_ops_record(&mut out, &single, 9);
+        assert_eq!(out.len(), ops_record_len(&single));
+    }
+
     // ── corruption / torn tail ──────────────────────────────────
 
     #[test]
@@ -1185,7 +1553,6 @@ mod tests {
         let (mut wal, path) = new_wal(&dir);
         wal.append_put(b"good", b"v", 1).unwrap();
         wal.append_put(b"torn", b"v", 2).unwrap();
-        wal.flush().unwrap();
         drop(wal);
 
         // Last byte of the file is the high byte of the trailing
@@ -1207,7 +1574,6 @@ mod tests {
         let (mut wal, path) = new_wal(&dir);
         wal.append_put(b"good", b"v", 1).unwrap();
         wal.append_put(b"torn", b"v", 2).unwrap();
-        wal.flush().unwrap();
         drop(wal);
 
         // Flip a byte deep inside the second record's data (6 bytes
@@ -1236,7 +1602,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (mut wal, path) = new_wal(&dir);
         wal.append_put(b"k", b"v", 1).unwrap();
-        wal.flush().unwrap();
         drop(wal);
 
         flip_byte(&path, 4);
@@ -1277,7 +1642,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (mut wal, path) = new_wal(&dir);
         wal.append_put(b"good", b"v", 1).unwrap();
-        wal.flush().unwrap();
         drop(wal);
 
         // Simulate a crash in the middle of writing the next record's
@@ -1324,7 +1688,7 @@ mod tests {
         for i in 0..4u64 {
             wal.append_put(format!("k{i}").as_bytes(), b"v", i).unwrap();
         }
-        wal.flush().unwrap();
+        wal.sync_data().unwrap();
         drop(wal);
 
         let mut bytes = fs::read(&path).unwrap();
@@ -1356,7 +1720,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (mut wal, path) = new_wal(&dir);
         wal.append_put(b"good", b"v", 1).unwrap();
-        wal.flush().unwrap();
+        wal.sync_data().unwrap();
         drop(wal);
 
         let mut bytes = fs::read(&path).unwrap();
@@ -1399,7 +1763,7 @@ mod tests {
         for i in 0..4u64 {
             wal.append_put(format!("k{i}").as_bytes(), b"v", i).unwrap();
         }
-        wal.flush().unwrap();
+        wal.sync_data().unwrap();
         drop(wal);
 
         let full = fs::read(&path).unwrap();

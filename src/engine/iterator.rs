@@ -60,16 +60,19 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use super::block::encoded_entry_size;
-use super::block::{decode_entry_at, Block, RESTART_INTERVAL};
+use super::block::{Block, RESTART_INTERVAL, decode_entry_at};
 use super::block_cache::BlockCache;
 use super::internal_key::{
-    compare_internal_keys, decode_internal_key, lookup_key, user_key_of, INTERNAL_KEY_SUFFIX_LEN,
-    VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE,
+    INTERNAL_KEY_SUFFIX_LEN, VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE,
+    encode_internal_key,
+    compare_internal_keys, decode_internal_key, user_key_of,
 };
+use super::lookup_key::LookupKey;
 use super::manifest::Version;
 use super::memtable::MemTable;
 use super::range_tombstone::{RangeTombstone, RangeTombstoneSet};
 use super::sstable::{LiveSst, SsTableBlockCursor, SsTableReader};
+use crate::DbSlice;
 use crate::options::MergeOperator;
 use crate::options::PrefixExtractor;
 
@@ -143,7 +146,7 @@ impl LevelIter {
                 Ok(())
             }
             Self::SsTable(it) => {
-                if !it.reader.may_have_prefix(prefix) {
+                if !it.reader.may_have_prefix(prefix, &it.cache)? {
                     it.valid = false;
                     return Ok(());
                 }
@@ -203,24 +206,34 @@ impl LevelIter {
     fn value(&self) -> Option<&[u8]> {
         match self {
             Self::Memtable(it) => it.curr.as_ref().map(|(_, v)| v.as_slice()),
-            Self::SsTable(it) => {
-                if it.valid {
-                    let data = it.block.as_ref().unwrap().entry_data();
-                    Some(
-                        &data[it.cached_value_offset..it.cached_value_offset + it.cached_value_len],
-                    )
-                } else {
-                    None
-                }
-            }
+            Self::SsTable(it) => it.value(),
             Self::LevelConcat(it) => it.value(),
+        }
+    }
+
+    /// The current value as an owning view, so it survives the cursor
+    /// moving on. Free for an SSTable source (one reference count on
+    /// the block already in memory); a copy for a memtable source,
+    /// whose values are separately owned buffers.
+    fn value_slice(&self) -> Option<DbSlice> {
+        match self {
+            Self::Memtable(it) => it.curr.as_ref().map(|(_, v)| v.clone()),
+            Self::SsTable(it) => it.value_slice(),
+            Self::LevelConcat(it) => it.value_slice(),
         }
     }
 }
 
+/// Cursor over one memtable.
+///
+/// The skip list has no back pointers, so every step is a fresh
+/// `O(log N)` seek from the current key. Both halves of `curr` are
+/// arena-backed views rather than copies, so a step costs two reference
+/// counts and no allocation; the previous step's views are dropped only
+/// after the new seek has read the key it seeks from.
 struct MemtableLevelIter {
     mt: Arc<MemTable>,
-    curr: Option<(Vec<u8>, Vec<u8>)>,
+    curr: Option<(DbSlice, DbSlice)>,
 }
 
 impl MemtableLevelIter {
@@ -229,31 +242,33 @@ impl MemtableLevelIter {
     }
 
     fn seek_to_first(&mut self) {
-        self.curr = self.mt.first_entry_from(Bound::Unbounded);
+        self.curr = self.mt.first_slice_from(Bound::Unbounded);
     }
 
     fn seek_to_last(&mut self) {
-        self.curr = self.mt.last_entry_before(Bound::Unbounded);
+        self.curr = self.mt.last_slice_before(Bound::Unbounded);
     }
 
     fn seek(&mut self, target: &[u8]) {
-        self.curr = self.mt.first_entry_from(Bound::Included(target));
+        self.curr = self.mt.first_slice_from(Bound::Included(target));
     }
 
     fn seek_for_prev(&mut self, target: &[u8]) {
-        self.curr = self.mt.last_entry_before(Bound::Included(target));
+        self.curr = self.mt.last_slice_before(Bound::Included(target));
     }
 
     fn advance(&mut self) {
-        if let Some((k, _)) = self.curr.take() {
-            self.curr = self.mt.first_entry_from(Bound::Excluded(k.as_slice()));
-        }
+        let Some((key, _)) = self.curr.take() else {
+            return;
+        };
+        self.curr = self.mt.first_slice_from(Bound::Excluded(key.as_slice()));
     }
 
     fn advance_backward(&mut self) {
-        if let Some((k, _)) = self.curr.take() {
-            self.curr = self.mt.last_entry_before(Bound::Excluded(k.as_slice()));
-        }
+        let Some((key, _)) = self.curr.take() else {
+            return;
+        };
+        self.curr = self.mt.last_slice_before(Bound::Excluded(key.as_slice()));
     }
 }
 
@@ -294,6 +309,27 @@ impl SsTableLevelIter {
         }
     }
 
+    /// The current value, borrowed from the decoded block holding it.
+    fn value(&self) -> Option<&[u8]> {
+        if !self.valid {
+            return None;
+        }
+        let data = self.block.as_ref()?.entry_data();
+        let end = self
+            .cached_value_offset
+            .checked_add(self.cached_value_len)?;
+        data.get(self.cached_value_offset..end)
+    }
+
+    /// The current value as an owning view over the block holding it.
+    fn value_slice(&self) -> Option<DbSlice> {
+        if !self.valid {
+            return None;
+        }
+        let block = Arc::clone(self.block.as_ref()?);
+        DbSlice::from_block(block, self.cached_value_offset, self.cached_value_len)
+    }
+
     fn load_block(&mut self, cursor: SsTableBlockCursor) -> io::Result<()> {
         self.block = Some(self.reader.load_block_at_cursor(&cursor, &self.cache)?);
         self.block_cursor = Some(cursor);
@@ -324,7 +360,7 @@ impl SsTableLevelIter {
     }
 
     fn seek_to_first(&mut self) -> io::Result<()> {
-        let Some(cursor) = self.reader.first_block_cursor()? else {
+        let Some(cursor) = self.reader.first_block_cursor(&self.cache)? else {
             self.valid = false;
             return Ok(());
         };
@@ -334,7 +370,7 @@ impl SsTableLevelIter {
     }
 
     fn seek(&mut self, target: &[u8]) -> io::Result<()> {
-        let cursor = match self.reader.seek_block_cursor(target)? {
+        let cursor = match self.reader.seek_block_cursor(target, &self.cache)? {
             Some(cursor) => cursor,
             None => {
                 self.valid = false;
@@ -360,7 +396,7 @@ impl SsTableLevelIter {
         // Fell off end of block - try next block.
         let next = self
             .reader
-            .next_block_cursor(self.block_cursor.as_ref().unwrap())?;
+            .next_block_cursor(self.block_cursor.as_ref().unwrap(), &self.cache)?;
         let Some(next) = next else {
             self.valid = false;
             return Ok(());
@@ -371,9 +407,9 @@ impl SsTableLevelIter {
     }
 
     fn seek_for_prev(&mut self, target: &[u8]) -> io::Result<()> {
-        let cursor = match self.reader.seek_block_cursor(target)? {
+        let cursor = match self.reader.seek_block_cursor(target, &self.cache)? {
             Some(cursor) => cursor,
-            None => match self.reader.last_block_cursor()? {
+            None => match self.reader.last_block_cursor(&self.cache)? {
                 Some(cursor) => cursor,
                 None => {
                     self.valid = false;
@@ -403,26 +439,19 @@ impl SsTableLevelIter {
             None => {
                 let prev = self
                     .reader
-                    .prev_block_cursor(self.block_cursor.as_ref().unwrap())?;
+                    .prev_block_cursor(self.block_cursor.as_ref().unwrap(), &self.cache)?;
                 let Some(prev) = prev else {
                     self.valid = false;
                     return Ok(());
                 };
                 self.load_block(prev)?;
                 self.build_entry_offsets();
-                // An empty data block is representable on disk, so the
-                // last index is computed rather than assumed.
-                match self
-                    .entry_offsets
-                    .as_ref()
-                    .and_then(|offsets| offsets.len().checked_sub(1))
-                {
-                    Some(last) => {
-                        self.replay_key_to_index(last);
-                        self.valid = true;
-                    }
-                    None => self.valid = false,
-                }
+                let Some(last) = self.last_entry_index() else {
+                    self.valid = false;
+                    return Ok(());
+                };
+                self.replay_key_to_index(last);
+                self.valid = true;
             }
         }
         Ok(())
@@ -437,7 +466,7 @@ impl SsTableLevelIter {
         if self.entry_pos >= data.len() {
             let next = self
                 .reader
-                .next_block_cursor(self.block_cursor.as_ref().unwrap())?;
+                .next_block_cursor(self.block_cursor.as_ref().unwrap(), &self.cache)?;
             let Some(next) = next else {
                 self.valid = false;
                 return Ok(());
@@ -449,18 +478,16 @@ impl SsTableLevelIter {
     }
 
     fn seek_to_last(&mut self) -> io::Result<()> {
-        let Some(cursor) = self.reader.last_block_cursor()? else {
+        let Some(cursor) = self.reader.last_block_cursor(&self.cache)? else {
             self.valid = false;
             return Ok(());
         };
         self.load_block(cursor)?;
         self.build_entry_offsets();
-        let offsets = self.entry_offsets.as_ref().unwrap();
-        if offsets.is_empty() {
+        let Some(last) = self.last_entry_index() else {
             self.valid = false;
             return Ok(());
-        }
-        let last = offsets.len() - 1;
+        };
         self.replay_key_to_index(last);
         self.valid = true;
         Ok(())
@@ -482,19 +509,17 @@ impl SsTableLevelIter {
         if cur_idx == 0 {
             let prev = self
                 .reader
-                .prev_block_cursor(self.block_cursor.as_ref().unwrap())?;
+                .prev_block_cursor(self.block_cursor.as_ref().unwrap(), &self.cache)?;
             let Some(prev) = prev else {
                 self.valid = false;
                 return Ok(());
             };
             self.load_block(prev)?;
             self.build_entry_offsets();
-            let offsets = self.entry_offsets.as_ref().unwrap();
-            if offsets.is_empty() {
+            let Some(last) = self.last_entry_index() else {
                 self.valid = false;
                 return Ok(());
-            }
-            let last = offsets.len() - 1;
+            };
             self.replay_key_to_index(last);
             self.valid = true;
             return Ok(());
@@ -513,6 +538,16 @@ impl SsTableLevelIter {
             pos += encoded_entry_size(data, pos);
         }
         self.entry_offsets = Some(offsets);
+    }
+
+    /// Index of the last entry in the currently loaded block, or `None`
+    /// when that block holds no entries.
+    ///
+    /// A range-tombstone-only SSTable has zero data entries, so every
+    /// reverse-stepping path has to treat an empty block as "keep
+    /// walking back" rather than indexing one before the start.
+    fn last_entry_index(&self) -> Option<usize> {
+        self.entry_offsets.as_ref()?.len().checked_sub(1)
     }
 
     /// Replay key reconstruction from the nearest restart point up to
@@ -741,14 +776,11 @@ impl LevelConcatIter {
     }
 
     fn value(&self) -> Option<&[u8]> {
-        self.current.as_ref().and_then(|it| {
-            if it.valid {
-                let data = it.block.as_ref().unwrap().entry_data();
-                Some(&data[it.cached_value_offset..it.cached_value_offset + it.cached_value_len])
-            } else {
-                None
-            }
-        })
+        self.current.as_ref().and_then(|it| it.value())
+    }
+
+    fn value_slice(&self) -> Option<DbSlice> {
+        self.current.as_ref().and_then(|it| it.value_slice())
     }
 }
 
@@ -834,6 +866,10 @@ impl MergingIter {
 
     fn value(&self) -> Option<&[u8]> {
         self.current_idx.and_then(|i| self.levels[i].value())
+    }
+
+    fn value_slice(&self) -> Option<DbSlice> {
+        self.current_idx.and_then(|i| self.levels[i].value_slice())
     }
 
     fn pick_smallest(&mut self) {
@@ -996,10 +1032,18 @@ impl LarkIterator {
                 Arc::clone(&cache),
             )));
         }
-        // L1+: use a single concatenation iterator per level instead
-        // of one LevelIter per file. Point files are non-overlapping;
-        // RT-only files have no entries and are skipped by the concat
-        // iterator.
+        // L1+: one concatenation iterator per level rather than one
+        // LevelIter per file, which `LevelConcatIter` may do only because
+        // the files it is handed are sorted and non-overlapping.
+        //
+        // Compaction also emits range-tombstone-only files, whose key
+        // range is the tombstone's and therefore *does* overlap the data
+        // files beside it. They carry zero point entries, and their
+        // tombstones are collected below for every file in the level
+        // regardless, so they are dropped from the concat list: leaving
+        // one in place lets `seek_for_prev` bisect onto an empty file and
+        // report "no key <= target" while a live key sits in the data
+        // file that sorts after it.
         for level in 1..version.levels.len() {
             if version.levels[level].is_empty() {
                 continue;
@@ -1007,8 +1051,14 @@ impl LarkIterator {
             for file in &version.levels[level] {
                 range_tombstones.extend(file.reader.range_tombstones().iter().cloned());
             }
-            let mut sorted: Vec<Arc<LiveSst>> =
-                version.levels[level].iter().map(Arc::clone).collect();
+            let mut sorted: Vec<Arc<LiveSst>> = version.levels[level]
+                .iter()
+                .filter(|f| f.meta.num_entries > 0)
+                .map(Arc::clone)
+                .collect();
+            if sorted.is_empty() {
+                continue;
+            }
             sorted.sort_by(|a, b| a.meta.smallest_key.cmp(&b.meta.smallest_key));
             levels.push(LevelIter::LevelConcat(LevelConcatIter::new(
                 sorted,
@@ -1099,8 +1149,8 @@ impl LarkIterator {
         // Smallest internal key for `target` at any seq: `target || !u64::MAX || 0`.
         // This positions the merging iterator at the newest version of the
         // target user key, or the first user key > target if none exists.
-        let search_key = lookup_key(target, u64::MAX);
-        if let Err(e) = self.inner.seek(&search_key) {
+        let search_key = LookupKey::from_prefixed(target, u64::MAX);
+        if let Err(e) = self.inner.seek(search_key.internal()) {
             self.error = Some(e);
             return;
         }
@@ -1164,7 +1214,7 @@ impl LarkIterator {
         // 00`, the smallest internal key any entry for user key `bound`
         // could carry. Every internal key strictly below it belongs to
         // a user key strictly below `bound`, whatever its length.
-        let probe = lookup_key(exclusive_upper, u64::MAX);
+        let probe = encode_internal_key(exclusive_upper, u64::MAX, VALUE_TYPE_DELETION);
         if let Err(e) = self.inner.seek_for_prev(&probe) {
             self.error = Some(e);
             return;
@@ -1209,11 +1259,12 @@ impl LarkIterator {
             .as_ref()
             .and_then(|ex| ex.extract_query(prefix).map(|p| p.to_vec()));
 
-        let search_key = lookup_key(prefix, u64::MAX);
+        let search_key = LookupKey::from_prefixed(prefix, u64::MAX);
         let res = if let Some(probe) = bloom_probe.as_deref() {
-            self.inner.seek_with_prefix_skip(&search_key, probe)
+            self.inner
+                .seek_with_prefix_skip(search_key.internal(), probe)
         } else {
-            self.inner.seek(&search_key)
+            self.inner.seek(search_key.internal())
         };
         if let Err(e) = res {
             self.error = Some(e);
@@ -1293,6 +1344,28 @@ impl LarkIterator {
         }
     }
 
+    /// The current value as an owning view over whatever already holds
+    /// it. Zero-copy while iterating SSTables in forward order; a copy
+    /// for a memtable-resident entry, a merge result, or the reverse
+    /// path, all of which own their bytes separately.
+    pub(crate) fn value_slice(&self) -> Option<DbSlice> {
+        match self.direction {
+            Direction::Forward => {
+                if let Some((_, v)) = &self.merge_result {
+                    return Some(DbSlice::from_vec(v.clone()));
+                }
+                if !self.valid_entry {
+                    return None;
+                }
+                self.inner.value_slice()
+            }
+            Direction::Reverse => self
+                .reverse_curr
+                .as_ref()
+                .map(|(_, v)| DbSlice::from_vec(v.clone())),
+        }
+    }
+
     pub(crate) fn status(&self) -> io::Result<()> {
         match &self.error {
             Some(e) => Err(io::Error::new(e.kind(), e.to_string())),
@@ -1366,10 +1439,10 @@ impl LarkIterator {
                 return;
             }
 
-            if let Some(ub) = self.upper_bound.as_deref() {
-                if uk >= ub {
-                    return;
-                }
+            if let Some(ub) = self.upper_bound.as_deref()
+                && uk >= ub
+            {
+                return;
             }
 
             if seq > self.snapshot_seq {
@@ -1685,8 +1758,8 @@ impl LarkIterator {
         if uk.is_empty() {
             return;
         }
-        let probe = lookup_key(&uk, u64::MAX);
-        if let Err(e) = self.inner.seek_for_prev(&probe) {
+        let probe = LookupKey::from_prefixed(&uk, u64::MAX);
+        if let Err(e) = self.inner.seek_for_prev(probe.internal()) {
             self.error = Some(e);
         }
         self.valid_entry = false;

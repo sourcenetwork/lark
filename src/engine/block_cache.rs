@@ -8,6 +8,8 @@ use parking_lot::Mutex;
 use xxhash_rust::xxh3::xxh3_64;
 
 use super::block::Block;
+use super::filter_block::FilterBlock;
+use super::index_block::IndexBlock;
 use crate::options::MAX_BLOCK_CACHE_SHARD_BITS;
 use crate::statistics::{Statistics, Ticker};
 
@@ -16,7 +18,7 @@ use crate::statistics::{Statistics, Ticker};
 /// Ordered on `(file_id, offset)`, so every block of one file is a
 /// single contiguous range of the shard map and [`BlockCache::evict_file`]
 /// can walk that file's entries instead of the whole shard.
-#[derive(Eq, PartialEq, PartialOrd, Ord, Clone, Copy)]
+#[derive(Hash, Eq, PartialEq, PartialOrd, Ord, Clone, Copy)]
 struct CacheKey {
     file_id: u64,
     offset: u64,
@@ -53,8 +55,39 @@ const MIN_SHARD_CAPACITY: usize = 64 * 1024;
 const ENTRY_OVERHEAD: usize = 128;
 
 /// Bytes one cached entry costs the cache.
-fn entry_charge(block: &Block) -> usize {
-    block.charge() + ENTRY_OVERHEAD
+/// What a cache slot holds.
+///
+/// Data blocks, index blocks and filter blocks share one key space
+/// because they occupy disjoint byte ranges of the same file: the
+/// SSTable layout writes data blocks, then the range-tombstone block,
+/// then the filter region, then the index, so no two of them can start
+/// at the same offset.
+enum CacheEntry {
+    Data(Arc<Block>),
+    Index(Arc<IndexBlock>),
+    Filter(Arc<FilterBlock>),
+}
+
+impl CacheEntry {
+    fn payload_charge(&self) -> usize {
+        match self {
+            Self::Data(block) => block.charge(),
+            Self::Index(block) => block.charge(),
+            Self::Filter(block) => block.charge(),
+        }
+    }
+
+    fn clone_ref(&self) -> Self {
+        match self {
+            Self::Data(b) => Self::Data(Arc::clone(b)),
+            Self::Index(b) => Self::Index(Arc::clone(b)),
+            Self::Filter(b) => Self::Filter(Arc::clone(b)),
+        }
+    }
+}
+
+fn entry_charge(entry: &CacheEntry) -> usize {
+    entry.payload_charge() + ENTRY_OVERHEAD
 }
 
 /// One cached block plus the CLOCK bookkeeping the hand reads.
@@ -63,7 +96,7 @@ fn entry_charge(block: &Block) -> usize {
 /// so a reader that reaches the entry through the map sets the same
 /// reference bit the hand later clears.
 struct ClockEntry {
-    block: Arc<Block>,
+    entry: CacheEntry,
     /// The map key, so the hand can unlink the entry it evicts without
     /// a reverse lookup.
     key: CacheKey,
@@ -72,7 +105,15 @@ struct ClockEntry {
     charge: usize,
     /// Ring index, fixed for the entry's lifetime: a replace or an
     /// `evict_file` reaches the slot in O(1) instead of scanning.
-    slot: usize,
+    ///
+    /// 32 bits, not 64: slots are bounded by the live entry count,
+    /// which the byte budget bounds in turn. Overflowing this would
+    /// take more than 4.29 billion resident entries, or upwards of
+    /// 500 GiB of cache at the per-entry charge below. Narrowing it
+    /// pays for the payload enum's discriminant, so a cache entry
+    /// stays the same size it was when it could only hold a data
+    /// block.
+    slot: u32,
     /// Set by every reader through `&self`, cleared by the hand.
     /// Advisory only, so `Relaxed` is enough: no data is published
     /// through the bit, and a lost update costs one extra miss rather
@@ -187,13 +228,13 @@ impl CacheShard {
     /// Lock-free: the map read is an epoch-protected traversal and the
     /// reference bit is a plain atomic store, so a reader never waits on
     /// an insert that is freeing blocks.
-    fn get(&self, key: &CacheKey) -> Option<Arc<Block>> {
+    fn get(&self, key: &CacheKey) -> Option<CacheEntry> {
         let map = self.map.get()?;
         let guard = epoch::pin();
         let found = map.get(key, &guard)?;
         let entry = found.value();
         entry.referenced.store(true, Ordering::Relaxed);
-        Some(Arc::clone(&entry.block))
+        Some(entry.entry.clone_ref())
     }
 
     /// Drop any entry already stored at `key` so a re-insert replaces
@@ -207,7 +248,7 @@ impl CacheShard {
             return;
         };
         let entry = found.value();
-        ring.release(entry.slot, entry.charge);
+        ring.release(entry.slot as usize, entry.charge);
         found.remove();
     }
 
@@ -258,7 +299,7 @@ impl CacheShard {
         &self,
         ring: &mut ClockRing,
         key: CacheKey,
-        block: &Arc<Block>,
+        entry: &CacheEntry,
         size: usize,
     ) -> bool {
         // Checked before the replace-path removal so a refusal leaves
@@ -273,7 +314,7 @@ impl CacheShard {
                 break;
             }
         }
-        self.store(ring, key, Arc::clone(block), size, &guard);
+        self.store(ring, key, entry.clone_ref(), size, &guard);
         true
     }
 
@@ -282,16 +323,16 @@ impl CacheShard {
         &self,
         ring: &mut ClockRing,
         key: CacheKey,
-        block: Arc<Block>,
+        entry: CacheEntry,
         size: usize,
         guard: &Guard,
     ) {
         let slot = ring.alloc_slot();
-        let entry = Arc::new(ClockEntry {
-            block,
+        let slot_entry = Arc::new(ClockEntry {
+            entry,
             key,
             charge: size,
-            slot,
+            slot: slot as u32,
             // A fresh entry starts unreferenced. Inserting with the bit
             // already set is what classic VM CLOCK does and it costs
             // 0.9 to 2.0 points of hit rate against LRU on every trace
@@ -299,9 +340,9 @@ impl CacheShard {
             // 1.4 points instead.
             referenced: AtomicBool::new(false),
         });
-        ring.slots[slot] = Some(Arc::clone(&entry));
+        ring.slots[slot] = Some(Arc::clone(&slot_entry));
         ring.used += size;
-        self.map().insert(key, entry, guard).release(guard);
+        self.map().insert(key, slot_entry, guard).release(guard);
     }
 
     /// Replace the whole shard with one entry that is larger than the
@@ -311,12 +352,12 @@ impl CacheShard {
         &self,
         ring: &mut ClockRing,
         key: CacheKey,
-        block: Arc<Block>,
+        entry: CacheEntry,
         size: usize,
     ) {
         let mut guard = epoch::pin();
         self.clear(ring, &mut guard);
-        self.store(ring, key, block, size, &guard);
+        self.store(ring, key, entry, size, &guard);
     }
 
     /// Drop every entry belonging to `file_id`.
@@ -339,7 +380,7 @@ impl CacheShard {
             }
             cursor = found.next();
             let entry = found.value();
-            ring.release(entry.slot, entry.charge);
+            ring.release(entry.slot as usize, entry.charge);
             found.remove();
         }
     }
@@ -544,13 +585,24 @@ impl BlockCache {
     /// Try to get a block from the cache. A disabled cache
     /// (`block_cache_size` of 0) always misses and records nothing:
     /// there was no cache lookup to count.
-    pub(crate) fn get(&self, file_id: u64, offset: u64) -> Option<Arc<Block>> {
+    /// Look one slot up and project out the requested payload kind.
+    ///
+    /// A slot holding another kind reads as a miss and is left in place:
+    /// the key space is disjoint by construction, so a mismatch means a
+    /// corrupt or aliased offset, not a stale entry worth evicting. It is
+    /// counted as a miss too, because the caller got nothing back.
+    fn lookup<T>(
+        &self,
+        file_id: u64,
+        offset: u64,
+        project: fn(&CacheEntry) -> Option<Arc<T>>,
+    ) -> Option<Arc<T>> {
         if self.shards.is_empty() {
             return None;
         }
         let key = CacheKey { file_id, offset };
         let idx = self.shard_index(&key);
-        let hit = self.shards[idx].get(&key);
+        let hit = self.shards[idx].get(&key).as_ref().and_then(project);
         if let Some(s) = self.stats.as_deref() {
             if hit.is_some() {
                 s.add(Ticker::BlockCacheHit, 1);
@@ -562,6 +614,37 @@ impl BlockCache {
         hit
     }
 
+    pub(crate) fn get(&self, file_id: u64, offset: u64) -> Option<Arc<Block>> {
+        self.lookup(file_id, offset, |entry| match entry {
+            CacheEntry::Data(block) => Some(Arc::clone(block)),
+            _ => None,
+        })
+    }
+
+    /// Try to get an SSTable index block.
+    pub(crate) fn get_index(&self, file_id: u64, offset: u64) -> Option<Arc<IndexBlock>> {
+        self.lookup(file_id, offset, |entry| match entry {
+            CacheEntry::Index(block) => Some(Arc::clone(block)),
+            _ => None,
+        })
+    }
+
+    /// Try to get an SSTable filter block.
+    pub(crate) fn get_filter(&self, file_id: u64, offset: u64) -> Option<Arc<FilterBlock>> {
+        self.lookup(file_id, offset, |entry| match entry {
+            CacheEntry::Filter(block) => Some(Arc::clone(block)),
+            _ => None,
+        })
+    }
+
+    pub(crate) fn insert_index(&self, file_id: u64, offset: u64, block: Arc<IndexBlock>) -> bool {
+        self.store(file_id, offset, CacheEntry::Index(block))
+    }
+
+    pub(crate) fn insert_filter(&self, file_id: u64, offset: u64, block: Arc<FilterBlock>) -> bool {
+        self.store(file_id, offset, CacheEntry::Filter(block))
+    }
+
     /// Insert a block into the cache. The block may be evicted
     /// before it is next read, especially under memory pressure.
     /// The function signature deliberately takes ownership of the
@@ -569,17 +652,23 @@ impl BlockCache {
     /// use, and the cache's copy is managed internally. A disabled
     /// cache (`block_cache_size` of 0) drops the block.
     pub(crate) fn insert(&self, file_id: u64, offset: u64, block: Arc<Block>) {
+        self.store(file_id, offset, CacheEntry::Data(block));
+    }
+
+    /// Admit one entry of any kind, honouring the byte budget and
+    /// `strict_capacity_limit`. Returns whether it was cached.
+    fn store(&self, file_id: u64, offset: u64, entry: CacheEntry) -> bool {
         if self.shards.is_empty() {
-            return;
+            return false;
         }
         let key = CacheKey { file_id, offset };
-        let size = entry_charge(&block);
+        let size = entry_charge(&entry);
         let idx = self.shard_index(&key);
         let stored = {
             let shard = &self.shards[idx];
             let mut ring = shard.ring.lock();
             let before = ring.used;
-            if shard.insert_within_budget(&mut ring, key, &block, size) {
+            if shard.insert_within_budget(&mut ring, key, &entry, size) {
                 self.publish(before, ring.used);
                 true
             } else if self.strict || size > self.capacity {
@@ -600,7 +689,7 @@ impl BlockCache {
                     let current = self.total_used.load(Ordering::Acquire);
                     let after = current.saturating_sub(before).saturating_add(size);
                     if after > self.capacity {
-                        return;
+                        return false;
                     }
                     if self
                         .total_used
@@ -610,18 +699,17 @@ impl BlockCache {
                         break;
                     }
                 }
-                shard.replace_all_with(&mut ring, key, block, size);
+                shard.replace_all_with(&mut ring, key, entry, size);
                 true
             }
         };
         // Counted only when the block was actually cached: the ticker
         // documents itself as one per miss that populated the cache, and
         // a refusal populates nothing.
-        if stored {
-            if let Some(s) = self.stats.as_deref() {
-                s.add(Ticker::BlockCacheAdd, 1);
-            }
+        if stored && let Some(s) = self.stats.as_deref() {
+            s.add(Ticker::BlockCacheAdd, 1);
         }
+        stored
     }
 
     /// Publish a shard's byte delta to the lock-free running total.
@@ -749,6 +837,22 @@ impl BlockCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The per-entry footprint is charged against the byte budget, so
+    /// growing it silently would let the cache hold more heap than the
+    /// budget admits. `ENTRY_OVERHEAD` already under-charges the real
+    /// bookkeeping deliberately; this pins the part of it that a code
+    /// change could move without anyone noticing.
+    #[test]
+    fn a_cache_entry_does_not_outgrow_its_charge() {
+        assert_eq!(
+            std::mem::size_of::<ClockEntry>(),
+            48,
+            "ClockEntry grew: either shrink it again or raise ENTRY_OVERHEAD \
+             and re-measure the hit rate, because admission changes with it"
+        );
+    }
+
     use crate::engine::block::{BlockBuilder, RESTART_INTERVAL};
 
     fn dummy_block(size: usize) -> Arc<Block> {
@@ -983,7 +1087,7 @@ mod tests {
         let mut offered = 0usize;
         for i in 0..3500u64 {
             let blk = dummy_block(1024);
-            offered += entry_charge(&blk);
+            offered += entry_charge(&CacheEntry::Data(Arc::clone(&blk)));
             cache.insert(1, i * 4096, blk);
         }
         assert!(
@@ -1036,7 +1140,7 @@ mod tests {
         let mut expected = 0usize;
         for i in 0..64u64 {
             let blk = dummy_block(512);
-            expected += entry_charge(&blk);
+            expected += entry_charge(&CacheEntry::Data(Arc::clone(&blk)));
             cache.insert(1, i * 4096, blk);
         }
         assert_eq!(cache.usage(), expected);

@@ -5,8 +5,8 @@ resolver = "2"
 [package]
 name = "lark-kv"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.82"
+edition = "2024"
+rust-version = "1.90"
 license = "Apache-2.0 OR MIT"
 description = "A pure Rust, embedded LSM-tree key-value store built from scratch"
 repository = "https://github.com/sourcenetwork/lark"
@@ -18,9 +18,19 @@ categories = ["database-implementations"]
 [features]
 fuzzing = []
 
+# `--cfg loom` swaps the memtable's atomics and locks for loom's mocks
+# (see `src/engine/sync.rs`). Declaring it keeps `unexpected_cfgs` quiet
+# in the ordinary build without turning the lint off.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [dependencies]
+# Used only by the CLOCK block cache now; the memtable has its own
+# arena skip list (`src/engine/skiplist.rs`).
 crossbeam-epoch = "0.9"
 crossbeam-skiplist = "0.1"
+kovan-queue = "0.1.19"
+kovan-channel = "0.1.19"
 lz4_flex = "0.11"
 snap = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
@@ -31,9 +41,21 @@ thiserror = "1.0"
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1", features = ["fs"] }
 
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
 [dev-dependencies]
 proptest = "1"
 tempfile = "3.8"
+
+# tokio carries its own `cfg(loom)` arms and does not build under this
+# crate's `--cfg loom`, and cargo builds every dev-dependency of a test
+# target whether or not the target uses it. Nothing in the tree imports
+# tokio, so gating it out of the loom build costs nothing.
+[target.'cfg(not(loom))'.dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [profile.release]
@@ -44,3 +66,7 @@ strip = true
 
 [profile.bench]
 opt-level = 3
+
+[[bench]]
+name = "allocs"
+harness = false

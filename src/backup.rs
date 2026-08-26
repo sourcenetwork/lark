@@ -31,7 +31,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::engine::{checksum, durability, CheckpointSnapshot};
+use crate::engine::{CheckpointSnapshot, checksum, durability};
 use crate::{Db, Error, Result};
 
 /// Opaque identifier for a single backup generation. Monotonically
@@ -268,11 +268,11 @@ impl BackupEngine {
             if parse_backup_id(&name.to_string_lossy()).is_none() {
                 continue;
             }
-            if let Ok(bytes) = fs::read(entry.path()) {
-                if let Ok(m) = decode_manifest(&bytes) {
-                    for f in m.files {
-                        still_referenced.insert(f.hash);
-                    }
+            if let Ok(bytes) = fs::read(entry.path())
+                && let Ok(m) = decode_manifest(&bytes)
+            {
+                for f in m.files {
+                    still_referenced.insert(f.hash);
                 }
             }
         }
@@ -299,10 +299,10 @@ impl BackupEngine {
         let mut max_id = 0u64;
         for entry in fs::read_dir(&self.meta_dir).map_err(Error::from)? {
             let entry = entry.map_err(Error::from)?;
-            if let Some(id) = parse_backup_id(&entry.file_name().to_string_lossy()) {
-                if id > max_id {
-                    max_id = id;
-                }
+            if let Some(id) = parse_backup_id(&entry.file_name().to_string_lossy())
+                && id > max_id
+            {
+                max_id = id;
             }
         }
         Ok(max_id + 1)

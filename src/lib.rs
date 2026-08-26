@@ -39,7 +39,10 @@
 //! assert_eq!(snap.get(b"key1").unwrap(), Some(b"val1".to_vec()));
 //! ```
 
-#![forbid(unsafe_code)]
+// `unsafe` is confined to the modules that need raw pointers to hand
+// out zero-copy views of bytes the engine already owns. Every other
+// module inherits the crate-level deny.
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 mod backup;
@@ -53,6 +56,7 @@ mod options;
 mod os_hint;
 mod perf_context;
 mod rate_limiter;
+mod slice;
 mod sst_file_writer;
 mod statistics;
 mod tailing;
@@ -70,20 +74,37 @@ pub use event_listener::{
 };
 pub use iter::Iter;
 pub use options::{
-    CompactionDecision, CompactionFilter, CompactionStyle, CompressionType, DurabilityMode,
-    FifoCompactionOptions, FixedLengthPrefix, MergeOperator, Options, PrefixExtractor,
-    UniversalCompactionOptions, WriteOptions, DEFAULT_MAX_KEY_SIZE, DEFAULT_MAX_VALUE_SIZE,
-    MAX_BLOCK_CACHE_SHARD_BITS, MAX_BLOOM_BITS_PER_KEY,
+    ArenaProfile, CompactionDecision, CompactionFilter, CompactionStyle, CompressionType,
+    DEFAULT_MAX_KEY_SIZE, DEFAULT_MAX_VALUE_SIZE, DurabilityMode, FifoCompactionOptions,
+    FixedLengthPrefix, MAX_BLOCK_CACHE_SHARD_BITS, MAX_BLOOM_BITS_PER_KEY, MergeOperator, Options,
+    PrefixExtractor, UniversalCompactionOptions, WriteOptions,
 };
 pub use perf_context::{PerfContext, PerfContextSnapshot, PerfLevel};
 pub use rate_limiter::{Priority, RateLimiter, TokenBucketRateLimiter};
+pub use slice::DbSlice;
 pub use sst_file_writer::{IngestOptions, SstFileMeta, SstFileWriter};
 pub use statistics::{Histogram, HistogramSnapshot, Statistics, Ticker};
 pub use tailing::TailingIter;
 pub use transaction::{
     OptimisticTransactionDb, Transaction, TransactionDb, TransactionError, TxResult,
 };
-pub use ttl::{strip_timestamp, DbWithTtl, TtlCompactionFilter};
+pub use ttl::{DbWithTtl, TtlCompactionFilter, strip_timestamp};
+
+#[cfg(loom)]
+#[doc(hidden)]
+pub mod loom_exports {
+    //! Model-checking entry points, published only in a `--cfg loom`
+    //! build.
+    //!
+    //! `tests/loom_memtable.rs` is an integration test and so sees only
+    //! the public API, while everything the models drive - the arena,
+    //! the skip list, the memtable, the read horizon - is crate-private.
+    //! The models therefore live inside the crate, next to the code they
+    //! check, and this module is the seam that lets the test target call
+    //! them. It does not exist in an ordinary build.
+
+    pub use crate::engine::loom_model::{handoff, skiplist, slice, version};
+}
 
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
@@ -112,7 +133,10 @@ pub mod fuzzing {
     /// Replay arbitrary bytes as a WAL file.
     pub fn replay_wal(data: &[u8]) {
         with_temp_file("wal", "log", data, |path| {
-            let _ = crate::engine::wal::Wal::replay(path);
+            let Ok(mut iter) = crate::engine::wal_replay::WalReplayIter::open(path) else {
+                return;
+            };
+            while matches!(iter.next_entry(), Ok(Some(_))) {}
         });
     }
 
@@ -157,8 +181,9 @@ pub mod fuzzing {
 }
 
 use column_family::{
-    cf_lower_bound, cf_upper_bound, meta, prefix_key, CfRegistry, DEFAULT_CF_ID, META_CF_ID,
+    CfRegistry, DEFAULT_CF_ID, META_CF_ID, cf_lower_bound, cf_upper_bound, meta, prefix_key,
 };
+use engine::lookup_key::LookupKey;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -424,14 +449,78 @@ impl Db {
 
     /// Get the value for a key from the default column family.
     /// Returns `None` if the key doesn't exist.
+    ///
+    /// This is [`Db::get_slice`] followed by [`DbSlice::into_vec`].
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.get_raw(&prefix_key(DEFAULT_CF_ID, key))
+        Ok(self.get_slice(key)?.map(DbSlice::into_vec))
     }
 
-    /// Engine-direct point read that bypasses CF prefixing. Used
-    /// by the CF metadata loader and by other modules (e.g. the
-    /// `_cf` wrappers above) that have already prefixed the key.
-    fn get_raw(&self, prefixed_key: &[u8]) -> Result<Option<Vec<u8>>> {
+    /// Read a value from the default column family without copying it.
+    ///
+    /// The returned [`DbSlice`] borrows bytes the database already owns
+    /// and holds a reference count on their owner, so nothing is copied
+    /// on the way out. Holding one pins that owner: see [`DbSlice`].
+    ///
+    /// `Option<DbSlice>` does not compare against `Option<Vec<u8>>`
+    /// (`core`'s `PartialEq` for `Option` is homogeneous), so this
+    /// method is additive and [`Db::get`] keeps its signature.
+    pub fn get_slice(&self, key: &[u8]) -> Result<Option<DbSlice>> {
+        let seq = self.engine.snapshot_seq();
+        self.lookup_slice(&LookupKey::new(DEFAULT_CF_ID, key, seq))
+    }
+
+    /// [`Db::get_slice`] scoped to a column family.
+    pub fn get_slice_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<Option<DbSlice>> {
+        self.validate_cf_handle(cf)?;
+        let seq = self.engine.snapshot_seq();
+        self.lookup_slice(&LookupKey::new(cf.id(), key, seq))
+    }
+
+    /// Whether a live value exists for `key` in the default column
+    /// family.
+    ///
+    /// Reads the same sources [`Db::get`] does and pays the same block
+    /// reads: a bloom filter is probabilistic, so ruling a key *in*
+    /// still requires consulting the data block. What it skips is the
+    /// copy, so no value bytes are ever materialized and nothing is
+    /// pinned after it returns. On a bloom-negative lookup `has` and
+    /// `get` cost the same and neither touches a block.
+    ///
+    /// When a [`MergeOperator`] is configured this method does
+    /// materialize: the operator decides inside `full_merge` whether a
+    /// value exists at all, so there is no way to answer without
+    /// collapsing the chain.
+    pub fn has(&self, key: &[u8]) -> Result<bool> {
+        Ok(self.get_size(key)?.is_some())
+    }
+
+    /// [`Db::has`] scoped to a column family.
+    pub fn has_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<bool> {
+        Ok(self.get_size_cf(cf, key)?.is_some())
+    }
+
+    /// Length in bytes of the live value for `key` in the default
+    /// column family, or `None` when there is none.
+    ///
+    /// Same sources and same block reads as [`Db::get`], without the
+    /// copy. See [`Db::has`] for what that does and does not save, and
+    /// for the [`MergeOperator`] caveat.
+    pub fn get_size(&self, key: &[u8]) -> Result<Option<usize>> {
+        let seq = self.engine.snapshot_seq();
+        self.lookup_size(&LookupKey::new(DEFAULT_CF_ID, key, seq))
+    }
+
+    /// [`Db::get_size`] scoped to a column family.
+    pub fn get_size_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<Option<usize>> {
+        self.validate_cf_handle(cf)?;
+        let seq = self.engine.snapshot_seq();
+        self.lookup_size(&LookupKey::new(cf.id(), key, seq))
+    }
+
+    /// The one point-read implementation every `get*` entry point
+    /// projects from, so statistics and perf counters are recorded
+    /// identically no matter which one the caller used.
+    fn lookup_slice(&self, lk: &LookupKey) -> Result<Option<DbSlice>> {
         let stats = self.stats();
         let _scope = statistics::TimeScope::new(stats, Histogram::DbGet);
         if let Some(s) = stats {
@@ -440,13 +529,28 @@ impl Db {
         perf_context::record_get_call();
         let result = self
             .engine
-            .get_latest(prefixed_key)
-            .map_err(|err| map_point_read_error(err, prefixed_key));
+            .get_slice(lk)
+            .map_err(|err| map_point_read_error(err, lk.prefixed_user_key()));
         if let (Some(s), Ok(Some(v))) = (stats, &result) {
             s.add(Ticker::BytesRead, v.len() as u64);
             s.record(Histogram::BytesPerRead, v.len() as u64);
         }
         result
+    }
+
+    /// The length-only twin of [`Db::lookup_slice`], sharing the
+    /// engine's single source walk. `Ticker::BytesRead` is deliberately
+    /// not recorded: no bytes were handed to the caller.
+    fn lookup_size(&self, lk: &LookupKey) -> Result<Option<usize>> {
+        let stats = self.stats();
+        let _scope = statistics::TimeScope::new(stats, Histogram::DbGet);
+        if let Some(s) = stats {
+            s.add(Ticker::KeysRead, 1);
+        }
+        perf_context::record_get_call();
+        self.engine
+            .get_size(lk)
+            .map_err(|err| map_point_read_error(err, lk.prefixed_user_key()))
     }
 
     /// Helper that exposes a borrowed reference to the engine's
@@ -987,6 +1091,8 @@ impl Db {
         match name {
             "lark.total-sst-files-size" => Some(self.engine.total_sst_size()),
             "lark.cur-size-active-mem-table" => Some(self.engine.active_memtable_size()),
+            "lark.memtable-reserved-bytes" => Some(self.engine.memtables_reserved_size()),
+            "lark.arena-pool-bytes" => Some(self.engine.arena_pool_size()),
             "lark.cur-size-all-mem-tables" => {
                 Some(self.engine.active_memtable_size() + self.engine.frozen_memtables_size())
             }
@@ -1016,6 +1122,7 @@ impl Db {
             "lark.oldest-snapshot-time" => self.engine.oldest_snapshot_time_unix(),
             "lark.block-cache-usage" => Some(self.engine.block_cache_usage() as u64),
             "lark.block-cache-capacity" => Some(self.engine.block_cache_capacity() as u64),
+            "lark.pinned-metadata-bytes" => Some(self.engine.pinned_metadata_bytes() as u64),
             // Background errors are surfaced through the
             // `EventListener::on_background_error` callback today,
             // with no dedicated counter yet. Report `0` so any
@@ -1307,8 +1414,7 @@ impl Db {
     /// Read `key` from column family `cf`. Same semantics as
     /// [`Db::get`] but scoped to the CF's keyspace.
     pub fn get_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.validate_cf_handle(cf)?;
-        self.get_raw(&prefix_key(cf.id(), key))
+        Ok(self.get_slice_cf(cf, key)?.map(DbSlice::into_vec))
     }
 
     /// Batched point lookup across a single CF.
@@ -1616,6 +1722,15 @@ impl<'a> CfIter<'a> {
         self.inner.value()
     }
 
+    /// Current value as a [`DbSlice`], which outlives the cursor
+    /// moving on. See [`Iter::value_slice`].
+    pub fn value_slice(&self) -> Option<DbSlice> {
+        if !self.valid() {
+            return None;
+        }
+        self.inner.value_slice()
+    }
+
     /// Propagate any I/O error from the underlying iterator.
     pub fn status(&self) -> Result<()> {
         self.inner.status()
@@ -1691,6 +1806,12 @@ impl OwnedSnapshotIter {
         self.inner.value()
     }
 
+    /// Current value as a [`DbSlice`], which outlives the cursor
+    /// moving on. See [`Iter::value_slice`].
+    pub fn value_slice(&self) -> Option<DbSlice> {
+        self.inner.value_slice()
+    }
+
     /// Propagate any I/O error from the underlying iterator.
     pub fn status(&self) -> Result<()> {
         self.inner.status()
@@ -1747,10 +1868,54 @@ impl Snapshot {
 
     /// Get the value for a key at this snapshot (default CF).
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let prefixed = prefix_key(DEFAULT_CF_ID, key);
+        Ok(self.get_slice(key)?.map(DbSlice::into_vec))
+    }
+
+    /// Read a value at this snapshot without copying it. See
+    /// [`Db::get_slice`] and [`DbSlice`].
+    pub fn get_slice(&self, key: &[u8]) -> Result<Option<DbSlice>> {
+        self.lookup_slice(&LookupKey::new(DEFAULT_CF_ID, key, self.seq))
+    }
+
+    /// [`Snapshot::get_slice`] scoped to a column family.
+    pub fn get_slice_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<Option<DbSlice>> {
+        self.validate_cf_handle(cf)?;
+        self.lookup_slice(&LookupKey::new(cf.id(), key, self.seq))
+    }
+
+    fn lookup_slice(&self, lk: &LookupKey) -> Result<Option<DbSlice>> {
         self.engine
-            .get_at(&prefixed, self.seq)
-            .map_err(|err| map_point_read_error(err, &prefixed))
+            .get_slice(lk)
+            .map_err(|err| map_point_read_error(err, lk.prefixed_user_key()))
+    }
+
+    /// Whether a live value exists for `key` at this snapshot. See
+    /// [`Db::has`] for what this does and does not avoid.
+    pub fn has(&self, key: &[u8]) -> Result<bool> {
+        Ok(self.get_size(key)?.is_some())
+    }
+
+    /// [`Snapshot::has`] scoped to a column family.
+    pub fn has_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<bool> {
+        Ok(self.get_size_cf(cf, key)?.is_some())
+    }
+
+    /// Length in bytes of the live value for `key` at this snapshot,
+    /// or `None` when there is none. See [`Db::get_size`].
+    pub fn get_size(&self, key: &[u8]) -> Result<Option<usize>> {
+        self.lookup_size(&LookupKey::new(DEFAULT_CF_ID, key, self.seq))
+    }
+
+    /// [`Snapshot::get_size`] scoped to a column family.
+    pub fn get_size_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<Option<usize>> {
+        self.validate_cf_handle(cf)?;
+        self.lookup_size(&LookupKey::new(cf.id(), key, self.seq))
+    }
+
+    fn lookup_size(&self, lk: &LookupKey) -> Result<Option<usize>> {
+        self.engine
+            .get_size(lk)
+            .map_err(|err| map_point_read_error(err, lk.prefixed_user_key()))
     }
 
     /// Batched point lookup anchored at this snapshot (default CF).
@@ -1834,11 +1999,7 @@ impl Snapshot {
 
     /// CF-scoped get at this snapshot.
     pub fn get_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.validate_cf_handle(cf)?;
-        let prefixed = prefix_key(cf.id(), key);
-        self.engine
-            .get_at(&prefixed, self.seq)
-            .map_err(|err| map_point_read_error(err, &prefixed))
+        Ok(self.get_slice_cf(cf, key)?.map(DbSlice::into_vec))
     }
 
     /// CF-scoped multi_get at this snapshot.
@@ -1939,10 +2100,10 @@ fn collect_range(
         let (Some(k), Some(v)) = (iter.key(), iter.value()) else {
             break;
         };
-        if let Some(e) = end {
-            if k >= e {
-                break;
-            }
+        if let Some(e) = end
+            && k >= e
+        {
+            break;
         }
         out.push((k.to_vec(), v.to_vec()));
         iter.next();
@@ -2637,7 +2798,7 @@ mod tests {
         stale_wal
             .append_put(&prefix_key(DEFAULT_CF_ID, b"resurrect"), b"bad", 99)
             .unwrap();
-        stale_wal.sync().unwrap();
+        stale_wal.sync_data().unwrap();
 
         let db = Db::open(dir.path(), Options::default()).unwrap();
         assert_eq!(db.get(b"flushed").unwrap(), None);
@@ -4964,9 +5125,9 @@ mod tests {
     }
 
     #[test]
-    fn test_write_options_low_pri_and_no_slowdown_are_no_ops() {
-        // Accepted but currently ignored. Reserved for future
-        // write-stall / priority-queue plumbing.
+    fn test_write_options_low_pri_and_no_slowdown_pass_through_when_not_stalling() {
+        // `low_pri` is accepted and ignored. `no_slowdown` only bites
+        // while the engine is stalling, and an idle engine is not.
         let (db, _dir) = open_tmp();
         let opts = WriteOptions {
             low_pri: true,
@@ -5519,9 +5680,10 @@ mod tests {
         writer.put_cf(&stale, b"k", b"ghost").unwrap();
         writer.finish().unwrap();
 
-        assert!(db
-            .ingest_external_files(&[path], IngestOptions::default())
-            .is_err());
+        assert!(
+            db.ingest_external_files(&[path], IngestOptions::default())
+                .is_err()
+        );
         let live = db.create_column_family("tmp").unwrap();
         assert_eq!(db.get_cf(&live, b"k").unwrap(), None);
     }

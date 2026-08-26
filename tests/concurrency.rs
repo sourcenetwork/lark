@@ -7,8 +7,8 @@
 //! stays fast for PRs; CI runs them nightly via
 //! `cargo test -- --ignored`.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 

@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use crate::engine::internal_key::INTERNAL_KEY_SUFFIX_LEN;
+
 /// Default maximum user-key length accepted by write APIs: 8 MiB.
 pub const DEFAULT_MAX_KEY_SIZE: usize = 8 * 1024 * 1024;
 
@@ -129,9 +131,12 @@ pub struct WriteOptions {
     /// Reserved for future use by a cooperative write-lock priority
     /// queue. Currently accepted but ignored.
     pub low_pri: bool,
-    /// Reserved for future use by the write-stall / rate-limiter
-    /// plumbing. Currently accepted but ignored - the engine never
-    /// actually stalls today, so this knob is a no-op.
+    /// Fail the write instead of waiting when the engine is stalling.
+    ///
+    /// A write that would otherwise block on L0 or memtable pressure
+    /// returns [`crate::Error::Busy`] straight away, carrying the reason
+    /// it would have waited for. When the engine is not stalling this has
+    /// no effect.
     pub no_slowdown: bool,
 }
 
@@ -352,12 +357,27 @@ pub enum CompressionType {
     Lz4,
 }
 
+pub use crate::engine::arena::ArenaProfile;
+
 /// Configuration options for a lark database.
 #[derive(Clone)]
 pub struct Options {
     /// Write buffer (memtable) size before flush. Must be greater
     /// than zero. Default: 64 MB.
+    ///
+    /// This bounds the memtable's arena bytes: the node header, tower,
+    /// internal key and value of every entry, rounded to alignment. A
+    /// memtable's arena reserves at most
+    /// `write_buffer_size + max(arena_profile.max_chunk_size,
+    /// largest single entry)` between writes, because the engine rotates
+    /// as soon as the budget is reached. A single `WriteBatch` larger
+    /// than the remaining budget overshoots by that batch's size, so
+    /// batch size is the caller's to bound.
     pub write_buffer_size: usize,
+    /// Chunk sizing policy for the memtable arena. Default:
+    /// [`ArenaProfile::SERVER`]; [`Options::embedded`] selects the
+    /// small-footprint preset.
+    pub arena_profile: ArenaProfile,
     /// Data block size in SSTables. Must be greater than zero.
     /// Default: 16 KB.
     pub block_size: usize,
@@ -531,6 +551,30 @@ pub struct Options {
     /// extra disk read per point lookup (amortized by the OS page
     /// cache). Default: `false` (flat index loaded eagerly).
     pub partitioned_index: bool,
+    /// Charge SSTable index and filter blocks to the block cache
+    /// instead of pinning them in each open reader.
+    ///
+    /// With this off (the default), every open SSTable holds its whole
+    /// index and its bloom filters resident for the reader's lifetime,
+    /// outside [`Options::block_cache_size`]. With it on they are read
+    /// through the cache and are evictable, so `block_cache_size`
+    /// bounds index and filter bytes as well as data bytes. The cost is
+    /// one cache lookup on the point-read path and a re-read from disk
+    /// whenever an evicted filter is next consulted, which is why the
+    /// default is off.
+    ///
+    /// Independent of [`Options::partitioned_index`]: the *leaves* of a
+    /// partitioned index always go through the cache, and a partitioned
+    /// file's top-level index is always pinned. This option decides
+    /// where a flat file's whole index and every file's filter region
+    /// live.
+    ///
+    /// `Db::get_int_property("lark.pinned-metadata-bytes")` reports
+    /// what the open files are holding outside the cache budget either
+    /// way.
+    ///
+    /// Default: `false`.
+    pub cache_index_and_filter_blocks: bool,
     /// Target size for each index leaf block when
     /// [`Options::partitioned_index`] is enabled. Must be greater
     /// than zero. Ignored when partitioned indexing is off.
@@ -553,6 +597,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             write_buffer_size: 64 * 1024 * 1024,
+            arena_profile: ArenaProfile::SERVER,
             block_size: 16 * 1024,
             block_cache_size: 512 * 1024 * 1024,
             block_cache_num_shard_bits: 6,
@@ -584,6 +629,7 @@ impl Default for Options {
             max_background_compactions: 1,
             max_subcompactions: 1,
             partitioned_index: false,
+            cache_index_and_filter_blocks: false,
             metadata_block_size: 4096,
             read_only: false,
             max_key_size: DEFAULT_MAX_KEY_SIZE,
@@ -596,6 +642,7 @@ impl std::fmt::Debug for Options {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Options")
             .field("write_buffer_size", &self.write_buffer_size)
+            .field("arena_profile", &self.arena_profile)
             .field("block_size", &self.block_size)
             .field("block_cache_size", &self.block_cache_size)
             .field(
@@ -660,6 +707,10 @@ impl std::fmt::Debug for Options {
             )
             .field("max_subcompactions", &self.max_subcompactions)
             .field("partitioned_index", &self.partitioned_index)
+            .field(
+                "cache_index_and_filter_blocks",
+                &self.cache_index_and_filter_blocks,
+            )
             .field("metadata_block_size", &self.metadata_block_size)
             .field("read_only", &self.read_only)
             .field("max_key_size", &self.max_key_size)
@@ -669,6 +720,38 @@ impl std::fmt::Debug for Options {
 }
 
 impl Options {
+    /// Preset tuned for embedded and wasm32 targets: a small memtable, a
+    /// small block cache, and small arena chunks.
+    ///
+    /// Memtable-attributable memory under this preset is bounded by
+    /// `2 * M * (W + c) + M * W` where `W = write_buffer_size`,
+    /// `c = arena_profile.max_chunk_size` and
+    /// `M = max_write_buffer_number`: at most `2 * M` memtables are
+    /// in memory at once (the write stall stops writers there), each
+    /// arena holds at most `W + c`, and the recycling pool parks at most
+    /// `M * W`. With the values below that is 1792 KiB, or 28 wasm32
+    /// pages, reached once and flat from then on.
+    ///
+    /// That flatness is the point on wasm32, where linear memory grows
+    /// in 64 KiB pages and never shrinks, so every peak is permanent.
+    /// [`ArenaProfile::EMBEDDED`] caps a chunk at exactly one page and
+    /// the pool hands the same pages back to the next memtable, so
+    /// `memory.grow` runs once per size class rather than once per
+    /// flush-and-refill cycle.
+    ///
+    /// With [`Options::default`] the same bound is 388 MiB (260 MiB live
+    /// plus 128 MiB parked), which is why this preset exists.
+    pub fn embedded() -> Self {
+        Self {
+            write_buffer_size: 256 * 1024,
+            block_cache_size: 1024 * 1024,
+            block_cache_num_shard_bits: 0,
+            arena_profile: ArenaProfile::EMBEDDED,
+            max_write_buffer_number: 2,
+            ..Self::default()
+        }
+    }
+
     /// Validate option invariants before the database uses them.
     ///
     /// Public open paths call this automatically. Callers that build
@@ -682,6 +765,32 @@ impl Options {
         require_nonzero_u64("level_size_multiplier", self.level_size_multiplier)?;
         require_nonzero_u64("target_file_size", self.target_file_size)?;
         require_nonzero_usize("metadata_block_size", self.metadata_block_size)?;
+
+        if !self.arena_profile.is_valid() {
+            return invalid_option(
+                "arena_profile",
+                "initial_chunk_size and max_chunk_size must be powers of two with initial <= max",
+            );
+        }
+
+        // The memtable stores each entry's key and value length in a
+        // `u32` inside its arena node, so an entry that could not be
+        // encoded must be rejected at the boundary rather than at the
+        // write. What the node holds is the *internal* key, which is the
+        // caller's key plus the sequence and value-type suffix, so the
+        // key ceiling is that much lower: allowing a key of exactly
+        // `u32::MAX` would let a write pass validation, reach the WAL and
+        // take a sequence number, and then be dropped by the memtable.
+        const MAX_ENCODABLE_KEY: usize = u32::MAX as usize - INTERNAL_KEY_SUFFIX_LEN;
+        if self.max_key_size > MAX_ENCODABLE_KEY {
+            return invalid_option(
+                "max_key_size",
+                "must be <= u32::MAX minus the 9-byte internal-key suffix",
+            );
+        }
+        if self.max_value_size > u32::MAX as usize {
+            return invalid_option("max_value_size", "must be <= u32::MAX");
+        }
 
         if self.block_cache_num_shard_bits > MAX_BLOCK_CACHE_SHARD_BITS {
             return invalid_option(
@@ -764,6 +873,7 @@ impl Options {
     pub(crate) fn to_engine_options(&self) -> crate::engine::EngineOptions {
         crate::engine::EngineOptions {
             write_buffer_size: self.write_buffer_size,
+            arena_profile: self.arena_profile,
             block_size: self.block_size,
             block_cache_size: self.block_cache_size,
             block_cache_num_shard_bits: self.block_cache_num_shard_bits,
@@ -792,6 +902,7 @@ impl Options {
             evict_compaction_data_from_page_cache: self.evict_compaction_data_from_page_cache,
             max_background_compactions: self.max_background_compactions,
             partitioned_index: self.partitioned_index,
+            cache_index_and_filter_blocks: self.cache_index_and_filter_blocks,
             metadata_block_size: self.metadata_block_size,
             read_only: self.read_only,
             max_key_size: self.max_key_size,
@@ -1129,6 +1240,90 @@ mod tests {
     }
 
     #[test]
+    fn embedded_preset_is_valid_and_small() {
+        let opts = Options::embedded();
+        opts.validate()
+            .expect("the preset must be a valid option set");
+        assert_eq!(opts.arena_profile, ArenaProfile::EMBEDDED);
+        assert_eq!(
+            opts.to_engine_options().arena_profile,
+            ArenaProfile::EMBEDDED
+        );
+        // The documented bound: 2 * M * (W + c) + M * W.
+        let w = opts.write_buffer_size;
+        let c = opts.arena_profile.max_chunk_size;
+        let m = opts.max_write_buffer_number;
+        assert_eq!(2 * m * (w + c) + m * w, 1792 * 1024);
+    }
+
+    #[test]
+    fn arena_profile_validation_rejects_bad_shapes() {
+        let bad = [
+            ArenaProfile {
+                initial_chunk_size: 3000,
+                max_chunk_size: 64 * 1024,
+            },
+            ArenaProfile {
+                initial_chunk_size: 4096,
+                max_chunk_size: 3000,
+            },
+            ArenaProfile {
+                initial_chunk_size: 128 * 1024,
+                max_chunk_size: 64 * 1024,
+            },
+            ArenaProfile {
+                initial_chunk_size: 0,
+                max_chunk_size: 64 * 1024,
+            },
+        ];
+        for profile in bad {
+            assert!(!profile.is_valid(), "{profile:?} must be rejected");
+            let opts = Options {
+                arena_profile: profile,
+                ..Options::default()
+            };
+            match opts.validate() {
+                Err(crate::Error::InvalidArgument(message)) => {
+                    assert!(message.contains("arena_profile"), "{message}")
+                }
+                other => panic!("expected an arena_profile error, got {other:?}"),
+            }
+        }
+        assert!(ArenaProfile::SERVER.is_valid());
+        assert!(ArenaProfile::EMBEDDED.is_valid());
+        assert_eq!(ArenaProfile::default(), ArenaProfile::SERVER);
+    }
+
+    #[test]
+    fn key_and_value_size_caps_are_encodable() {
+        // The memtable stores both lengths in a `u32` inside its arena
+        // node, so an unencodable limit has to fail at the boundary.
+        for (name, opts) in [
+            (
+                "max_key_size",
+                Options {
+                    max_key_size: u32::MAX as usize + 1,
+                    ..Options::default()
+                },
+            ),
+            (
+                "max_value_size",
+                Options {
+                    max_value_size: u32::MAX as usize + 1,
+                    ..Options::default()
+                },
+            ),
+        ] {
+            match opts.validate() {
+                Err(crate::Error::InvalidArgument(message)) => {
+                    assert!(message.contains(name), "{message}")
+                }
+                other => panic!("expected a {name} error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn options_to_engine_options_preserves_engine_fields() {
         // Defaults consumed by the engine must survive the translation
         // unchanged; compatibility-only public knobs are intentionally
@@ -1156,6 +1351,10 @@ mod tests {
             opts.evict_compaction_data_from_page_cache
         );
         assert_eq!(eo.partitioned_index, opts.partitioned_index);
+        assert_eq!(
+            eo.cache_index_and_filter_blocks,
+            opts.cache_index_and_filter_blocks
+        );
     }
 
     /// Custom `PrefixExtractor` that returns everything before the

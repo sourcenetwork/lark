@@ -224,7 +224,10 @@ fn main() {
                 if got != expected {
                     eprintln!(
                         "MISMATCH at op {op_idx}: scan({:?}..{:?}) expected {} entries, got {}  [seed={seed}]",
-                        start, end, expected.len(), got.len(),
+                        start,
+                        end,
+                        expected.len(),
+                        got.len(),
                     );
                     mismatches += 1;
                 }

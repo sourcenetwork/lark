@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use super::sstable::{sst_filename, table_carries_data, LiveSst, SsTableMeta, SsTableReader};
+use super::sstable::{
+    LiveSst, MetadataPolicy, SsTableMeta, SsTableReader, sst_filename, table_carries_data,
+};
 use super::{checksum, durability};
 
 /// Maximum number of levels in the LSM tree.
@@ -304,12 +306,28 @@ impl VersionSet {
     /// recovery every SSTable referenced by the manifest is opened
     /// eagerly so the returned version is fully populated with live
     /// readers.
+    #[cfg(any(test, feature = "fuzzing"))]
     pub(crate) fn open(db_dir: &Path, sst_dir: &Path) -> io::Result<Self> {
+        Self::open_with_policy(db_dir, sst_dir, MetadataPolicy::Pinned)
+    }
+
+    /// [`VersionSet::open`] with an explicit policy for how the readers
+    /// it opens hold their index and filter blocks.
+    ///
+    /// Recovery is where this matters most: it opens a reader for every
+    /// SSTable the manifest references, so the policy decides whether
+    /// that whole set of indexes and filters is pinned or bounded by
+    /// the block cache.
+    pub(crate) fn open_with_policy(
+        db_dir: &Path,
+        sst_dir: &Path,
+        policy: MetadataPolicy,
+    ) -> io::Result<Self> {
         let manifest_path = db_dir.join("MANIFEST");
 
         let (version, writer) = if manifest_path.exists() {
             let data = fs::read(&manifest_path)?;
-            let replay = Self::replay_manifest(&data, sst_dir)?;
+            let replay = Self::replay_manifest(&data, sst_dir, policy)?;
             Self::reject_discarded_tables(&replay, data.len(), sst_dir, &manifest_path)?;
 
             let file = OpenOptions::new().append(true).open(&manifest_path)?;
@@ -338,10 +356,14 @@ impl VersionSet {
     /// This is used by read-only opens: replay still tolerates a
     /// truncated trailing record exactly like the read-write path, but
     /// the file is not repaired in place and no append writer is kept.
-    pub(crate) fn open_read_only(db_dir: &Path, sst_dir: &Path) -> io::Result<Self> {
+    pub(crate) fn open_read_only(
+        db_dir: &Path,
+        sst_dir: &Path,
+        policy: MetadataPolicy,
+    ) -> io::Result<Self> {
         let manifest_path = db_dir.join("MANIFEST");
         let data = fs::read(&manifest_path)?;
-        let replay = Self::replay_manifest(&data, sst_dir)?;
+        let replay = Self::replay_manifest(&data, sst_dir, policy)?;
         Self::reject_discarded_tables(&replay, data.len(), sst_dir, &manifest_path)?;
 
         Ok(Self {
@@ -587,7 +609,11 @@ impl VersionSet {
         suspects
     }
 
-    fn replay_manifest(data: &[u8], sst_dir: &Path) -> io::Result<ManifestReplay> {
+    fn replay_manifest(
+        data: &[u8],
+        sst_dir: &Path,
+        policy: MetadataPolicy,
+    ) -> io::Result<ManifestReplay> {
         // Two-pass replay. The first pass walks every record and tracks
         // the *logical* state of each level - which file ids are live -
         // without touching the filesystem. Only after replay completes
@@ -676,9 +702,11 @@ impl VersionSet {
         for (level, files) in surviving.into_iter().enumerate() {
             for meta in files {
                 let path = sst_dir.join(sst_filename(meta.file_id));
-                let reader = Arc::new(SsTableReader::open(&path, meta.file_id).map_err(|e| {
-                    std::io::Error::new(e.kind(), format!("open {}: {e}", path.display()))
-                })?);
+                let reader = Arc::new(
+                    SsTableReader::open_with(&path, meta.file_id, policy).map_err(|e| {
+                        std::io::Error::new(e.kind(), format!("open {}: {e}", path.display()))
+                    })?,
+                );
                 version.levels[level].push(LiveSst::new(meta, reader));
             }
         }
@@ -695,7 +723,7 @@ mod tests {
     /// Build a real on-disk SSTable and open a reader for it. Used by
     /// tests that need a non-trivial `LiveSst` instance.
     fn make_live_sst(dir: &Path, file_id: u64, smallest: &[u8], largest: &[u8]) -> Arc<LiveSst> {
-        use super::super::internal_key::{encode_internal_key, VALUE_TYPE_VALUE};
+        use super::super::internal_key::{VALUE_TYPE_VALUE, encode_internal_key};
         use super::super::sstable::SsTableWriter;
         use crate::options::CompressionType;
 
@@ -767,7 +795,8 @@ mod tests {
         data.extend_from_slice(&record);
         data.extend_from_slice(&checksum::legacy_payload_u32(&record).to_le_bytes());
 
-        let replay = VersionSet::replay_manifest(&data, dir.path()).unwrap();
+        let replay =
+            VersionSet::replay_manifest(&data, dir.path(), MetadataPolicy::Pinned).unwrap();
         assert_eq!(replay.version.last_seq, 7);
         assert_eq!(replay.valid_len, data.len());
     }

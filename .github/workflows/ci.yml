@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    # Nightly at 07:00 UTC — drives the long-running stress/soak jobs.
+    # Nightly at 07:00 UTC - drives the long-running stress/soak jobs.
     - cron: '0 7 * * *'
   workflow_dispatch:
 
@@ -56,11 +56,44 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --workspace --no-deps
 
+  alloc-budget:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Exits non-zero the moment a hot path allocates more per
+      # operation than its budget.
+      - run: cargo bench --bench allocs
+
+  # Model-checks the arena memtable's publication protocol, the flush
+  # and compaction version handoffs, and the engine's read horizon under
+  # every interleaving loom can reach. The models live in
+  # `src/engine/loom_model/`; `--cfg loom` is what swaps the memtable's
+  # atomics for loom's instrumented ones. Cheap enough to run on every
+  # pull request: both profiles together are under four minutes.
+  #
+  # Both profiles run, and neither is redundant. Release explores the
+  # larger search on the biggest model. Debug is where the skip list's
+  # single-writer guard (invariant S2) exists at all, because it is a
+  # `debug_assert`, so the calibration that proves the guard fires on an
+  # unserialized insert only runs there.
+  loom:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: --cfg loom -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release --test loom_memtable -- --nocapture
+      - run: cargo test --test loom_memtable -- --nocapture
+
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.82
+      - uses: dtolnay/rust-toolchain@1.90
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
 
@@ -97,7 +130,7 @@ jobs:
           # Pulls the percentage off the TOTAL row of `cargo llvm-cov`'s
           # summary table. The line-coverage column is the 10th field
           # (Filename, Regions, Missed, Cover, Functions, Missed, Cover,
-          # Lines, Missed, Cover). Soft gate — emits an annotation but
+          # Lines, Missed, Cover). Soft gate - emits an annotation but
           # never fails the job.
           total=$(awk '/^TOTAL/ {gsub("%", "", $10); print $10}' coverage-summary.txt)
           if [ -z "$total" ]; then
@@ -108,10 +141,52 @@ jobs:
             && echo "::warning::line coverage $total% is below the 90% soft floor" \
             || echo "line coverage $total% ≥ 90% ✓"
 
+  # Miri over the modules that carry the crate's `unsafe`: the arena's
+  # chunk layout and bump arithmetic, the skip list's node layout and
+  # publication, the memtable's arena-backed slices, and the block
+  # decoder. Interpreted execution is orders of magnitude slower than
+  # native, so this runs on the nightly schedule rather than per pull
+  # request. Two things are scaled down under `cfg(miri)` in the tests
+  # themselves, with every assertion left intact: the two spinning-reader
+  # stress tests are `#[ignore]`d in favour of an interpreter-sized
+  # equivalent, and the arena's multi-megabyte fills use a smaller
+  # budget.
+  miri:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      # Kovan's flag set, run the way kovan's own CI runs it, because
+      # `kovan-queue` backs the arena's chunk pool. Each flag is there
+      # for something miri cannot model rather than for a defect:
+      # `tree-borrows` because miri's default Stacked Borrows model
+      # rejects the pointer provenance a deferred-reclamation scheme
+      # uses, `ignore-leaks` because such a scheme defers frees by
+      # design and may legitimately still hold retired entries at exit,
+      # `permissive-provenance` for its int-to-pointer tagged pointers,
+      # and `+cmpxchg16b` for its double-width CAS, which miri cannot
+      # emulate in doctests - hence `--lib` only.
+      #
+      # Measured on this tree: lark's own modules also pass under miri's
+      # bare defaults, the arena tests that exercise `kovan-queue`'s ring
+      # included. These flags are headroom against kovan's internals, not
+      # cover for anything here, and a finding that originates inside
+      # kovan does not block this crate.
+      MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-ignore-leaks -Zmiri-tree-borrows
+      RUSTFLAGS: -C target-feature=+cmpxchg16b -D warnings
+      PROPTEST_CASES: '4'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo miri test --lib -- --test-threads=1 engine::arena:: engine::skiplist:: engine::memtable:: engine::block:: slice::tests::
+
   # Long-running stress, soak, and fault-injection tests. Gated behind
   # `#[ignore]` in the main crate so `cargo test` stays fast for PRs;
   # this job unlocks them via `--ignored`. Runs on the nightly schedule,
-  # manual dispatch, or direct pushes to `main` — never on PRs.
+  # manual dispatch, or direct pushes to `main`, never on PRs.
   nightly-stress:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     runs-on: ubuntu-latest

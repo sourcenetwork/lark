@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::options::{CompactionDecision, CompactionFilter};
-use crate::{Db, Error, Options, Result, WriteBatch, WriteBatchOp};
+use crate::{Db, DbSlice, Error, Options, Result, WriteBatch, WriteBatchOp};
 
 const LEGACY_TS_LEN: usize = 4;
 const TTL_MAGIC: [u8; 4] = *b"LTTL";
@@ -84,6 +84,26 @@ impl DbWithTtl {
             Some(stamped) => Ok(self.filter_expired(stamped)),
             None => Ok(None),
         }
+    }
+
+    /// [`DbWithTtl::get`] without copying the value.
+    ///
+    /// The TTL suffix is dropped by narrowing the view, so the result
+    /// still borrows the bytes the database already owns. Same absence
+    /// semantics as [`DbWithTtl::get`]: an expired entry, and a value
+    /// with no decodable TTL suffix, both read as `Ok(None)`.
+    pub fn get_slice(&self, key: &[u8]) -> Result<Option<DbSlice>> {
+        let Some(stamped) = self.inner.get_slice(key)? else {
+            return Ok(None);
+        };
+        let Some(decoded) = decode_ttl_suffix(stamped.as_slice()) else {
+            return Ok(None);
+        };
+        let horizon = self.expiry_horizon();
+        if horizon > 0 && decoded.timestamp < horizon {
+            return Ok(None);
+        }
+        Ok(stamped.try_subslice(0..decoded.value_len))
     }
 
     /// Delete `key`. Range deletes are delegated to the inner
@@ -507,6 +527,43 @@ mod tests {
             filter.filter(0, b"k", &legacy_stamp(b"stale", 1)),
             CompactionDecision::Remove
         );
+    }
+
+    #[test]
+    fn get_slice_strips_the_suffix_without_copying() {
+        let dir = TempDir::new().unwrap();
+        let db = DbWithTtl::open(dir.path(), tiny_opts(), 0).unwrap();
+        db.put(b"k", b"payload").unwrap();
+
+        let slice = db.get_slice(b"k").unwrap().expect("present");
+        assert_eq!(slice.as_slice(), b"payload");
+        assert_eq!(Some(slice.to_vec()), db.get(b"k").unwrap());
+        assert_eq!(db.get_slice(b"absent").unwrap(), None);
+    }
+
+    #[test]
+    fn get_slice_hides_an_expired_entry() {
+        let dir = TempDir::new().unwrap();
+        let db = DbWithTtl::open(dir.path(), tiny_opts(), 1).unwrap();
+        // Write straight through the inner `Db` with an ancient stamp so
+        // the test does not have to wait a wall-clock second.
+        db.inner()
+            .put(
+                b"stale",
+                &stamp(b"payload", now_seconds().saturating_sub(1000)),
+            )
+            .unwrap();
+        assert_eq!(db.get_slice(b"stale").unwrap(), None);
+        assert_eq!(db.get(b"stale").unwrap(), None);
+    }
+
+    #[test]
+    fn get_slice_hides_a_value_too_short_to_carry_a_suffix() {
+        let dir = TempDir::new().unwrap();
+        let db = DbWithTtl::open(dir.path(), tiny_opts(), 0).unwrap();
+        db.inner().put(b"raw", b"ab").unwrap();
+        assert_eq!(db.get_slice(b"raw").unwrap(), None);
+        assert_eq!(db.get(b"raw").unwrap(), None);
     }
 
     #[test]

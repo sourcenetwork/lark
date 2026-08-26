@@ -80,13 +80,13 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
-use crate::column_family::{prefix_key, DEFAULT_CF_ID};
+use crate::column_family::{DEFAULT_CF_ID, prefix_key};
 use crate::engine::{CommitOutcome, LarkEngine};
 use crate::{Db, Error, Options, Result};
 
@@ -682,11 +682,11 @@ impl<'db> Transaction<'db> {
             return;
         }
         self.resources_released = true;
-        if let Some(lm) = self.lock_manager.as_ref() {
-            if let TxMode::Pessimistic { tx_id } = self.mode {
-                for key in self.held_locks.drain(..) {
-                    lm.release(&key, tx_id);
-                }
+        if let Some(lm) = self.lock_manager.as_ref()
+            && let TxMode::Pessimistic { tx_id } = self.mode
+        {
+            for key in self.held_locks.drain(..) {
+                lm.release(&key, tx_id);
             }
         }
         self.engine.release_snapshot(self.snapshot_seq);
@@ -769,11 +769,11 @@ impl LockManager {
     /// waiters.
     fn release(&self, key: &[u8], tx_id: u64) {
         let mut guard = self.locks.lock();
-        if let Some(&holder) = guard.get(key) {
-            if holder == tx_id {
-                guard.remove(key);
-                self.cvar.notify_all();
-            }
+        if let Some(&holder) = guard.get(key)
+            && holder == tx_id
+        {
+            guard.remove(key);
+            self.cvar.notify_all();
         }
     }
 }
@@ -1004,7 +1004,7 @@ mod tests {
             // The default lock timeout is 1s, which is too long for
             // the test, so recreate the transaction with a shorter
             // manual lock acquisition via `get_for_update`. We
-            // rely on acquire_lock_if_needed using the DB's
+            // rely on acquire_lock using the DB's
             // configured timeout; so we just do a normal put and
             // expect `Busy`.
             let mut tx2 = db2.begin_transaction();

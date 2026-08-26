@@ -198,6 +198,12 @@ mod tests {
     use super::*;
     use crate::engine::manifest::VersionEdit;
 
+    /// A memtable arena sized for the unit tests here: small enough to
+    /// stay cheap, large enough that nothing in these tests rotates.
+    fn test_memtable_config() -> crate::engine::memtable::MemTableConfig {
+        crate::engine::memtable::MemTableConfig::new(crate::engine::arena::ArenaProfile::EMBEDDED, 64 * 1024, 2)
+    }
+
     fn store_with_view() -> (tempfile::TempDir, Arc<VersionStore>, Arc<ReadViewCell>) {
         let dir = tempfile::tempdir().unwrap();
         let sst_dir = dir.path().join("sst");
@@ -205,7 +211,7 @@ mod tests {
         let versions = VersionSet::open(dir.path(), &sst_dir).unwrap();
         let store = Arc::new(VersionStore::new(versions));
         let cell = Arc::new(ReadViewCell::new(ReadView {
-            active: Arc::new(MemTable::new()),
+            active: Arc::new(MemTable::new(&test_memtable_config()).unwrap()),
             frozen: Vec::new(),
             version: store.lock().current(),
         }));
@@ -222,7 +228,7 @@ mod tests {
         cell.update_memtables(|active, frozen| {
             let mut next = frozen.to_vec();
             next.push(Arc::clone(active));
-            (Arc::new(MemTable::new()), next, ())
+            (Arc::new(MemTable::new(&test_memtable_config()).unwrap()), next, ())
         });
 
         let after = cell.load();

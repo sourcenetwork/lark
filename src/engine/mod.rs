@@ -1,38 +1,57 @@
+pub(crate) mod arena;
 pub(crate) mod block;
 pub(crate) mod block_cache;
 pub(crate) mod bloom;
 pub(crate) mod checksum;
+pub(crate) mod commit;
 pub(crate) mod compaction;
 mod db_lock;
 pub(crate) mod durability;
+pub(crate) mod filter_block;
+pub(crate) mod index_block;
 pub(crate) mod internal_key;
 pub(crate) mod iterator;
+pub(crate) mod lookup_key;
+#[cfg(loom)]
+pub mod loom_model;
 pub(crate) mod manifest;
 pub(crate) mod memtable;
 pub(crate) mod range_tombstone;
 pub(crate) mod read_view;
+pub(crate) mod read_horizon;
+pub(crate) mod skiplist;
 pub(crate) mod snapshot_registry;
 pub(crate) mod sstable;
+pub(crate) mod sync;
 pub(crate) mod wal;
+pub(crate) mod wal_replay;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
-use parking_lot::{Condvar, Mutex, RwLock};
+use kovan_queue::array_queue::ArrayQueue;
+use parking_lot::{Mutex, RwLock};
 
 use block_cache::BlockCache;
+use commit::{Pipeline, StallSignal, WriteSlot};
 use compaction::{CompactionOptions, CompactionScheduler};
 use db_lock::DbDirectoryLock;
+use lookup_key::{LookupKey, with_key_scratch};
 use manifest::{VersionEdit, VersionSet};
-use memtable::MemTable;
+use memtable::{MemTable, MemTableConfig};
+use read_horizon::ReadHorizon;
 use read_view::{ReadView, ReadViewCell, VersionStore};
 use snapshot_registry::SnapshotRegistry;
 
-use crate::{event_listener, WriteBatchOp};
-use sstable::{sst_filename, LiveSst, LookupResult, SsTableMeta, SsTableReader, SsTableWriter};
-use wal::{wal_filename, Wal, WalEntry};
+use crate::{DbSlice, WriteBatchOp, event_listener};
+use sstable::{
+    LiveSst, LookupResult, Materialize, PointValue, SsTableMeta, SsTableReader, SsTableWriter,
+    sst_filename,
+};
+use wal::{Wal, WalEntry, wal_filename};
+use wal_replay::WalReplayIter;
 
 /// Controls when data is flushed to disk after a commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,15 +108,6 @@ fn memtable_needs_flush(memtable: &MemTable) -> bool {
     !memtable.is_empty() || !memtable.clone_range_tombstones().is_empty()
 }
 
-fn append_single_wal_op(wal: &mut Wal, op: &WriteBatchOp, seq: u64) -> std::io::Result<()> {
-    match op {
-        WriteBatchOp::Put { key, value } => wal.append_put(key, value, seq),
-        WriteBatchOp::Delete { key } => wal.append_delete(key, seq),
-        WriteBatchOp::DeleteRange { start, end } => wal.append_delete_range(start, end, seq),
-        WriteBatchOp::Merge { key, operand } => wal.append_merge(key, operand, seq),
-    }
-}
-
 fn apply_batch_op_to_memtable(memtable: &MemTable, op: &WriteBatchOp, seq: u64) {
     match op {
         WriteBatchOp::Put { key, value } => memtable.put(key, value, seq),
@@ -143,9 +153,9 @@ fn key_range_for_file(entries: &[MultiGetEntry], file: &LiveSst) -> std::ops::Ra
     start..end
 }
 
-fn resolve_multi_get_value(pseq: u64, popt: Option<Vec<u8>>, rt_seq: u64) -> Option<Vec<u8>> {
+fn resolve_multi_get_value(pseq: u64, popt: Option<DbSlice>, rt_seq: u64) -> Option<Vec<u8>> {
     if pseq > rt_seq {
-        popt
+        popt.map(DbSlice::into_vec)
     } else {
         None
     }
@@ -166,6 +176,7 @@ fn set_multi_get_result(
 #[derive(Clone)]
 pub(crate) struct EngineOptions {
     pub(crate) write_buffer_size: usize,
+    pub(crate) arena_profile: crate::options::ArenaProfile,
     pub(crate) block_size: usize,
     pub(crate) block_cache_size: usize,
     pub(crate) block_cache_num_shard_bits: u32,
@@ -195,12 +206,23 @@ pub(crate) struct EngineOptions {
     pub(crate) max_background_compactions: usize,
     pub(crate) partitioned_index: bool,
     pub(crate) metadata_block_size: usize,
+    pub(crate) cache_index_and_filter_blocks: bool,
     pub(crate) read_only: bool,
     pub(crate) max_key_size: usize,
     pub(crate) max_value_size: usize,
 }
 
 impl EngineOptions {
+    /// How readers this engine opens should hold their index and
+    /// filter blocks.
+    pub(crate) fn metadata_policy(&self) -> sstable::MetadataPolicy {
+        if self.cache_index_and_filter_blocks {
+            sstable::MetadataPolicy::Cached
+        } else {
+            sstable::MetadataPolicy::Pinned
+        }
+    }
+
     /// Resolve the codec to use when writing an SSTable destined for
     /// `level`. A per-level override (if any) wins; otherwise fall
     /// back to the default codec.
@@ -216,6 +238,7 @@ impl Default for EngineOptions {
     fn default() -> Self {
         Self {
             write_buffer_size: 64 * 1024 * 1024,
+            arena_profile: crate::options::ArenaProfile::SERVER,
             block_size: 16 * 1024,
             block_cache_size: 512 * 1024 * 1024,
             block_cache_num_shard_bits: 6,
@@ -245,6 +268,7 @@ impl Default for EngineOptions {
             max_background_compactions: 1,
             partitioned_index: false,
             metadata_block_size: 4096,
+            cache_index_and_filter_blocks: false,
             read_only: false,
             max_key_size: crate::options::DEFAULT_MAX_KEY_SIZE,
             max_value_size: crate::options::DEFAULT_MAX_VALUE_SIZE,
@@ -264,6 +288,9 @@ pub(crate) struct LarkEngine {
     /// acquisition and one `Arc` clone - and the three sources it hands
     /// back are consistent with each other by construction.
     view: Arc<ReadViewCell>,
+    /// The engine's one memtable arena pool and its sizing policy. Every
+    /// memtable this engine builds recycles the others' chunks through it.
+    memtable_config: MemTableConfig,
     /// The version set, together with the publication of every version
     /// it installs into `view`.
     versions: Arc<VersionStore>,
@@ -275,10 +302,9 @@ pub(crate) struct LarkEngine {
     /// Published read horizon: the highest sequence whose data is fully
     /// applied and durable. Snapshots read this, never `latest_seq`, so a
     /// snapshot taken mid-commit cannot observe a sequence whose WAL and
-    /// memtable writes have not landed yet. Advanced monotonically
-    /// (`fetch_max`) after apply, so a slow writer can never publish a
-    /// lower horizon than a faster concurrent one.
-    visible_seq: AtomicU64,
+    /// memtable writes have not landed yet. The ordering that makes that
+    /// true lives in [`ReadHorizon`], which is where it is model-checked.
+    visible_seq: ReadHorizon,
     close_state: AtomicU8,
     close_lock: Mutex<()>,
     active_wal: Mutex<Option<Wal>>,
@@ -300,7 +326,23 @@ pub(crate) struct LarkEngine {
     /// horizon.
     snapshot_registry: Arc<SnapshotRegistry>,
     options: EngineOptions,
-    write_lock: Mutex<()>,
+    /// Bounded ring of writers waiting for a commit group. Writers push a
+    /// ticket here and park; they never block on `pipeline`, which is what
+    /// takes the WAL fsync off every writer's critical path.
+    commit_ring: ArrayQueue<Arc<WriteSlot>>,
+    /// Exclusion for the whole write pipeline, and the leader-owned
+    /// staging buffers. Acquiring it *is* becoming the commit leader.
+    /// Administrative operations that rotate the memtable or the WAL
+    /// (`compact_range`, `ingest_external_files`, `checkpoint_capture`,
+    /// `drop_all`, `close`) take it blockingly; no follower ever does.
+    pipeline: Mutex<Pipeline>,
+    /// Latched write-path failure. Set only when a failed commit group
+    /// could not be rolled back out of the WAL, which leaves the log with
+    /// a tail no later write may extend. Once set, every write fails loud
+    /// with the original reason instead of appending after unknown bytes.
+    wal_failure: Mutex<Option<(std::io::ErrorKind, String)>>,
+    /// Cheap gate on `wal_failure`, checked on every write.
+    wal_failed: AtomicBool,
     /// Signal used by foreground writers to wait out a "stop writes"
     /// condition (too many L0 files, too many unflushed memtables).
     /// The background compaction thread holds a clone of this `Arc`
@@ -318,28 +360,6 @@ pub(crate) struct LarkEngine {
     _db_lock: DbDirectoryLock,
 }
 
-/// Lock + condvar pair shared between foreground writers (which
-/// wait on it during a write stall) and the background compaction
-/// thread (which notifies after each compaction pass).
-pub(crate) struct StallSignal {
-    lock: Mutex<()>,
-    cv: Condvar,
-}
-
-impl StallSignal {
-    pub(crate) fn new() -> Self {
-        Self {
-            lock: Mutex::new(()),
-            cv: Condvar::new(),
-        }
-    }
-
-    pub(crate) fn notify_all(&self) {
-        let _guard = self.lock.lock();
-        self.cv.notify_all();
-    }
-}
-
 impl LarkEngine {
     /// Open or create the database at the given path.
     pub(crate) fn open(db_dir: &Path, mut options: EngineOptions) -> std::io::Result<Arc<Self>> {
@@ -351,20 +371,26 @@ impl LarkEngine {
         std::fs::create_dir_all(&sst_dir)?;
         std::fs::create_dir_all(&wal_dir)?;
 
-        let version_set = VersionSet::open(db_dir, &sst_dir)?;
+        let version_set =
+            VersionSet::open_with_policy(db_dir, &sst_dir, options.metadata_policy())?;
         let version = version_set.current();
         let mut latest_seq = version.last_seq;
 
         // Replay WAL files to recover memtable state
-        let memtable = Arc::new(MemTable::new());
+        let memtable_config = MemTableConfig::new(
+            options.arena_profile,
+            options.write_buffer_size,
+            options.max_write_buffer_number,
+        );
+        let memtable = Arc::new(MemTable::new(&memtable_config)?);
         let mut wal_files = list_wal_files(&wal_dir)?;
         wal_files.sort();
         wal_files.retain(|path| should_replay_wal(path, version.min_wal_id));
 
         for wal_path in &wal_files {
             tracing::info!(path = %wal_path.display(), "Replaying WAL");
-            let entries = Wal::replay(wal_path)?;
-            for entry in entries {
+            let mut replay = WalReplayIter::open(wal_path)?;
+            while let Some(entry) = replay.next_entry()? {
                 latest_seq = latest_seq.max(apply_replayed_wal_entry(&memtable, entry));
             }
         }
@@ -427,6 +453,7 @@ impl LarkEngine {
             max_background_compactions: options.max_background_compactions,
             partitioned_index: options.partitioned_index,
             metadata_block_size: options.metadata_block_size,
+            cache_index_and_filter_blocks: options.cache_index_and_filter_blocks,
         };
 
         let compaction_lock = Arc::new(RwLock::new(()));
@@ -447,10 +474,11 @@ impl LarkEngine {
 
         let engine = Arc::new(Self {
             view,
+            memtable_config,
             versions,
             cache,
             latest_seq: AtomicU64::new(latest_seq),
-            visible_seq: AtomicU64::new(latest_seq),
+            visible_seq: ReadHorizon::new(latest_seq),
             close_state: AtomicU8::new(CLOSE_STATE_OPEN),
             close_lock: Mutex::new(()),
             active_wal: Mutex::new(Some(wal)),
@@ -461,7 +489,10 @@ impl LarkEngine {
             compaction_lock,
             snapshot_registry,
             options,
-            write_lock: Mutex::new(()),
+            commit_ring: Self::new_commit_ring(),
+            pipeline: Mutex::new(Pipeline::new()),
+            wal_failure: Mutex::new(None),
+            wal_failed: AtomicBool::new(false),
             stall_signal,
             cached_stall_level: AtomicU8::new(0),
             _db_lock: db_lock,
@@ -500,19 +531,24 @@ impl LarkEngine {
         }
 
         options.read_only = true;
-        let version_set = VersionSet::open_read_only(db_dir, &sst_dir)?;
+        let version_set = VersionSet::open_read_only(db_dir, &sst_dir, options.metadata_policy())?;
         let version = version_set.current();
         let mut latest_seq = version.last_seq;
 
-        let memtable = Arc::new(MemTable::new());
+        let memtable_config = MemTableConfig::new(
+            options.arena_profile,
+            options.write_buffer_size,
+            options.max_write_buffer_number,
+        );
+        let memtable = Arc::new(MemTable::new(&memtable_config)?);
         let mut wal_files = list_wal_files(&wal_dir)?;
         wal_files.sort();
         wal_files.retain(|path| should_replay_wal(path, version.min_wal_id));
 
         for wal_path in &wal_files {
             tracing::info!(path = %wal_path.display(), "Replaying WAL for read-only open");
-            let entries = Wal::replay(wal_path)?;
-            for entry in entries {
+            let mut replay = WalReplayIter::open(wal_path)?;
+            while let Some(entry) = replay.next_entry()? {
                 latest_seq = latest_seq.max(apply_replayed_wal_entry(&memtable, entry));
             }
         }
@@ -539,10 +575,11 @@ impl LarkEngine {
 
         Ok(Arc::new(Self {
             view,
+            memtable_config,
             versions,
             cache,
             latest_seq: AtomicU64::new(latest_seq),
-            visible_seq: AtomicU64::new(latest_seq),
+            visible_seq: ReadHorizon::new(latest_seq),
             close_state: AtomicU8::new(CLOSE_STATE_OPEN),
             close_lock: Mutex::new(()),
             active_wal: Mutex::new(None),
@@ -553,7 +590,10 @@ impl LarkEngine {
             compaction_lock,
             snapshot_registry,
             options,
-            write_lock: Mutex::new(()),
+            commit_ring: Self::new_commit_ring(),
+            pipeline: Mutex::new(Pipeline::new()),
+            wal_failure: Mutex::new(None),
+            wal_failed: AtomicBool::new(false),
             stall_signal,
             cached_stall_level: AtomicU8::new(0),
             _db_lock: db_lock,
@@ -561,7 +601,7 @@ impl LarkEngine {
     }
 
     pub(crate) fn snapshot_seq(&self) -> u64 {
-        self.visible_seq.load(Ordering::Acquire)
+        self.visible_seq.visible()
     }
 
     pub(crate) fn is_read_only(&self) -> bool {
@@ -593,10 +633,31 @@ impl LarkEngine {
 
     fn ensure_writable(&self) -> std::io::Result<()> {
         self.ensure_open()?;
+        if self.wal_failed.load(Ordering::Acquire) {
+            return Err(self.wal_failure_error());
+        }
         if self.is_read_only() {
             Err(Self::read_only_error())
         } else {
             Ok(())
+        }
+    }
+
+    /// Latch a write-ahead-log failure the engine cannot recover from
+    /// on its own, so every later write fails loud with the reason
+    /// rather than appending after a tail nobody can account for.
+    pub(crate) fn latch_wal_failure(&self, err: &std::io::Error) {
+        *self.wal_failure.lock() = Some((err.kind(), err.to_string()));
+        self.wal_failed.store(true, Ordering::Release);
+    }
+
+    fn wal_failure_error(&self) -> std::io::Error {
+        match self.wal_failure.lock().as_ref() {
+            Some((kind, message)) => std::io::Error::new(
+                *kind,
+                format!("write-ahead log left in an unknown state: {message}"),
+            ),
+            None => std::io::Error::other("write-ahead log left in an unknown state"),
         }
     }
 
@@ -685,11 +746,11 @@ impl LarkEngine {
     /// does not yet contain this pin. Returns the pinned sequence.
     pub(crate) fn register_snapshot_at_horizon(&self) -> u64 {
         if self.is_closed() {
-            return self.visible_seq.load(Ordering::Acquire);
+            return self.visible_seq.visible();
         }
         let seq = self
             .snapshot_registry
-            .register_at(|| self.visible_seq.load(Ordering::Acquire));
+            .register_at(|| self.visible_seq.visible());
         if let Some(s) = self.statistics() {
             s.add(crate::statistics::Ticker::SnapshotsRegistered, 1);
         }
@@ -717,7 +778,7 @@ impl LarkEngine {
     pub(crate) fn new_iter_latest(&self) -> iterator::LarkIterator {
         let closed = self.is_closed();
         let view = self.view.load();
-        let snapshot_seq = self.visible_seq.load(Ordering::Acquire);
+        let snapshot_seq = self.visible_seq.visible();
         self.iter_in_view(&view, snapshot_seq, closed)
     }
 
@@ -773,13 +834,7 @@ impl LarkEngine {
     /// that moment and every later view still exposes that memtable's
     /// data, as `active`, as `frozen`, or folded into the version.
     pub(crate) fn get_latest(&self, key: &[u8]) -> std::io::Result<Option<Vec<u8>>> {
-        self.ensure_open()?;
-        let view = self.view.load();
-        let snapshot_seq = self.visible_seq.load(Ordering::Acquire);
-        if let Some(merge_op) = self.options.merge_operator.as_ref() {
-            return self.get_with_merge_in_view(key, snapshot_seq, merge_op, &view);
-        }
-        self.get_in_view(key, snapshot_seq, &view)
+        self.get(key, self.visible_seq.visible())
     }
 
     /// Point lookup at a caller-pinned snapshot sequence. The
@@ -788,12 +843,7 @@ impl LarkEngine {
     /// order does not matter here; the view is still loaded once so
     /// every source the read walks agrees with every other.
     pub(crate) fn get_at(&self, key: &[u8], snapshot_seq: u64) -> std::io::Result<Option<Vec<u8>>> {
-        self.ensure_open()?;
-        let view = self.view.load();
-        if let Some(merge_op) = self.options.merge_operator.as_ref() {
-            return self.get_with_merge_in_view(key, snapshot_seq, merge_op, &view);
-        }
-        self.get_in_view(key, snapshot_seq, &view)
+        self.get(key, snapshot_seq)
     }
 
     /// Point lookup resolved against one already-loaded view.
@@ -811,12 +861,77 @@ impl LarkEngine {
     /// collects any merge operands that sit on top of the terminator
     /// and calls the operator to collapse the chain into a final
     /// value at visibility time.
-    fn get_in_view(
+    pub(crate) fn get(
         &self,
-        key: &[u8],
+        prefixed_key: &[u8],
         snapshot_seq: u64,
-        view: &ReadView,
     ) -> std::io::Result<Option<Vec<u8>>> {
+        let lk = LookupKey::from_prefixed(prefixed_key, snapshot_seq);
+        Ok(self.get_slice(&lk)?.map(DbSlice::into_vec))
+    }
+
+    /// [`LarkEngine::get`] without copying the value. The returned
+    /// [`DbSlice`] borrows the block or heap buffer the value already
+    /// lives in and keeps that owner alive.
+    pub(crate) fn get_slice(&self, lk: &LookupKey) -> std::io::Result<Option<DbSlice>> {
+        match self.lookup(lk, Materialize::Value)? {
+            Some(PointValue::Value(value)) => Ok(Some(value)),
+            Some(PointValue::Length(_)) => Err(std::io::Error::other(
+                "point lookup produced a length where a value was requested",
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Length of the live value for `lk`, or `None` when there is none.
+    ///
+    /// Reads the same sources [`LarkEngine::get_slice`] does and pays
+    /// the same block reads, but never takes a reference on the block
+    /// or buffer the value lives in.
+    pub(crate) fn get_size(&self, lk: &LookupKey) -> std::io::Result<Option<usize>> {
+        Ok(self.lookup(lk, Materialize::LengthOnly)?.map(|v| v.len()))
+    }
+
+    /// Look one SSTable up, projecting the hit into whichever form the
+    /// caller asked for. The two arms run the same bloom check, index
+    /// search, block read and block scan; they differ only in whether
+    /// the winning value is handed back as bytes or as a length.
+    fn probe_file(
+        &self,
+        reader: &SsTableReader,
+        lk: &LookupKey,
+        materialize: Materialize,
+    ) -> std::io::Result<LookupResult<PointValue>> {
+        with_key_scratch(|buf| match materialize {
+            Materialize::Value => Ok(reader
+                .get(lk, buf, &self.cache)?
+                .map_value(PointValue::Value)),
+            Materialize::LengthOnly => Ok(reader
+                .get_size(lk, buf, &self.cache)?
+                .map_value(PointValue::Length)),
+        })
+    }
+
+    /// The single point-read source walk. `materialize` decides only
+    /// what the winning entry is projected into, never which sources
+    /// are consulted or how MVCC and range-tombstone precedence are
+    /// resolved, so every `get`-shaped entry point agrees by
+    /// construction.
+    fn lookup(
+        &self,
+        lk: &LookupKey,
+        materialize: Materialize,
+    ) -> std::io::Result<Option<PointValue>> {
+        self.ensure_open()?;
+        if self.options.merge_operator.is_some() {
+            // A merge operator decides inside `full_merge` whether a
+            // value exists at all, so a length-only request has to
+            // collapse the chain exactly like a full read does.
+            return Ok(self.get_with_merge(lk)?.map(PointValue::Value));
+        }
+        let key = lk.prefixed_user_key();
+        let snapshot_seq = lk.snapshot_seq();
+        let view = self.view.load();
         let mut max_rt_seq: u64 = 0;
 
         // Memtable phase - timed via `PerfContext` at
@@ -832,8 +947,12 @@ impl LarkEngine {
                 if rt > max_rt_seq {
                     max_rt_seq = rt;
                 }
-                if let Some((pseq, popt)) = active.get(key, snapshot_seq) {
-                    return Ok(if pseq > max_rt_seq { popt } else { None });
+                if let Some((pseq, popt)) = active.get(lk) {
+                    return Ok(if pseq > max_rt_seq {
+                        popt.map(|v| PointValue::of(v, materialize))
+                    } else {
+                        None
+                    });
                 }
             }
             {
@@ -843,8 +962,12 @@ impl LarkEngine {
                     if rt > max_rt_seq {
                         max_rt_seq = rt;
                     }
-                    if let Some((pseq, popt)) = mt.get(key, snapshot_seq) {
-                        return Ok(if pseq > max_rt_seq { popt } else { None });
+                    if let Some((pseq, popt)) = mt.get(lk) {
+                        return Ok(if pseq > max_rt_seq {
+                            popt.map(|v| PointValue::of(v, materialize))
+                        } else {
+                            None
+                        });
                     }
                 }
             }
@@ -866,9 +989,9 @@ impl LarkEngine {
             if rt > max_rt_seq {
                 max_rt_seq = rt;
             }
-            match file.reader.get(key, snapshot_seq, &self.cache)? {
+            match self.probe_file(&file.reader, lk, materialize)? {
                 LookupResult::Found { seq, value } => {
-                    return Ok(if seq > max_rt_seq { Some(value) } else { None });
+                    return Ok((seq > max_rt_seq).then_some(value));
                 }
                 LookupResult::FoundTombstone { .. } => return Ok(None),
                 LookupResult::NotInTable => {}
@@ -908,9 +1031,9 @@ impl LarkEngine {
                 {
                     continue;
                 }
-                match file.reader.get(key, snapshot_seq, &self.cache)? {
+                match self.probe_file(&file.reader, lk, materialize)? {
                     LookupResult::Found { seq, value } => {
-                        return Ok(if seq > max_rt_seq { Some(value) } else { None });
+                        return Ok((seq > max_rt_seq).then_some(value));
                     }
                     LookupResult::FoundTombstone { .. } => return Ok(None),
                     LookupResult::NotInTable => {}
@@ -927,38 +1050,42 @@ impl LarkEngine {
     /// [`crate::MergeOperator::full_merge`] at the end to materialize
     /// the final value.
     ///
-    /// `merge_op` is the operator the caller already resolved from
-    /// the options, passed in so this helper cannot be reached
-    /// without one.
-    fn get_with_merge_in_view(
-        &self,
-        key: &[u8],
-        snapshot_seq: u64,
-        merge_op: &Arc<dyn crate::options::MergeOperator>,
-        view: &ReadView,
-    ) -> std::io::Result<Option<Vec<u8>>> {
+    /// Callers are responsible for having checked that
+    /// `self.options.merge_operator.is_some()`; this helper asserts
+    /// internally.
+    fn get_with_merge(&self, lk: &LookupKey) -> std::io::Result<Option<DbSlice>> {
         use internal_key::{VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE};
 
+        let key = lk.prefixed_user_key();
+        let snapshot_seq = lk.snapshot_seq();
+
+        let merge_op = self
+            .options
+            .merge_operator
+            .as_ref()
+            .expect("get_with_merge called without a merge operator");
+
+        let view = self.view.load();
         // `chain` records visible entries for `key` in newest-seq-
         // first order, stopping at (and including) the first
         // terminator (`VALUE` or `DELETION`). Range tombstones that
         // cover the key are treated as virtual deletion terminators.
-        let mut chain: Vec<(u64, u8, Vec<u8>)> = Vec::new();
+        let mut chain: Vec<(u64, u8, DbSlice)> = Vec::new();
         let mut max_rt_seq: u64 = 0;
         let mut terminated;
 
         // `consume_partial` appends entries from one source into the
         // running chain, short-circuiting if a terminator (real or
         // RT-synthesized) is reached.
-        let consume_partial = |partial: Vec<(u64, u8, Vec<u8>)>,
+        let consume_partial = |partial: Vec<(u64, u8, DbSlice)>,
                                max_rt_seq: u64,
-                               chain: &mut Vec<(u64, u8, Vec<u8>)>|
+                               chain: &mut Vec<(u64, u8, DbSlice)>|
          -> bool {
             for (seq, vt, value) in partial {
                 if seq <= max_rt_seq {
                     // Range tombstone hides this and every older
                     // entry for the same key.
-                    chain.push((max_rt_seq, VALUE_TYPE_DELETION, Vec::new()));
+                    chain.push((max_rt_seq, VALUE_TYPE_DELETION, DbSlice::empty()));
                     return true;
                 }
                 chain.push((seq, vt, value));
@@ -977,7 +1104,7 @@ impl LarkEngine {
                 max_rt_seq = rt;
             }
             let mut partial = Vec::new();
-            let _ = active.collect_merge_chain(key, snapshot_seq, &mut partial);
+            let _ = active.collect_merge_chain(lk, &mut partial);
             terminated = consume_partial(partial, max_rt_seq, &mut chain);
         }
 
@@ -989,7 +1116,7 @@ impl LarkEngine {
                     max_rt_seq = rt;
                 }
                 let mut partial = Vec::new();
-                let _ = mt.collect_merge_chain(key, snapshot_seq, &mut partial);
+                let _ = mt.collect_merge_chain(lk, &mut partial);
                 terminated = consume_partial(partial, max_rt_seq, &mut chain);
                 if terminated {
                     break;
@@ -1007,8 +1134,10 @@ impl LarkEngine {
                     max_rt_seq = rt;
                 }
                 let mut partial = Vec::new();
-                file.reader
-                    .collect_merge_chain(key, snapshot_seq, &self.cache, &mut partial)?;
+                with_key_scratch(|buf| {
+                    file.reader
+                        .collect_merge_chain(lk, buf, &self.cache, &mut partial)
+                })?;
                 terminated = consume_partial(partial, max_rt_seq, &mut chain);
                 if terminated {
                     break;
@@ -1043,12 +1172,10 @@ impl LarkEngine {
                             continue;
                         }
                         let mut partial = Vec::new();
-                        file.reader.collect_merge_chain(
-                            key,
-                            snapshot_seq,
-                            &self.cache,
-                            &mut partial,
-                        )?;
+                        with_key_scratch(|buf| {
+                            file.reader
+                                .collect_merge_chain(lk, buf, &self.cache, &mut partial)
+                        })?;
                         terminated = consume_partial(partial, max_rt_seq, &mut chain);
                         if terminated {
                             break;
@@ -1087,11 +1214,15 @@ impl LarkEngine {
         if operands_owned.is_empty() {
             // No merges at all - the chain is just a plain
             // Value / Deletion / nothing. Return the base directly.
-            return Ok(base_slice.map(|s| s.to_vec()));
+            drop(operands_owned);
+            return Ok(match chain.pop() {
+                Some((_, vt, value)) if vt == VALUE_TYPE_VALUE => Some(value),
+                _ => None,
+            });
         }
 
         match merge_op.full_merge(key, base_slice, &operands_owned) {
-            Some(v) => Ok(Some(v)),
+            Some(v) => Ok(Some(DbSlice::from_vec(v))),
             None => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("merge operator {} failed for key", merge_op.name()),
@@ -1111,7 +1242,7 @@ impl LarkEngine {
     pub(crate) fn multi_get_latest(&self, keys: &[&[u8]]) -> std::io::Result<Vec<Option<Vec<u8>>>> {
         self.ensure_open()?;
         let view = self.view.load();
-        let snapshot_seq = self.visible_seq.load(Ordering::Acquire);
+        let snapshot_seq = self.visible_seq.visible();
         self.multi_get_in_view(keys, snapshot_seq, &view)
     }
 
@@ -1139,10 +1270,12 @@ impl LarkEngine {
         // doesn't compose cleanly with merge-chain collection, and
         // merges are rare enough that the cost difference isn't
         // worth a specialized batched path.
-        if let Some(merge_op) = self.options.merge_operator.as_ref() {
+        if self.options.merge_operator.is_some() {
             let mut out = Vec::with_capacity(keys.len());
+            let mut lk = LookupKey::from_prefixed(&[], snapshot_seq);
             for key in keys {
-                out.push(self.get_with_merge_in_view(key, snapshot_seq, merge_op, view)?);
+                lk.reset_prefixed(key, snapshot_seq);
+                out.push(self.get_with_merge(&lk)?.map(DbSlice::into_vec));
             }
             return Ok(out);
         }
@@ -1153,6 +1286,9 @@ impl LarkEngine {
         }
         let mut entries = grouped_multi_get_entries(keys);
         let mut unresolved = entries.len();
+        // One encoder, re-pointed per key, instead of one per key per
+        // source.
+        let mut lk = LookupKey::from_prefixed(&[], snapshot_seq);
 
         // 1. Active memtable.
         {
@@ -1165,7 +1301,8 @@ impl LarkEngine {
                 if rt > entry.max_rt {
                     entry.max_rt = rt;
                 }
-                if let Some((pseq, popt)) = mt.get(&entry.key, snapshot_seq) {
+                lk.reset_prefixed(&entry.key, snapshot_seq);
+                if let Some((pseq, popt)) = mt.get(&lk) {
                     let value = resolve_multi_get_value(pseq, popt, entry.max_rt);
                     set_multi_get_result(entry, &mut results, value);
                     unresolved -= 1;
@@ -1188,7 +1325,8 @@ impl LarkEngine {
                     if rt > entry.max_rt {
                         entry.max_rt = rt;
                     }
-                    if let Some((pseq, popt)) = mt.get(&entry.key, snapshot_seq) {
+                    lk.reset_prefixed(&entry.key, snapshot_seq);
+                    if let Some((pseq, popt)) = mt.get(&lk) {
                         let value = resolve_multi_get_value(pseq, popt, entry.max_rt);
                         set_multi_get_result(entry, &mut results, value);
                         unresolved -= 1;
@@ -1214,7 +1352,8 @@ impl LarkEngine {
                 if rt > entry.max_rt {
                     entry.max_rt = rt;
                 }
-                match file.reader.get(&entry.key, snapshot_seq, &self.cache)? {
+                lk.reset_prefixed(&entry.key, snapshot_seq);
+                match with_key_scratch(|buf| file.reader.get(&lk, buf, &self.cache))? {
                     LookupResult::Found { seq, value } => {
                         let value = resolve_multi_get_value(seq, Some(value), entry.max_rt);
                         set_multi_get_result(entry, &mut results, value);
@@ -1267,7 +1406,8 @@ impl LarkEngine {
                     if entry.resolved {
                         continue;
                     }
-                    match file.reader.get(&entry.key, snapshot_seq, &self.cache)? {
+                    lk.reset_prefixed(&entry.key, snapshot_seq);
+                    match with_key_scratch(|buf| file.reader.get(&lk, buf, &self.cache))? {
                         LookupResult::Found { seq, value } => {
                             let value = resolve_multi_get_value(seq, Some(value), entry.max_rt);
                             set_multi_get_result(entry, &mut results, value);
@@ -1426,12 +1566,10 @@ impl LarkEngine {
                         return Err(crate::Error::Busy(reason));
                     }
                     any_stall = true;
-                    let mut guard = self.stall_signal.lock.lock();
                     // Bounded wait so a missed notification can't
                     // wedge a writer forever.
                     self.stall_signal
-                        .cv
-                        .wait_for(&mut guard, std::time::Duration::from_millis(100));
+                        .wait(std::time::Duration::from_millis(100));
                 }
                 Some((reason, false)) => {
                     if no_slowdown {
@@ -1448,204 +1586,12 @@ impl LarkEngine {
         }
 
         let micros = start.elapsed().as_micros() as u64;
-        if any_stall {
-            if let Some(s) = self.statistics() {
-                s.add(crate::statistics::Ticker::WriteStallMicros, micros);
-            }
+        if any_stall && let Some(s) = self.statistics() {
+            s.add(crate::statistics::Ticker::WriteStallMicros, micros);
         }
         Ok(micros)
     }
 
-    /// Apply an ordered batch of writes atomically.
-    ///
-    /// Operations are assigned consecutive sequence numbers in the
-    /// same order the caller recorded them. That order matters when
-    /// a batch mixes range tombstones with puts/deletes/merges for
-    /// keys inside the range.
-    ///
-    /// `durability` controls WAL fsync semantics (`Immediate` = fsync
-    /// per call, `Eventual` = buffered flush). `disable_wal` skips
-    /// the WAL append entirely - the caller accepts that a crash
-    /// before the next memtable flush loses the write.
-    pub(crate) fn apply_batch(
-        &self,
-        ops: Vec<WriteBatchOp>,
-        durability: DurabilityMode,
-        disable_wal: bool,
-    ) -> std::io::Result<()> {
-        self.ensure_writable()?;
-        if ops.is_empty() {
-            return Ok(());
-        }
-        self.validate_ops_sizes(&ops)?;
-
-        let _write_guard = self.write_lock.lock();
-        self.apply_batch_locked(ops, durability, disable_wal)
-    }
-
-    /// Apply grouped writes from older internal callers that do not
-    /// preserve a single operation log.
-    pub(crate) fn apply_grouped_batch(
-        &self,
-        point_ops: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
-        range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
-        merges: Vec<(Vec<u8>, Vec<u8>)>,
-        durability: DurabilityMode,
-        disable_wal: bool,
-    ) -> std::io::Result<()> {
-        let ops = grouped_batch_ops(point_ops, range_deletes, merges);
-        self.apply_batch(ops, durability, disable_wal)
-    }
-
-    /// Fast path for a single put - avoids BTreeMap construction,
-    /// WAL formatting, and memtable insertion overhead for the
-    /// most common write operation.
-    pub(crate) fn apply_single_put(
-        &self,
-        key: Vec<u8>,
-        value: Vec<u8>,
-        durability: DurabilityMode,
-        disable_wal: bool,
-    ) -> std::io::Result<()> {
-        self.ensure_writable()?;
-        self.validate_prefixed_key_size(&key)?;
-        self.validate_value_size(&value)?;
-        let _write_guard = self.write_lock.lock();
-        self.ensure_writable()?;
-        self.rotate_if_full()?;
-        let seq = self.latest_seq.fetch_add(1, Ordering::AcqRel) + 1;
-
-        if !disable_wal {
-            let _perf_wal =
-                crate::perf_context::PerfTimer::new(crate::perf_context::PerfTimerField::WriteWal);
-            let wal_start = std::time::Instant::now();
-            let mut wal = self.active_wal.lock();
-            let wal = wal.as_mut().ok_or_else(Self::read_only_error)?;
-            wal.append_put(&key, &value, seq)?;
-            let wal_bytes = (key.len() + value.len() + 8) as u64;
-            match durability {
-                DurabilityMode::Immediate => wal.sync()?,
-                DurabilityMode::Eventual => wal.flush()?,
-            }
-            if let Some(s) = self.statistics() {
-                s.add(crate::statistics::Ticker::WalBytesWritten, wal_bytes);
-                if matches!(durability, DurabilityMode::Immediate) {
-                    s.add(crate::statistics::Ticker::WalSyncCount, 1);
-                }
-                s.record(
-                    crate::statistics::Histogram::WalWriteTime,
-                    wal_start.elapsed().as_micros() as u64,
-                );
-            }
-        }
-
-        {
-            let _perf_mt = crate::perf_context::PerfTimer::new(
-                crate::perf_context::PerfTimerField::WriteMemtable,
-            );
-            let view = self.view.load();
-            view.active.put(&key, &value, seq);
-        }
-
-        // Publish visibility only now that the write is WAL-durable and
-        // applied. `fetch_max` keeps the horizon monotonic against a
-        // concurrent ingest publishing a different sequence.
-        self.visible_seq.fetch_max(seq, Ordering::AcqRel);
-
-        Ok(())
-    }
-
-    /// Apply a batch assuming the caller already holds
-    /// `self.write_lock`. Used by [`Self::apply_batch`] and by the
-    /// transaction commit path, which needs to interleave a
-    /// conflict-detection step with the write while holding the
-    /// write lock the whole time.
-    fn apply_batch_locked(
-        &self,
-        ops: Vec<WriteBatchOp>,
-        durability: DurabilityMode,
-        disable_wal: bool,
-    ) -> std::io::Result<()> {
-        self.ensure_writable()?;
-        if ops.is_empty() {
-            return Ok(());
-        }
-        self.validate_ops_sizes(&ops)?;
-
-        self.rotate_if_full()?;
-
-        let total_ops = ops.len();
-        let base_seq = self
-            .latest_seq
-            .fetch_add(total_ops as u64, Ordering::AcqRel)
-            + 1;
-
-        if !disable_wal {
-            let _perf_wal =
-                crate::perf_context::PerfTimer::new(crate::perf_context::PerfTimerField::WriteWal);
-            let wal_start = std::time::Instant::now();
-            let mut wal = self.active_wal.lock();
-            let wal = wal.as_mut().ok_or_else(Self::read_only_error)?;
-            let wal_bytes: u64 = ops.iter().map(batch_op_wal_bytes).sum();
-            if total_ops == 1 {
-                append_single_wal_op(wal, &ops[0], base_seq)?;
-            } else {
-                wal.append_ops_batch(&ops, base_seq)?;
-            }
-            match durability {
-                DurabilityMode::Immediate => wal.sync()?,
-                DurabilityMode::Eventual => wal.flush()?,
-            }
-            if let Some(s) = self.statistics() {
-                s.add(crate::statistics::Ticker::WalBytesWritten, wal_bytes);
-                if matches!(durability, DurabilityMode::Immediate) {
-                    s.add(crate::statistics::Ticker::WalSyncCount, 1);
-                }
-                s.record(
-                    crate::statistics::Histogram::WalWriteTime,
-                    wal_start.elapsed().as_micros() as u64,
-                );
-            }
-        }
-
-        {
-            let _perf_mt = crate::perf_context::PerfTimer::new(
-                crate::perf_context::PerfTimerField::WriteMemtable,
-            );
-            let view = self.view.load();
-            for (i, op) in ops.iter().enumerate() {
-                let seq = base_seq + i as u64;
-                apply_batch_op_to_memtable(&view.active, op, seq);
-            }
-        }
-
-        // Publish visibility only now that the whole batch is WAL-durable
-        // and applied, so a snapshot can never observe a torn batch.
-        // `fetch_max` keeps the horizon monotonic against a concurrent
-        // ingest publishing a different sequence.
-        self.visible_seq
-            .fetch_max(base_seq + total_ops as u64 - 1, Ordering::AcqRel);
-
-        Ok(())
-    }
-
-    /// Commit a transaction's buffered writes under the engine
-    /// write lock. For every `(key, observed_seq)` pair, verify that
-    /// no version of `key` newer than `observed_seq` has landed
-    /// since the transaction observed it; if one has, return
-    /// `Ok(CommitOutcome::Conflict { .. })` without applying
-    /// anything. Otherwise apply the batch atomically and return
-    /// `Ok(CommitOutcome::Ok)`.
-    ///
-    /// An optimistic transaction passes its begin snapshot seq for
-    /// every key. A pessimistic transaction passes, per key, the
-    /// read horizon sampled when it took that key's lock.
-    ///
-    /// Range-delete operations from a transaction are applied
-    /// unconditionally: their conflict semantics require tracking
-    /// every key the range could shadow, which the initial
-    /// transaction impl does not support. See the transaction
-    /// module for the caveat.
     pub(crate) fn commit_with_conflict_check(
         &self,
         conflict_keys: &[(Vec<u8>, u64)],
@@ -1654,29 +1600,7 @@ impl LarkEngine {
         merges: Vec<(Vec<u8>, Vec<u8>)>,
         durability: DurabilityMode,
     ) -> std::io::Result<CommitOutcome> {
-        self.ensure_writable()?;
-        let _write_guard = self.write_lock.lock();
-
-        // For each tracked key, peek at the latest visible version
-        // without a snapshot bound. If its seq is newer than the one
-        // the transaction observed the key at, someone else wrote to
-        // the key in between.
-        let view = self.view.load();
-        for (key, observed_seq) in conflict_keys {
-            if let Some(latest_seq) = self.latest_version_seq_in_view(key, &view)? {
-                if latest_seq > *observed_seq {
-                    return Ok(CommitOutcome::Conflict {
-                        key: key.clone(),
-                        observed_seq: *observed_seq,
-                        latest_seq,
-                    });
-                }
-            }
-        }
-
-        let ops = grouped_batch_ops(point_ops, range_deletes, merges);
-        self.apply_batch_locked(ops, durability, false)?;
-        Ok(CommitOutcome::Ok)
+        self.commit_optimistic(conflict_keys, point_ops, range_deletes, merges, durability)
     }
 
     /// Return the sequence number of the newest write that touched
@@ -1696,12 +1620,13 @@ impl LarkEngine {
         view: &ReadView,
     ) -> std::io::Result<Option<u64>> {
         let snap = u64::MAX;
+        let lk = LookupKey::from_prefixed(key, snap);
         let mut max_rt_seq: u64 = 0;
         let newest = |point_seq: u64, max_rt_seq: u64| Some(point_seq.max(max_rt_seq));
         {
             let active = &view.active;
             max_rt_seq = max_rt_seq.max(active.covering_range_tombstone_seq(key, snap));
-            if let Some((seq, _)) = active.get(key, snap) {
+            if let Some((seq, _)) = active.get(&lk) {
                 return Ok(newest(seq, max_rt_seq));
             }
         }
@@ -1709,7 +1634,7 @@ impl LarkEngine {
             let frozen = &view.frozen;
             for mt in frozen.iter().rev() {
                 max_rt_seq = max_rt_seq.max(mt.covering_range_tombstone_seq(key, snap));
-                if let Some((seq, _)) = mt.get(key, snap) {
+                if let Some((seq, _)) = mt.get(&lk) {
                     return Ok(newest(seq, max_rt_seq));
                 }
             }
@@ -1717,7 +1642,7 @@ impl LarkEngine {
         let version = &view.version;
         for file in version.levels[0].iter().rev() {
             max_rt_seq = max_rt_seq.max(file.reader.covering_range_tombstone_seq(key, snap));
-            match file.reader.get(key, snap, &self.cache)? {
+            match with_key_scratch(|buf| file.reader.get(&lk, buf, &self.cache))? {
                 LookupResult::Found { seq, .. } | LookupResult::FoundTombstone { seq } => {
                     return Ok(newest(seq, max_rt_seq));
                 }
@@ -1745,7 +1670,7 @@ impl LarkEngine {
                 {
                     continue;
                 }
-                match file.reader.get(key, snap, &self.cache)? {
+                match with_key_scratch(|buf| file.reader.get(&lk, buf, &self.cache))? {
                     LookupResult::Found { seq, .. } | LookupResult::FoundTombstone { seq } => {
                         return Ok(newest(seq, max_rt_seq));
                     }
@@ -1764,7 +1689,7 @@ impl LarkEngine {
     /// failure is surfaced before the write is assigned a sequence or
     /// applied - keeping write errors determinate: a returned error means
     /// the write did not land, never that it landed but a later step
-    /// failed. Caller must hold `write_lock`.
+    /// failed. Caller must hold the pipeline mutex.
     fn rotate_if_full(&self) -> std::io::Result<()> {
         if self.view.load().active.approximate_size() >= self.options.write_buffer_size {
             self.rotate_memtable()?;
@@ -1776,11 +1701,14 @@ impl LarkEngine {
         self.ensure_writable()?;
         // One publication: the sealed memtable joins `frozen` in the
         // same view that hands writers the fresh active one, so no
-        // reader can catch it in neither.
+        // reader can catch it in neither. The fresh memtable is built
+        // before the publication so the fallible allocation happens
+        // once, outside it.
+        let fresh = Arc::new(MemTable::new(&self.memtable_config)?);
         self.view.update_memtables(|active, frozen| {
             let mut next_frozen = frozen.to_vec();
             next_frozen.push(Arc::clone(active));
-            (Arc::new(MemTable::new()), next_frozen, ())
+            (fresh, next_frozen, ())
         });
 
         let new_wal_id = {
@@ -1844,10 +1772,10 @@ impl LarkEngine {
 
         // Walk the memtable in internal-key order and copy every version
         // and tombstone into the SSTable unchanged, preserving MVCC.
-        let entries = memtable.iter_internal();
-        for (internal_key, value) in &entries {
-            writer.add(internal_key, value)?;
-        }
+        // The walk streams straight out of the arena: a flush holds one
+        // entry plus the block builder, never a second copy of the
+        // whole memtable.
+        memtable.try_for_each_entry(|internal_key, value| writer.add(internal_key, value))?;
 
         // Persist range tombstones alongside the point entries.
         for rt in &range_tombstones {
@@ -1874,7 +1802,11 @@ impl LarkEngine {
             limiter.request(file_size, crate::rate_limiter::Priority::Low);
         }
 
-        let reader = Arc::new(SsTableReader::open(&sst_path, file_id)?);
+        let reader = Arc::new(SsTableReader::open_with(
+            &sst_path,
+            file_id,
+            self.options.metadata_policy(),
+        )?);
         let file = LiveSst::new(
             SsTableMeta {
                 file_id,
@@ -1987,7 +1919,7 @@ impl LarkEngine {
         //    here includes range tombstones, not just point entries.
         let needs_flush = |mt: &MemTable| !mt.is_empty() || !mt.clone_range_tombstones().is_empty();
         if needs_flush(&self.view.load().active) {
-            let _write_guard = self.write_lock.lock();
+            let _write_guard = self.pipeline.lock();
             if needs_flush(&self.view.load().active) {
                 self.rotate_memtable()?;
             }
@@ -2028,6 +1960,7 @@ impl LarkEngine {
             max_background_compactions: self.options.max_background_compactions,
             partitioned_index: self.options.partitioned_index,
             metadata_block_size: self.options.metadata_block_size,
+            cache_index_and_filter_blocks: self.options.cache_index_and_filter_blocks,
         };
         // Under FIFO compaction there is no level push-down; a
         // synchronous compact_range just flushes the memtable and
@@ -2112,33 +2045,48 @@ impl LarkEngine {
         // Pre-open every source file and compute its key range, so we
         // can reject bad inputs before we start mutating anything.
         let mut sources: Vec<IngestSource> = Vec::with_capacity(files.len());
-        for path in files {
-            let reader = SsTableReader::open(path, 0).map_err(|e| {
+        let _cache_guard = IngestCacheGuard::new(&self.cache, files.len());
+        for (source_idx, path) in files.iter().enumerate() {
+            // Source files are read through the engine's shared block
+            // cache, which is keyed `(file_id, offset)`. They are not in
+            // the version, so they have no allocated id; giving every
+            // source the same one (or one a live file already owns) makes
+            // the second source read the first source's cached blocks and
+            // silently ingest the wrong bytes. Ids are handed out from the
+            // top of the space, which `next_file_id` counts up from 1 and
+            // never reaches.
+            let cache_id = ingest_probe_file_id(source_idx);
+            let reader = SsTableReader::open(path, cache_id).map_err(|e| {
                 std::io::Error::new(e.kind(), format!("ingest: open {}: {e}", path.display()))
             })?;
-            let entries = reader.iter_internal(&self.cache)?;
-            let rts = reader.range_tombstones();
-            for (ik, value) in &entries {
-                let (user_key, _, _) = decode_internal_key(ik);
-                self.validate_prefixed_key_size(user_key).map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "ingest: source file {} contains an over-sized key: {e}",
-                            path.display()
-                        ),
-                    )
-                })?;
-                self.validate_value_size(value).map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "ingest: source file {} contains an over-sized value: {e}",
-                            path.display()
-                        ),
-                    )
-                })?;
-                validate_user_key(user_key).map_err(|e| {
+            // Stream the source instead of materialising it: the
+            // validation pass holds one entry and one data block, and
+            // tracks the key range as it goes.
+            let mut first_user_key: Option<Vec<u8>> = None;
+            let mut last_user_key: Vec<u8> = Vec::new();
+            {
+                let mut entries = reader.iter_internal_stream(&self.cache)?;
+                while let Some((ik, value)) = entries.next_entry()? {
+                    let (user_key, _, _) = decode_internal_key(&ik);
+                    self.validate_prefixed_key_size(user_key).map_err(|e| {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!(
+                                "ingest: source file {} contains an over-sized key: {e}",
+                                path.display()
+                            ),
+                        )
+                    })?;
+                    self.validate_value_size(&value).map_err(|e| {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!(
+                                "ingest: source file {} contains an over-sized value: {e}",
+                                path.display()
+                            ),
+                        )
+                    })?;
+                    validate_user_key(user_key).map_err(|e| {
                     std::io::Error::new(
                         e.kind(),
                         format!(
@@ -2147,7 +2095,14 @@ impl LarkEngine {
                         ),
                     )
                 })?;
+                    if first_user_key.is_none() {
+                        first_user_key = Some(user_key.to_vec());
+                    }
+                    last_user_key.clear();
+                    last_user_key.extend_from_slice(user_key);
+                }
             }
+            let rts = reader.range_tombstones();
             for rt in rts {
                 self.validate_prefixed_key_size(&rt.start).map_err(|e| {
                     std::io::Error::new(
@@ -2186,29 +2141,26 @@ impl LarkEngine {
                     )
                 })?;
             }
-            let (smallest, largest) =
-                if let (Some(first), Some(last)) = (entries.first(), entries.last()) {
-                    let (uk_lo, _, _) = decode_internal_key(&first.0);
-                    let (uk_hi, _, _) = decode_internal_key(&last.0);
-                    (uk_lo.to_vec(), uk_hi.to_vec())
-                } else if !rts.is_empty() {
-                    let mut lo = rts[0].start.clone();
-                    let mut hi = rts[0].end.clone();
-                    for rt in rts.iter().skip(1) {
-                        if rt.start < lo {
-                            lo = rt.start.clone();
-                        }
-                        if rt.end > hi {
-                            hi = rt.end.clone();
-                        }
+            let (smallest, largest) = if let Some(first) = first_user_key {
+                (first, last_user_key)
+            } else if !rts.is_empty() {
+                let mut lo = rts[0].start.clone();
+                let mut hi = rts[0].end.clone();
+                for rt in rts.iter().skip(1) {
+                    if rt.start < lo {
+                        lo = rt.start.clone();
                     }
-                    (lo, hi)
-                } else {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("ingest: source file {} is empty", path.display()),
-                    ));
-                };
+                    if rt.end > hi {
+                        hi = rt.end.clone();
+                    }
+                }
+                (lo, hi)
+            } else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("ingest: source file {} is empty", path.display()),
+                ));
+            };
             sources.push(IngestSource {
                 path: path.clone(),
                 reader,
@@ -2247,7 +2199,7 @@ impl LarkEngine {
             !view.active.is_empty() || !view.active.clone_range_tombstones().is_empty()
         };
         if needs_flush {
-            let _write_guard = self.write_lock.lock();
+            let _write_guard = self.pipeline.lock();
             let view = self.view.load();
             if !view.active.is_empty() || !view.active.clone_range_tombstones().is_empty() {
                 drop(view);
@@ -2286,13 +2238,16 @@ impl LarkEngine {
             self.options.metadata_block_size,
         )?;
 
-        // Re-encode every point entry with the ingest seq.
-        let entries = source.reader.iter_internal(&self.cache)?;
-        for (ik, value) in entries {
+        // Re-encode every point entry with the ingest seq. The second
+        // pass streams too, so an ingest never holds more than one
+        // source data block regardless of how large the file is.
+        let mut entries = source.reader.iter_internal_stream(&self.cache)?;
+        while let Some((ik, value)) = entries.next_entry()? {
             let (uk, _old_seq, vt) = decode_internal_key(&ik);
             let new_ik = encode_internal_key(uk, ingest_seq, vt);
             writer.add(&new_ik, &value)?;
         }
+        drop(entries);
         // Carry range tombstones across with the same seq rewrite.
         for rt in source.reader.range_tombstones() {
             writer.add_range_tombstone(&rt.start, &rt.end, ingest_seq);
@@ -2313,7 +2268,11 @@ impl LarkEngine {
         };
 
         let file_size = std::fs::metadata(&dest_path)?.len();
-        let reader = Arc::new(SsTableReader::open(&dest_path, file_id)?);
+        let reader = Arc::new(SsTableReader::open_with(
+            &dest_path,
+            file_id,
+            self.options.metadata_policy(),
+        )?);
         let live = LiveSst::new(
             SsTableMeta {
                 file_id,
@@ -2338,7 +2297,7 @@ impl LarkEngine {
         // sequence. `fetch_max` guards against a concurrent write (ingest
         // holds the compaction lock, not the write lock) having already
         // published a higher horizon.
-        self.visible_seq.fetch_max(ingest_seq, Ordering::AcqRel);
+        self.visible_seq.publish(ingest_seq);
 
         if !self.options.listeners.is_empty() {
             // Fire the table-created event first (file-level
@@ -2405,7 +2364,7 @@ impl LarkEngine {
                 !view.active.is_empty() || !view.active.clone_range_tombstones().is_empty()
             };
             if has_any {
-                let _write_guard = self.write_lock.lock();
+                let _write_guard = self.pipeline.lock();
                 let still_has_any = {
                     let view = self.view.load();
                     !view.active.is_empty() || !view.active.clone_range_tombstones().is_empty()
@@ -2466,7 +2425,9 @@ impl LarkEngine {
                 if file.meta.smallest_key.as_slice() >= end {
                     continue;
                 }
-                total += file.reader.approximate_size_in_range(start, end);
+                total += file
+                    .reader
+                    .approximate_size_in_range(start, end, &self.cache);
             }
         }
         total
@@ -2536,6 +2497,33 @@ impl LarkEngine {
         self.view.load().active.approximate_size() as u64
     }
 
+    /// Bytes every in-memory memtable actually reserved from the global
+    /// allocator: the sum of their arena chunk sizes plus the heap their
+    /// range tombstones own.
+    ///
+    /// [`LarkEngine::active_memtable_size`] is the payload figure that
+    /// `write_buffer_size` bounds; this is what the process is really
+    /// holding, so the gap between them is the arena's rounding waste.
+    pub(crate) fn memtables_reserved_size(&self) -> u64 {
+        let active = self.view.load().active.reserved_size() as u64;
+        let frozen: u64 = self
+            .view
+            .load()
+            .frozen
+            .iter()
+            .map(|mt| mt.reserved_size() as u64)
+            .sum();
+        active + frozen
+    }
+
+    /// Bytes parked in the memtable arena's recycling pool, waiting to
+    /// back the next memtable instead of being returned to the global
+    /// allocator. Bounded by
+    /// `write_buffer_size * max_write_buffer_number`.
+    pub(crate) fn arena_pool_size(&self) -> u64 {
+        self.memtable_config.pool_bytes().0 as u64
+    }
+
     /// Total approximate size of every frozen memtable.
     pub(crate) fn frozen_memtables_size(&self) -> u64 {
         self.view
@@ -2565,6 +2553,29 @@ impl LarkEngine {
         self.cache.capacity()
     }
 
+    /// Bytes the currently-live SSTable readers hold *outside* the
+    /// block cache budget: pinned indexes, pinned filter regions, any
+    /// metadata block the cache refused, and range tombstones.
+    ///
+    /// This is the honest counterpart to `lark.block-cache-usage`:
+    /// together they account for every byte of SSTable metadata the
+    /// engine is holding. With
+    /// [`Options::cache_index_and_filter_blocks`] off this number grows
+    /// with the number of open files; with it on, only the pinned
+    /// top-level index of each partitioned file and its range
+    /// tombstones remain here.
+    ///
+    /// [`Options::cache_index_and_filter_blocks`]: crate::Options::cache_index_and_filter_blocks
+    pub(crate) fn pinned_metadata_bytes(&self) -> usize {
+        let version = self.versions.lock().current();
+        version
+            .levels
+            .iter()
+            .flat_map(|level| level.iter())
+            .map(|file| file.reader.pinned_metadata_bytes())
+            .sum()
+    }
+
     /// Unix-seconds timestamp of the oldest live snapshot, or
     /// `None` when no snapshot is alive.
     pub(crate) fn oldest_snapshot_time_unix(&self) -> Option<u64> {
@@ -2580,7 +2591,7 @@ impl LarkEngine {
     /// Drop all data in the engine.
     pub(crate) fn drop_all(&self) -> std::io::Result<()> {
         self.ensure_writable()?;
-        let _write_guard = self.write_lock.lock();
+        let _write_guard = self.pipeline.lock();
         self.ensure_writable()?;
 
         // Published before the version `Reset` below, so no reader can
@@ -2588,8 +2599,9 @@ impl LarkEngine {
         // `drop_all` holds `write_lock`, which excludes writers but not
         // readers: a concurrent reader may still briefly observe
         // pre-drop SSTable data, exactly as before this view existed.
+        let fresh = Arc::new(MemTable::new(&self.memtable_config)?);
         self.view
-            .update_memtables(|_, _| (Arc::new(MemTable::new()), Vec::new(), ()));
+            .update_memtables(|_, _| (fresh, Vec::new(), ()));
 
         let (old_version, wal_id, wal_path, new_wal) = {
             let mut versions = self.versions.lock();
@@ -2608,7 +2620,7 @@ impl LarkEngine {
         let _old_wal = self.active_wal.lock().replace(new_wal);
         self.wal_id.store(wal_id, Ordering::Release);
         self.latest_seq.store(0, Ordering::Release);
-        self.visible_seq.store(0, Ordering::Release);
+        self.visible_seq.reset();
 
         self.versions.lock().compact_manifest()?;
 
@@ -2656,7 +2668,8 @@ impl LarkEngine {
         let mut out = Vec::new();
         for level in &version.levels {
             for file in level {
-                for (ik, _v) in file.reader.iter_internal(&self.cache)? {
+                let mut entries = file.reader.iter_internal_stream(&self.cache)?;
+                while let Some((ik, _v)) = entries.next_entry()? {
                     let (uk, seq, vt) = decode_internal_key(&ik);
                     if uk == user_key {
                         out.push((seq, vt));
@@ -2707,7 +2720,7 @@ impl LarkEngine {
             .lock()
             .as_mut()
             .ok_or_else(Self::read_only_error)?
-            .sync()?;
+            .sync_data()?;
         self.compaction.lock().shutdown();
 
         Ok(())
@@ -2724,7 +2737,7 @@ impl LarkEngine {
             }
 
             let old_wal = {
-                let _write_guard = self.write_lock.lock();
+                let _write_guard = self.pipeline.lock();
                 let view = self.view.load();
                 let active_needs_flush = memtable_needs_flush(&view.active);
                 let has_frozen = !view.frozen.is_empty();
@@ -2746,13 +2759,14 @@ impl LarkEngine {
                     // One publication for the seal and the enqueue: two
                     // would leave a window where the sealed memtable is
                     // in neither the active slot nor the frozen list.
+                    let fresh = Arc::new(MemTable::new(&self.memtable_config)?);
                     self.view.update_memtables(|active, frozen| {
                         let sealed = Arc::clone(active);
                         let mut next_frozen = frozen.to_vec();
                         if memtable_needs_flush(&sealed) {
                             next_frozen.push(sealed);
                         }
-                        (Arc::new(MemTable::new()), next_frozen, ())
+                        (fresh, next_frozen, ())
                     });
                 }
 
@@ -2766,6 +2780,40 @@ impl LarkEngine {
             };
 
             self.flush_frozen_memtable(old_wal)?;
+        }
+    }
+}
+
+/// Block-cache file id for the `n`-th source of one ingest call.
+///
+/// Live file ids are allocated upward from 1 by `next_file_id`, so ids
+/// taken from the top of the space cannot collide with a real file, and
+/// distinct sources cannot collide with each other.
+fn ingest_probe_file_id(source_idx: usize) -> u64 {
+    u64::MAX - source_idx as u64
+}
+
+/// Drops the ingest sources' blocks from the shared block cache when the
+/// ingest call returns, by any path.
+///
+/// Source blocks are read twice (validate, then rewrite) and are useless
+/// afterwards, so leaving them resident would hold block-cache budget for
+/// bytes no reader can ask for again.
+struct IngestCacheGuard<'a> {
+    cache: &'a BlockCache,
+    sources: usize,
+}
+
+impl<'a> IngestCacheGuard<'a> {
+    fn new(cache: &'a BlockCache, sources: usize) -> Self {
+        Self { cache, sources }
+    }
+}
+
+impl Drop for IngestCacheGuard<'_> {
+    fn drop(&mut self) {
+        for source_idx in 0..self.sources {
+            self.cache.evict_file(ingest_probe_file_id(source_idx));
         }
     }
 }
@@ -2958,12 +3006,12 @@ fn apply_replayed_wal_entry(memtable: &MemTable, entry: WalEntry) -> u64 {
 fn rewrite_recovered_memtable_to_wal(memtable: &MemTable, wal: &mut Wal) -> std::io::Result<()> {
     let mut wrote_record = false;
 
-    for (internal_key, value) in memtable.iter_internal() {
-        let (user_key, seq, value_type) = internal_key::decode_internal_key(&internal_key);
+    memtable.try_for_each_entry(|internal_key, value| {
+        let (user_key, seq, value_type) = internal_key::decode_internal_key(internal_key);
         match value_type {
-            internal_key::VALUE_TYPE_VALUE => wal.append_put(user_key, &value, seq)?,
+            internal_key::VALUE_TYPE_VALUE => wal.append_put(user_key, value, seq)?,
             internal_key::VALUE_TYPE_DELETION => wal.append_delete(user_key, seq)?,
-            internal_key::VALUE_TYPE_MERGE => wal.append_merge(user_key, &value, seq)?,
+            internal_key::VALUE_TYPE_MERGE => wal.append_merge(user_key, value, seq)?,
             other => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -2972,7 +3020,8 @@ fn rewrite_recovered_memtable_to_wal(memtable: &MemTable, wal: &mut Wal) -> std:
             }
         }
         wrote_record = true;
-    }
+        Ok(())
+    })?;
 
     for tombstone in memtable.clone_range_tombstones() {
         wal.append_delete_range(&tombstone.start, &tombstone.end, tombstone.seq)?;
@@ -2980,7 +3029,7 @@ fn rewrite_recovered_memtable_to_wal(memtable: &MemTable, wal: &mut Wal) -> std:
     }
 
     if wrote_record {
-        wal.sync()?;
+        wal.sync_data()?;
     }
 
     Ok(())

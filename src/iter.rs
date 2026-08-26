@@ -12,10 +12,10 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::engine::iterator::LarkIterator;
 use crate::engine::LarkEngine;
+use crate::engine::iterator::LarkIterator;
 use crate::statistics::{Histogram, Statistics, Ticker, TimeScope};
-use crate::Result;
+use crate::{DbSlice, Result};
 
 /// Streaming iterator over a consistent view of the database.
 ///
@@ -191,6 +191,20 @@ impl<'a> Iter<'a> {
     /// positioned on a live entry.
     pub fn value(&self) -> Option<&[u8]> {
         self.inner.value()
+    }
+
+    /// Returns the current value as a [`DbSlice`], or `None` if the
+    /// iterator isn't positioned on a live entry.
+    ///
+    /// Unlike [`Iter::value`], the returned slice does not borrow the
+    /// iterator, so it stays valid after [`Iter::next`] moves on. While
+    /// scanning SSTables forward this costs one reference count and no
+    /// copy; a memtable-resident entry, a merge result and the reverse
+    /// path all own their bytes separately and are copied once.
+    ///
+    /// Holding one pins its owner: see [`DbSlice`].
+    pub fn value_slice(&self) -> Option<DbSlice> {
+        self.inner.value_slice()
     }
 
     /// Returns `Ok(())` if the iterator has not encountered an I/O error,

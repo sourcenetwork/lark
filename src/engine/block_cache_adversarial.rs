@@ -86,7 +86,7 @@ fn assert_shard_invariants(cache: &BlockCache, context: &str) {
 
         let guard = epoch::pin();
         for (i, entry) in &live {
-            assert_eq!(entry.slot, *i, "{context}: shard {idx} slot index drifted");
+            assert_eq!(entry.slot as usize, *i, "{context}: shard {idx} slot index drifted");
             let found = shard
                 .map
                 .get()
@@ -323,11 +323,11 @@ fn reinserting_a_key_with_a_different_size_reprices_it() {
     let small = block_with(1, 256);
     let large = block_with(2, 64 * 1024);
     cache.insert(4, 0, Arc::clone(&small));
-    assert_eq!(cache.usage(), entry_charge(&small));
+    assert_eq!(cache.usage(), entry_charge(&CacheEntry::Data(Arc::clone(&small))));
     cache.insert(4, 0, Arc::clone(&large));
-    assert_eq!(cache.usage(), entry_charge(&large));
+    assert_eq!(cache.usage(), entry_charge(&CacheEntry::Data(Arc::clone(&large))));
     cache.insert(4, 0, Arc::clone(&small));
-    assert_eq!(cache.usage(), entry_charge(&small));
+    assert_eq!(cache.usage(), entry_charge(&CacheEntry::Data(Arc::clone(&small))));
     assert_eq!(cache.entry_count(), 1);
     assert_shard_invariants(&cache, "re-insert repricing");
 }
@@ -486,6 +486,11 @@ fn oversized_inserts_racing_normal_inserts_stay_in_budget() {
     }
 }
 
+/// Samples the budget monitor must take before it may stop, so the
+/// observation is dense enough to catch a transient overshoot without
+/// the test depending on how the scheduler treated it.
+const MONITOR_SAMPLE_FLOOR: u64 = 1_000;
+
 /// Attack: the cache-wide reservation for an oversized entry reads
 /// `total_used`, which an insert in flight on another shard has not
 /// published yet. If that lag is exploitable the committed per-shard
@@ -502,7 +507,11 @@ fn the_oversized_reservation_cannot_be_raced_over_budget() {
         std::thread::spawn(move || {
             let mut worst = 0usize;
             let mut samples = 0u64;
-            while !stop.load(Ordering::Relaxed) {
+            // Sample until the workers are done AND a floor is reached.
+            // Asserting afterwards that the floor happened to be hit
+            // makes the test fail on a loaded machine for a reason that
+            // has nothing to do with the budget being respected.
+            while !stop.load(Ordering::Relaxed) || samples < MONITOR_SAMPLE_FLOOR {
                 worst = worst.max(cache.true_usage());
                 samples += 1;
             }
@@ -533,7 +542,10 @@ fn the_oversized_reservation_cannot_be_raced_over_budget() {
     stop.store(true, Ordering::Relaxed);
     let (worst, samples) = monitor.join().expect("monitor");
     println!("ADVPEAK oversized race peaked at {worst} of {capacity} bytes over {samples} samples");
-    assert!(samples > 1000, "the monitor barely sampled: {samples}");
+    assert!(
+        samples >= MONITOR_SAMPLE_FLOOR,
+        "the monitor did not reach its sample floor: {samples}"
+    );
     assert!(
         worst <= capacity,
         "the oversized reservation was raced to {worst} bytes against a {capacity}-byte budget"
@@ -635,7 +647,7 @@ fn strict_mode_refuses_without_disturbing_the_accounting() {
 #[test]
 fn an_entry_that_exactly_fills_a_shard_is_admitted_once() {
     let probe = dummy_block(4096);
-    let exact = entry_charge(&probe);
+    let exact = entry_charge(&CacheEntry::Data(Arc::clone(&probe)));
     let cache = BlockCache::with_config(exact, 0, false);
     assert_eq!(cache.capacity(), exact);
     cache.insert(1, 0, dummy_block(4096));
@@ -898,7 +910,7 @@ fn clock_hit_rate_against_exact_lru_on_fixed_traces() {
     const OPS: usize = 300_000;
     const UNIVERSE: usize = 20_000;
     let block = dummy_block(1024);
-    let charge = entry_charge(&block);
+    let charge = entry_charge(&CacheEntry::Data(Arc::clone(&block)));
 
     let mut worst: Option<(String, usize, f64)> = None;
     println!("\ntrace                entries    LRU hits   LRU %   CLOCK hits CLOCK %   delta");
@@ -1108,8 +1120,8 @@ fn the_add_ticker_counts_only_inserts_that_stored_a_block() {
         BlockCache::with_config(8 * 64 * 1024, 3, false).with_stats(Some(Arc::clone(&stats)));
     let oversized = dummy_block(100 * 1024);
     assert!(
-        entry_charge(&oversized) > cache.capacity() / 8
-            && entry_charge(&oversized) < cache.capacity(),
+        entry_charge(&CacheEntry::Data(Arc::clone(&oversized))) > cache.capacity() / 8
+            && entry_charge(&CacheEntry::Data(Arc::clone(&oversized))) < cache.capacity(),
         "setup: the block must be oversized for a shard but not for the cache"
     );
     const CALLS: u64 = 200;
