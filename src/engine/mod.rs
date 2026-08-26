@@ -2388,22 +2388,12 @@ impl LarkEngine {
     /// snapshot holds).
     pub(crate) fn checkpoint_capture(&self) -> std::io::Result<CheckpointSnapshot> {
         self.ensure_writable()?;
-        {
-            let has_any = {
-                let view = self.view.load();
-                !view.active.is_empty() || !view.active.clone_range_tombstones().is_empty()
-            };
-            if has_any {
-                let _write_guard = self.pipeline.lock();
-                let still_has_any = {
-                    let view = self.view.load();
-                    !view.active.is_empty() || !view.active.clone_range_tombstones().is_empty()
-                };
-                if still_has_any {
-                    self.rotate_memtable()?;
-                }
-            }
-        }
+        // Drain, do not merely seal. A checkpoint captures the SSTables
+        // the current version names and copies no WAL, so a memtable that
+        // is still waiting on a background flush would be missing from
+        // the result entirely. Done before the compaction lock is taken,
+        // because flushing needs it.
+        self.drain_memtables(ActiveFlush::Always)?;
 
         let compaction_guard = self.compaction_lock.write_arc();
         self.ensure_writable()?;
@@ -2757,10 +2747,29 @@ impl LarkEngine {
     }
 
     fn flush_memtables_for_close(&self) -> std::io::Result<()> {
+        self.drain_memtables(ActiveFlush::WhenFull)
+    }
+
+    /// Flush frozen memtables until none remain, and the active one
+    /// according to `active`.
+    ///
+    /// [`ActiveFlush::Always`] is what a checkpoint needs: it captures
+    /// the SSTables the current version names and copies no WAL, so any
+    /// write still sitting in a memtable would be absent from the
+    /// result. Sealing without waiting is not enough either, because a
+    /// sealed memtable is flushed by a background worker and the capture
+    /// would race it.
+    fn drain_memtables(&self, active: ActiveFlush) -> std::io::Result<()> {
+        let active_pending = |view: &ReadView| match active {
+            ActiveFlush::WhenFull => memtable_needs_flush(&view.active),
+            ActiveFlush::Always => {
+                !view.active.is_empty() || !view.active.clone_range_tombstones().is_empty()
+            }
+        };
         loop {
             let should_flush = {
                 let view = self.view.load();
-                memtable_needs_flush(&view.active) || !view.frozen.is_empty()
+                active_pending(&view) || !view.frozen.is_empty()
             };
             if !should_flush {
                 return Ok(());
@@ -2769,7 +2778,7 @@ impl LarkEngine {
             let old_wal = {
                 let _write_guard = self.pipeline.lock();
                 let view = self.view.load();
-                let active_needs_flush = memtable_needs_flush(&view.active);
+                let active_needs_flush = active_pending(&view);
                 let has_frozen = !view.frozen.is_empty();
                 drop(view);
                 if !active_needs_flush && !has_frozen {
@@ -2793,9 +2802,7 @@ impl LarkEngine {
                     self.view.update_memtables(|active, frozen| {
                         let sealed = Arc::clone(active);
                         let mut next_frozen = frozen.to_vec();
-                        if memtable_needs_flush(&sealed) {
-                            next_frozen.push(sealed);
-                        }
+                        next_frozen.push(sealed);
                         (fresh, next_frozen, ())
                     });
                 }
@@ -2819,6 +2826,14 @@ impl LarkEngine {
 /// Live file ids are allocated upward from 1 by `next_file_id`, so ids
 /// taken from the top of the space cannot collide with a real file, and
 /// distinct sources cannot collide with each other.
+/// Whether a drain must flush the active memtable unconditionally, or
+/// only once it has grown past the write buffer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActiveFlush {
+    WhenFull,
+    Always,
+}
+
 fn ingest_probe_file_id(source_idx: usize) -> u64 {
     u64::MAX - source_idx as u64
 }

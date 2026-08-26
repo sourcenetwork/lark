@@ -2633,9 +2633,17 @@ mod tests {
         batch.put(b"b", b"2");
         db.write(batch).unwrap();
 
+        // Records begin after the file stamp; the type byte is the fifth
+        // byte of the first record.
+        let stamp = crate::engine::wal::WAL_STAMP_LEN;
         let wal = std::fs::read(first_wal_path(&dir)).unwrap();
-        assert!(wal.len() >= 5);
-        assert_eq!(wal[4], 0x05, "multi-op WriteBatch must use RECORD_BATCH");
+        assert!(wal.len() >= stamp + 5);
+        assert_eq!(&wal[0..4], b"REGO", "the log must carry its stamp");
+        assert_eq!(
+            wal[stamp + 4],
+            0x05,
+            "multi-op WriteBatch must use RECORD_BATCH"
+        );
     }
 
     #[test]

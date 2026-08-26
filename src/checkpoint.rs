@@ -225,6 +225,69 @@ mod tests {
         assert_eq!(reopened.get(b"post_2").unwrap(), Some(b"pv2".to_vec()));
     }
 
+    /// A checkpoint captures the SSTables the current version names and
+    /// copies no WAL, so anything still in a memtable has to be flushed
+    /// before the capture, not merely sealed.
+    ///
+    /// Sealing alone leaves the data to a background worker, and the
+    /// capture then races it. This writes far less than one write buffer,
+    /// so nothing is flushed on its own: every key is still in the active
+    /// memtable when the checkpoint is taken, which is the case that was
+    /// silently lost.
+    #[test]
+    fn a_checkpoint_captures_data_that_never_reached_an_sstable() {
+        let src_dir = TempDir::new().unwrap();
+        let tgt_dir = TempDir::new().unwrap();
+        let db = Db::open(src_dir.path(), Options::default()).unwrap();
+
+        for i in 0..200u64 {
+            let k = format!("unflushed_{i:04}");
+            db.put(k.as_bytes(), k.as_bytes()).unwrap();
+        }
+
+        let cp = Checkpoint::new(&db).unwrap();
+        cp.create(tgt_dir.path()).unwrap();
+
+        let reopened = Db::open(tgt_dir.path(), Options::default()).unwrap();
+        for i in 0..200u64 {
+            let k = format!("unflushed_{i:04}");
+            assert_eq!(
+                reopened.get(k.as_bytes()).unwrap(),
+                Some(k.clone().into_bytes()),
+                "{k} was acknowledged before the checkpoint but is not in it"
+            );
+        }
+    }
+
+    /// The same property with range tombstones, which live beside the
+    /// entries rather than in them and are dropped by a different path.
+    #[test]
+    fn a_checkpoint_captures_unflushed_range_deletes() {
+        let src_dir = TempDir::new().unwrap();
+        let tgt_dir = TempDir::new().unwrap();
+        let db = Db::open(src_dir.path(), Options::default()).unwrap();
+
+        for i in 0..50u64 {
+            let k = format!("k_{i:04}");
+            db.put(k.as_bytes(), b"v").unwrap();
+        }
+        db.delete_range(b"k_0010", b"k_0020").unwrap();
+
+        let cp = Checkpoint::new(&db).unwrap();
+        cp.create(tgt_dir.path()).unwrap();
+
+        let reopened = Db::open(tgt_dir.path(), Options::default()).unwrap();
+        for i in 0..50u64 {
+            let k = format!("k_{i:04}");
+            let deleted = (10..20).contains(&i);
+            assert_eq!(
+                reopened.get(k.as_bytes()).unwrap().is_none(),
+                deleted,
+                "{k}: range delete did not survive the checkpoint"
+            );
+        }
+    }
+
     #[test]
     fn checkpoint_with_concurrent_writer() {
         let src_dir = TempDir::new().unwrap();
