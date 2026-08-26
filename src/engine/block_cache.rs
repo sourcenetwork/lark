@@ -821,7 +821,15 @@ impl BlockCache {
     /// supposed to track.
     #[cfg(test)]
     pub(crate) fn true_usage(&self) -> usize {
-        self.shards.iter().map(|s| s.ring.lock().used).sum()
+        // One consistent snapshot, not a running sum. Locking each shard
+        // in turn and adding as it goes can report a total that never
+        // existed: an insert that moves bytes while the walk is in
+        // progress is counted in the shard it left and again in the one
+        // it reached. Every ring is held at once so the sum is a real
+        // instant. Acquiring in index order is safe because no path ever
+        // holds two ring locks.
+        let held: Vec<_> = self.shards.iter().map(|s| s.ring.lock()).collect();
+        held.iter().map(|ring| ring.used).sum()
     }
 
     /// Entries currently held across every shard.
