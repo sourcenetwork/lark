@@ -128,55 +128,6 @@ fn a_write_batch_around_the_lock_manager_is_detected() {
 }
 
 #[test]
-#[ignore = "Stress test, run deliberately with --ignored. It races a raw-put storm against transactional read-modify-writes, so the number that notice is purely scheduling-dependent: most of them in isolation, sometimes ZERO under a loaded runner. Even asserting > 0 flaked. The property itself is proven deterministically by a_raw_put_between_read_and_commit_is_detected, which forces the interleaving instead of racing for it."]
-fn a_raw_put_storm_aborts_the_read_modify_writes_it_races() {
-    const ROUNDS: usize = 200;
-    let dir = TempDir::new().unwrap();
-    let db = Arc::new(pes_db(&dir));
-    db.db().put(b"k", &0u64.to_le_bytes()).unwrap();
-
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let writer = {
-        let db = Arc::clone(&db);
-        let stop = Arc::clone(&stop);
-        std::thread::spawn(move || {
-            let mut n = 1_000_000u64;
-            while !stop.load(Ordering::Relaxed) {
-                db.db().put(b"k", &n.to_le_bytes()).unwrap();
-                n += 1;
-            }
-        })
-    };
-
-    let mut aborted = 0usize;
-    for _ in 0..ROUNDS {
-        let mut tx = db.begin_transaction();
-        let current = decode(tx.get_for_update(b"k").unwrap());
-        tx.put(b"k", &(current + 1).to_le_bytes()).unwrap();
-        match tx.commit() {
-            Ok(()) => {}
-            Err(TransactionError::Conflict { .. }) | Err(TransactionError::Busy(_)) => {
-                aborted += 1;
-            }
-            Err(e) => panic!("unexpected error: {e}"),
-        }
-    }
-    stop.store(true, Ordering::Relaxed);
-    writer.join().unwrap();
-    // The abort RATE is a function of how often the storm lands inside a
-    // transaction's read-commit window, which is scheduling-dependent: in
-    // isolation it is most of them, under a loaded test runner it can be a
-    // handful. Asserting a rate here made this test flaky, and a flaky test is
-    // a failing test. The invariant that detection works at all is proven
-    // deterministically by `a_raw_put_between_read_and_commit_is_detected`,
-    // which forces the interleaving instead of racing for it.
-    assert!(
-        aborted > 0,
-        "no bypassing write was detected across {ROUNDS} read-modify-writes"
-    );
-}
-
-#[test]
 fn a_range_delete_around_the_lock_manager_is_detected() {
     for pessimistic in [true, false] {
         let dir = TempDir::new().unwrap();
