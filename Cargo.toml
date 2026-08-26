@@ -41,6 +41,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 # arena skip list (`src/engine/skiplist.rs`).
 crossbeam-epoch = "0.9"
 crossbeam-skiplist = "0.1"
+kovan-mvcc = "0.1.19"
 kovan-queue = "0.1.19"
 kovan-channel = "0.1.19"
 

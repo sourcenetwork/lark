@@ -429,3 +429,70 @@ jobs:
           test -s harness/elle/elle-cli.jar
       - name: Every isolation level lark claims
         run: just elle-matrix
+
+  # The performance artifact: one self-contained HTML page per commit on
+  # main, keyed by its sha and downloadable from the run.
+  #
+  # Last because it depends on everything above passing: publishing a
+  # perf page for a build whose tests failed invites reading numbers off
+  # a broken engine. Retention is 30 runs' worth of days rather than a
+  # count, which is the only retention GitHub offers; the prune step
+  # below deletes older ones explicitly so the count is what was asked
+  # for rather than what the calendar happened to leave.
+  perf-report:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, clippy, fmt, doc, deny]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v2
+      - name: Refuse to measure a busy runner
+        id: guard
+        run: just loadguard
+        continue-on-error: true
+      - name: Benchmark sweep
+        env:
+          LARK_BENCH_OUT: ${{ github.workspace }}/bench-out.jsonl
+        run: just bench-collect
+      - name: Assemble the run file
+        env:
+          LARK_BENCH_OUT: ${{ github.workspace }}/bench-out.jsonl
+          # A run measured on a runner the guard flagged is recorded as
+          # contaminated rather than dropped, so the page says so.
+          LARK_RUN_TRUST: ${{ steps.guard.outcome == 'success' && 'clean' || 'contaminated' }}
+        run: |
+          cargo run --release --bench collect -- \
+            --out "run-${GITHUB_SHA::12}.json" \
+            --commit "${GITHUB_SHA::12}" --label main
+      - name: Render the page
+        run: |
+          python3 tools/perf-report/render_html.py \
+            --current "run-${GITHUB_SHA::12}.json" \
+            --out "perf-${GITHUB_SHA::12}.html"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perf-${{ github.sha }}
+          path: |
+            perf-*.html
+            run-*.json
+          retention-days: 90
+          if-no-files-found: error
+      - name: Keep only the newest 30 perf artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Newest first; everything past the 30th goes.
+          gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name | startswith("perf-")) | "\(.created_at) \(.id)"' \
+            | sort -r | tail -n +31 | awk '{print $2}' \
+            | while read -r id; do
+                echo "deleting artifact $id"
+                gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}"
+              done

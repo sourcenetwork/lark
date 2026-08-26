@@ -158,13 +158,20 @@ loadguard:
 
 bench-baseline: loadguard
     cargo bench --bench point_read --bench write_durable --bench write_buffered \
-                --bench scan --bench batch --bench transaction --bench isolation \
+                --bench scan --bench batch --bench transaction \
                 --bench large_value -- --save-baseline pre
 
 # Compare against the `pre` baseline. This is what a PR pastes into its body.
 
 bench: loadguard
     cargo bench -- --baseline pre
+
+# The sweep the CI perf artifact is built from: every family, into the
+# JSON Lines file `collect` assembles a run file out of.
+bench-collect: loadguard
+    cargo bench --bench point_read --bench write_durable --bench write_buffered \
+                --bench scan --bench batch --bench transaction \
+                --bench large_value --bench memory --bench size
 
 bench-one name: loadguard
     cargo bench --bench {{name}} -- --baseline pre
