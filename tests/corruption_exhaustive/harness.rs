@@ -14,14 +14,14 @@ use std::fs;
 use std::panic;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex, Once, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use lark_kv::{Db, DurabilityMode, Options};
 use tempfile::TempDir;
 
-use crate::common::fault::{validate_prefix_of_state, ChildSpec, CrashRun, History, Phase};
+use crate::common::fault::{ChildSpec, CrashRun, History, Phase, validate_prefix_of_state};
 
 /// Seed for every sampled sweep. Fixed, so a failing offset is reported
 /// once and reproduced on the next run without a `--seed` dance.
@@ -272,14 +272,14 @@ pub fn read_state(db: &Db) -> Result<State, ReadError> {
             Some(v) => v.to_vec(),
             None => return Err(ReadError::Broken("valid iterator with no value".into())),
         };
-        if let Some((prev, _)) = forward.last() {
-            if prev >= &k {
-                return Err(ReadError::Broken(format!(
-                    "forward scan returned {} after {}",
-                    show(&k),
-                    show(prev)
-                )));
-            }
+        if let Some((prev, _)) = forward.last()
+            && prev >= &k
+        {
+            return Err(ReadError::Broken(format!(
+                "forward scan returned {} after {}",
+                show(&k),
+                show(prev)
+            )));
         }
         forward.push((k, v));
         it.next();
@@ -296,7 +296,7 @@ pub fn read_state(db: &Db) -> Result<State, ReadError> {
             _ => {
                 return Err(ReadError::Broken(
                     "valid reverse iterator with no entry".into(),
-                ))
+                ));
             }
         }
         rit.prev();
@@ -325,7 +325,7 @@ pub fn read_state(db: &Db) -> Result<State, ReadError> {
                     show(k),
                     show(v),
                     other.as_deref().map(show),
-                )))
+                )));
             }
             Err(e) => return Err(ReadError::Engine(format!("get {}: {e}", show(k)))),
         }
@@ -394,7 +394,7 @@ pub fn never_invents(pristine: &State) -> impl Fn(&State) -> Result<(), String> 
                         show(k),
                         show(v),
                         show(want)
-                    ))
+                    ));
                 }
                 Some(_) => {}
             }

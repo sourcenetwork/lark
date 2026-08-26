@@ -32,14 +32,24 @@ static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCS.fetch_add(1, Ordering::Relaxed);
-        System.alloc(layout)
+        // SAFETY: `layout` upholds `GlobalAlloc::alloc`'s contract by
+        // this function's own contract, and `System` is a valid
+        // allocator to forward it to.
+        unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout)
+        // SAFETY: by this function's contract `ptr` came from a
+        // `System` allocation made with exactly `layout`, which is the
+        // invariant `System::dealloc` requires.
+        unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ALLOCS.fetch_add(1, Ordering::Relaxed);
-        System.realloc(ptr, layout, new_size)
+        // SAFETY: by this function's contract `ptr` came from a
+        // `System` allocation made with exactly `layout`, and
+        // `new_size` yields a valid layout when paired with
+        // `layout.align()`.
+        unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
 
@@ -156,7 +166,9 @@ fn point_read_scaling() {
         line.push_str(&format!("{threads}t={ops:.0}/{cpu_per_m:.2}cpu "));
     }
     let scaling = rates[rates.len() - 1] / rates[0];
-    println!("POINT_READ_SCALING {line}scaling_8t={scaling:.2}x (ops/s per thread count, and CPU seconds per million reads)");
+    println!(
+        "POINT_READ_SCALING {line}scaling_8t={scaling:.2}x (ops/s per thread count, and CPU seconds per million reads)"
+    );
 }
 
 #[test]

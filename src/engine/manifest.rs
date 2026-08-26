@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use super::sstable::{sst_filename, table_carries_data, LiveSst, SsTableMeta, SsTableReader};
+use super::sstable::{LiveSst, SsTableMeta, SsTableReader, sst_filename, table_carries_data};
 use super::{checksum, durability};
 
 /// Maximum number of levels in the LSM tree.
@@ -695,7 +695,7 @@ mod tests {
     /// Build a real on-disk SSTable and open a reader for it. Used by
     /// tests that need a non-trivial `LiveSst` instance.
     fn make_live_sst(dir: &Path, file_id: u64, smallest: &[u8], largest: &[u8]) -> Arc<LiveSst> {
-        use super::super::internal_key::{encode_internal_key, VALUE_TYPE_VALUE};
+        use super::super::internal_key::{VALUE_TYPE_VALUE, encode_internal_key};
         use super::super::sstable::SsTableWriter;
         use crate::options::CompressionType;
 

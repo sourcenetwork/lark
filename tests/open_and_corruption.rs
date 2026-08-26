@@ -276,10 +276,10 @@ fn manifest_single_byte_flips_do_not_panic() {
 fn vm_peak_kib() -> u64 {
     let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
     for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("VmPeak:") {
-            if let Some(n) = rest.split_whitespace().next() {
-                return n.parse().unwrap_or(0);
-            }
+        if let Some(rest) = line.strip_prefix("VmPeak:")
+            && let Some(n) = rest.split_whitespace().next()
+        {
+            return n.parse().unwrap_or(0);
         }
     }
     0

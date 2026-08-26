@@ -882,11 +882,13 @@ mod tests {
 
         let entries = Wal::replay(&path).unwrap();
         match entries.as_slice() {
-            [WalEntry::Merge {
-                key,
-                operand,
-                seq: 99,
-            }] => {
+            [
+                WalEntry::Merge {
+                    key,
+                    operand,
+                    seq: 99,
+                },
+            ] => {
                 assert_eq!(key, b"counter");
                 assert_eq!(operand, b"+3");
             }

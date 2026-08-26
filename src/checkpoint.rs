@@ -138,8 +138,8 @@ fn copy_truncated(src: &Path, dst: &Path, len: u64) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::{Options, WriteBatch};
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use tempfile::TempDir;
 

@@ -11,9 +11,12 @@
 //! already saw, is a read-path violation.
 //!
 //! A watchdog thread fails the test rather than hanging if the workload
-//! stops making progress, so a lock-order inversion between the version
-//! store and the read view's publish mutex surfaces as a failure
-//! instead of a timeout.
+//! stops making progress, so a wedge surfaces as a failure instead of a
+//! timeout. It was written for a lock-order inversion between the
+//! version store and the read view's publish mutex; that mutex is gone
+//! now that publication is a compare-exchange, so the watchdog no
+//! longer gates that specific hazard. It is kept because it still
+//! catches a wedge from any other source, at no cost.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -151,7 +154,10 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
     let bad: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let mask = env("LARK_CHAOS_MASK", 0b1111);
     let enabled = |bit: u64| mask & bit != 0;
-    let chaos_threads = 1 + [1u64, 2, 4, 8].iter().filter(|b| enabled(**b)).count();
+    // Only the mask-selected chaos threads wait on the gate. The
+    // stall diagnostic below deliberately does not: it must be free to
+    // report while the run is still starting up.
+    let chaos_threads = [1u64, 2, 4, 8].iter().filter(|b| enabled(**b)).count();
     let gate = Arc::new(Barrier::new(WRITERS + readers() + chaos_threads + 1));
     let mut handles = Vec::new();
 
@@ -330,7 +336,7 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
             while !stop.load(Ordering::Relaxed) && live.load(Ordering::Acquire) > 0 {
                 thread::sleep(Duration::from_secs(5));
                 ticks += 1;
-                if ticks % 2 == 0 {
+                if ticks.is_multiple_of(2) {
                     // `no_slowdown` turns any active stall condition into
                     // `Error::Busy(reason)`, which names the threshold.
                     let mut probe_opts = lark_kv::WriteOptions::new();

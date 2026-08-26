@@ -80,13 +80,13 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
-use crate::column_family::{prefix_key, DEFAULT_CF_ID};
+use crate::column_family::{DEFAULT_CF_ID, prefix_key};
 use crate::engine::{CommitOutcome, LarkEngine};
 use crate::{Db, Error, Options, Result};
 
@@ -623,10 +623,8 @@ impl<'db> Transaction<'db> {
         match self.mode {
             TxMode::Optimistic => self.snapshot_seq,
             TxMode::Pessimistic { .. } => {
-                if already_held {
-                    if let Some(state) = self.tracked.get(key) {
-                        return state.read_seq;
-                    }
+                if already_held && let Some(state) = self.tracked.get(key) {
+                    return state.read_seq;
                 }
                 self.engine.snapshot_seq()
             }
@@ -682,11 +680,11 @@ impl<'db> Transaction<'db> {
             return;
         }
         self.resources_released = true;
-        if let Some(lm) = self.lock_manager.as_ref() {
-            if let TxMode::Pessimistic { tx_id } = self.mode {
-                for key in self.held_locks.drain(..) {
-                    lm.release(&key, tx_id);
-                }
+        if let Some(lm) = self.lock_manager.as_ref()
+            && let TxMode::Pessimistic { tx_id } = self.mode
+        {
+            for key in self.held_locks.drain(..) {
+                lm.release(&key, tx_id);
             }
         }
         self.engine.release_snapshot(self.snapshot_seq);
@@ -769,11 +767,11 @@ impl LockManager {
     /// waiters.
     fn release(&self, key: &[u8], tx_id: u64) {
         let mut guard = self.locks.lock();
-        if let Some(&holder) = guard.get(key) {
-            if holder == tx_id {
-                guard.remove(key);
-                self.cvar.notify_all();
-            }
+        if let Some(&holder) = guard.get(key)
+            && holder == tx_id
+        {
+            guard.remove(key);
+            self.cvar.notify_all();
         }
     }
 }

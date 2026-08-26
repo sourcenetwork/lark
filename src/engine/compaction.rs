@@ -7,15 +7,15 @@ use std::thread;
 
 use super::block_cache::BlockCache;
 use super::internal_key::{compare_internal_keys, decode_internal_key, user_key_of};
-use super::manifest::{VersionEdit, MAX_LEVELS};
+use super::manifest::{MAX_LEVELS, VersionEdit};
 use super::range_tombstone::{
-    exclusive_successor, sort_dedup_tombstones, RangeTombstone, RangeTombstoneSet,
+    RangeTombstone, RangeTombstoneSet, exclusive_successor, sort_dedup_tombstones,
 };
 use super::read_view::VersionStore;
 use super::snapshot_registry::SnapshotRegistry;
 use super::sstable::{
-    remove_sst, sst_filename, LiveSst, SsTableInternalIter, SsTableMeta, SsTableReader,
-    SsTableWriter,
+    LiveSst, SsTableInternalIter, SsTableMeta, SsTableReader, SsTableWriter, remove_sst,
+    sst_filename,
 };
 
 /// Default compaction trigger: flush L0 → L1 when L0 has this many SSTables.
@@ -303,6 +303,14 @@ fn compaction_loop(
     in_progress: Arc<parking_lot::Mutex<HashSet<u64>>>,
 ) {
     loop {
+        // Release what this thread's reservation slot still gates
+        // before parking on the condvar. kovan keeps a slot published
+        // after the last guard drops, so an idle worker would hold
+        // every retired `ReadView` born at or before its last pin -
+        // and with it the open descriptors of SSTables the compaction
+        // it just finished has already unlinked.
+        crate::engine::read_view::quiesce();
+
         // Wait for a trigger, for the periodic check, or for shutdown.
         //
         // The trigger flag is consumed by whichever worker wakes
@@ -971,15 +979,15 @@ fn perform_compaction_to(
     // the point-entry RT shadow pass so a filter that drops a range
     // tombstone doesn't leave orphaned point entries already wiped
     // out by that same RT. Only runs when no snapshot is pinned.
-    if pin_seq == u64::MAX {
-        if let Some(filter) = opts.compaction_filter.as_ref() {
-            merged_range_tombstones.retain(|rt| {
-                !matches!(
-                    filter.filter_range_delete(target_level, &rt.start, &rt.end),
-                    crate::options::CompactionDecision::Remove
-                )
-            });
-        }
+    if pin_seq == u64::MAX
+        && let Some(filter) = opts.compaction_filter.as_ref()
+    {
+        merged_range_tombstones.retain(|rt| {
+            !matches!(
+                filter.filter_range_delete(target_level, &rt.start, &rt.end),
+                crate::options::CompactionDecision::Remove
+            )
+        });
     }
 
     // Dedup merged range tombstones by (start, end, seq) - a single
@@ -1185,7 +1193,7 @@ fn apply_compaction_filter(
     filter: &dyn crate::options::CompactionFilter,
     level: usize,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
-    use super::internal_key::{encode_internal_key, VALUE_TYPE_DELETION, VALUE_TYPE_VALUE};
+    use super::internal_key::{VALUE_TYPE_DELETION, VALUE_TYPE_VALUE, encode_internal_key};
 
     let mut out = Vec::with_capacity(entries.len());
     for (ik, value) in entries {
@@ -1237,7 +1245,7 @@ fn collapse_merge_chains(
     op: &dyn crate::options::MergeOperator,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
     use super::internal_key::{
-        encode_internal_key, VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE,
+        VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE, encode_internal_key,
     };
 
     let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(entries.len());
@@ -1368,15 +1376,15 @@ fn collapse_merge_chains(
 /// Whether a file's user-key range intersects `[start, end)`. `None`
 /// bounds are treated as unbounded.
 fn file_overlaps_range(file: &Arc<LiveSst>, start: Option<&[u8]>, end: Option<&[u8]>) -> bool {
-    if let Some(s) = start {
-        if file.meta.largest_key.as_slice() < s {
-            return false;
-        }
+    if let Some(s) = start
+        && file.meta.largest_key.as_slice() < s
+    {
+        return false;
     }
-    if let Some(e) = end {
-        if file.meta.smallest_key.as_slice() >= e {
-            return false;
-        }
+    if let Some(e) = end
+        && file.meta.smallest_key.as_slice() >= e
+    {
+        return false;
     }
     true
 }
@@ -1863,11 +1871,11 @@ fn group_range_tombstone_fragments(mut fragments: Vec<RangeTombstone>) -> Vec<Ve
     let mut current_end: Option<Vec<u8>> = None;
 
     for rt in fragments {
-        if let Some(end) = &current_end {
-            if rt.start.as_slice() > end.as_slice() {
-                groups.push(std::mem::take(&mut current));
-                current_end = None;
-            }
+        if let Some(end) = &current_end
+            && rt.start.as_slice() > end.as_slice()
+        {
+            groups.push(std::mem::take(&mut current));
+            current_end = None;
         }
 
         if current_end
@@ -1909,19 +1917,11 @@ fn merge_key_ranges(ranges: &[(Vec<u8>, Vec<u8>)]) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 fn min_key(a: &[u8], b: &[u8]) -> Vec<u8> {
-    if a <= b {
-        a.to_vec()
-    } else {
-        b.to_vec()
-    }
+    if a <= b { a.to_vec() } else { b.to_vec() }
 }
 
 fn max_key(a: &[u8], b: &[u8]) -> Vec<u8> {
-    if a >= b {
-        a.to_vec()
-    } else {
-        b.to_vec()
-    }
+    if a >= b { a.to_vec() } else { b.to_vec() }
 }
 
 fn key_range(files: &[Arc<LiveSst>]) -> (Vec<u8>, Vec<u8>) {

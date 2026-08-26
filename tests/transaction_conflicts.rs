@@ -6,8 +6,8 @@
 //! a lost update shows up as a final count below the number of
 //! increments performed.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use lark_kv::{

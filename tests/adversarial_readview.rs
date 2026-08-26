@@ -381,52 +381,27 @@ fn multi_get_never_travels_backwards() {
 /// `Db::scan` never travels backwards and never drops a key that is
 /// only ever overwritten.
 ///
-/// **Currently FAILS.** `Db::scan`, `Db::scan_page`, `Db::scan_cf`,
-/// `Db::scan_page_cf` and `Db::list_column_families` still sample the
-/// read horizon *before* they load the view:
-///
-/// ```text
-/// let seq = self.engine.snapshot_seq();          // horizon first
-/// let raw = collect_range(&self.engine, .., seq)?;  // view second
-/// ```
-///
-/// That is the exact ordering `LarkEngine::get_latest` documents as
-/// load-bearing and inverts. `snapshot_seq()` registers nothing in the
-/// snapshot registry, so `get_at`'s "the pin makes the order free"
-/// argument does not apply to these callers: a compaction is free to
-/// drop the newest version at or below the sampled horizon before the
-/// iterator captures its sources, after which the key reads absent.
-///
-/// Measured on this box, 48 instances per variant, 12 rounds of 4
-/// concurrent databases:
-///
-/// | surface | ordering | reads | dirty | violations |
-/// |---|---|---|---|---|
-/// | `Db::get` | view then horizon | 17605728 | 0/48 | 0 |
-/// | `Db::multi_get` | view then horizon | 15712272 | 0/48 | 0 |
-/// | `Db::iter` | view then horizon | 7966128 | 0/48 | 0 |
-/// | `Snapshot::scan` | registered pin | 5732256 | 0/48 | 0 |
-/// | `Db::scan` | horizon then view | 9006720 | 8/48 | 75 |
-/// | `Db::scan_page` | horizon then view | 6483408 | 9/48 | 53 |
-///
-/// `Db::iter` and `Db::scan` run the same iterator over the same
-/// workload and differ only in that ordering, and removing the
-/// user-thread `compact_range` from the `Db::scan` workload takes it to
-/// 0 violations over 5625360 reads, which is the G27 mechanism exactly.
+/// The ordering this catches: `Db::scan`, `Db::scan_page`,
+/// `Db::scan_cf`, `Db::scan_page_cf` and `Db::list_column_families`
+/// build their iterator with `LarkEngine::new_iter_latest`, which loads
+/// the view and *then* samples the horizon, the order
+/// `LarkEngine::get_latest` documents as load-bearing. Sampling first
+/// is unsafe here in a way it is not for `get_at`: `snapshot_seq()`
+/// registers nothing in the snapshot registry, so a compaction is free
+/// to drop the newest version at or below the sampled horizon before
+/// the iterator captures its sources, after which the key reads absent.
 #[test]
-#[ignore = "records an unfixed instance of G27 in Db::scan; un-ignore when the scan entry points load the view before sampling the horizon"]
 fn scan_never_travels_backwards() {
     drive(Surface::Scan);
 }
 
 /// `Db::scan_page` never travels backwards and never drops a key.
 ///
-/// **Currently FAILS**, for the reason on
-/// [`scan_never_travels_backwards`]. Paging is not the cause: the
-/// single-call `Db::scan` fails the same way, and a page walk over a key
-/// set that is never inserted into or deleted from cannot skip a key.
+/// Paging is not a risk of its own: it runs the same iterator as
+/// `Db::scan` over a key set that is never inserted into or deleted
+/// from, so a page walk cannot skip a key by itself. What it adds is a
+/// second entry point that has to get the load order right.
 #[test]
-#[ignore = "records an unfixed instance of G27 in Db::scan_page; un-ignore with scan_never_travels_backwards"]
 fn scan_page_never_travels_backwards() {
     drive(Surface::ScanPage);
 }

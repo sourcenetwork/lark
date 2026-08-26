@@ -12,7 +12,7 @@
 
 use std::io;
 
-use super::internal_key::{compare_internal_keys, INTERNAL_KEY_SUFFIX_LEN};
+use super::internal_key::{INTERNAL_KEY_SUFFIX_LEN, compare_internal_keys};
 
 /// Entries per restart point. Smaller = faster lookups, larger = better compression.
 pub(crate) const RESTART_INTERVAL: usize = 16;
@@ -248,16 +248,17 @@ impl BlockBuilder {
     }
 
     pub(crate) fn add(&mut self, key: &[u8], value: &[u8]) {
-        let shared = if self.entry_count % self.restart_interval == 0 && self.entry_count > 0 {
-            self.restarts.push(self.buffer.len() as u32);
-            0 // Restart point: no prefix sharing.
-        } else {
-            self.last_key
-                .iter()
-                .zip(key.iter())
-                .take_while(|(a, b)| a == b)
-                .count()
-        };
+        let shared =
+            if self.entry_count.is_multiple_of(self.restart_interval) && self.entry_count > 0 {
+                self.restarts.push(self.buffer.len() as u32);
+                0 // Restart point: no prefix sharing.
+            } else {
+                self.last_key
+                    .iter()
+                    .zip(key.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count()
+            };
 
         let unshared = key.len() - shared;
 

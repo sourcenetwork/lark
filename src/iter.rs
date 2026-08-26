@@ -12,10 +12,10 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::engine::iterator::LarkIterator;
-use crate::engine::LarkEngine;
-use crate::statistics::{Histogram, Statistics, Ticker, TimeScope};
 use crate::Result;
+use crate::engine::LarkEngine;
+use crate::engine::iterator::LarkIterator;
+use crate::statistics::{Histogram, Statistics, Ticker, TimeScope};
 
 /// Streaming iterator over a consistent view of the database.
 ///
