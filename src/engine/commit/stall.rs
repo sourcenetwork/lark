@@ -1,12 +1,19 @@
 //! Broadcast wake-up for stalled writers.
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+
+#[cfg(not(target_arch = "wasm32"))]
 use kovan_channel::signal::Signal;
+#[cfg(not(target_arch = "wasm32"))]
 use kovan_queue::array_queue::ArrayQueue;
 
 /// How many stalled writers can hold a registration at once.
+#[cfg(not(target_arch = "wasm32"))]
 const STALL_WAITER_SLOTS: usize = 256;
 
 /// Bounded broadcast wake-up for writers parked on a stop-writes stall.
@@ -15,10 +22,32 @@ const STALL_WAITER_SLOTS: usize = 256;
 /// worker drains every registration after each pass. The ring is bounded,
 /// and a writer that finds it full parks without registering, which stays
 /// live because the deadline alone already bounds every wait.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct StallSignal {
     waiters: ArrayQueue<Arc<Signal>>,
 }
 
+/// On wasm32 there is nothing to park: the platform has no threads, so
+/// compaction runs on the calling thread and a stalled writer has no
+/// worker to wait for. Waiting would deadlock rather than delay, so the
+/// wait returns immediately and the caller re-checks its thresholds.
+#[cfg(target_arch = "wasm32")]
+pub(crate) struct StallSignal;
+
+#[cfg(target_arch = "wasm32")]
+impl StallSignal {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    /// Returns at once: the work this would wait for happens inline.
+    pub(crate) fn wait(&self, _timeout: Duration) {}
+
+    /// No registrations exist to wake.
+    pub(crate) fn notify_all(&self) {}
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 impl StallSignal {
     pub(crate) fn new() -> Self {
         Self {
@@ -52,7 +81,7 @@ impl Default for StallSignal {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use std::thread;

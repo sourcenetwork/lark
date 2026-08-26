@@ -2,10 +2,16 @@ use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+// The periodic worker poll is the only user of these, and the worker
+// itself does not exist on a target without threads.
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{Duration, Instant};
 
+#[cfg(not(target_arch = "wasm32"))]
 use kovan_channel::RecvDeadline;
-use kovan_channel::unbounded::{Receiver, Sender};
+#[cfg(not(target_arch = "wasm32"))]
+use kovan_channel::unbounded::Receiver;
+use kovan_channel::unbounded::Sender;
 
 // Through the portability shim so a target without 64-bit atomics still
 // builds; see `src/portability.rs`.
@@ -40,6 +46,7 @@ pub(crate) const DEFAULT_TARGET_FILE_SIZE: u64 = 64 * 1024 * 1024;
 /// How long a worker sleeps between periodic checks when no wake-up
 /// arrives. The backstop that keeps compaction live if a coalesced
 /// notification is ever dropped.
+#[cfg(not(target_arch = "wasm32"))]
 const WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Manages background compaction on one or more dedicated OS threads.
@@ -98,6 +105,9 @@ impl CompactionScheduler {
     // `compaction_loop` below carries the same fan-out for the same
     // reason.
     #[allow(clippy::too_many_arguments)]
+    // On wasm32 the spawn half below is compiled out, which leaves the
+    // shared handles the workers would have taken unread.
+    #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
     pub(crate) fn start(
         compaction_lock: Arc<parking_lot::RwLock<()>>,
         snapshot_registry: Arc<SnapshotRegistry>,
@@ -109,7 +119,7 @@ impl CompactionScheduler {
         in_progress: Arc<parking_lot::Mutex<HashSet<u64>>>,
     ) -> std::io::Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
-        let (trigger, receiver) = kovan_channel::unbounded();
+        let (trigger, receiver) = kovan_channel::unbounded::<()>();
         let pending = Arc::new(AtomicBool::new(false));
 
         // Zero means no background worker: compaction runs on the
@@ -118,61 +128,76 @@ impl CompactionScheduler {
         if worker_count == 0 {
             return Ok(Self::disabled());
         }
-        let mut scheduler = Self {
-            shutdown: Arc::clone(&shutdown),
-            trigger,
-            pending: Arc::clone(&pending),
-            handles: Vec::with_capacity(worker_count),
-        };
 
-        for i in 0..worker_count {
-            let shutdown_clone = Arc::clone(&shutdown);
-            let receiver_clone = receiver.clone();
-            let pending_clone = Arc::clone(&pending);
-            let lock_clone = Arc::clone(&compaction_lock);
-            let registry_clone = Arc::clone(&snapshot_registry);
-            let versions_clone = Arc::clone(&versions);
-            let sst_dir_clone = Arc::clone(&sst_dir);
-            let cache_clone = Arc::clone(&cache);
-            let opts_clone = opts.clone();
-            let stall_clone = Arc::clone(&stall_signal);
-            let in_progress_clone = Arc::clone(&in_progress);
+        // wasm32 has no threads at all, so `Env::spawn` reports
+        // `Unsupported` for every worker. Report it up front and leave
+        // the whole worker loop out of the build rather than carrying
+        // machinery the target can never reach.
+        #[cfg(target_arch = "wasm32")]
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "failed to spawn compaction thread 0: this target has no threads; set \
+             Options::max_background_compactions = 0 to run compaction on the calling thread",
+        ));
 
-            let spawned = spawn_worker(&*opts.env, i, move || {
-                compaction_loop(
-                    shutdown_clone,
-                    receiver_clone,
-                    pending_clone,
-                    lock_clone,
-                    registry_clone,
-                    versions_clone,
-                    sst_dir_clone,
-                    cache_clone,
-                    opts_clone,
-                    stall_clone,
-                    in_progress_clone,
-                );
-            });
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut scheduler = Self {
+                shutdown: Arc::clone(&shutdown),
+                trigger,
+                pending: Arc::clone(&pending),
+                handles: Vec::with_capacity(worker_count),
+            };
 
-            match spawned {
-                Ok(handle) => scheduler.handles.push(handle),
-                Err(e) => {
-                    // Dropping `scheduler` on the way out signals
-                    // shutdown and joins the workers already started,
-                    // which is the same path `shutdown` takes.
-                    return Err(std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "failed to spawn compaction thread {i}: {e}; set \
+            for i in 0..worker_count {
+                let shutdown_clone = Arc::clone(&shutdown);
+                let receiver_clone = receiver.clone();
+                let pending_clone = Arc::clone(&pending);
+                let lock_clone = Arc::clone(&compaction_lock);
+                let registry_clone = Arc::clone(&snapshot_registry);
+                let versions_clone = Arc::clone(&versions);
+                let sst_dir_clone = Arc::clone(&sst_dir);
+                let cache_clone = Arc::clone(&cache);
+                let opts_clone = opts.clone();
+                let stall_clone = Arc::clone(&stall_signal);
+                let in_progress_clone = Arc::clone(&in_progress);
+
+                let spawned = spawn_worker(&*opts.env, i, move || {
+                    compaction_loop(
+                        shutdown_clone,
+                        receiver_clone,
+                        pending_clone,
+                        lock_clone,
+                        registry_clone,
+                        versions_clone,
+                        sst_dir_clone,
+                        cache_clone,
+                        opts_clone,
+                        stall_clone,
+                        in_progress_clone,
+                    );
+                });
+
+                match spawned {
+                    Ok(handle) => scheduler.handles.push(handle),
+                    Err(e) => {
+                        // Dropping `scheduler` on the way out signals
+                        // shutdown and joins the workers already started,
+                        // which is the same path `shutdown` takes.
+                        return Err(std::io::Error::new(
+                            e.kind(),
+                            format!(
+                                "failed to spawn compaction thread {i}: {e}; set \
                              Options::max_background_compactions = 0 to run compaction \
                              on the calling thread"
-                        ),
-                    ));
+                            ),
+                        ));
+                    }
                 }
             }
-        }
 
-        Ok(scheduler)
+            Ok(scheduler)
+        }
     }
 
     /// Notify the compaction workers that work may be available.
@@ -216,6 +241,7 @@ impl Drop for CompactionScheduler {
 ///
 /// Split out of [`CompactionScheduler::start`] so tests can force the
 /// spawn failure that a single-threaded target produces natively.
+#[cfg(not(target_arch = "wasm32"))]
 fn spawn_worker<F>(env: &dyn Env, index: usize, body: F) -> std::io::Result<Box<dyn JoinHandle>>
 where
     F: FnOnce() + Send + 'static,
@@ -345,6 +371,7 @@ impl Default for CompactionOptions {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
 fn compaction_loop(
     shutdown: Arc<AtomicBool>,
