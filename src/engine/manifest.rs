@@ -364,7 +364,7 @@ impl VersionSet {
     ) -> io::Result<Self> {
         let manifest_path = db_dir.join("MANIFEST");
 
-        let mut manifest_bytes = 0u64;
+        let manifest_bytes;
         let (version, writer) = if env.exists(&manifest_path) {
             let data = env.read(&manifest_path)?;
             let replay = Self::replay_manifest(env, &data, sst_dir, policy)?;

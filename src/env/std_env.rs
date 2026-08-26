@@ -267,6 +267,10 @@ impl WriteFile for StdWriteFile {
         self.file.sync_all()
     }
 
+    fn sync_data(&mut self) -> io::Result<()> {
+        self.file.sync_data()
+    }
+
     fn set_len(&mut self, len: u64) -> io::Result<()> {
         self.file.set_len(len)
     }

@@ -449,7 +449,6 @@ impl LarkEngine {
 
         let version_set =
             VersionSet::open_with_policy(&env, db_dir, &sst_dir, options.metadata_policy())?;
-        let mut version_set = VersionSet::open_with_policy(&env, db_dir, &sst_dir, options.metadata_policy())?;
         let version = version_set.current();
         let mut latest_seq = version.last_seq;
 
@@ -615,9 +614,6 @@ impl LarkEngine {
         }
 
         options.read_only = true;
-        let version_set = VersionSet::open_read_only(&env, db_dir, &sst_dir, options.metadata_policy())?;
-        let version = version_set.current();
-        let mut latest_seq = version.last_seq;
 
         let memtable_config = MemTableConfig::new(
             options.arena_profile,
@@ -3004,7 +3000,7 @@ impl LarkEngine {
             return Ok(());
         }
 
-        self.drain_memtables(ActiveFlush::Always)?;
+        self.flush_memtables_for_close()?;
 
         self.active_wal
             .lock()

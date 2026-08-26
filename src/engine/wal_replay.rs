@@ -145,6 +145,12 @@ impl WalReplayIter {
             // A record claiming more bytes than the file can still hold
             // is truncated by definition. Deciding that from the header
             // keeps a corrupt length from sizing an allocation.
+            if len as u64 > super::wal::MAX_RECORD_LEN as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WAL record length exceeds the format's maximum",
+                ));
+            }
             let remaining = self.file_len.saturating_sub(self.consumed);
             if len as u64 + 4 > remaining {
                 return Err(io::Error::new(

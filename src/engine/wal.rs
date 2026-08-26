@@ -78,8 +78,8 @@
 //! the stamp's `format` field is what lets that arrive without breaking
 //! the logs written before it.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -91,7 +91,7 @@ use std::fs::File;
 use std::io::Write;
 
 use super::checksum;
-use crate::env::{BufferedWriter, Env, ReadFileCursor, WriteMode};
+use crate::env::{BufferedWriter, Env, WriteMode};
 use crate::WriteBatchOp;
 
 /// Record types in the WAL.
@@ -128,7 +128,9 @@ const CHECKSUM_LEN: usize = 4;
 /// torn-write and bit-rot detection. On crash recovery, WAL files are
 /// replayed to reconstruct memtable state.
 pub(crate) struct Wal {
-    file: File,
+    /// Through the host environment, so a log is written the same way on
+    /// a filesystem, under wasi, and against OPFS in a browser.
+    file: BufferedWriter,
     /// Bytes appended so far, tracked in memory rather than queried so
     /// [`Wal::rollback_to`] can discard a failed group without a metadata
     /// syscall on the write path.
@@ -165,11 +167,7 @@ pub(crate) enum WalEntry {
 impl Wal {
     /// Create a new WAL file at the given path.
     pub(crate) fn create_in(env: &Arc<dyn Env>, path: &Path) -> io::Result<Self> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(path)?;
+        let mut file = BufferedWriter::new(env.open_write(path, WriteMode::Truncate)?);
         // Every log this build creates is stamped. That is what makes the
         // format identifiable and versioned from here on, so a later
         // build can change the framing and still know what it is holding.
@@ -195,6 +193,11 @@ impl Wal {
         if bytes.is_empty() {
             return Ok(());
         }
+        debug_assert!(
+            bytes.len() as u64 <= MAX_RECORD_LEN as u64,
+            "a group larger than MAX_RECORD_LEN would frame a length that \
+             could be mistaken for the REGO stamp"
+        );
         self.file.write_all(bytes)?;
         self.offset += bytes.len() as u64;
         Ok(())
@@ -217,8 +220,9 @@ impl Wal {
             offset >= WAL_STAMP_LEN as u64,
             "rollback must not truncate into the WAL stamp"
         );
+        // The handle appends, so truncating is enough to move the write
+        // position back: there is no cursor to seek.
         self.file.set_len(offset)?;
-        self.file.seek(SeekFrom::Start(offset))?;
         self.offset = offset;
         Ok(())
     }

@@ -255,6 +255,23 @@ pub trait WriteFile: Send {
     /// may return `Ok(())` without providing durability.
     fn sync_all(&mut self) -> io::Result<()>;
 
+    /// Make the file's *data* durable, without necessarily flushing
+    /// metadata that no reader depends on.
+    ///
+    /// This is `fdatasync` rather than `fsync`. A log that is appended
+    /// to and fsynced on every commit otherwise pays an inode update per
+    /// commit for a size field nothing reads back: recovery finds the
+    /// end of the log from the records themselves, not from the length.
+    /// On an NVMe device that is a second round trip to the drive on the
+    /// critical path of every durable write.
+    ///
+    /// Defaults to [`WriteFile::sync_all`], which is always correct and
+    /// merely slower, so an environment that cannot separate the two
+    /// needs no implementation.
+    fn sync_data(&mut self) -> io::Result<()> {
+        self.sync_all()
+    }
+
     /// Truncate or extend the file to exactly `len` bytes.
     fn set_len(&mut self, len: u64) -> io::Result<()>;
 

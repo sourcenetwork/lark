@@ -111,10 +111,9 @@ impl CompactionScheduler {
         let shutdown = Arc::new(AtomicBool::new(false));
         let (trigger, receiver) = kovan_channel::unbounded();
         let pending = Arc::new(AtomicBool::new(false));
-        let in_progress: Arc<parking_lot::Mutex<HashSet<u64>>> =
-            Arc::new(parking_lot::Mutex::new(HashSet::new()));
 
-        let worker_count = opts.max_background_compactions.max(1);
+        // Zero means no background worker: compaction runs on the
+        // calling thread, which is what a target without threads needs.
         let worker_count = opts.max_background_compactions;
         if worker_count == 0 {
             return Ok(Self::disabled());
