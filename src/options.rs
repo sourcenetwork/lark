@@ -18,18 +18,23 @@ pub const MAX_BLOOM_BITS_PER_KEY: usize = 64;
 /// Default value of [`Options::max_background_compactions`]: one
 /// background worker, or none on a target that has no threads.
 ///
-/// A wasm module built without the `atomics` target feature has exactly
-/// one thread and `std::thread::spawn` there reports
-/// [`std::io::ErrorKind::Unsupported`], so `1` could never open. `0`
-/// runs compaction on the calling thread instead, which is a
-/// compile-time property of the target rather than a runtime fallback:
-/// this build cannot grow a second thread later.
-#[cfg(all(target_family = "wasm", not(target_feature = "atomics")))]
+/// No wasm build can carry a background compaction worker, so this is
+/// `0` on every wasm target rather than only on the single-threaded
+/// ones. Two independent reasons, either of which alone is decisive:
+/// without the `atomics` target feature the module has exactly one
+/// thread and `std::thread::spawn` reports
+/// [`std::io::ErrorKind::Unsupported`]; and the worker's blocking wait
+/// is built on thread-parking primitives that do not exist for
+/// `wasm32` at all. `0` runs compaction on the calling thread instead.
+///
+/// This is a compile-time property of the target, not a runtime
+/// fallback: the build cannot grow a second thread later.
+#[cfg(target_family = "wasm")]
 pub const DEFAULT_MAX_BACKGROUND_COMPACTIONS: usize = 0;
 
 /// Default value of [`Options::max_background_compactions`]: one
 /// background worker, or none on a target that has no threads.
-#[cfg(not(all(target_family = "wasm", not(target_feature = "atomics"))))]
+#[cfg(not(target_family = "wasm"))]
 pub const DEFAULT_MAX_BACKGROUND_COMPACTIONS: usize = 1;
 
 /// Decision returned by a [`CompactionFilter`] for each entry it sees.
@@ -584,10 +589,11 @@ pub struct Options {
     /// time because L0 files can overlap arbitrarily.
     ///
     /// `1` keeps compaction single-threaded and matches
-    /// pre-multi-worker behavior. It is the default on every target
-    /// that has threads; see [`DEFAULT_MAX_BACKGROUND_COMPACTIONS`]
-    /// for why single-threaded wasm defaults to `0` instead, so that
-    /// [`crate::Db::open`] with [`Options::default`] works there too.
+    /// pre-multi-worker behavior. It is the default off wasm; see
+    /// [`DEFAULT_MAX_BACKGROUND_COMPACTIONS`] for why every wasm
+    /// target defaults to `0` instead, so that [`crate::Db::open`]
+    /// with [`Options::default`] works there too. On wasm any other
+    /// value is rejected by [`Options::validate`].
     pub max_background_compactions: usize,
     /// Accepted for compatibility with earlier releases.
     ///
@@ -960,6 +966,138 @@ impl Options {
         }
     }
 
+    /// Tuning for a wasm module: `wasm32-unknown-unknown` in a
+    /// browser, or `wasm32-wasip1` under a wasi host.
+    ///
+    /// wasm is not just a small machine, and that is why this is a
+    /// separate profile from [`Options::embedded`] rather than an
+    /// alias for it. Three properties of the platform drive every
+    /// value that differs.
+    ///
+    /// # What makes wasm different
+    ///
+    /// - **There are no threads, and there is no way to wait for
+    ///   one.** [`Options::max_background_compactions`] is `0` and on
+    ///   a wasm target [`Options::validate`] rejects anything else,
+    ///   so the failure arrives at the option rather than out of the
+    ///   middle of [`crate::Db::open`]. Compaction runs on whichever
+    ///   thread asks for it. Every other value here is chosen so that
+    ///   the writer paying that cost pays it in small installments.
+    /// - **There is no OS page cache.** This is the sharpest split
+    ///   from [`Options::embedded`], which sets
+    ///   [`Options::block_cache_size`] to `0` precisely because a
+    ///   Linux-class board has a page cache to absorb the re-reads. A
+    ///   wasm module has none, so a cache miss costs a host call and,
+    ///   because [`Options::compression`] defaults to
+    ///   [`CompressionType::Lz4`], a fresh decompression every time.
+    ///   The cache here holds decompressed blocks, so it buys back
+    ///   both. It is 1 MiB, and one shard, because a single-threaded
+    ///   host never contends on it.
+    /// - **Linear memory grows in 64 KiB pages and never shrinks.**
+    ///   Every peak is permanent for the life of the instance, so the
+    ///   figure to keep down is the high-water mark, not the average.
+    ///   [`ArenaProfile::EMBEDDED`] caps a chunk at exactly one page
+    ///   and the memtable pool hands the same pages to the next
+    ///   memtable, so `memory.grow` runs once per size class rather
+    ///   than once per flush-and-refill cycle.
+    ///
+    /// # Where the budget goes
+    ///
+    /// Up to 2 MiB of memtable entry bytes (a 1 MiB write buffer, at
+    /// most one active plus one frozen), 1 MiB of block cache, and
+    /// per-SSTable index and Bloom residency that grows with the file
+    /// count. Skip-list node overhead sits on top of the entry bytes.
+    /// Past roughly 100 MiB of database, set
+    /// [`Options::partitioned_index`] to `true` to stop the per-file
+    /// index term from growing without bound;
+    /// [`Options::metadata_block_size`] is already 1 KiB here so that
+    /// switch needs no further retuning.
+    ///
+    /// Measured, not estimated. The `embedded_profile` example run on
+    /// `wasm32-wasip1` under wasmtime (open, 20000 x 128 B puts,
+    /// sampled reads, page scan, compact, close, reopen, read back)
+    /// reaches **4480 KiB** of linear memory, of which 3392 KiB is
+    /// over the pre-open baseline, against **1600 KiB** for
+    /// [`Options::embedded`] and **11456 KiB** for
+    /// [`Options::default`] on the same run. Most of the gap over
+    /// `embedded` is the block cache this profile buys and `embedded`
+    /// declines, plus the larger write buffer. Linear memory only
+    /// grows, so for a wasm module the high-water mark *is* the
+    /// footprint. Reproduce with `just wasm-budget`.
+    ///
+    /// [`Options::evict_compaction_data_from_page_cache`] is `false`,
+    /// unlike [`Options::embedded`]: the hint is `posix_fadvise` on
+    /// Linux and a no-op everywhere else, so asking for it on wasm
+    /// would imply an effect the target cannot deliver.
+    ///
+    /// [`Options::max_value_size`] is 1 MiB, exactly one write
+    /// buffer, which is the same rule [`Options::embedded`] follows:
+    /// a write the API accepts must fit in a memtable that can hold
+    /// it. Raising it above [`Options::write_buffer_size`] is
+    /// supported and costs a flush per outsized value, which on wasm
+    /// is also paid in pages that never come back.
+    ///
+    /// # Not a promise about your workload
+    ///
+    /// These values bound what lark reserves. They do not bound what
+    /// your keys and values cost, nor what the allocator does with
+    /// fragmentation. Measure in the target runtime.
+    ///
+    /// # It does not choose a filesystem for you
+    ///
+    /// On `wasm32-wasip1` the default [`Options::env`] works: wasi has
+    /// a real `std::fs` behind a preopened directory. On
+    /// `wasm32-unknown-unknown` it does not, because that target has no
+    /// filesystem at all and every `std::fs` call reports
+    /// [`std::io::ErrorKind::Unsupported`]. In a browser, mount OPFS
+    /// and set the env yourself:
+    ///
+    /// ```ignore
+    /// let opfs = OpfsEnv::mount("my-db", OpfsOptions::default()).await?;
+    /// let mut options = Options::wasm();
+    /// options.env = opfs.as_env();
+    /// let db = Db::open(opfs.db_path(), options)?;
+    /// ```
+    ///
+    /// Mounting is async, which is why the profile cannot do it.
+    ///
+    /// The profile is a plain value with no wasm-only fields, so it
+    /// builds and opens on the host too, which is what lets it be
+    /// exercised by the normal test suite:
+    ///
+    /// ```
+    /// use lark_kv::{Db, Options};
+    ///
+    /// let dir = tempfile::TempDir::new()?;
+    /// let db = Db::open(dir.path(), Options::wasm())?;
+    /// db.put(b"k", b"v")?;
+    /// assert_eq!(db.get(b"k")?.as_deref(), Some(&b"v"[..]));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn wasm() -> Self {
+        Self {
+            write_buffer_size: 1024 * 1024,
+            arena_profile: ArenaProfile::EMBEDDED,
+            block_size: 4 * 1024,
+            block_cache_size: 1024 * 1024,
+            block_cache_num_shard_bits: 0,
+            l0_compaction_trigger: 4,
+            level_base_bytes: 8 * 1024 * 1024,
+            target_file_size: 1024 * 1024,
+            level0_slowdown_writes_trigger: 8,
+            level0_stop_writes_trigger: 12,
+            soft_pending_compaction_bytes_limit: 32 * 1024 * 1024,
+            hard_pending_compaction_bytes_limit: 128 * 1024 * 1024,
+            max_write_buffer_number: 2,
+            max_background_compactions: 0,
+            evict_compaction_data_from_page_cache: false,
+            metadata_block_size: 1024,
+            max_key_size: 16 * 1024,
+            max_value_size: 1024 * 1024,
+            ..Self::default()
+        }
+    }
+
     /// Validate option invariants before the database uses them.
     ///
     /// Public open paths call this automatically. Callers that build
@@ -973,6 +1111,20 @@ impl Options {
         require_nonzero_u64("level_size_multiplier", self.level_size_multiplier)?;
         require_nonzero_u64("target_file_size", self.target_file_size)?;
         require_nonzero_usize("metadata_block_size", self.metadata_block_size)?;
+
+        // No wasm build can carry a compaction worker: `Env::spawn`
+        // reports `Unsupported` there and the worker's blocking wait
+        // has no wasm implementation to build against. Reject it here
+        // so the reason arrives with the option that caused it rather
+        // than as an io error from the middle of `open`.
+        #[cfg(target_family = "wasm")]
+        if self.max_background_compactions > 0 {
+            return invalid_option(
+                "max_background_compactions",
+                "must be 0 on wasm, which has no threads; compaction then runs on the \
+                 calling thread. Options::wasm() sets this and the rest of the profile",
+            );
+        }
 
         if !self.arena_profile.is_valid() {
             return invalid_option(
@@ -1406,6 +1558,83 @@ mod tests {
 
         // Compaction runs on the calling thread.
         assert_eq!(o.max_background_compactions, 0);
+    }
+
+    #[test]
+    fn wasm_profile_validates() {
+        Options::wasm()
+            .validate()
+            .expect("the shipped wasm profile must satisfy its own invariants");
+    }
+
+    #[test]
+    fn wasm_profile_bounds_every_resident_term() {
+        let o = Options::wasm();
+
+        // Entry bytes held in memory at once: two write buffers.
+        assert_eq!(o.write_buffer_size, 1024 * 1024);
+        assert_eq!(o.max_write_buffer_number, 2);
+
+        // A chunk is exactly one wasm page, so a chunk never straddles
+        // more pages than its contents need.
+        assert_eq!(o.arena_profile.max_chunk_size, 64 * 1024);
+
+        // Unlike `embedded`, the cache is real: wasm has no OS page
+        // cache behind it. One shard, because nothing contends.
+        assert_eq!(o.block_cache_size, 1024 * 1024);
+        assert_eq!(o.block_cache_num_shard_bits, 0);
+
+        // The same admission rule `embedded` holds: a write the API
+        // accepts must fit in a memtable that can hold it.
+        assert!(o.max_value_size <= o.write_buffer_size);
+        assert!(o.max_key_size < o.write_buffer_size);
+
+        // Compaction runs on the calling thread. This is not a tuning
+        // choice on wasm; `validate` rejects anything else there.
+        assert_eq!(o.max_background_compactions, 0);
+
+        // The page-cache hint is a no-op on wasm, so the profile does
+        // not ask for an effect the target cannot deliver.
+        assert!(!o.evict_compaction_data_from_page_cache);
+
+        // Already set for the `partitioned_index` switch the doc
+        // points at, so flipping it later needs no further retuning.
+        assert_eq!(o.metadata_block_size, 1024);
+    }
+
+    #[test]
+    fn wasm_profile_is_smaller_than_the_default_but_roomier_than_embedded() {
+        let d = Options::default();
+        let w = Options::wasm();
+        let e = Options::embedded();
+
+        assert!(w.write_buffer_size < d.write_buffer_size);
+        assert!(w.block_cache_size < d.block_cache_size);
+        assert!(w.max_value_size < d.max_value_size);
+        assert!(w.hard_pending_compaction_bytes_limit < d.hard_pending_compaction_bytes_limit);
+
+        // Roomier than `embedded` everywhere it differs, because a
+        // browser tab or a wasi host is not an ESP32.
+        assert!(w.write_buffer_size > e.write_buffer_size);
+        assert!(w.target_file_size > e.target_file_size);
+        assert!(w.level_base_bytes > e.level_base_bytes);
+        assert!(w.max_value_size > e.max_value_size);
+
+        // The one term that goes the other way, and the reason this is
+        // a separate profile rather than an alias for `embedded`.
+        assert_eq!(e.block_cache_size, 0);
+        assert!(w.block_cache_size > e.block_cache_size);
+    }
+
+    #[test]
+    fn default_profile_opens_on_every_target_it_is_compiled_for() {
+        // `Db::open` validates, so a default that a target rejects
+        // would make the zero-configuration path unopenable there.
+        Options::default()
+            .validate()
+            .expect("Options::default must be valid on the target it was built for");
+        #[cfg(target_family = "wasm")]
+        assert_eq!(Options::default().max_background_compactions, 0);
     }
 
     #[test]

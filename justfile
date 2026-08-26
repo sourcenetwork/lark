@@ -192,6 +192,27 @@ soak-pair:
 size:
     cargo run --release --bench size
 
+# The memory table in the README: every profile, on both hosts, one
+# workload. The wasm column is the reproducible one because linear
+# memory only ever grows; RSS moves between runs.
+
+wasm-budget puts="20000":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release --example embedded_profile --target wasm32-wasip1
+    for profile in embedded wasm default; do
+        echo "== $profile, x86_64 Linux =="
+        d=$(mktemp -d)
+        cargo run --release --quiet --example embedded_profile -- "$d" "$profile" {{puts}}
+        rm -rf "$d"
+        echo "== $profile, wasm32-wasip1 under wasmtime =="
+        d=$(mktemp -d)
+        wasmtime run --dir="$d::/data" \
+            target/wasm32-wasip1/release/examples/embedded_profile.wasm \
+            /data "$profile" {{puts}}
+        rm -rf "$d"
+    done
+
 # Point memory probes from section 6.5.
 
 mem:
@@ -284,19 +305,29 @@ wasm records="5000" sustained="20000":
     # which is the case that wedges when nothing compacts on the
     # calling thread.
     cargo build --release -p lark-wasm-probe --target wasm32-wasip1
-    d=$(mktemp -d)
-    trap 'rm -rf "$d"' EXIT
-    wasmtime run --dir="$d::/data" \
-        target/wasm32-wasip1/release/lark-wasm-probe.wasm -- \
-        --profile embedded --records {{records}} --sustained {{sustained}} \
-        --probe-host --report-memory
+    # Both shipped profiles a wasm module can open with, on the real
+    # target: `embedded` runs with no block cache, `wasm` with one.
+    for profile in embedded wasm; do
+        echo "== profile $profile =="
+        d=$(mktemp -d)
+        wasmtime run --dir="$d::/data" \
+            target/wasm32-wasip1/release/lark-wasm-probe.wasm -- \
+            --profile "$profile" --records {{records}} --sustained {{sustained}} \
+            --probe-host --report-memory
+        rm -rf "$d"
+    done
 
 # The same lifecycle natively, to tell a lark bug apart from a wasm one.
 
 wasm-native records="5000" sustained="20000":
-    cargo run --release -p lark-wasm-probe -- \
-        --profile embedded --records {{records}} --sustained {{sustained}} \
-        --probe-host --report-memory
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for profile in embedded wasm; do
+        echo "== profile $profile =="
+        cargo run --release -p lark-wasm-probe -- \
+            --profile "$profile" --records {{records}} --sustained {{sustained}} \
+            --probe-host --report-memory
+    done
 
 wasm-browser:
     wasm-pack test --headless --firefox

@@ -54,7 +54,7 @@ OPTIONS:
     --dir <PATH>              database directory
                               (default: /data/lark-probe under wasi,
                                a temp directory otherwise)
-    --profile <NAME>          embedded | default   (default: embedded)
+    --profile <NAME>          embedded | wasm | default  (default: embedded)
     --background-compactions <N>
                               override max_background_compactions;
                               0 runs compaction on the calling thread
@@ -87,6 +87,7 @@ struct Args {
 #[derive(Clone, Copy)]
 enum Profile {
     Embedded,
+    Wasm,
     Default,
 }
 
@@ -94,6 +95,7 @@ impl Profile {
     fn options(self) -> Options {
         match self {
             Profile::Embedded => Options::embedded(),
+            Profile::Wasm => Options::wasm(),
             Profile::Default => Options::default(),
         }
     }
@@ -101,6 +103,7 @@ impl Profile {
     fn label(self) -> &'static str {
         match self {
             Profile::Embedded => "embedded",
+            Profile::Wasm => "wasm",
             Profile::Default => "default",
         }
     }
@@ -170,6 +173,35 @@ fn run() -> Result<(), String> {
         options().max_background_compactions
     ));
 
+    // On wasm a background compaction worker cannot exist, and the
+    // rejection has to arrive from `validate` with the option named
+    // rather than as an io error out of the middle of `open`. This
+    // runs on the target, which the library's own `#[cfg(test)]`
+    // tests cannot: a dev-dependency of the workspace does not build
+    // for wasm, so the lib test cfg is unbuildable there.
+    #[cfg(target_family = "wasm")]
+    {
+        let mut hostile = profile.options();
+        hostile.max_background_compactions = 1;
+        match hostile.validate() {
+            Ok(()) => {
+                return Err(
+                    "max_background_compactions = 1 validated on wasm, which has no threads"
+                        .to_string(),
+                );
+            }
+            Err(e) => {
+                let message = e.to_string();
+                if !message.contains("max_background_compactions") {
+                    return Err(format!(
+                        "wasm rejected a background worker without naming the option: {message}"
+                    ));
+                }
+                reporter.pass("background compaction worker rejected at the option");
+            }
+        }
+    }
+
     let db_dir = args.dir.join("db");
     lifecycle::run(&db_dir, &options, args.records, &findings, &mut reporter)?;
 
@@ -220,6 +252,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--profile" => {
                 args.profile = match next(&mut raw, "--profile")?.as_str() {
                     "embedded" => Profile::Embedded,
+                    "wasm" => Profile::Wasm,
                     "default" => Profile::Default,
                     other => return Err(format!("unknown --profile {other}")),
                 }

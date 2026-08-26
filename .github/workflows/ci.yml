@@ -180,18 +180,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Memory high-water, embedded profile
+      - uses: extractions/setup-just@v2
+      - name: Add the wasm target
+        run: rustup target add wasm32-wasip1
+      - uses: bytecodealliance/actions/wasmtime/setup@v1
+      - name: Memory high-water, every profile on both hosts
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/lark-mem"
-          cargo run --release --example embedded_profile -- \
-            "$RUNNER_TEMP/lark-mem" embedded 20000 | tee embedded-memory.txt
-      - name: Memory high-water, default profile for contrast
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/lark-mem-default"
-          cargo run --release --example embedded_profile -- \
-            "$RUNNER_TEMP/lark-mem-default" default 20000 | tee default-memory.txt
+          just wasm-budget 20000 | tee profile-memory.txt
       - name: Worst-case stack depth per path
         run: |
           set -euo pipefail
@@ -202,13 +198,9 @@ jobs:
           {
             echo "## Embedded budget"
             echo ""
-            echo "### Memory high-water, Options::embedded()"
+            echo "### Memory high-water: embedded, wasm and default, on x86_64 and wasm32-wasip1"
             echo '```'
-            cat embedded-memory.txt
-            echo '```'
-            echo "### Memory high-water, Options::default()"
-            echo '```'
-            cat default-memory.txt
+            cat profile-memory.txt
             echo '```'
             echo "### Stack depth"
             echo '```'

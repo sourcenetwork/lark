@@ -22,6 +22,7 @@
 //!
 //! ```sh
 //! cargo run --release --example embedded_profile -- /tmp/lark-mem
+//! cargo run --release --example embedded_profile -- /tmp/lark-mem wasm
 //! cargo run --release --example embedded_profile -- /tmp/lark-mem default
 //!
 //! cargo build --release --example embedded_profile --target wasm32-wasip1
@@ -29,7 +30,7 @@
 //!     target/wasm32-wasip1/release/examples/embedded_profile.wasm /data
 //! ```
 //!
-//! Arguments: `<db-dir> [embedded|default] [num-puts]`. The directory
+//! Arguments: `<db-dir> [embedded|wasm|default] [num-puts]`. The directory
 //! must already exist on wasip1, where it is a host preopen.
 
 use std::path::Path;
@@ -49,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = args
         .first()
         .map(String::as_str)
-        .ok_or("usage: embedded_profile <db-dir> [embedded|default] [num-puts]")?;
+        .ok_or("usage: embedded_profile <db-dir> [embedded|wasm|default] [num-puts]")?;
     let profile = args.get(1).map(String::as_str).unwrap_or("embedded");
     let puts: usize = match args.get(2) {
         Some(n) => n.parse()?,
@@ -58,8 +59,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let opts = match profile {
         "embedded" => Options::embedded(),
+        "wasm" => Options::wasm(),
         "default" => Options::default(),
-        other => return Err(format!("unknown profile {other:?}; use embedded or default").into()),
+        other => {
+            return Err(format!("unknown profile {other:?}; use embedded, wasm or default").into());
+        }
     };
 
     println!("lark memory profile");

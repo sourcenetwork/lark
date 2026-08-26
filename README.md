@@ -142,38 +142,60 @@ large value is rewritten in full by every compaction that touches its key, and w
 
 ### Embedded and small-memory hosts
 
-`Options::embedded()` is a profile for a host whose whole working set has to fit in
-roughly 1-4 MiB: a Linux-class board (Cortex-A, ESP32-S3 under esp-idf), or a wasm
-module, where linear memory grows in 64 KiB pages and never shrinks.
+Two profiles replace the server-shaped defaults with values bounded by a memory budget
+rather than by throughput.
+
+`Options::embedded()` targets a host whose whole working set has to fit in roughly
+1-4 MiB: a Linux-class board (Cortex-A, ESP32-S3 under esp-idf). A 256 KiB write buffer,
+no block cache at all, 4 KiB blocks, 256 KiB SSTables, an L0 stop trigger of 8, and
+`max_background_compactions: 0`, which runs compaction on the calling thread instead of a
+background worker.
+
+`Options::wasm()` targets a wasm module, in a browser or under a wasi host. It is not an
+alias for `embedded()`, because wasm is not merely a small machine:
+
+- **No threads, and no way to wait for one.** `max_background_compactions` is `0`, and on
+  a wasm target `Options::validate()` *rejects* anything else, so the failure arrives at
+  the option rather than out of the middle of `Db::open`. This holds on every wasm target,
+  with or without the `atomics` feature, so `Options::default()` also opens there.
+- **No OS page cache.** This is the sharpest split from `embedded()`, which sets
+  `block_cache_size` to `0` precisely *because* a Linux-class board has a page cache to
+  absorb the re-reads. A wasm module has none, so `wasm()` keeps a 1 MiB single-shard
+  cache of decompressed blocks, buying back both the host call and the LZ4 decompression.
+- **Linear memory grows in 64 KiB pages and never shrinks**, so the high-water mark *is*
+  the footprint. The arena caps a chunk at exactly one page and the memtable pool recycles
+  pages, so `memory.grow` runs once per size class rather than once per flush.
 
 ```rust
 let db = lark_kv::Db::open("/path/to/db", lark_kv::Options::embedded())?;
+let db = lark_kv::Db::open("/path/to/db", lark_kv::Options::wasm())?;
 ```
 
-It replaces the server-shaped defaults with values bounded by the budget rather than by
-throughput: a 256 KiB write buffer, no block cache at all, 4 KiB blocks, 256 KiB SSTables,
-an L0 stop trigger of 8, and `max_background_compactions: 0`, which runs compaction on the
-calling thread instead of a background worker. Every value and the reasoning behind it is
-documented on `Options::embedded` itself.
+Every value and the reasoning behind it is documented on `Options::embedded` and
+`Options::wasm` themselves.
 
 #### Measured budget
 
-Both figures come from checked-in examples, re-run by the `embedded-budget` CI job rather
-than quoted from here. Reproduce them with:
+Every figure comes from a checked-in example, re-run by the `embedded-budget` CI job
+rather than quoted from here. Reproduce with:
 
 ```sh
-cargo run --release --example embedded_profile -- /tmp/lark-mem embedded 20000
+just wasm-budget    # both columns of the table below, all three profiles
 cargo run --release --example stack_depth -- /tmp/lark-stack
 cargo run --release --example read_scaling -- /tmp/lark-scale 500000 3
 ```
 
 Full lifecycle (open, 20k x 128 B puts, sampled reads, page scan, compact, close, reopen,
-read back), x86_64 Linux and wasm32-wasip1 under wasmtime:
+read back), x86_64 Linux and wasm32-wasip1 under wasmtime, one run per cell:
 
-| profile      | Linux RSS attributable to lark | wasm linear memory high-water          |
-| ------------ | ------------------------------ | -------------------------------------- |
-| `embedded()` | 1.53 MiB                       | 2.00 MiB total, 0.94 MiB over baseline |
-| `default()`  | 10.2 MiB                       | 11.25 MiB total, 10.2 MiB over baseline |
+| profile      | Linux RSS attributable to lark | wasm linear memory high-water            |
+| ------------ | ------------------------------ | ---------------------------------------- |
+| `embedded()` | 1.12 MiB                       | 1.56 MiB total, 0.50 MiB over baseline   |
+| `wasm()`     | 4.00 MiB                       | 4.38 MiB total, 3.31 MiB over baseline   |
+| `default()`  | 7.42 MiB                       | 11.19 MiB total, 10.13 MiB over baseline |
+
+RSS is machine- and allocator-dependent and moves between runs; the wasm column does not,
+because linear memory only ever grows. Treat the wasm figures as the reproducible ones.
 
 #### Stack requirement
 
