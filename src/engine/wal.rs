@@ -3,12 +3,28 @@
 //!
 //! # On-disk format
 //!
-//! A WAL file is a bare sequence of records with no file header and no
-//! framing above the record itself:
+//! A WAL file opens with a self-checksummed stamp and is followed by a
+//! sequence of records:
 //!
 //! ```text
+//! ["REGO"][format: u16 LE][reserved: u16 LE = 0][stamp checksum: u32 LE]
 //! [len: u32 LE][type: u8][payload: len bytes][checksum: u32 LE]
+//! ...
 //! ```
+//!
+//! # Reading a log written before the stamp existed
+//!
+//! Logs written before the stamp begin directly with a record, and they
+//! still open: a file whose first four bytes are not `REGO` is replayed
+//! as a bare record sequence, exactly as it was written. Nothing is
+//! rewritten to migrate one. The next log the engine creates carries the
+//! stamp, so a database moves forward one WAL at a time simply by being
+//! used, and a mixed directory is normal rather than an error state.
+//!
+//! The two shapes cannot be confused. `REGO` read as the little-endian
+//! `len` of a legacy record is 0x4F47_4552, about 1.3 GiB, and
+//! [`MAX_RECORD_LEN`] caps a record far below that, so no legacy record
+//! can begin with those bytes.
 //!
 //! The checksum covers the length, the type byte and the payload, so the
 //! length field is both what finds the next record and part of what the
@@ -56,8 +72,11 @@
 //! is reported with the offset and the byte count rather than passing
 //! silently.
 //!
-//! Closing either properly needs a self-checksummed header or fixed-size
-//! blocks, which is a format change.
+//! The stamp closes neither of those: it is checksummed for itself, not
+//! for the records after it. Closing them needs per-record framing that
+//! does not depend on a trusted length, such as fixed-size blocks, and
+//! the stamp's `format` field is what lets that arrive without breaking
+//! the logs written before it.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -75,6 +94,21 @@ pub(super) const RECORD_BATCH: u8 = 0x05;
 
 /// On-disk record header: 4-byte little-endian payload length plus a
 /// one-byte record type.
+/// `REGO`, the four bytes every WAL written by this version begins with.
+pub(crate) const WAL_MAGIC: [u8; 4] = *b"REGO";
+
+/// Stamp layout: magic, format, reserved, checksum.
+pub(crate) const WAL_STAMP_LEN: usize = 12;
+
+/// On-disk WAL format this build writes.
+const WAL_FORMAT_V1: u16 = 1;
+
+/// Largest record payload the writer will emit, and the largest a reader
+/// will believe. Well under `REGO` read as a little-endian length
+/// (0x4F47_4552), which is what keeps a stamped file from ever being
+/// mistaken for a legacy record and the reverse.
+pub(crate) const MAX_RECORD_LEN: u32 = 1 << 30;
+
 const WAL_HEADER_LEN: usize = 5;
 /// Trailing 4-byte little-endian checksum of every record.
 const CHECKSUM_LEN: usize = 4;
@@ -121,14 +155,18 @@ pub(crate) enum WalEntry {
 impl Wal {
     /// Create a new WAL file at the given path.
     pub(crate) fn create(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(path)?;
+        // Every log this build creates is stamped. That is what makes the
+        // format identifiable and versioned from here on, so a later
+        // build can change the framing and still know what it is holding.
+        file.write_all(&encode_wal_stamp())?;
         Ok(Self {
             file,
-            offset: 0,
+            offset: WAL_STAMP_LEN as u64,
             path: path.to_path_buf(),
             parent_synced: false,
         })
@@ -162,6 +200,12 @@ impl Wal {
     /// written group never survives as a torn record that replay would
     /// have to reason about.
     pub(crate) fn rollback_to(&mut self, offset: u64) -> io::Result<()> {
+        // The stamp is not a record and is never rolled back over: doing
+        // so would leave an unidentifiable file behind.
+        debug_assert!(
+            offset >= WAL_STAMP_LEN as u64,
+            "rollback must not truncate into the WAL stamp"
+        );
         self.file.set_len(offset)?;
         self.file.seek(SeekFrom::Start(offset))?;
         self.offset = offset;
@@ -706,6 +750,61 @@ fn resync_after(bytes: &[u8], pos: usize) -> Option<usize> {
     first
 }
 
+/// Encode the stamp a fresh WAL begins with.
+fn encode_wal_stamp() -> [u8; WAL_STAMP_LEN] {
+    let mut out = [0u8; WAL_STAMP_LEN];
+    out[0..4].copy_from_slice(&WAL_MAGIC);
+    out[4..6].copy_from_slice(&WAL_FORMAT_V1.to_le_bytes());
+    out[6..8].copy_from_slice(&0u16.to_le_bytes());
+    let checksum = checksum::wal_stamp(&WAL_MAGIC, WAL_FORMAT_V1, 0);
+    out[8..12].copy_from_slice(&checksum.to_le_bytes());
+    out
+}
+
+/// Validate the stamp at the head of `bytes` and return its length.
+///
+/// The stamp is mandatory: every log this build creates carries one, so
+/// a file that does not is not a log this build wrote. The exception is
+/// a log a crash caught before the stamp reached the disk, which reads
+/// back as nothing or as zeros; that is an empty log, not damage, and
+/// the same rule covers it as covers an unwritten record tail.
+pub(super) fn validate_wal_stamp(bytes: &[u8]) -> io::Result<Option<usize>> {
+    // Too short to hold a stamp is too short to hold a record, so there
+    // is nothing in the file to lose and nothing to misread. That is what
+    // a crash during `create` leaves behind.
+    if bytes.len() < WAL_STAMP_LEN {
+        return Ok(None);
+    }
+    if bytes[0..4] != WAL_MAGIC {
+        if bytes.iter().all(|b| *b == 0) {
+            return Ok(None);
+        }
+        return Err(invalid_wal(
+            "not a lark WAL: the file does not begin with the REGO stamp",
+        ));
+    }
+    let format = u16::from_le_bytes([bytes[4], bytes[5]]);
+    let reserved = u16::from_le_bytes([bytes[6], bytes[7]]);
+    let stored = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    if stored != checksum::wal_stamp(&WAL_MAGIC, format, reserved) {
+        return Err(invalid_wal("WAL stamp checksum mismatch"));
+    }
+    // A newer format is refused rather than guessed at. This is the whole
+    // point of the field: an older build must fail loudly on a log a
+    // newer one wrote, instead of misreading its framing.
+    if format > WAL_FORMAT_V1 {
+        return Err(invalid_wal(format!(
+            "WAL format {format} was written by a newer lark than this build, \
+             which understands up to {WAL_FORMAT_V1}"
+        )));
+    }
+    Ok(Some(WAL_STAMP_LEN))
+}
+
+fn invalid_wal(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
 pub(super) fn read_wal_header(reader: &mut impl Read) -> io::Result<Option<[u8; 5]>> {
     let mut header = [0u8; 5];
     let mut read = 0;
@@ -1190,7 +1289,11 @@ mod tests {
         encode_ops_record(&mut record, &[], 1);
         assert!(record.is_empty());
         wal.append_group(&record).unwrap();
-        assert_eq!(wal.offset(), 0);
+        assert_eq!(
+            wal.offset(),
+            WAL_STAMP_LEN as u64,
+            "an empty group appends nothing past the stamp"
+        );
         drop(wal);
 
         assert!(Wal::replay(&path).unwrap().is_empty());
@@ -1394,15 +1497,100 @@ mod tests {
 
     // ── group append and rollback ───────────────────────────────
 
+    // ── the REGO stamp ──────────────────────────────────────────
+
+    #[test]
+    fn a_fresh_log_begins_with_the_rego_stamp() {
+        let dir = TempDir::new().unwrap();
+        let (mut wal, path) = new_wal(&dir);
+        wal.append_put(b"k", b"v", 1).unwrap();
+        wal.sync_data().unwrap();
+        drop(wal);
+
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(&bytes[0..4], b"REGO", "the log is not stamped");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            WAL_FORMAT_V1,
+            "the stamp names the format this build writes"
+        );
+        assert_eq!(
+            validate_wal_stamp(&bytes).unwrap(),
+            Some(WAL_STAMP_LEN),
+            "the stamp validates against its own checksum"
+        );
+    }
+
+    #[test]
+    fn the_stamp_cannot_be_confused_with_a_record_length() {
+        // `REGO` read as a little-endian record length is far above the
+        // largest record the writer will emit, so no legacy-shaped record
+        // can begin with the magic and no stamp can be read as a record.
+        let as_len = u32::from_le_bytes(WAL_MAGIC);
+        assert!(
+            as_len > MAX_RECORD_LEN,
+            "REGO as a length ({as_len}) must exceed MAX_RECORD_LEN ({MAX_RECORD_LEN})"
+        );
+    }
+
+    #[test]
+    fn a_log_from_a_newer_format_is_refused_rather_than_guessed_at() {
+        let mut stamp = encode_wal_stamp();
+        let future = WAL_FORMAT_V1 + 1;
+        stamp[4..6].copy_from_slice(&future.to_le_bytes());
+        let checksum = checksum::wal_stamp(&WAL_MAGIC, future, 0);
+        stamp[8..12].copy_from_slice(&checksum.to_le_bytes());
+
+        let err = validate_wal_stamp(&stamp).expect_err("a newer format must not be parsed");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("newer lark"),
+            "the error must say why: {err}"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_stamp_is_damage_not_a_record_stream() {
+        let mut stamp = encode_wal_stamp();
+        stamp[8] ^= 0xFF;
+        let err = validate_wal_stamp(&stamp).expect_err("a bad checksum must not pass");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_lark_log_is_refused() {
+        let bytes = b"this is not a write-ahead log at all";
+        let err = validate_wal_stamp(bytes).expect_err("foreign bytes must not replay");
+        assert!(err.to_string().contains("REGO"), "{err}");
+    }
+
+    #[test]
+    fn a_crash_before_the_stamp_reached_disk_reads_as_an_empty_log() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("torn-stamp.wal");
+        // Every prefix of a stamp is too short to hold a record, so there
+        // is nothing in it to lose and nothing to misread.
+        for cut in 0..WAL_STAMP_LEN {
+            fs::write(&path, &encode_wal_stamp()[..cut]).unwrap();
+            assert!(
+                Wal::replay(&path).unwrap().is_empty(),
+                "a stamp torn at {cut} must read as an empty log"
+            );
+        }
+    }
+
     #[test]
     fn offset_tracks_every_appended_byte() {
         let dir = TempDir::new().unwrap();
         let (mut wal, path) = new_wal(&dir);
-        assert_eq!(wal.offset(), 0);
+        assert_eq!(wal.offset(), WAL_STAMP_LEN as u64, "a fresh log holds its stamp");
 
         wal.append_put(b"k", b"v", 1).unwrap();
         let after_one = wal.offset();
-        assert_eq!(after_one as usize, put_record_len(b"k", b"v"));
+        assert_eq!(
+            after_one as usize,
+            WAL_STAMP_LEN + put_record_len(b"k", b"v")
+        );
 
         wal.append_put(b"k2", b"v2", 2).unwrap();
         assert_eq!(
@@ -1619,6 +1807,7 @@ mod tests {
         let path = dir.path().join("legacy.wal");
         let data = put_data(b"k", b"v", 1);
         let mut f = File::create(&path).unwrap();
+        f.write_all(&encode_wal_stamp()).unwrap();
         append_raw_record(
             &mut f,
             RECORD_PUT,
@@ -1692,7 +1881,7 @@ mod tests {
         drop(wal);
 
         let mut bytes = fs::read(&path).unwrap();
-        let second = frame_at(&bytes, 0).unwrap().end;
+        let second = frame_at(&bytes, WAL_STAMP_LEN).unwrap().end;
         bytes[second..second + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         fs::write(&path, &bytes).unwrap();
 
@@ -1767,13 +1956,16 @@ mod tests {
         drop(wal);
 
         let full = fs::read(&path).unwrap();
-        let mut boundaries = vec![0usize];
+        let mut boundaries = vec![WAL_STAMP_LEN];
         while let Some(frame) = frame_at(&full, *boundaries.last().unwrap()) {
             boundaries.push(frame.end);
         }
         assert_eq!(boundaries.len(), 5, "four records tile the file");
 
-        for cut in 0..=full.len() {
+        // Cuts inside the stamp leave a file with no records at all, which
+        // the stamp rule already covers; the interesting range starts once
+        // a whole stamp is on disk.
+        for cut in WAL_STAMP_LEN..=full.len() {
             fs::write(&path, &full[..cut]).unwrap();
             let whole = boundaries.iter().filter(|b| **b <= cut).count() - 1;
             let entries = Wal::replay(&path)

@@ -17,7 +17,8 @@ use super::checksum;
 use super::wal::{
     RECORD_BATCH, RECORD_DELETE, RECORD_DELETE_RANGE, RECORD_MERGE, RECORD_PUT, WalEntry,
     parse_batch_record, parse_delete_range_record, parse_delete_record, parse_merge_record,
-    TailVerdict, classify_incomplete_record, classify_unusable_record, parse_put_record,
+    TailVerdict, WAL_STAMP_LEN, classify_incomplete_record, classify_unusable_record,
+    parse_put_record,
     read_exact_or_truncated, read_wal_header,
 };
 
@@ -48,16 +49,47 @@ pub(crate) struct WalReplayIter {
     tail: Option<TailVerdict>,
 }
 
+/// Read up to `buf.len()` bytes, returning how many were available.
+/// A short read is not an error here: a crash can leave a log shorter
+/// than its own stamp.
+fn read_full(reader: &mut impl io::Read, buf: &mut [u8]) -> io::Result<usize> {
+    let mut read = 0;
+    while read < buf.len() {
+        match reader.read(&mut buf[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(read)
+}
+
 impl WalReplayIter {
     /// Open a WAL file for streaming replay.
     pub(crate) fn open(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
         let file_len = file.metadata()?.len();
+        let mut reader = BufReader::new(file);
+
+        // Consume the stamp before any record is read. A log the stamp
+        // never reached reads back as empty; anything else that is not a
+        // valid stamp is refused here rather than parsed as records.
+        let mut head = [0u8; WAL_STAMP_LEN];
+        let stamped = match read_full(&mut reader, &mut head)? {
+            0 => None,
+            n => super::wal::validate_wal_stamp(&head[..n])?,
+        };
+        let consumed = stamped.unwrap_or(0) as u64;
+        // Nothing but a stamp-less empty log can leave records unread
+        // here, so an unstamped file yields no entries at all.
+        let file_len = if stamped.is_some() { file_len } else { consumed };
+
         Ok(Self {
-            reader: BufReader::new(file),
+            reader,
             path: path.to_path_buf(),
             file_len,
-            consumed: 0,
+            consumed,
             payload: Vec::new(),
             pending: VecDeque::new(),
             tail: None,

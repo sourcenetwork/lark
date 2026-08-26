@@ -11,6 +11,7 @@ use std::io::{self, Read};
 use xxhash_rust::xxh3::{Xxh3Default, xxh3_64};
 
 const WAL_RECORD_DOMAIN: &[u8] = b"lark/wal-record/v2";
+const WAL_STAMP_DOMAIN: &[u8] = b"lark/wal-stamp/v1";
 const MANIFEST_RECORD_DOMAIN: &[u8] = b"lark/manifest-record/v2";
 const SST_BLOCK_DOMAIN: &[u8] = b"lark/sst-block/v2";
 const SST_META_DOMAIN: &[u8] = b"lark/sst-meta/v1";
@@ -21,6 +22,15 @@ pub(crate) fn wal_record(len: u32, record_type: u8, data: &[u8]) -> u32 {
     let len = len.to_le_bytes();
     let record_type = [record_type];
     u32_parts(WAL_RECORD_DOMAIN, &[&len, &record_type, data])
+}
+
+/// Checksum over a WAL file's stamp: the magic, the format and the
+/// reserved field. Covers the stamp only, so a stamp that survives says
+/// nothing about the records after it.
+pub(crate) fn wal_stamp(magic: &[u8; 4], format: u16, reserved: u16) -> u32 {
+    let format = format.to_le_bytes();
+    let reserved = reserved.to_le_bytes();
+    u32_parts(WAL_STAMP_DOMAIN, &[magic, &format, &reserved])
 }
 
 pub(crate) fn manifest_record(len: u32, data: &[u8]) -> u32 {
