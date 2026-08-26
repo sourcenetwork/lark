@@ -84,10 +84,9 @@ impl SnapshotRegistry {
     /// pin at all, computes its GC horizon as `u64::MAX`, and is free
     /// to drop the very version the new snapshot was about to read.
     pub(crate) fn register_at(&self, sample: impl FnOnce() -> u64) -> u64 {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        // Through the env: a target without a wall clock reports none
+        // rather than panicking, and the age is simply unknown there.
+        let now = self.env.unix_secs();
         let mut active = self.active.lock();
         let seq = sample();
         active

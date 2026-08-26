@@ -51,8 +51,8 @@ pub(crate) struct CompactionScheduler {
     /// so a flush storm cannot queue thousands of wake-ups for work a
     /// single pass already covers.
     pending: Arc<AtomicBool>,
-    handles: Vec<thread::JoinHandle<()>>,
-    trigger: Arc<(Mutex<bool>, Condvar)>,
+    /// Joined through the env, so a target that cannot spawn threads
+    /// runs compaction in the foreground instead of failing to build.
     handles: Vec<Box<dyn JoinHandle>>,
 }
 
@@ -459,7 +459,7 @@ pub(crate) enum CompactionOutcome {
 /// side of the engine-wide compaction lock and pass the engine-wide
 /// `in_progress` set.
 pub(crate) fn pick_and_run_compaction(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
@@ -1786,6 +1786,7 @@ impl<'a> StreamingCompactionWriter<'a> {
         }
 
         let reader = Arc::new(SsTableReader::open_with(
+            &self.opts.env,
             &current.path,
             current.file_id,
             self.opts.metadata_policy(),
@@ -1894,11 +1895,7 @@ impl<'a> StreamingCompactionWriter<'a> {
             self.opts.env.drop_page_cache(&path);
         }
 
-        let reader = Arc::new(SsTableReader::open_with(
-            &path,
-            file_id,
-            self.opts.metadata_policy(),
-        )?);
+        let reader = Arc::new(SsTableReader::open_with(&self.opts.env, &path, file_id, self.opts.metadata_policy())?);
         let new_file = LiveSst::new(
             SsTableMeta {
                 file_id,

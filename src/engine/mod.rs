@@ -24,30 +24,25 @@ pub(crate) mod sync;
 pub(crate) mod wal;
 pub(crate) mod wal_replay;
 
-use crate::portability::{AtomicU64, AtomicU8, Ordering};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use crate::portability::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use kovan_queue::array_queue::ArrayQueue;
 use parking_lot::{Mutex, RwLock};
 
 use block_cache::BlockCache;
 use commit::{Pipeline, StallSignal, WriteSlot};
-use compaction::{CompactionOptions, CompactionScheduler};
-use db_lock::DbDirectoryLock;
-use lookup_key::{LookupKey, with_key_scratch};
-use parking_lot::{Mutex, RwLock};
-
-use block_cache::BlockCache;
 use compaction::{CompactionOptions, CompactionOutcome, CompactionScheduler};
+use lookup_key::{LookupKey, with_key_scratch};
 use manifest::{VersionEdit, VersionSet};
 use memtable::{MemTable, MemTableConfig};
 use read_horizon::ReadHorizon;
 use read_view::{ReadView, ReadViewCell, VersionStore};
 use snapshot_registry::SnapshotRegistry;
 
+use crate::env::{Capabilities, Env, FileLock};
 use crate::{DbSlice, WriteBatchOp, event_listener};
 use sstable::{
     LiveSst, LookupResult, Materialize, PointValue, SsTableMeta, SsTableReader, SsTableWriter,
@@ -55,10 +50,6 @@ use sstable::{
 };
 use wal::{Wal, WalEntry, wal_filename};
 use wal_replay::WalReplayIter;
-use crate::env::{Capabilities, Env, FileLock};
-use crate::{event_listener, WriteBatchOp};
-use sstable::{sst_filename, LiveSst, LookupResult, SsTableMeta, SsTableReader, SsTableWriter};
-use wal::{wal_filename, Wal, WalEntry};
 
 /// Controls when data is flushed to disk after a commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,6 +248,7 @@ impl EngineOptions {
             target_file_size: self.target_file_size,
             block_size: self.block_size,
             bloom_bits_per_key: self.bloom_bits_per_key,
+            cache_index_and_filter_blocks: self.cache_index_and_filter_blocks,
             compression: self.compression,
             compression_per_level: self.compression_per_level.clone(),
             compaction_filter: self.compaction_filter.clone(),
@@ -425,41 +417,6 @@ pub(crate) struct LarkEngine {
     _db_lock: Box<dyn FileLock>,
 }
 
-/// Lock + condvar pair shared between foreground writers (which
-/// wait on it during a write stall) and the background compaction
-/// thread (which notifies after each compaction pass).
-///
-/// Deliberately `std::sync` rather than `parking_lot`: parking_lot's
-/// wasm thread parker aborts the module the first time a writer waits
-/// (`Parking not supported on this platform`), which would be a panic
-/// on a path reachable from [`crate::Db::put`]. `std::sync::Condvar`
-/// works on `wasm32-wasip1`. Waiting at all is confined to
-/// [`StallPolicy::WaitForWorker`]; a single-threaded host runs
-/// [`StallPolicy::CompactInline`] and never touches the condvar.
-pub(crate) struct StallSignal {
-    lock: std::sync::Mutex<()>,
-    cv: std::sync::Condvar,
-}
-
-impl StallSignal {
-    pub(crate) fn new() -> Self {
-        Self {
-            lock: std::sync::Mutex::new(()),
-            cv: std::sync::Condvar::new(),
-        }
-    }
-
-    /// The critical section is empty, so it cannot unwind and the mutex
-    /// cannot be poisoned; recovering the inner value keeps the wake-up
-    /// path panic-free regardless.
-    pub(crate) fn notify_all(&self) {
-        let _guard = self
-            .lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.cv.notify_all();
-    }
-}
 
 /// How a writer that has hit a "stop writes" threshold makes room.
 ///
@@ -491,8 +448,8 @@ impl LarkEngine {
         env.create_dir_all(&wal_dir)?;
 
         let version_set =
-            VersionSet::open_with_policy(db_dir, &sst_dir, options.metadata_policy())?;
-        let mut version_set = VersionSet::open_in(&env, db_dir, &sst_dir)?;
+            VersionSet::open_with_policy(&env, db_dir, &sst_dir, options.metadata_policy())?;
+        let mut version_set = VersionSet::open_with_policy(&env, db_dir, &sst_dir, options.metadata_policy())?;
         let version = version_set.current();
         let mut latest_seq = version.last_seq;
 
@@ -503,7 +460,7 @@ impl LarkEngine {
             options.max_write_buffer_number,
         );
         let memtable = Arc::new(MemTable::new(&memtable_config)?);
-        let mut wal_files = list_wal_files(&wal_dir)?;
+        let mut wal_files = list_wal_files(&*env, &wal_dir)?;
         wal_files.sort();
         wal_files.retain(|path| should_replay_wal(path, version.min_wal_id));
 
@@ -566,30 +523,7 @@ impl LarkEngine {
             )
             .with_stats(options.statistics.clone()),
         );
-        let compaction_opts = CompactionOptions {
-            l0_compaction_trigger: options.l0_compaction_trigger,
-            level_base_bytes: options.level_base_bytes,
-            level_size_multiplier: options.level_size_multiplier,
-            target_file_size: options.target_file_size,
-            block_size: options.block_size,
-            bloom_bits_per_key: options.bloom_bits_per_key,
-            compression: options.compression,
-            compression_per_level: options.compression_per_level.clone(),
-            compaction_filter: options.compaction_filter.clone(),
-            prefix_extractor: options.prefix_extractor.clone(),
-            merge_operator: options.merge_operator.clone(),
-            listeners: options.listeners.clone(),
-            statistics: options.statistics.clone(),
-            rate_limiter: options.rate_limiter.clone(),
-            compaction_style: options.compaction_style,
-            fifo_compaction_options: options.fifo_compaction_options,
-            universal_compaction_options: options.universal_compaction_options,
-            evict_compaction_data_from_page_cache: options.evict_compaction_data_from_page_cache,
-            max_background_compactions: options.max_background_compactions,
-            partitioned_index: options.partitioned_index,
-            metadata_block_size: options.metadata_block_size,
-            cache_index_and_filter_blocks: options.cache_index_and_filter_blocks,
-        };
+        let compaction_opts = options.to_compaction_options();
 
         let compaction_lock = Arc::new(RwLock::new(()));
         let snapshot_registry = Arc::new(SnapshotRegistry::with_env(Arc::clone(&env)));
@@ -681,7 +615,7 @@ impl LarkEngine {
         }
 
         options.read_only = true;
-        let version_set = VersionSet::open_read_only(db_dir, &sst_dir, options.metadata_policy())?;
+        let version_set = VersionSet::open_read_only(&env, db_dir, &sst_dir, options.metadata_policy())?;
         let version = version_set.current();
         let mut latest_seq = version.last_seq;
 
@@ -690,13 +624,12 @@ impl LarkEngine {
             options.write_buffer_size,
             options.max_write_buffer_number,
         );
-        let memtable = Arc::new(MemTable::new(&memtable_config)?);
-        let mut wal_files = list_wal_files(&wal_dir)?;
-        let version_set = VersionSet::open_read_only_in(&env, db_dir, &sst_dir)?;
+        let version_set =
+            VersionSet::open_read_only(&env, db_dir, &sst_dir, options.metadata_policy())?;
         let version = version_set.current();
         let mut latest_seq = version.last_seq;
 
-        let memtable = Arc::new(MemTable::new());
+        let memtable = Arc::new(MemTable::new(&memtable_config)?);
         let mut wal_files = list_wal_files(&*env, &wal_dir)?;
         wal_files.sort();
         wal_files.retain(|path| should_replay_wal(path, version.min_wal_id));
@@ -1771,16 +1704,7 @@ impl LarkEngine {
     /// background worker, and `CompactInline` waits on whichever other
     /// foreground thread currently holds the input files it needs.
     fn wait_for_stall_signal(&self) {
-        let guard = self
-            .stall_signal
-            .lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _unused = self
-            .stall_signal
-            .cv
-            .wait_timeout(guard, Self::STALL_WAIT)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.stall_signal.wait(Self::STALL_WAIT);
     }
 
     /// Upper bound on compaction jobs one stalled write will perform on
@@ -1850,7 +1774,7 @@ impl LarkEngine {
     /// explicit flush and a close write memtables out the same way.
     pub(crate) fn flush_active_memtable(&self) -> std::io::Result<()> {
         self.ensure_writable()?;
-        self.flush_all_memtables()?;
+        self.drain_memtables(ActiveFlush::Always)?;
         self.refresh_stall_level();
         Ok(())
     }
@@ -2122,7 +2046,9 @@ impl LarkEngine {
     }
 
     fn flush_frozen_memtable(&self, old_wal: Wal) -> std::io::Result<()> {
-        let flush_start = std::time::Instant::now();
+        // Through the env: a target with no monotonic clock reports
+        // nothing measured rather than a fabricated duration.
+        let flush_start = self.env.now_micros();
         let memtable = match self.view.load().frozen.first() {
             Some(mt) => Arc::clone(mt),
             None => return Ok(()),
@@ -2132,7 +2058,7 @@ impl LarkEngine {
 
         if memtable.is_empty() && range_tombstones.is_empty() {
             self.retire_oldest_frozen();
-            let _ = Wal::remove(old_wal.path());
+            let _ = Wal::remove_in(&*self.env, old_wal.path());
             return Ok(());
         }
 
@@ -2174,7 +2100,7 @@ impl LarkEngine {
             Some(s) => s,
             None => {
                 self.retire_oldest_frozen();
-                let _ = Wal::remove(old_wal.path());
+                let _ = Wal::remove_in(&*self.env, old_wal.path());
                 let _ = std::fs::remove_file(&sst_path);
                 return Ok(());
             }
@@ -2191,6 +2117,7 @@ impl LarkEngine {
         }
 
         let reader = Arc::new(SsTableReader::open_with(
+            &self.env,
             &sst_path,
             file_id,
             self.options.metadata_policy(),
@@ -2216,7 +2143,7 @@ impl LarkEngine {
         // Retired only now: until the `AddFile` above is published, the
         // flushed data lives in this memtable alone.
         self.retire_oldest_frozen();
-        let _ = Wal::remove(old_wal.path());
+        let _ = Wal::remove_in(&*self.env, old_wal.path());
         self.compaction.lock().notify();
 
         // Publish flush statistics before the listener dispatch
@@ -2326,32 +2253,7 @@ impl LarkEngine {
         let pin_seq = self.oldest_live_seq();
 
         // 4. Run the level-by-level push-down.
-        let compaction_opts = compaction::CompactionOptions {
-            l0_compaction_trigger: self.options.l0_compaction_trigger,
-            level_base_bytes: self.options.level_base_bytes,
-            level_size_multiplier: self.options.level_size_multiplier,
-            target_file_size: self.options.target_file_size,
-            block_size: self.options.block_size,
-            bloom_bits_per_key: self.options.bloom_bits_per_key,
-            compression: self.options.compression,
-            compression_per_level: self.options.compression_per_level.clone(),
-            compaction_filter: self.options.compaction_filter.clone(),
-            prefix_extractor: self.options.prefix_extractor.clone(),
-            merge_operator: self.options.merge_operator.clone(),
-            listeners: self.options.listeners.clone(),
-            statistics: self.options.statistics.clone(),
-            rate_limiter: self.options.rate_limiter.clone(),
-            compaction_style: self.options.compaction_style,
-            fifo_compaction_options: self.options.fifo_compaction_options,
-            universal_compaction_options: self.options.universal_compaction_options,
-            evict_compaction_data_from_page_cache: self
-                .options
-                .evict_compaction_data_from_page_cache,
-            max_background_compactions: self.options.max_background_compactions,
-            partitioned_index: self.options.partitioned_index,
-            metadata_block_size: self.options.metadata_block_size,
-            cache_index_and_filter_blocks: self.options.cache_index_and_filter_blocks,
-        };
+        let compaction_opts = self.options.to_compaction_options();
         // Under FIFO compaction there is no level push-down; a
         // synchronous compact_range just flushes the memtable and
         // runs the FIFO picker so any pending files over the cap
@@ -2446,7 +2348,13 @@ impl LarkEngine {
             // top of the space, which `next_file_id` counts up from 1 and
             // never reaches.
             let cache_id = ingest_probe_file_id(source_idx);
-            let reader = SsTableReader::open(path, cache_id).map_err(|e| {
+            let reader = SsTableReader::open_with(
+                &self.env,
+                path,
+                cache_id,
+                self.options.metadata_policy(),
+            )
+            .map_err(|e| {
                 std::io::Error::new(e.kind(), format!("ingest: open {}: {e}", path.display()))
             })?;
             // Stream the source instead of materialising it: the
@@ -2658,8 +2566,9 @@ impl LarkEngine {
             }
         };
 
-        let file_size = std::fs::metadata(&dest_path)?.len();
+        let file_size = self.env.metadata(&dest_path)?.len;
         let reader = Arc::new(SsTableReader::open_with(
+            &self.env,
             &dest_path,
             file_id,
             self.options.metadata_policy(),
@@ -3095,7 +3004,7 @@ impl LarkEngine {
             return Ok(());
         }
 
-        self.flush_all_memtables()?;
+        self.drain_memtables(ActiveFlush::Always)?;
 
         self.active_wal
             .lock()

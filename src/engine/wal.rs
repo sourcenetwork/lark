@@ -164,7 +164,7 @@ pub(crate) enum WalEntry {
 
 impl Wal {
     /// Create a new WAL file at the given path.
-    pub(crate) fn create(path: &Path) -> io::Result<Self> {
+    pub(crate) fn create_in(env: &Arc<dyn Env>, path: &Path) -> io::Result<Self> {
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -276,7 +276,8 @@ impl Wal {
     /// concern that no `fdatasync` on the file itself can cover, so the
     /// parent directory is fsynced once per WAL file on first sync.
     pub(crate) fn sync_data(&mut self) -> io::Result<()> {
-        self.sync_with_parent_sync(durability::sync_parent_dir)
+        let env = Arc::clone(&self.env);
+        self.sync_with_parent_sync(move |p| crate::env::sync_parent_dir(&*env, p))
     }
 
     fn sync_with_parent_sync(

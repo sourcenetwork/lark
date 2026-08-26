@@ -14,9 +14,7 @@ use parking_lot::RwLock;
 use super::sstable::{
     LiveSst, MetadataPolicy, SsTableMeta, SsTableReader, sst_filename, table_carries_data,
 };
-use super::{checksum, durability};
 use super::checksum;
-use super::sstable::{sst_filename, LiveSst, SsTableMeta, SsTableReader};
 
 /// Maximum number of levels in the LSM tree.
 pub(crate) const MAX_LEVELS: usize = 7;
@@ -299,7 +297,6 @@ pub(crate) struct VersionSet {
     /// Bytes the manifest holds on disk, tracked rather than stat'ed so
     /// the rewrite check costs nothing on the common path.
     manifest_bytes: u64,
-    manifest_writer: Option<BufWriter<File>>,
     manifest_writer: Option<BufferedWriter>,
     env: Arc<dyn Env>,
 }
@@ -837,7 +834,7 @@ impl VersionSet {
             for meta in files {
                 let path = sst_dir.join(sst_filename(meta.file_id));
                 let reader = Arc::new(
-                    SsTableReader::open_with(&path, meta.file_id, policy).map_err(|e| {
+                    SsTableReader::open_with(env, &path, meta.file_id, policy).map_err(|e| {
                         std::io::Error::new(e.kind(), format!("open {}: {e}", path.display()))
                     })?,
                 );

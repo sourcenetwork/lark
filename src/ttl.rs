@@ -135,7 +135,7 @@ impl DbWithTtl {
         let Some(decoded) = decode_ttl_suffix(stamped.as_slice()) else {
             return Ok(None);
         };
-        let horizon = self.expiry_horizon();
+        let horizon = self.expiry_horizon()?;
         if horizon > 0 && decoded.timestamp < horizon {
             return Ok(None);
         }

@@ -71,18 +71,16 @@ use std::path::{Path, PathBuf};
 use std::fs;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+
 use std::sync::{Arc, OnceLock};
 
 use std::ops::ControlFlow;
 
-use parking_lot::Mutex;
 
 use super::block::{Block, BlockBuilder, BlockHandle, RESTART_INTERVAL, decode_entry_at};
-use super::block::{decode_entry_at, Block, BlockBuilder, BlockHandle, RESTART_INTERVAL};
 use super::block_cache::BlockCache;
 use super::bloom::{BloomFilterBuilder, encode_bloom_block};
 use super::checksum;
-use super::durability;
 use super::filter_block::FilterBlock;
 use super::index_block::IndexBlock;
 use super::internal_key::{
@@ -274,22 +272,20 @@ impl Footer {
 /// Read the trailing footer of an SSTable. The magic is the file's last
 /// 8 bytes, so the footer's length is known before it is parsed and a
 /// legacy table needs no separate code path.
-fn read_footer(file: &mut File, file_size: u64) -> io::Result<Footer> {
+fn read_footer(file: &dyn ReadFile, file_size: u64) -> io::Result<Footer> {
     if file_size < 8 {
         return Err(invalid_data(
             "SSTable file too small to carry a magic number",
         ));
     }
-    file.seek(SeekFrom::End(-8))?;
     let mut magic_buf = [0u8; 8];
-    file.read_exact(&mut magic_buf)?;
+    file.read_exact_at(file_size - 8, &mut magic_buf)?;
     let footer_size = Footer::size_for_magic(u64::from_le_bytes(magic_buf))?;
     if file_size < footer_size as u64 {
         return Err(invalid_data("SSTable file too small for its footer"));
     }
-    file.seek(SeekFrom::Start(file_size - footer_size as u64))?;
     let mut footer_buf = vec![0u8; footer_size];
-    file.read_exact(&mut footer_buf)?;
+    file.read_exact_at(file_size - footer_size as u64, &mut footer_buf)?;
     Footer::decode(&footer_buf)
 }
 
@@ -669,7 +665,7 @@ fn validate_footer_regions(footer: &Footer, data_end: u64) -> io::Result<()> {
 /// advance `offset` past both. The reader half is `verify_meta_region`;
 /// the two must agree on the trailer or no table opens.
 fn write_meta_region(
-    writer: &mut BufWriter<File>,
+    writer: &mut BufferedWriter,
     offset: &mut u64,
     payload: &[u8],
     kind: u8,
@@ -1100,13 +1096,12 @@ impl SsTableWriter {
 /// [`SsTableReader::pinned_metadata_bytes`] reports exactly what this
 /// reader is holding outside the cache budget.
 pub(crate) struct SsTableReader {
-    file: Mutex<File>,
+    /// Positional reads, so concurrent readers need no lock between them.
+    file: Box<dyn ReadFile>,
     /// First byte past the region area: the file size less the footer.
     /// Every region bound is checked against this, so a damaged offset
     /// can never send a read into the footer or past the file.
     data_end: u64,
-    file: Box<dyn ReadFile>,
-    file_size: u64,
     pub(crate) file_id: u64,
     /// The flat index of a V1 file, or the top-level index of a V2
     /// file. A V2 top-level index is always `Pinned`.
@@ -1178,8 +1173,14 @@ impl SsTableReader {
     /// This is [`MetadataPolicy::Pinned`]: the same residency the
     /// reader has always had. Callers that want the block cache to
     /// bound index and filter bytes use [`SsTableReader::open_with`].
+    #[cfg(test)]
     pub(crate) fn open(path: &Path, file_id: u64) -> io::Result<Self> {
-        Self::open_with(path, file_id, MetadataPolicy::Pinned)
+        Self::open_with(
+            &crate::env::std_env(),
+            path,
+            file_id,
+            MetadataPolicy::Pinned,
+        )
     }
 
     /// Open an SSTable file under an explicit metadata policy.
@@ -1196,10 +1197,10 @@ impl SsTableReader {
         file_id: u64,
         policy: MetadataPolicy,
     ) -> io::Result<Self> {
-        let mut file = env.open_read(path)?;
+        let file = env.open_read(path)?;
         let file_size = file.len()?;
 
-        let footer = read_footer(&mut file, file_size)?;
+        let footer = read_footer(&*file, file_size)?;
         let data_end = file_size - footer.size() as u64;
         validate_footer_regions(&footer, data_end)?;
         let meta_checksummed = footer.checksummed();
@@ -1209,7 +1210,7 @@ impl SsTableReader {
             size: footer.bloom_size,
         };
         let filter_region = read_file_region(
-            &mut file,
+            &*file,
             filter_handle.offset,
             filter_handle.size,
             data_end,
@@ -1232,7 +1233,7 @@ impl SsTableReader {
             size: footer.index_size,
         };
         let mut index_region = read_file_region(
-            &mut file,
+            &*file,
             index_handle.offset,
             index_handle.size,
             data_end,
@@ -1254,7 +1255,7 @@ impl SsTableReader {
             Vec::new()
         } else {
             let rt_region = read_file_region(
-                &mut file,
+            &*file,
                 footer.range_tombstone_offset,
                 footer.range_tombstone_size,
                 data_end,
@@ -1278,7 +1279,7 @@ impl SsTableReader {
         };
 
         Ok(Self {
-            file: Mutex::new(file),
+            file,
             data_end,
             file_id,
             index,
@@ -1378,8 +1379,7 @@ impl SsTableReader {
         name: &'static str,
     ) -> io::Result<Vec<u8>> {
         let mut region = {
-            let mut file = self.file.lock();
-            read_file_region(&mut file, handle.offset, handle.size, self.data_end, name)?
+                read_file_region(&*self.file, handle.offset, handle.size, self.data_end, name)?
         };
         let payload_len =
             verify_meta_region(&region, kind, self.meta_checksummed, name)?.len();
@@ -2014,24 +2014,22 @@ impl SsTableReader {
 /// `Err` means the file is not a readable SSTable at all, which the
 /// caller must not read as "holds nothing": a file whose footer will not
 /// parse cannot be proved empty.
-pub(crate) fn table_carries_data(path: &Path) -> io::Result<bool> {
-    let mut file = File::open(path)?;
-    let file_size = file.metadata()?.len();
+pub(crate) fn table_carries_data(env: &dyn Env, path: &Path) -> io::Result<bool> {
+    let file = env.open_read(path)?;
+    let file_size = file.len()?;
     if file_size < 8 {
         return Err(invalid_data(
             "SSTable file too small to carry a magic number",
         ));
     }
-    file.seek(SeekFrom::End(-8))?;
     let mut magic_buf = [0u8; 8];
-    file.read_exact(&mut magic_buf)?;
+    file.read_exact_at(file_size - 8, &mut magic_buf)?;
     let footer_size = Footer::size_for_magic(u64::from_le_bytes(magic_buf))?;
     let data_end = file_size
         .checked_sub(footer_size as u64)
         .ok_or_else(|| invalid_data("SSTable file too small for its footer"))?;
-    file.seek(SeekFrom::Start(data_end))?;
     let mut footer_buf = vec![0u8; footer_size];
-    file.read_exact(&mut footer_buf)?;
+    file.read_exact_at(data_end, &mut footer_buf)?;
     let footer = Footer::decode(&footer_buf)?;
     validate_footer_regions(&footer, data_end)?;
     Ok(footer.num_entries > 0 || footer.range_tombstone_size > 0)
