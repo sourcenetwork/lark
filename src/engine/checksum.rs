@@ -17,6 +17,7 @@ const SST_BLOCK_DOMAIN: &[u8] = b"lark/sst-block/v2";
 const SST_META_DOMAIN: &[u8] = b"lark/sst-meta/v1";
 const BACKUP_MANIFEST_DOMAIN: &[u8] = b"lark/backup-manifest/v2";
 const BACKUP_SHARED_FILE_DOMAIN: &[u8] = b"lark/backup-shared-file/v2";
+const OPFS_SLOT_HEADER_DOMAIN: &[u8] = b"lark/opfs-slot-header/v1";
 
 pub(crate) fn wal_record(len: u32, record_type: u8, data: &[u8]) -> u32 {
     let len = len.to_le_bytes();
@@ -66,6 +67,16 @@ pub(crate) fn sst_footer(fields: &[u8], magic: u64) -> u64 {
         SST_META_DOMAIN,
         &[&[META_KIND_FOOTER], fields, &magic.to_le_bytes()],
     )
+}
+
+/// Checksum of an OPFS slot header: the fixed-width fields followed by
+/// the logical path they describe.
+#[cfg_attr(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    allow(dead_code)
+)]
+pub(crate) fn opfs_slot_header(fixed: &[u8], path: &[u8]) -> u32 {
+    u32_parts(OPFS_SLOT_HEADER_DOMAIN, &[fixed, path])
 }
 
 pub(crate) fn backup_manifest(body: &[u8]) -> u64 {

@@ -78,6 +78,7 @@
 //!   view (`Transaction::iter` is not implemented; callers can
 //!   commit then iterate, or use point lookups).
 
+use crate::portability::{AtomicU64, Ordering};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
@@ -737,7 +738,13 @@ impl LockManager {
     /// Acquire an exclusive lock on `key` for `tx_id`. Blocks up
     /// to `timeout`. Returns `Err(())` on timeout.
     fn acquire(&self, key: &[u8], tx_id: u64, timeout: Duration) -> std::result::Result<(), ()> {
-        let deadline = Instant::now() + timeout;
+        // Microseconds from the platform clock. `None` means this
+        // platform cannot measure a timeout at all, which is the same
+        // single-threaded platform on which no other transaction can
+        // be holding the lock, so the wait simply is not bounded by a
+        // deadline there.
+        let deadline =
+            crate::env::platform_micros().map(|now| now.saturating_add(timeout.as_micros() as u64));
         let mut guard = self.locks.lock();
         loop {
             match guard.get(key) {
@@ -747,11 +754,15 @@ impl LockManager {
                     return Ok(());
                 }
                 Some(_) => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Err(());
-                    }
-                    let remaining = deadline - now;
+                    let remaining = match (deadline, crate::env::platform_micros()) {
+                        (Some(deadline), Some(now)) => {
+                            if now >= deadline {
+                                return Err(());
+                            }
+                            Duration::from_micros(deadline - now)
+                        }
+                        _ => timeout,
+                    };
                     let result = self.cvar.wait_for(&mut guard, remaining);
                     if result.timed_out() && guard.get(key).is_some_and(|&h| h != tx_id) {
                         return Err(());

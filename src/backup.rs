@@ -26,12 +26,17 @@
 //! target directory and write a new MANIFEST reflecting the
 //! captured version.
 
-use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
 
-use crate::engine::{CheckpointSnapshot, checksum, durability};
+// The module's own tests inspect and corrupt the backup directory
+// directly, which is the one thing that has to bypass the environment.
+#[cfg(test)]
+use std::fs;
+
+use crate::engine::{checksum, CheckpointSnapshot};
+use crate::env::{Env, ReadFileCursor, WriteMode};
 use crate::{Db, Error, Result};
 
 /// Opaque identifier for a single backup generation. Monotonically
@@ -67,6 +72,7 @@ pub struct BackupEngine {
     root: PathBuf,
     meta_dir: PathBuf,
     shared_dir: PathBuf,
+    env: Arc<dyn Env>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,21 +106,31 @@ const BACKUP_MANIFEST_VERSION: u32 = 2;
 const BACKUP_MANIFEST_VERSION_LEGACY: u32 = 1;
 
 impl BackupEngine {
-    /// Open or create a backup repository at `backup_dir`.
+    /// Open or create a backup repository at `backup_dir` on the
+    /// standard filesystem.
     pub fn open<P: AsRef<Path>>(backup_dir: P) -> Result<Self> {
+        Self::open_with_env(backup_dir, crate::env::std_env())
+    }
+
+    /// Open or create a backup repository at `backup_dir` on `env`.
+    ///
+    /// The repository does not have to live on the same environment
+    /// as the database it backs up: bytes are copied, never linked.
+    pub fn open_with_env<P: AsRef<Path>>(backup_dir: P, env: Arc<dyn Env>) -> Result<Self> {
         let root = backup_dir.as_ref().to_path_buf();
         let meta_dir = root.join("meta");
         let shared_dir = root.join("shared");
-        fs::create_dir_all(&meta_dir).map_err(Error::from)?;
-        fs::create_dir_all(&shared_dir).map_err(Error::from)?;
-        durability::sync_parent_dir(&root).map_err(Error::from)?;
-        durability::sync_dir(&root).map_err(Error::from)?;
-        durability::sync_dir(&meta_dir).map_err(Error::from)?;
-        durability::sync_dir(&shared_dir).map_err(Error::from)?;
+        env.create_dir_all(&meta_dir).map_err(Error::from)?;
+        env.create_dir_all(&shared_dir).map_err(Error::from)?;
+        crate::env::sync_parent_dir(&*env, &root).map_err(Error::from)?;
+        env.sync_dir(&root).map_err(Error::from)?;
+        env.sync_dir(&meta_dir).map_err(Error::from)?;
+        env.sync_dir(&shared_dir).map_err(Error::from)?;
         Ok(Self {
             root,
             meta_dir,
             shared_dir,
+            env,
         })
     }
 
@@ -127,10 +143,12 @@ impl BackupEngine {
     /// already present in the shared pool.
     pub fn create_backup(&mut self, db: &Db) -> Result<BackupId> {
         let id = BackupId(self.next_backup_id()?);
-        let created_at_unix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        // A backup records when it was taken. Without a wall clock
+        // there is no honest value to write, so the call fails here
+        // rather than stamping every backup with the epoch.
+        let created_at_unix = self.env.unix_secs().ok_or_else(|| {
+            Error::invalid_argument("creating a backup needs a wall clock, and this Env has none")
+        })?;
 
         // Take the snapshot in a limited scope so its held
         // compaction lock is released before we touch the backup
@@ -146,10 +164,10 @@ impl BackupEngine {
                     let src = snapshot
                         .sst_dir
                         .join(CheckpointSnapshot::sst_filename(file.meta.file_id));
-                    let hash = hash_file(&src).map_err(Error::from)?;
+                    let hash = hash_file(&*self.env, &src).map_err(Error::from)?;
                     let shared_name = shared_filename(hash);
                     let shared_path = self.shared_dir.join(&shared_name);
-                    ensure_shared_file(&src, &shared_path, hash, file.meta.file_size)
+                    ensure_shared_file(&*self.env, &src, &shared_path, hash, file.meta.file_size)
                         .map_err(Error::from)?;
                     files.push(BackupFileEntry {
                         level: level_idx as u32,
@@ -178,7 +196,7 @@ impl BackupEngine {
         };
         let bytes = encode_manifest(&manifest);
         let manifest_path = self.meta_dir.join(backup_filename(id.0));
-        atomic_write(&manifest_path, &bytes).map_err(Error::from)?;
+        atomic_write(&*self.env, &manifest_path, &bytes).map_err(Error::from)?;
         Ok(id)
     }
 
@@ -186,17 +204,19 @@ impl BackupEngine {
     /// by backup id (creation order).
     pub fn list_backups(&self) -> Vec<BackupInfo> {
         let mut out = Vec::new();
-        let Ok(entries) = fs::read_dir(&self.meta_dir) else {
+        let Ok(entries) = self.env.read_dir(&self.meta_dir) else {
             return out;
         };
         let mut ids: Vec<u64> = entries
-            .filter_map(|e| e.ok())
-            .filter_map(|e| parse_backup_id(&e.file_name().to_string_lossy()))
+            .iter()
+            .filter_map(|e| parse_backup_id(&e.file_name()))
             .collect();
         ids.sort_unstable();
         for id in ids {
             let path = self.meta_dir.join(backup_filename(id));
-            let Ok(bytes) = fs::read(&path) else { continue };
+            let Ok(bytes) = self.env.read(&path) else {
+                continue;
+            };
             let Ok(manifest) = decode_manifest(&bytes) else {
                 continue;
             };
@@ -220,23 +240,23 @@ impl BackupEngine {
         let target_dir = target_dir.as_ref();
         let target_sst = target_dir.join("sst");
         let target_wal = target_dir.join("wal");
-        fs::create_dir_all(&target_sst).map_err(Error::from)?;
-        fs::create_dir_all(&target_wal).map_err(Error::from)?;
-        durability::sync_parent_dir(target_dir).map_err(Error::from)?;
-        durability::sync_dir(target_dir).map_err(Error::from)?;
-        durability::sync_dir(&target_sst).map_err(Error::from)?;
-        durability::sync_dir(&target_wal).map_err(Error::from)?;
+        self.env.create_dir_all(&target_sst).map_err(Error::from)?;
+        self.env.create_dir_all(&target_wal).map_err(Error::from)?;
+        crate::env::sync_parent_dir(&*self.env, target_dir).map_err(Error::from)?;
+        self.env.sync_dir(target_dir).map_err(Error::from)?;
+        self.env.sync_dir(&target_sst).map_err(Error::from)?;
+        self.env.sync_dir(&target_wal).map_err(Error::from)?;
 
         for f in &manifest.files {
             let src = self.shared_dir.join(shared_filename(f.hash));
-            verify_shared_file(&src, f.hash, f.file_size).map_err(Error::from)?;
+            verify_shared_file(&*self.env, &src, f.hash, f.file_size).map_err(Error::from)?;
             let dst = target_sst.join(CheckpointSnapshot::sst_filename(f.file_id));
-            copy_file_atomic(&src, &dst).map_err(Error::from)?;
+            copy_file_atomic(&*self.env, &src, &dst).map_err(Error::from)?;
         }
 
         let manifest_bytes = encode_engine_manifest(&manifest);
         let manifest_path = target_dir.join("MANIFEST");
-        atomic_write(&manifest_path, &manifest_bytes).map_err(Error::from)?;
+        atomic_write(&*self.env, &manifest_path, &manifest_bytes).map_err(Error::from)?;
         Ok(())
     }
 
@@ -244,11 +264,11 @@ impl BackupEngine {
     /// to zero are removed from disk.
     pub fn delete_backup(&mut self, backup_id: BackupId) -> Result<()> {
         let path = self.meta_dir.join(backup_filename(backup_id.0));
-        if !path.exists() {
+        if !self.env.exists(&path) {
             return Ok(());
         }
         let manifest = self.read_manifest(backup_id)?;
-        durability::remove_file_and_sync_parent(&path).map_err(Error::from)?;
+        crate::env::remove_file_and_sync_parent(&*self.env, &path).map_err(Error::from)?;
         self.gc_shared(&manifest)?;
         Ok(())
     }
@@ -268,26 +288,25 @@ impl BackupEngine {
 
     fn gc_shared(&self, removed: &BackupManifest) -> Result<()> {
         let mut still_referenced = std::collections::HashSet::new();
-        let Ok(entries) = fs::read_dir(&self.meta_dir) else {
+        let Ok(entries) = self.env.read_dir(&self.meta_dir) else {
             return Ok(());
         };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if parse_backup_id(&name.to_string_lossy()).is_none() {
+        for entry in entries {
+            if parse_backup_id(&entry.file_name()).is_none() {
                 continue;
             }
-            if let Ok(bytes) = fs::read(entry.path())
-                && let Ok(m) = decode_manifest(&bytes)
-            {
-                for f in m.files {
-                    still_referenced.insert(f.hash);
+            if let Ok(bytes) = self.env.read(&entry.path) {
+                if let Ok(m) = decode_manifest(&bytes) {
+                    for f in m.files {
+                        still_referenced.insert(f.hash);
+                    }
                 }
             }
         }
         for f in &removed.files {
             if !still_referenced.contains(&f.hash) {
                 let p = self.shared_dir.join(shared_filename(f.hash));
-                match durability::remove_file_and_sync_parent(&p) {
+                match crate::env::remove_file_and_sync_parent(&*self.env, &p) {
                     Ok(()) => {}
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                     Err(e) => return Err(Error::from(e)),
@@ -299,66 +318,72 @@ impl BackupEngine {
 
     fn read_manifest(&self, id: BackupId) -> Result<BackupManifest> {
         let path = self.meta_dir.join(backup_filename(id.0));
-        let bytes = fs::read(&path).map_err(Error::from)?;
+        let bytes = self.env.read(&path).map_err(Error::from)?;
         decode_manifest(&bytes).map_err(Error::from)
     }
 
     fn next_backup_id(&self) -> Result<u64> {
         let mut max_id = 0u64;
-        for entry in fs::read_dir(&self.meta_dir).map_err(Error::from)? {
-            let entry = entry.map_err(Error::from)?;
-            if let Some(id) = parse_backup_id(&entry.file_name().to_string_lossy())
-                && id > max_id
-            {
-                max_id = id;
+        for entry in self.env.read_dir(&self.meta_dir).map_err(Error::from)? {
+            if let Some(id) = parse_backup_id(&entry.file_name()) {
+                if id > max_id {
+                    max_id = id;
+                }
             }
         }
         Ok(max_id + 1)
     }
 }
 
-fn hash_file(path: &Path) -> io::Result<u128> {
-    let mut f = File::open(path)?;
-    checksum::backup_shared_file(&mut f)
+fn hash_file(env: &dyn Env, path: &Path) -> io::Result<u128> {
+    let file = env.open_read(path)?;
+    let mut cursor = ReadFileCursor::new(&*file)?;
+    checksum::backup_shared_file(&mut cursor)
 }
 
 fn ensure_shared_file(
+    env: &dyn Env,
     src: &Path,
     dst: &Path,
     expected_hash: u128,
     expected_size: u64,
 ) -> io::Result<()> {
-    match verify_shared_file(dst, expected_hash, expected_size) {
+    match verify_shared_file(env, dst, expected_hash, expected_size) {
         Ok(()) => return Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) if e.kind() == io::ErrorKind::InvalidData => {
-            if dst.is_dir() {
+            if env.is_dir(dst) {
                 return Err(e);
             }
         }
         Err(e) => return Err(e),
     }
 
-    copy_file_atomic(src, dst)?;
-    verify_shared_file(dst, expected_hash, expected_size)
+    copy_file_atomic(env, src, dst)?;
+    verify_shared_file(env, dst, expected_hash, expected_size)
 }
 
-fn verify_shared_file(path: &Path, expected_hash: u128, expected_size: u64) -> io::Result<()> {
-    let meta = fs::metadata(path)?;
-    if !meta.is_file() {
+fn verify_shared_file(
+    env: &dyn Env,
+    path: &Path,
+    expected_hash: u128,
+    expected_size: u64,
+) -> io::Result<()> {
+    let meta = env.metadata(path)?;
+    if meta.is_dir {
         return Err(invalid_data(format!(
             "backup shared object {} is not a regular file",
             path.display()
         )));
     }
-    if meta.len() != expected_size {
+    if meta.len != expected_size {
         return Err(invalid_data(format!(
             "backup shared object {} has size {}, expected {expected_size}",
             path.display(),
-            meta.len()
+            meta.len
         )));
     }
-    let actual_hash = hash_file(path)?;
+    let actual_hash = hash_file(env, path)?;
     if actual_hash != expected_hash {
         return Err(invalid_data(format!(
             "backup shared object {} content id mismatch",
@@ -368,28 +393,38 @@ fn verify_shared_file(path: &Path, expected_hash: u128, expected_size: u64) -> i
     Ok(())
 }
 
-fn copy_file_atomic(src: &Path, dst: &Path) -> io::Result<()> {
+fn copy_file_atomic(env: &dyn Env, src: &Path, dst: &Path) -> io::Result<()> {
     let tmp = dst.with_extension("tmp");
     {
-        let mut input = File::open(src)?;
-        let mut output = File::create(&tmp)?;
-        io::copy(&mut input, &mut output)?;
+        let input = env.open_read(src)?;
+        let mut output = env.open_write(&tmp, WriteMode::Truncate)?;
+        // A fixed 64 KiB window, so a multi-gigabyte SSTable costs one
+        // buffer rather than its own size in memory.
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut offset = 0u64;
+        let len = input.len()?;
+        while offset < len {
+            let want = (len - offset).min(buf.len() as u64) as usize;
+            input.read_exact_at(offset, &mut buf[..want])?;
+            output.write_all(&buf[..want])?;
+            offset += want as u64;
+        }
         output.sync_all()?;
     }
-    fs::rename(&tmp, dst)?;
-    durability::sync_parent_dir(dst)?;
+    env.rename(&tmp, dst)?;
+    crate::env::sync_parent_dir(env, dst)?;
     Ok(())
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+fn atomic_write(env: &dyn Env, path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     {
-        let mut f = File::create(&tmp)?;
+        let mut f = env.open_write(&tmp, WriteMode::Truncate)?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }
-    fs::rename(&tmp, path)?;
-    durability::sync_parent_dir(path)?;
+    env.rename(&tmp, path)?;
+    crate::env::sync_parent_dir(env, path)?;
     Ok(())
 }
 

@@ -26,11 +26,10 @@
 //! parallel with [`Checkpoint::create`] cannot race a file unlink or
 //! tear the checkpoint.
 
-use std::fs::{self, File};
-use std::io::{Read, Write};
 use std::path::Path;
 
 use crate::engine::CheckpointSnapshot;
+use crate::env::{Env, WriteMode};
 use crate::{Db, Error, Result};
 
 /// A handle to a [`Db`] prepared for checkpointing. The handle itself
@@ -73,10 +72,11 @@ impl<'db> Checkpoint<'db> {
         let target_sst = target_dir.join("sst");
         let target_wal = target_dir.join("wal");
 
-        fs::create_dir_all(&target_sst).map_err(Error::from)?;
-        fs::create_dir_all(&target_wal).map_err(Error::from)?;
+        let env = self.db.engine().env();
+        env.create_dir_all(&target_sst).map_err(Error::from)?;
+        env.create_dir_all(&target_wal).map_err(Error::from)?;
 
-        if target_sst.read_dir().map_err(Error::from)?.next().is_some() {
+        if !env.read_dir(&target_sst).map_err(Error::from)?.is_empty() {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 "checkpoint target sst directory is not empty",
@@ -97,12 +97,22 @@ impl<'db> Checkpoint<'db> {
                 let name = CheckpointSnapshot::sst_filename(file.meta.file_id);
                 let src = snapshot.sst_dir.join(&name);
                 let dst = target_sst.join(&name);
-                fs::hard_link(&src, &dst).map_err(Error::from)?;
+                // An environment without hard links copies the bytes
+                // instead, which is slower but produces the same
+                // checkpoint. `Capabilities::hard_link` is what says
+                // which one happened.
+                if env.capabilities().hard_link {
+                    env.hard_link(&src, &dst).map_err(Error::from)?;
+                } else {
+                    let len = env.metadata(&src).map_err(Error::from)?.len;
+                    copy_truncated(&**env, &src, &dst, len).map_err(Error::from)?;
+                }
             }
         }
 
         let target_manifest = target_dir.join("MANIFEST");
         copy_truncated(
+            &**env,
             &snapshot.manifest_path,
             &target_manifest,
             snapshot.manifest_len,
@@ -116,19 +126,19 @@ impl<'db> Checkpoint<'db> {
 /// Copy exactly `len` bytes from `src` to `dst`, creating `dst`
 /// anew. Used to stage a point-in-time manifest snapshot without
 /// picking up `AddFile` records appended by concurrent flushes.
-fn copy_truncated(src: &Path, dst: &Path, len: u64) -> std::io::Result<()> {
-    let mut reader = File::open(src)?;
-    let mut writer = File::create(dst)?;
-    let mut remaining = len;
+fn copy_truncated(env: &dyn Env, src: &Path, dst: &Path, len: u64) -> std::io::Result<()> {
+    let reader = env.open_read(src)?;
+    let mut writer = env.open_write(dst, WriteMode::Truncate)?;
+    // A fixed 16 KiB window, so copying a multi-gigabyte SSTable
+    // costs one buffer rather than its own size in memory.
     let mut buf = [0u8; 16 * 1024];
-    while remaining > 0 {
-        let want = remaining.min(buf.len() as u64) as usize;
-        let n = reader.read(&mut buf[..want])?;
-        if n == 0 {
-            break;
-        }
-        writer.write_all(&buf[..n])?;
-        remaining -= n as u64;
+    let available = reader.len()?.min(len);
+    let mut offset = 0u64;
+    while offset < available {
+        let want = (available - offset).min(buf.len() as u64) as usize;
+        reader.read_exact_at(offset, &mut buf[..want])?;
+        writer.write_all(&buf[..want])?;
+        offset += want as u64;
     }
     writer.sync_all()?;
     Ok(())

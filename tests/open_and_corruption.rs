@@ -6,6 +6,11 @@
 //! allocation, never an endless iterator, and never a silently empty
 //! database when the tables are still on disk.
 
+// Native-only. wasm-pack builds every test target for wasm32, and these use
+// threads, the filesystem or proptest, none of which exist there. The browser
+// suite lives in tests/wasm_opfs*.rs.
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};

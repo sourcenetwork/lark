@@ -49,12 +49,13 @@ mod backup;
 mod checkpoint;
 mod column_family;
 mod engine;
+pub mod env;
 mod error;
 mod event_listener;
 mod iter;
 mod options;
-mod os_hint;
 mod perf_context;
+mod portability;
 mod rate_limiter;
 mod slice;
 mod sst_file_writer;
@@ -66,6 +67,9 @@ mod ttl;
 pub use backup::{BackupEngine, BackupId, BackupInfo};
 pub use checkpoint::Checkpoint;
 pub use column_family::{ColumnFamilyHandle, DEFAULT_CF_NAME};
+#[cfg(target_os = "wasi")]
+pub use env::WasiEnv;
+pub use env::{Capabilities, Env, MemEnv, StdEnv};
 pub use error::Error;
 pub use event_listener::{
     BackgroundErrorReason, CompactionJobInfo, EventListener, ExternalFileIngestionInfo,
@@ -75,9 +79,10 @@ pub use event_listener::{
 pub use iter::Iter;
 pub use options::{
     ArenaProfile, CompactionDecision, CompactionFilter, CompactionStyle, CompressionType,
-    DEFAULT_MAX_KEY_SIZE, DEFAULT_MAX_VALUE_SIZE, DurabilityMode, FifoCompactionOptions,
-    FixedLengthPrefix, MAX_BLOCK_CACHE_SHARD_BITS, MAX_BLOOM_BITS_PER_KEY, MergeOperator, Options,
-    PrefixExtractor, UniversalCompactionOptions, WriteOptions,
+    DEFAULT_MAX_BACKGROUND_COMPACTIONS, DEFAULT_MAX_KEY_SIZE, DEFAULT_MAX_VALUE_SIZE,
+    DurabilityMode, FifoCompactionOptions, FixedLengthPrefix, MAX_BLOCK_CACHE_SHARD_BITS,
+    MAX_BLOOM_BITS_PER_KEY, MergeOperator, Options, PrefixExtractor,
+    UniversalCompactionOptions, WriteOptions,
 };
 pub use perf_context::{PerfContext, PerfContextSnapshot, PerfLevel};
 pub use rate_limiter::{Priority, RateLimiter, TokenBucketRateLimiter};
@@ -1061,6 +1066,52 @@ impl Db {
             .map_err(Error::from)
     }
 
+    /// Rotate the active memtable and write it to a level-0 SSTable,
+    /// on this thread, before returning.
+    ///
+    /// A no-op when the active memtable holds no entries and no range
+    /// tombstones. This is the same flush a full memtable triggers on
+    /// the write path, made explicit so a caller can decide when to
+    /// pay for it. Memtable flushes are written by the calling thread
+    /// in every mode, so this behaves identically with and without
+    /// background compaction workers.
+    ///
+    /// Flushing does not compact: the new file lands in L0 and stays
+    /// there until a compaction job merges it. See [`Db::compact_step`]
+    /// and [`Db::compact_range`].
+    pub fn flush(&self) -> Result<()> {
+        self.ensure_writable()?;
+        self.engine.flush_active_memtable().map_err(Error::from)
+    }
+
+    /// Perform at most one pending compaction job on this thread.
+    ///
+    /// Returns `Ok(true)` when a job ran. Callers running with
+    /// [`Options::max_background_compactions`] set to `0` use this to
+    /// keep the level structure healthy outside the write path; a
+    /// writer that would otherwise stall already performs the same job
+    /// itself, so this is an optimization of write latency rather than
+    /// a requirement for correctness.
+    ///
+    /// `Ok(false)` means this call did no work, for either of two
+    /// reasons: nothing was over its compaction trigger, or another
+    /// thread currently holds the files that would be compacted. A
+    /// loop of the form `while db.compact_step()? {}` therefore
+    /// terminates, and terminates having compacted everything this
+    /// thread could reach. Every compaction style lark offers reduces
+    /// the file count it merges, so the loop cannot be fed forever by
+    /// its own output.
+    ///
+    /// Safe to call with background workers running: the job is picked
+    /// under the same engine-wide compaction lock and the same
+    /// in-progress file set the workers use, so the two can never pick
+    /// overlapping inputs.
+    pub fn compact_step(&self) -> Result<bool> {
+        self.ensure_writable()?;
+        let outcome = self.engine.run_one_compaction_pass().map_err(Error::from)?;
+        Ok(outcome == engine::compaction::CompactionOutcome::DidWork)
+    }
+
     /// Return the string value of a named property, or `None` if
     /// `name` isn't recognized. See the module-level docs for the
     /// full list of supported properties; the most useful ones
@@ -1079,6 +1130,20 @@ impl Db {
                 self.get_int_property(name).map(|v| v.to_string())
             }
         }
+    }
+
+    /// What the environment this database was opened on can
+    /// actually do.
+    ///
+    /// Read this when a durability or isolation guarantee matters.
+    /// lark keeps working on a host without directory fsync, without
+    /// hard links, or without cross-process locking, but the
+    /// guarantee is narrower there, and this is where it says so
+    /// instead of the database quietly claiming more than it
+    /// provides. On the default [`crate::env::StdEnv`] every flag is
+    /// `true` on Linux, macOS, and Windows.
+    pub fn capabilities(&self) -> env::Capabilities {
+        self.engine.capabilities()
     }
 
     /// Return the integer value of a named property, or `None` if

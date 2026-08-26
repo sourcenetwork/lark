@@ -15,6 +15,23 @@ pub const MAX_BLOCK_CACHE_SHARD_BITS: u32 = 8;
 /// because the hash count is already capped internally.
 pub const MAX_BLOOM_BITS_PER_KEY: usize = 64;
 
+/// Default value of [`Options::max_background_compactions`]: one
+/// background worker, or none on a target that has no threads.
+///
+/// A wasm module built without the `atomics` target feature has exactly
+/// one thread and `std::thread::spawn` there reports
+/// [`std::io::ErrorKind::Unsupported`], so `1` could never open. `0`
+/// runs compaction on the calling thread instead, which is a
+/// compile-time property of the target rather than a runtime fallback:
+/// this build cannot grow a second thread later.
+#[cfg(all(target_family = "wasm", not(target_feature = "atomics")))]
+pub const DEFAULT_MAX_BACKGROUND_COMPACTIONS: usize = 0;
+
+/// Default value of [`Options::max_background_compactions`]: one
+/// background worker, or none on a target that has no threads.
+#[cfg(not(all(target_family = "wasm", not(target_feature = "atomics"))))]
+pub const DEFAULT_MAX_BACKGROUND_COMPACTIONS: usize = 1;
+
 /// Decision returned by a [`CompactionFilter`] for each entry it sees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactionDecision {
@@ -243,6 +260,12 @@ pub enum CompactionStyle {
     /// no L1+) so read amplification grows with the number of
     /// retained files; this is the trade-off for ~zero write
     /// amplification.
+    ///
+    /// Because nothing merges L0, the L0 *count* triggers
+    /// ([`Options::level0_slowdown_writes_trigger`] and
+    /// [`Options::level0_stop_writes_trigger`]) cannot be relieved by
+    /// compaction under this style. Set them to `0` unless the byte
+    /// cap is guaranteed to bite first.
     Fifo,
     /// Universal (size-tiered): all files live at L0 and are
     /// merged into progressively larger runs based on size ratios
@@ -255,6 +278,14 @@ pub enum CompactionStyle {
     /// the merge and more read amplification than leveled. Best
     /// fit for write-heavy workloads where disk is cheap and read
     /// latency is tolerant.
+    ///
+    /// Merging is driven by [`UniversalCompactionOptions`], not by the
+    /// L0 *count* triggers: a well-formed size tier legitimately holds
+    /// many L0 files without merging any of them. Set
+    /// [`Options::level0_stop_writes_trigger`] and
+    /// [`Options::level0_slowdown_writes_trigger`] to `0` under this
+    /// style, or raise them well past the tier depth the workload
+    /// produces.
     Universal,
 }
 
@@ -481,12 +512,35 @@ pub struct Options {
     /// background compaction can catch up. `0` disables this
     /// trigger. If both L0 triggers are enabled, this must be <=
     /// [`Options::level0_stop_writes_trigger`]. Default: 20.
+    ///
+    /// Level-style, with the same caveat as
+    /// [`Options::level0_stop_writes_trigger`]: under FIFO and
+    /// universal compaction the L0 file count is not what the picker
+    /// reduces, so this delay can become permanent rather than
+    /// transient.
     pub level0_slowdown_writes_trigger: usize,
     /// Stop foreground writes entirely when the number of L0
     /// SSTables reaches this threshold. Writers block on a
     /// condvar that compaction notifies once it reduces the
     /// count below the slowdown trigger. `0` disables this
     /// trigger. Default: 36.
+    ///
+    /// # This is a level-style trigger
+    ///
+    /// Only [`CompactionStyle::Level`] reduces the L0 *file count*
+    /// in response to this threshold. Under [`CompactionStyle::Fifo`]
+    /// nothing ever merges L0 files (only the byte cap unlinks them),
+    /// and under [`CompactionStyle::Universal`] the picker merges on
+    /// its own size-ratio and amplification rules, which a healthy
+    /// size tier can satisfy while sitting above this count. With
+    /// either of those styles the threshold can therefore be reached
+    /// and never relieved, and writes then fail with
+    /// [`crate::Error::Busy`] until the configuration changes. The
+    /// error message names the style and this field. Set this to `0`
+    /// with those styles and bound memory with
+    /// [`Options::max_write_buffer_number`] and
+    /// [`Options::hard_pending_compaction_bytes_limit`] instead,
+    /// which both apply to every style.
     pub level0_stop_writes_trigger: usize,
     /// Start slowing writes when total bytes in L0 (lark's
     /// approximation of "pending compaction bytes") reach this
@@ -514,14 +568,26 @@ pub struct Options {
     pub universal_compaction_options: UniversalCompactionOptions,
     /// Number of background threads available for compaction.
     ///
+    /// `0` starts no background worker at all. Compaction then runs
+    /// on whichever thread asks for it: a writer that reaches a
+    /// write-stall threshold performs a compaction job itself before
+    /// retrying instead of parking on a condvar nobody would ever
+    /// signal. This is the only mode that works on a single-threaded
+    /// host such as `wasm32-wasip1`, where `std::thread::spawn`
+    /// reports [`std::io::ErrorKind::Unsupported`], and it is what
+    /// [`Options::embedded`] selects.
+    ///
     /// When `> 1`, multiple non-overlapping compaction jobs can
     /// run concurrently (e.g. L1→L2 at key range `[a,m)` on one
     /// worker while L2→L3 at `[m,z)` runs on another). L0
     /// compactions are exclusive - only one L0 job runs at a
     /// time because L0 files can overlap arbitrarily.
     ///
-    /// Must be greater than zero. `1` (default) keeps compaction
-    /// single-threaded and matches pre-multi-worker behavior.
+    /// `1` keeps compaction single-threaded and matches
+    /// pre-multi-worker behavior. It is the default on every target
+    /// that has threads; see [`DEFAULT_MAX_BACKGROUND_COMPACTIONS`]
+    /// for why single-threaded wasm defaults to `0` instead, so that
+    /// [`crate::Db::open`] with [`Options::default`] works there too.
     pub max_background_compactions: usize,
     /// Accepted for compatibility with earlier releases.
     ///
@@ -591,6 +657,19 @@ pub struct Options {
     /// Maximum value and merge-operand length accepted by write APIs.
     /// Default: 64 MiB.
     pub max_value_size: usize,
+    /// The host platform this database runs on: its filesystem, its
+    /// clock, and its threads.
+    ///
+    /// Defaults to [`crate::env::StdEnv`], which is `std::fs` +
+    /// `std::time` + `std::thread` and behaves exactly as lark did
+    /// before this field existed. Replace it to run on a filesystem
+    /// lark does not know about, or on [`crate::env::MemEnv`] to keep
+    /// a database entirely in memory.
+    ///
+    /// What the environment can actually do is reported by
+    /// [`crate::env::Env::capabilities`] and handed back to callers
+    /// through [`crate::Db::capabilities`].
+    pub env: Arc<dyn crate::env::Env>,
 }
 
 impl Default for Options {
@@ -626,7 +705,7 @@ impl Default for Options {
             fifo_compaction_options: FifoCompactionOptions::default(),
             universal_compaction_options: UniversalCompactionOptions::default(),
             evict_compaction_data_from_page_cache: false,
-            max_background_compactions: 1,
+            max_background_compactions: DEFAULT_MAX_BACKGROUND_COMPACTIONS,
             max_subcompactions: 1,
             partitioned_index: false,
             cache_index_and_filter_blocks: false,
@@ -634,6 +713,7 @@ impl Default for Options {
             read_only: false,
             max_key_size: DEFAULT_MAX_KEY_SIZE,
             max_value_size: DEFAULT_MAX_VALUE_SIZE,
+            env: crate::env::std_env(),
         }
     }
 }
@@ -715,22 +795,140 @@ impl std::fmt::Debug for Options {
             .field("read_only", &self.read_only)
             .field("max_key_size", &self.max_key_size)
             .field("max_value_size", &self.max_value_size)
+            .field("env", &self.env)
             .finish()
     }
 }
 
 impl Options {
-    /// Preset tuned for embedded and wasm32 targets: a small memtable, a
-    /// small block cache, and small arena chunks.
+    /// Tuning for a device or module whose whole working set has to
+    /// fit in roughly 1-4 MiB: a Linux-class embedded board (Cortex-A,
+    /// or an ESP32-S3 under esp-idf), or a wasm module, where every
+    /// 64 KiB page linear memory ever touches stays committed for the
+    /// life of the instance.
     ///
-    /// Memtable-attributable memory under this preset is bounded by
+    /// [`Options::default`] is tuned for a server and reserves far
+    /// more than such a host has: a 64 MiB write buffer, a 512 MiB
+    /// block cache, and a 64 MiB target file size. This profile
+    /// replaces every one of those with a value that is bounded by the
+    /// budget rather than by throughput.
+    ///
+    /// # The budget, term by term
+    ///
+    /// Steady-state resident cost, which is what the 1-4 MiB figure
+    /// has to cover:
+    ///
+    /// - **Memtables, ~0.5 MiB of entry bytes.**
+    ///   [`Options::write_buffer_size`] is 256 KiB and
+    ///   [`Options::max_write_buffer_number`] is 2, so at most one
+    ///   active plus one frozen memtable is resident. Skip-list node
+    ///   overhead sits on top of the entry bytes, so budget more than
+    ///   512 KiB for this term, not exactly 512 KiB.
+    /// - **Block cache, exactly 0 bytes.**
+    ///   [`Options::block_cache_size`] of 0 allocates no shard at all,
+    ///   retains no block, and leaves the cache tickers at zero. A
+    ///   host with an OS page cache absorbs the resulting re-reads;
+    ///   a wasm module serves them out of bytes it already holds.
+    ///   Raise it to 256 KiB if the budget is nearer 4 MiB than 1 MiB.
+    /// - **Per-SSTable metadata, linear in the number of open files.**
+    ///   Each open SSTable holds its index block and Bloom filter
+    ///   resident. With a 256 KiB [`Options::target_file_size`], a
+    ///   4 KiB [`Options::block_size`], and 10
+    ///   [`Options::bloom_bits_per_key`], that is roughly 4-6 KiB per
+    ///   file, so about 0.25 MiB for a 16 MiB database. This term is
+    ///   the one that grows without bound as the database grows; see
+    ///   the note on [`Options::partitioned_index`] below.
+    /// - **Transient flush and compaction buffers**, bounded by
+    ///   [`Options::target_file_size`] and [`Options::block_size`]
+    ///   rather than by the size of the level being merged.
+    ///
+    /// # Every value, and what it buys
+    ///
+    /// - [`Options::write_buffer_size`] `256 KiB`: the largest
+    ///   steady-state allocation, and the bound on how much WAL
+    ///   accumulates between rotations.
+    /// - [`Options::max_write_buffer_number`] `2`: caps in-memory
+    ///   entry bytes at two write buffers.
+    /// - [`Options::block_size`] `4 KiB`: matches LittleFS and SPIFFS
+    ///   page granularity, and caps the transient decompression buffer
+    ///   for an uncached read at 4 KiB instead of the default 16 KiB.
+    ///   That transient matters more here precisely because there is
+    ///   no block cache to amortize it.
+    /// - [`Options::block_cache_size`] `0` and
+    ///   [`Options::block_cache_num_shard_bits`] `0`: no cache, and
+    ///   the shard count pinned so that raising the budget later does
+    ///   not silently allocate 64 shards.
+    /// - [`Options::target_file_size`] `256 KiB`: bounds one
+    ///   compaction output file, and keeps compaction holding a block
+    ///   at a time rather than a file at a time.
+    /// - [`Options::level_base_bytes`] `1 MiB` with
+    ///   [`Options::level_size_multiplier`] `10`: L1 1 MiB, L2 10 MiB,
+    ///   L3 100 MiB - a shape suited to flash measured in tens of MiB.
+    /// - [`Options::l0_compaction_trigger`] `2`,
+    ///   [`Options::level0_slowdown_writes_trigger`] `4`,
+    ///   [`Options::level0_stop_writes_trigger`] `8`: compact early
+    ///   and often. A writer that compacts on its own thread should
+    ///   pay in small installments rather than take one long stall,
+    ///   and a low L0 count also caps how many files a point lookup
+    ///   has to consult.
+    /// - [`Options::soft_pending_compaction_bytes_limit`] `4 MiB` and
+    ///   [`Options::hard_pending_compaction_bytes_limit`] `16 MiB`:
+    ///   the byte-denominated back-pressure, scaled to flash rather
+    ///   than to the default's 64 GiB / 256 GiB.
+    /// - [`Options::max_background_compactions`] `0`: compaction runs
+    ///   on the calling thread. Required on a single-threaded host;
+    ///   on a board with a spare core, set this to `1`.
+    /// - [`Options::evict_compaction_data_from_page_cache`] `true`: on
+    ///   a device whose page cache is a few MiB, compaction streaming
+    ///   through it would evict every hot foreground page. The hint is
+    ///   `posix_fadvise(DONTNEED)` on Linux and a no-op elsewhere.
+    /// - [`Options::max_key_size`] `16 KiB` and
+    ///   [`Options::max_value_size`] `256 KiB`: the defaults accept an
+    ///   8 MiB key and a 64 MiB value, either of which exceeds the
+    ///   whole budget on its own. Capping a value at one write buffer
+    ///   keeps a single accepted write from being one the memtable
+    ///   cannot hold.
+    /// - [`Options::compression`] stays [`CompressionType::Lz4`],
+    ///   inherited from [`Options::default`]. It is pure Rust, its
+    ///   block format needs no allocator tricks, and it reduces flash
+    ///   writes, which is the resource that wears out.
+    /// - [`Options::bloom_bits_per_key`] stays `10`: about a 1% false
+    ///   positive rate for 1.25 bytes per key. Cutting it saves little
+    ///   memory and costs real reads.
+    /// - [`Options::partitioned_index`] stays `false`, so each open
+    ///   SSTable's index is resident. That is the cheaper choice while
+    ///   the per-file metadata term above stays small. Past roughly
+    ///   100 MiB of database - about 400 files at this file size, or
+    ///   ~1 MiB of resident index - set it to `true` to keep only a
+    ///   top-level index in memory, at the cost of one extra read per
+    ///   point lookup. [`Options::metadata_block_size`] is already set
+    ///   to 1 KiB here so that switch does not also need retuning.
+    ///
+    /// # Not a promise about your workload
+    ///
+    /// These values bound what lark reserves. They do not bound what
+    /// your keys and values cost, nor what the allocator does with
+    /// fragmentation. Measure on the target.
+    ///
+    /// ```
+    /// use lark_kv::{Db, Options};
+    ///
+    /// let dir = tempfile::TempDir::new()?;
+    /// let db = Db::open(dir.path(), Options::embedded())?;
+    /// db.put(b"k", b"v")?;
+    /// assert_eq!(db.get(b"k")?.as_deref(), Some(&b"v"[..]));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Why the memtable term stays flat
+    ///
+    /// Memtable-attributable memory is bounded by
     /// `2 * M * (W + c) + M * W` where `W = write_buffer_size`,
     /// `c = arena_profile.max_chunk_size` and
-    /// `M = max_write_buffer_number`: at most `2 * M` memtables are
-    /// in memory at once (the write stall stops writers there), each
-    /// arena holds at most `W + c`, and the recycling pool parks at most
-    /// `M * W`. With the values below that is 1792 KiB, or 28 wasm32
-    /// pages, reached once and flat from then on.
+    /// `M = max_write_buffer_number`: at most `2 * M` memtables are in
+    /// memory at once (the write stall stops writers there), each arena
+    /// holds at most `W + c`, and the recycling pool parks at most
+    /// `M * W`.
     ///
     /// That flatness is the point on wasm32, where linear memory grows
     /// in 64 KiB pages and never shrinks, so every peak is permanent.
@@ -738,16 +936,26 @@ impl Options {
     /// the pool hands the same pages back to the next memtable, so
     /// `memory.grow` runs once per size class rather than once per
     /// flush-and-refill cycle.
-    ///
-    /// With [`Options::default`] the same bound is 388 MiB (260 MiB live
-    /// plus 128 MiB parked), which is why this preset exists.
     pub fn embedded() -> Self {
         Self {
             write_buffer_size: 256 * 1024,
-            block_cache_size: 1024 * 1024,
-            block_cache_num_shard_bits: 0,
             arena_profile: ArenaProfile::EMBEDDED,
+            block_size: 4 * 1024,
+            block_cache_size: 0,
+            block_cache_num_shard_bits: 0,
+            l0_compaction_trigger: 2,
+            level_base_bytes: 1024 * 1024,
+            target_file_size: 256 * 1024,
+            level0_slowdown_writes_trigger: 4,
+            level0_stop_writes_trigger: 8,
+            soft_pending_compaction_bytes_limit: 4 * 1024 * 1024,
+            hard_pending_compaction_bytes_limit: 16 * 1024 * 1024,
             max_write_buffer_number: 2,
+            max_background_compactions: 0,
+            evict_compaction_data_from_page_cache: true,
+            metadata_block_size: 1024,
+            max_key_size: 16 * 1024,
+            max_value_size: 256 * 1024,
             ..Self::default()
         }
     }
@@ -826,8 +1034,20 @@ impl Options {
             );
         }
 
-        if self.max_background_compactions == 0 {
-            return invalid_option("max_background_compactions", "must be greater than 0");
+        // Fail loud rather than accepting a durability the platform
+        // cannot keep: an env without `durable_sync` returns `Ok(())`
+        // from `sync_all` without making anything durable, so honouring
+        // `Immediate` there would report a guarantee that does not
+        // exist. OPFS in mirror mode is the case this catches.
+        if matches!(self.durability, DurabilityMode::Immediate)
+            && !self.env.capabilities().durable_sync
+        {
+            return invalid_option(
+                "durability",
+                "DurabilityMode::Immediate needs an Env whose \
+                 Capabilities::durable_sync is true; this one reports false, \
+                 so a synced write would not be durable",
+            );
         }
 
         match self.compaction_style {
@@ -907,6 +1127,7 @@ impl Options {
             read_only: self.read_only,
             max_key_size: self.max_key_size,
             max_value_size: self.max_value_size,
+            env: Arc::clone(&self.env),
         }
     }
 }
@@ -1142,13 +1363,64 @@ mod tests {
             },
             "bloom_bits_per_key",
         );
-        assert_invalid_option(
-            Options {
-                max_background_compactions: 0,
-                ..Options::default()
-            },
-            "max_background_compactions",
-        );
+    }
+
+    #[test]
+    fn zero_background_compactions_is_a_supported_configuration() {
+        Options {
+            max_background_compactions: 0,
+            ..Options::default()
+        }
+        .validate()
+        .expect("zero background workers selects foreground compaction, not an error");
+    }
+
+    #[test]
+    fn embedded_profile_validates() {
+        Options::embedded()
+            .validate()
+            .expect("the shipped embedded profile must satisfy its own invariants");
+    }
+
+    #[test]
+    fn embedded_profile_bounds_every_resident_term() {
+        let o = Options::embedded();
+
+        // Entry bytes held in memory at once: two write buffers.
+        assert_eq!(o.write_buffer_size, 256 * 1024);
+        assert_eq!(o.max_write_buffer_number, 2);
+
+        // The cache must allocate nothing at all, not merely a little.
+        assert_eq!(o.block_cache_size, 0);
+        assert_eq!(o.block_cache_num_shard_bits, 0);
+
+        // Per-file metadata and transient buffers.
+        assert_eq!(o.block_size, 4 * 1024);
+        assert_eq!(o.target_file_size, 256 * 1024);
+        assert_eq!(o.metadata_block_size, 1024);
+
+        // A single accepted write must not exceed one write buffer,
+        // or the memtable cannot hold what the API just admitted.
+        assert!(o.max_value_size <= o.write_buffer_size);
+        assert!(o.max_key_size < o.write_buffer_size);
+
+        // Compaction runs on the calling thread.
+        assert_eq!(o.max_background_compactions, 0);
+    }
+
+    #[test]
+    fn embedded_profile_is_strictly_smaller_than_the_default() {
+        let d = Options::default();
+        let e = Options::embedded();
+        assert!(e.write_buffer_size < d.write_buffer_size);
+        assert!(e.block_cache_size < d.block_cache_size);
+        assert!(e.block_size < d.block_size);
+        assert!(e.target_file_size < d.target_file_size);
+        assert!(e.level_base_bytes < d.level_base_bytes);
+        assert!(e.max_key_size < d.max_key_size);
+        assert!(e.max_value_size < d.max_value_size);
+        assert!(e.level0_stop_writes_trigger < d.level0_stop_writes_trigger);
+        assert!(e.hard_pending_compaction_bytes_limit < d.hard_pending_compaction_bytes_limit);
     }
 
     #[test]

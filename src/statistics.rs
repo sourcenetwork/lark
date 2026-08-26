@@ -25,8 +25,7 @@
 //! that drops in behind the existing API without breaking
 //! callers.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use crate::portability::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
@@ -403,7 +402,11 @@ impl Statistics {
 /// `Drop`. If the statistics handle is `None` the helper is
 /// optimized out - both construction and drop are no-ops.
 pub(crate) struct TimeScope<'a> {
-    start: Option<Instant>,
+    /// Start reading in microseconds. `None` when no statistics
+    /// handle is installed, and also `None` on a platform with no
+    /// monotonic clock: the histogram then takes no sample at all
+    /// rather than a zero that reads like a measurement.
+    start: Option<u64>,
     stats: Option<&'a Statistics>,
     hist: Histogram,
 }
@@ -411,7 +414,7 @@ pub(crate) struct TimeScope<'a> {
 impl<'a> TimeScope<'a> {
     pub(crate) fn new(stats: Option<&'a Statistics>, hist: Histogram) -> Self {
         Self {
-            start: stats.as_ref().map(|_| Instant::now()),
+            start: stats.and_then(|_| crate::env::platform_micros()),
             stats,
             hist,
         }
@@ -420,9 +423,10 @@ impl<'a> TimeScope<'a> {
 
 impl Drop for TimeScope<'_> {
     fn drop(&mut self) {
-        if let (Some(start), Some(stats)) = (self.start, self.stats) {
-            let micros = start.elapsed().as_micros() as u64;
-            stats.record(self.hist, micros);
+        if let (Some(start), Some(stats), Some(now)) =
+            (self.start, self.stats, crate::env::platform_micros())
+        {
+            stats.record(self.hist, now.saturating_sub(start));
         }
     }
 }

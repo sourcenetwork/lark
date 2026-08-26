@@ -48,7 +48,6 @@
 //! writes naturally attribute work to the originating thread.
 
 use std::cell::RefCell;
-use std::time::Instant;
 
 /// Granularity of `PerfContext` measurement. Higher levels
 /// produce more detail at the cost of more work per
@@ -240,7 +239,8 @@ pub(crate) fn record_bloom_check(useful: bool) {
 /// `Drop` does nothing.
 #[must_use]
 pub(crate) struct PerfTimer {
-    start: Option<Instant>,
+    /// Start reading in nanoseconds from the platform clock.
+    start: Option<u64>,
     which: PerfTimerField,
 }
 
@@ -258,8 +258,11 @@ pub(crate) enum PerfTimerField {
 impl PerfTimer {
     #[inline]
     pub(crate) fn new(which: PerfTimerField) -> Self {
+        // `None` covers both "not timing" and "this platform has no
+        // monotonic clock". Either way the scope records nothing
+        // rather than a fabricated zero.
         let start = if is_timed() {
-            Some(Instant::now())
+            crate::env::platform_nanos()
         } else {
             None
         };
@@ -273,7 +276,10 @@ impl Drop for PerfTimer {
         let Some(start) = self.start else {
             return;
         };
-        let nanos = start.elapsed().as_nanos() as u64;
+        let Some(now) = crate::env::platform_nanos() else {
+            return;
+        };
+        let nanos = now.saturating_sub(start);
         PERF_STATE.with(|cell| {
             let mut s = cell.borrow_mut();
             match self.which {

@@ -1,6 +1,10 @@
 use std::ops::Bound;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
+
+// Through the portability shim: a 32-bit target without a 64-bit atomic
+// instruction gets the fallback implementation rather than failing to build.
+use crate::portability::{AtomicUsize, Ordering};
 
 use crossbeam_epoch::{self as epoch, Guard};
 use crossbeam_skiplist::SkipList;
@@ -841,6 +845,9 @@ impl BlockCache {
             .sum()
     }
 }
+
+#[cfg(test)]
+mod contention_bench;
 
 #[cfg(test)]
 mod tests {

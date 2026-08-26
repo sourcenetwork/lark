@@ -7,6 +7,12 @@
 //! stays fast for PRs; CI runs them nightly via
 //! `cargo test -- --ignored`.
 
+// Native-only. wasm-pack builds every test target for wasm32, and these use
+// threads, the filesystem or proptest, none of which exist there. The browser
+// suite lives in tests/wasm_opfs*.rs.
+#![cfg(not(target_arch = "wasm32"))]
+
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;

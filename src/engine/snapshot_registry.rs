@@ -17,9 +17,11 @@
 //! live snapshot and to current reads, and can be discarded.
 
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
+
+use crate::env::Env;
 
 /// Thread-safe registry of live snapshot sequence numbers.
 pub(crate) struct SnapshotRegistry {
@@ -31,29 +33,38 @@ pub(crate) struct SnapshotRegistry {
     /// `lark.oldest-snapshot-time` is stable across refcount
     /// changes.
     active: Mutex<BTreeMap<u64, SlotState>>,
+    env: Arc<dyn Env>,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct SlotState {
     refcount: usize,
-    registered_at_unix: u64,
+    /// `None` on a platform with no wall clock. The
+    /// `lark.oldest-snapshot-time` property then reports the
+    /// timestamp as absent rather than as the epoch.
+    registered_at_unix: Option<u64>,
 }
 
 impl SnapshotRegistry {
-    pub(crate) fn new() -> Self {
+    /// A registry whose timestamps come from `env`.
+    pub(crate) fn with_env(env: Arc<dyn Env>) -> Self {
         Self {
             active: Mutex::new(BTreeMap::new()),
+            env,
         }
+    }
+
+    /// A registry timed by the standard environment.
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
+        Self::with_env(crate::env::std_env())
     }
 
     /// Register a new pin at `seq`. Must be balanced by a later
     /// [`release`](Self::release) call - typically from the
     /// `Drop` impl of the owning snapshot type.
     pub(crate) fn register(&self, seq: u64) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = self.env.unix_secs();
         let mut active = self.active.lock();
         active
             .entry(seq)
@@ -127,15 +138,18 @@ impl SnapshotRegistry {
     }
 
     /// Unix-seconds timestamp when the oldest currently-live
-    /// snapshot was registered, or `None` when no snapshot is
-    /// alive. Used to populate the
-    /// `lark.oldest-snapshot-time` property.
+    /// snapshot was registered.
+    ///
+    /// `None` when no snapshot is alive, and also `None` when the
+    /// environment has no wall clock: lark reports "not known"
+    /// rather than inventing an epoch timestamp. Used to populate
+    /// the `lark.oldest-snapshot-time` property.
     pub(crate) fn oldest_snapshot_time_unix(&self) -> Option<u64> {
         self.active
             .lock()
             .values()
             .next()
-            .map(|slot| slot.registered_at_unix)
+            .and_then(|slot| slot.registered_at_unix)
     }
 
     /// Test-only: number of distinct seq values currently pinned.

@@ -81,8 +81,17 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use super::{checksum, durability};
+// The module's own tests craft corrupt WAL files byte by byte, which
+// is the one thing that has to bypass the environment.
+#[cfg(test)]
+use std::fs::File;
+#[cfg(test)]
+use std::io::Write;
+
+use super::checksum;
+use crate::env::{BufferedWriter, Env, ReadFileCursor, WriteMode};
 use crate::WriteBatchOp;
 
 /// Record types in the WAL.
@@ -126,6 +135,7 @@ pub(crate) struct Wal {
     offset: u64,
     path: PathBuf,
     parent_synced: bool,
+    env: Arc<dyn Env>,
 }
 
 /// A replayed WAL entry.
@@ -169,6 +179,7 @@ impl Wal {
             offset: WAL_STAMP_LEN as u64,
             path: path.to_path_buf(),
             parent_synced: false,
+            env: Arc::clone(env),
         })
     }
 
@@ -308,9 +319,21 @@ impl Wal {
         Ok(entries)
     }
 
-    /// Delete a WAL file.
+    /// Replay a WAL file through the standard environment.
+    #[cfg(test)]
+    pub(crate) fn replay(path: &Path) -> io::Result<Vec<WalEntry>> {
+        Self::replay_in(&*crate::env::std_env(), path)
+    }
+
+    /// Delete a WAL file from `env`.
+    pub(crate) fn remove_in(env: &dyn Env, path: &Path) -> io::Result<()> {
+        crate::env::remove_file_and_sync_parent(env, path)
+    }
+
+    /// Delete a WAL file through the standard environment.
+    #[cfg(test)]
     pub(crate) fn remove(path: &Path) -> io::Result<()> {
-        durability::remove_file_and_sync_parent(path)
+        Self::remove_in(&*crate::env::std_env(), path)
     }
 }
 

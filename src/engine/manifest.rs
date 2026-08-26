@@ -1,7 +1,13 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self};
 use std::path::{Path, PathBuf};
+
+// The module's own tests craft corrupt manifests byte by byte, which
+// is the one thing that has to bypass the environment.
+#[cfg(test)]
+use std::fs::OpenOptions;
 use std::sync::Arc;
+
+use crate::env::{BufferedWriter, Env, WriteMode};
 
 use parking_lot::RwLock;
 
@@ -9,6 +15,8 @@ use super::sstable::{
     LiveSst, MetadataPolicy, SsTableMeta, SsTableReader, sst_filename, table_carries_data,
 };
 use super::{checksum, durability};
+use super::checksum;
+use super::sstable::{sst_filename, LiveSst, SsTableMeta, SsTableReader};
 
 /// Maximum number of levels in the LSM tree.
 pub(crate) const MAX_LEVELS: usize = 7;
@@ -292,6 +300,8 @@ pub(crate) struct VersionSet {
     /// the rewrite check costs nothing on the common path.
     manifest_bytes: u64,
     manifest_writer: Option<BufWriter<File>>,
+    manifest_writer: Option<BufferedWriter>,
+    env: Arc<dyn Env>,
 }
 
 struct ManifestReplay {
@@ -350,6 +360,7 @@ impl VersionSet {
     /// that whole set of indexes and filters is pinned or bounded by
     /// the block cache.
     pub(crate) fn open_with_policy(
+        env: &Arc<dyn Env>,
         db_dir: &Path,
         sst_dir: &Path,
         policy: MetadataPolicy,
@@ -357,26 +368,26 @@ impl VersionSet {
         let manifest_path = db_dir.join("MANIFEST");
 
         let mut manifest_bytes = 0u64;
-        let (version, writer) = if manifest_path.exists() {
-            let data = fs::read(&manifest_path)?;
-            let replay = Self::replay_manifest(&data, sst_dir, policy)?;
-            Self::reject_discarded_tables(&replay, data.len(), sst_dir, &manifest_path)?;
+        let (version, writer) = if env.exists(&manifest_path) {
+            let data = env.read(&manifest_path)?;
+            let replay = Self::replay_manifest(env, &data, sst_dir, policy)?;
+            Self::reject_discarded_tables(&**env, &replay, data.len(), sst_dir, &manifest_path)?;
 
-            let file = OpenOptions::new().append(true).open(&manifest_path)?;
+            let mut file = env.open_write(&manifest_path, WriteMode::Append)?;
             if replay.valid_len < data.len() {
                 file.set_len(replay.valid_len as u64)?;
                 file.sync_all()?;
             }
             manifest_bytes = replay.valid_len as u64;
-            (replay.version, BufWriter::new(file))
+            (replay.version, BufferedWriter::new(file))
         } else {
             let version = Version::new();
-            let mut file = File::create(&manifest_path)?;
+            let mut file = env.open_write(&manifest_path, WriteMode::Truncate)?;
             file.write_all(&Self::encode_stamp())?;
             file.sync_all()?;
-            durability::sync_parent_dir(&manifest_path)?;
+            crate::env::sync_parent_dir(&**env, &manifest_path)?;
             manifest_bytes = MANIFEST_STAMP_LEN as u64;
-            (version, BufWriter::new(file))
+            (version, BufferedWriter::new(file))
         };
 
         Ok(Self {
@@ -384,7 +395,20 @@ impl VersionSet {
             manifest_path,
             manifest_bytes,
             manifest_writer: Some(writer),
+            env: Arc::clone(env),
         })
+    }
+
+    /// Create or recover a VersionSet through the standard
+    /// environment.
+    #[cfg(test)]
+    pub(crate) fn open(db_dir: &Path, sst_dir: &Path) -> io::Result<Self> {
+        Self::open_with_policy(
+            &crate::env::std_env(),
+            db_dir,
+            sst_dir,
+            MetadataPolicy::Pinned,
+        )
     }
 
     /// Recover an existing VersionSet without mutating the manifest.
@@ -393,20 +417,22 @@ impl VersionSet {
     /// truncated trailing record exactly like the read-write path, but
     /// the file is not repaired in place and no append writer is kept.
     pub(crate) fn open_read_only(
+        env: &Arc<dyn Env>,
         db_dir: &Path,
         sst_dir: &Path,
         policy: MetadataPolicy,
     ) -> io::Result<Self> {
         let manifest_path = db_dir.join("MANIFEST");
-        let data = fs::read(&manifest_path)?;
-        let replay = Self::replay_manifest(&data, sst_dir, policy)?;
-        Self::reject_discarded_tables(&replay, data.len(), sst_dir, &manifest_path)?;
+        let data = env.read(&manifest_path)?;
+        let replay = Self::replay_manifest(env, &data, sst_dir, policy)?;
+        Self::reject_discarded_tables(&**env, &replay, data.len(), sst_dir, &manifest_path)?;
 
         Ok(Self {
             current: Arc::new(RwLock::new(Arc::new(replay.version))),
             manifest_path,
             manifest_bytes: replay.valid_len as u64,
             manifest_writer: None,
+            env: Arc::clone(env),
         })
     }
 
@@ -467,9 +493,10 @@ impl VersionSet {
         let requires_sync = edits.iter().any(VersionEdit::requires_manifest_sync);
         if let Some(writer) = &mut self.manifest_writer {
             writer.write_all(&encoded)?;
-            writer.flush()?;
             if requires_sync {
-                writer.get_ref().sync_all()?;
+                writer.sync_all()?;
+            } else {
+                writer.flush()?;
             }
         }
 
@@ -520,17 +547,19 @@ impl VersionSet {
 
         let tmp_path = self.manifest_path.with_extension("tmp");
         {
-            let mut file = File::create(&tmp_path)?;
+            let mut file = self.env.open_write(&tmp_path, WriteMode::Truncate)?;
             file.write_all(&Self::encode_stamp())?;
             file.write_all(&encoded)?;
             file.sync_all()?;
         }
-        fs::rename(&tmp_path, &self.manifest_path)?;
-        durability::sync_parent_dir(&self.manifest_path)?;
+        self.env.rename(&tmp_path, &self.manifest_path)?;
+        crate::env::sync_parent_dir(&*self.env, &self.manifest_path)?;
         self.manifest_bytes = (MANIFEST_STAMP_LEN + encoded.len()) as u64;
 
-        let file = OpenOptions::new().append(true).open(&self.manifest_path)?;
-        self.manifest_writer = Some(BufWriter::new(file));
+        let file = self
+            .env
+            .open_write(&self.manifest_path, WriteMode::Append)?;
+        self.manifest_writer = Some(BufferedWriter::new(file));
 
         Ok(())
     }
@@ -607,6 +636,7 @@ impl VersionSet {
     /// the WAL still has, so `suspect_tables` rules it out
     /// before the count is taken.
     fn reject_discarded_tables(
+        env: &dyn Env,
         replay: &ManifestReplay,
         manifest_len: usize,
         sst_dir: &Path,
@@ -616,7 +646,7 @@ impl VersionSet {
         if replayed_cleanly || replay.version.levels.iter().any(|level| !level.is_empty()) {
             return Ok(());
         }
-        let suspects = Self::suspect_tables(sst_dir);
+        let suspects = Self::suspect_tables(env, sst_dir);
         if suspects.is_empty() {
             return Ok(());
         }
@@ -648,8 +678,8 @@ impl VersionSet {
     /// Nothing is deleted here, so a crash part way through recovery
     /// leaves the directory exactly as this pass found it and the next
     /// open reaches the same verdict.
-    fn suspect_tables(sst_dir: &Path) -> Vec<SuspectTable> {
-        let entries = match fs::read_dir(sst_dir) {
+    fn suspect_tables(env: &dyn Env, sst_dir: &Path) -> Vec<SuspectTable> {
+        let entries = match env.read_dir(sst_dir) {
             Ok(entries) => entries,
             Err(e) => {
                 tracing::warn!(
@@ -662,13 +692,13 @@ impl VersionSet {
         };
 
         let mut suspects = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
+        for entry in entries {
+            let path = entry.path.clone();
             if path.extension().and_then(|ext| ext.to_str()) != Some("sst") {
                 continue;
             }
-            let len = match entry.metadata() {
-                Ok(meta) => Some(meta.len()),
+            let len = match env.metadata(&path) {
+                Ok(meta) => Some(meta.len),
                 Err(e) => {
                     suspects.push(SuspectTable {
                         path,
@@ -685,7 +715,7 @@ impl VersionSet {
                 );
                 continue;
             }
-            match table_carries_data(&path) {
+            match table_carries_data(env, &path) {
                 Ok(true) => suspects.push(SuspectTable {
                     path,
                     len,
@@ -706,7 +736,10 @@ impl VersionSet {
         suspects
     }
 
+    /// Replay every record, then open a reader for each surviving file
+    /// through `env` under `policy`.
     fn replay_manifest(
+        env: &Arc<dyn Env>,
         data: &[u8],
         sst_dir: &Path,
         policy: MetadataPolicy,
@@ -813,6 +846,12 @@ impl VersionSet {
         }
 
         Ok(ManifestReplay { version, valid_len })
+    }
+
+    /// Replay manifest bytes through the standard environment.
+    #[cfg(test)]
+    fn replay_manifest(data: &[u8], sst_dir: &Path) -> io::Result<ManifestReplay> {
+        Self::replay_manifest_in(&crate::env::std_env(), data, sst_dir)
     }
 }
 

@@ -62,9 +62,13 @@
 //! guard and not a MAC: they catch bit rot and torn writes, not an
 //! attacker who can rewrite the file and its checksum together.
 
-use std::fs::{self, File};
-use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self};
 use std::path::{Path, PathBuf};
+
+// The module's own tests craft corrupt SSTable files byte by byte,
+// which is the one thing that has to bypass the environment.
+#[cfg(test)]
+use std::fs;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -74,6 +78,7 @@ use std::ops::ControlFlow;
 use parking_lot::Mutex;
 
 use super::block::{Block, BlockBuilder, BlockHandle, RESTART_INTERVAL, decode_entry_at};
+use super::block::{decode_entry_at, Block, BlockBuilder, BlockHandle, RESTART_INTERVAL};
 use super::block_cache::BlockCache;
 use super::bloom::{BloomFilterBuilder, encode_bloom_block};
 use super::checksum;
@@ -86,6 +91,7 @@ use super::internal_key::{
 use super::lookup_key::LookupKey;
 use super::range_tombstone::{RangeTombstone, RangeTombstoneSet};
 use crate::DbSlice;
+use crate::env::{BufferedWriter, Env, ReadFile, WriteMode};
 use crate::options::{CompressionType, PrefixExtractor};
 
 /// SSTable magic number: "LARKSST\x01" - flat-index format with the
@@ -677,7 +683,7 @@ fn write_meta_region(
 }
 
 fn read_file_region(
-    file: &mut File,
+    file: &dyn ReadFile,
     offset: u64,
     size: u64,
     data_end: u64,
@@ -687,8 +693,7 @@ fn read_file_region(
     let len = usize::try_from(size)
         .map_err(|_| invalid_data(format!("{name} is too large to address")))?;
     let mut buf = vec![0u8; len];
-    file.seek(SeekFrom::Start(offset))?;
-    file.read_exact(&mut buf)?;
+    file.read_exact_at(offset, &mut buf)?;
     Ok(buf)
 }
 
@@ -718,8 +723,9 @@ fn validate_file_region(
 /// responsible for supplying keys in ascending internal-key order (newer
 /// versions of a user key appear before older ones).
 pub(crate) struct SsTableWriter {
-    writer: BufWriter<File>,
+    writer: BufferedWriter,
     path: PathBuf,
+    env: Arc<dyn Env>,
     block_builder: BlockBuilder,
     index_entries: Vec<(Vec<u8>, BlockHandle)>,
     bloom_builder: BloomFilterBuilder,
@@ -740,7 +746,10 @@ pub(crate) struct SsTableWriter {
 }
 
 impl SsTableWriter {
-    pub(crate) fn new(
+    /// Start writing an SSTable at `path` on `env`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_in(
+        env: &Arc<dyn Env>,
         path: &Path,
         block_size: usize,
         bloom_bits_per_key: usize,
@@ -749,13 +758,14 @@ impl SsTableWriter {
         partitioned_index: bool,
         metadata_block_size: usize,
     ) -> io::Result<Self> {
-        let file = File::create(path)?;
+        let file = env.open_write(path, WriteMode::Truncate)?;
         let prefix_bloom_builder = prefix_extractor
             .as_ref()
             .map(|_| BloomFilterBuilder::new(bloom_bits_per_key));
         Ok(Self {
-            writer: BufWriter::new(file),
+            writer: BufferedWriter::new(file),
             path: path.to_path_buf(),
+            env: Arc::clone(env),
             block_builder: BlockBuilder::new(RESTART_INTERVAL),
             index_entries: Vec::new(),
             bloom_builder: BloomFilterBuilder::new(bloom_bits_per_key),
@@ -774,6 +784,29 @@ impl SsTableWriter {
             partitioned_index,
             metadata_block_size,
         })
+    }
+
+    /// Start writing an SSTable through the standard environment.
+    #[cfg(test)]
+    pub(crate) fn new(
+        path: &Path,
+        block_size: usize,
+        bloom_bits_per_key: usize,
+        compression: CompressionType,
+        prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
+        partitioned_index: bool,
+        metadata_block_size: usize,
+    ) -> io::Result<Self> {
+        Self::new_in(
+            &crate::env::std_env(),
+            path,
+            block_size,
+            bloom_bits_per_key,
+            compression,
+            prefix_extractor,
+            partitioned_index,
+            metadata_block_size,
+        )
     }
 
     /// Attach a range tombstone to the SSTable being built. Range
@@ -969,9 +1002,8 @@ impl SsTableWriter {
             magic,
         };
         self.writer.write_all(&footer.encode())?;
-        self.writer.flush()?;
-        self.writer.get_ref().sync_all()?;
-        durability::sync_parent_dir(&self.path)?;
+        self.writer.sync_all()?;
+        crate::env::sync_parent_dir(&*self.env, &self.path)?;
 
         let mut smallest_user_key = self.smallest_user_key.take();
         let mut largest_user_key = self.largest_user_key.take();
@@ -1073,6 +1105,8 @@ pub(crate) struct SsTableReader {
     /// Every region bound is checked against this, so a damaged offset
     /// can never send a read into the footer or past the file.
     data_end: u64,
+    file: Box<dyn ReadFile>,
+    file_size: u64,
     pub(crate) file_id: u64,
     /// The flat index of a V1 file, or the top-level index of a V2
     /// file. A V2 top-level index is always `Pinned`.
@@ -1156,9 +1190,14 @@ impl SsTableReader {
     /// [`MetadataPolicy::Cached`] the decoded blocks are then dropped
     /// and re-fetched through the block cache on first use, which is
     /// what puts them inside the configured budget.
-    pub(crate) fn open_with(path: &Path, file_id: u64, policy: MetadataPolicy) -> io::Result<Self> {
-        let mut file = File::open(path)?;
-        let file_size = file.metadata()?.len();
+    pub(crate) fn open_with(
+        env: &Arc<dyn Env>,
+        path: &Path,
+        file_id: u64,
+        policy: MetadataPolicy,
+    ) -> io::Result<Self> {
+        let mut file = env.open_read(path)?;
+        let file_size = file.len()?;
 
         let footer = read_footer(&mut file, file_size)?;
         let data_end = file_size - footer.size() as u64;
@@ -1371,6 +1410,17 @@ impl SsTableReader {
         let leaf = Arc::new(IndexBlock::decode(buf)?);
         cache.insert_index(self.file_id, handle.offset, Arc::clone(&leaf));
         Ok(leaf)
+    }
+
+    /// Open an SSTable file through the standard environment.
+    #[cfg(test)]
+    pub(crate) fn open(path: &Path, file_id: u64) -> io::Result<Self> {
+        Self::open_with(
+            &crate::env::std_env(),
+            path,
+            file_id,
+            MetadataPolicy::Pinned,
+        )
     }
 
     #[cfg(test)]
@@ -1891,15 +1941,13 @@ impl SsTableReader {
         if handle.size < 5 {
             return Err(invalid_data("block frame too short"));
         }
-        let mut file = self.file.lock();
         let block_data = read_file_region(
-            &mut file,
+            &*self.file,
             handle.offset,
             handle.size,
             self.data_end,
             "data block",
         )?;
-        drop(file);
 
         // Frame: [compression_type: u8][payload][checksum: u32].
         // The checksum is an accidental-corruption guard, not a MAC.
@@ -1994,9 +2042,9 @@ pub(crate) fn sst_filename(id: u64) -> String {
     format!("{:06}.sst", id)
 }
 
-/// Delete an SSTable file.
-pub(crate) fn remove_sst(path: &Path) -> io::Result<()> {
-    fs::remove_file(path)
+/// Delete an SSTable file from `env`.
+pub(crate) fn remove_sst_in(env: &dyn Env, path: &Path) -> io::Result<()> {
+    env.remove_file(path)
 }
 
 #[cfg(test)]
@@ -2781,10 +2829,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("short-block.bin");
         fs::write(&path, [0u8; 4]).unwrap();
-        let file = File::open(&path).unwrap();
         let reader = SsTableReader {
-            file: Mutex::new(file),
-            data_end: 4,
+            file: crate::env::std_env().open_read(&path).unwrap(),
+            file_size: FOOTER_SIZE as u64 + 4,
             file_id: 1,
             index: MetaSlot::Pinned(Arc::new(
                 IndexBlock::decode(0u32.to_le_bytes().to_vec()).unwrap(),

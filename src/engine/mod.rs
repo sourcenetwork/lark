@@ -5,8 +5,6 @@ pub(crate) mod bloom;
 pub(crate) mod checksum;
 pub(crate) mod commit;
 pub(crate) mod compaction;
-mod db_lock;
-pub(crate) mod durability;
 pub(crate) mod filter_block;
 pub(crate) mod index_block;
 pub(crate) mod internal_key;
@@ -26,7 +24,8 @@ pub(crate) mod sync;
 pub(crate) mod wal;
 pub(crate) mod wal_replay;
 
-use std::collections::BTreeMap;
+use crate::portability::{AtomicU64, AtomicU8, Ordering};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -39,6 +38,10 @@ use commit::{Pipeline, StallSignal, WriteSlot};
 use compaction::{CompactionOptions, CompactionScheduler};
 use db_lock::DbDirectoryLock;
 use lookup_key::{LookupKey, with_key_scratch};
+use parking_lot::{Mutex, RwLock};
+
+use block_cache::BlockCache;
+use compaction::{CompactionOptions, CompactionOutcome, CompactionScheduler};
 use manifest::{VersionEdit, VersionSet};
 use memtable::{MemTable, MemTableConfig};
 use read_horizon::ReadHorizon;
@@ -52,6 +55,10 @@ use sstable::{
 };
 use wal::{Wal, WalEntry, wal_filename};
 use wal_replay::WalReplayIter;
+use crate::env::{Capabilities, Env, FileLock};
+use crate::{event_listener, WriteBatchOp};
+use sstable::{sst_filename, LiveSst, LookupResult, SsTableMeta, SsTableReader, SsTableWriter};
+use wal::{wal_filename, Wal, WalEntry};
 
 /// Controls when data is flushed to disk after a commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +217,9 @@ pub(crate) struct EngineOptions {
     pub(crate) read_only: bool,
     pub(crate) max_key_size: usize,
     pub(crate) max_value_size: usize,
+    /// The host platform this database runs on. Every filesystem,
+    /// clock, and thread call the engine makes goes through it.
+    pub(crate) env: Arc<dyn Env>,
 }
 
 impl EngineOptions {
@@ -230,6 +240,50 @@ impl EngineOptions {
         match &self.compression_per_level {
             Some(per_level) if level < per_level.len() => per_level[level],
             _ => self.compression,
+        }
+    }
+
+    /// Project these options onto the subset compaction consumes.
+    ///
+    /// The three places that need a [`CompactionOptions`] - starting
+    /// the scheduler, `compact_range`, and the foreground inline pass -
+    /// all call this, so a knob added to one cannot go missing from
+    /// another.
+    pub(crate) fn to_compaction_options(&self) -> CompactionOptions {
+        CompactionOptions {
+            l0_compaction_trigger: self.l0_compaction_trigger,
+            level_base_bytes: self.level_base_bytes,
+            level_size_multiplier: self.level_size_multiplier,
+            target_file_size: self.target_file_size,
+            block_size: self.block_size,
+            bloom_bits_per_key: self.bloom_bits_per_key,
+            compression: self.compression,
+            compression_per_level: self.compression_per_level.clone(),
+            compaction_filter: self.compaction_filter.clone(),
+            prefix_extractor: self.prefix_extractor.clone(),
+            merge_operator: self.merge_operator.clone(),
+            listeners: self.listeners.clone(),
+            statistics: self.statistics.clone(),
+            rate_limiter: self.rate_limiter.clone(),
+            compaction_style: self.compaction_style,
+            fifo_compaction_options: self.fifo_compaction_options,
+            universal_compaction_options: self.universal_compaction_options,
+            evict_compaction_data_from_page_cache: self.evict_compaction_data_from_page_cache,
+            max_background_compactions: self.max_background_compactions,
+            partitioned_index: self.partitioned_index,
+            metadata_block_size: self.metadata_block_size,
+            env: Arc::clone(&self.env),
+        }
+    }
+
+    /// The stall policy implied by this configuration: with no
+    /// background worker there is nobody to signal a parked writer, so
+    /// the writer compacts on its own thread instead.
+    pub(crate) fn stall_policy(&self) -> StallPolicy {
+        if self.max_background_compactions == 0 {
+            StallPolicy::CompactInline
+        } else {
+            StallPolicy::WaitForWorker
         }
     }
 }
@@ -272,6 +326,7 @@ impl Default for EngineOptions {
             read_only: false,
             max_key_size: crate::options::DEFAULT_MAX_KEY_SIZE,
             max_value_size: crate::options::DEFAULT_MAX_VALUE_SIZE,
+            env: crate::env::std_env(),
         }
     }
 }
@@ -357,22 +412,87 @@ pub(crate) struct LarkEngine {
     /// level is nonzero, saving 2 lock round-trips per write in
     /// the common no-stall case.
     cached_stall_level: AtomicU8,
-    _db_lock: DbDirectoryLock,
+    /// How a stalled writer makes room. See [`StallPolicy`].
+    stall_policy: StallPolicy,
+    /// File ids currently being compacted, shared with every background
+    /// worker and with [`LarkEngine::run_one_compaction_pass`]. One set
+    /// for the whole engine is what stops a foreground pass and a
+    /// worker from picking overlapping inputs.
+    compaction_in_progress: Arc<Mutex<HashSet<u64>>>,
+    /// The host platform. Cloned out of [`EngineOptions`] so the read
+    /// and write paths reach it without going through `options`.
+    env: Arc<dyn Env>,
+    _db_lock: Box<dyn FileLock>,
+}
+
+/// Lock + condvar pair shared between foreground writers (which
+/// wait on it during a write stall) and the background compaction
+/// thread (which notifies after each compaction pass).
+///
+/// Deliberately `std::sync` rather than `parking_lot`: parking_lot's
+/// wasm thread parker aborts the module the first time a writer waits
+/// (`Parking not supported on this platform`), which would be a panic
+/// on a path reachable from [`crate::Db::put`]. `std::sync::Condvar`
+/// works on `wasm32-wasip1`. Waiting at all is confined to
+/// [`StallPolicy::WaitForWorker`]; a single-threaded host runs
+/// [`StallPolicy::CompactInline`] and never touches the condvar.
+pub(crate) struct StallSignal {
+    lock: std::sync::Mutex<()>,
+    cv: std::sync::Condvar,
+}
+
+impl StallSignal {
+    pub(crate) fn new() -> Self {
+        Self {
+            lock: std::sync::Mutex::new(()),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    /// The critical section is empty, so it cannot unwind and the mutex
+    /// cannot be poisoned; recovering the inner value keeps the wake-up
+    /// path panic-free regardless.
+    pub(crate) fn notify_all(&self) {
+        let _guard = self
+            .lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.cv.notify_all();
+    }
+}
+
+/// How a writer that has hit a "stop writes" threshold makes room.
+///
+/// Decided once at open from
+/// [`crate::Options::max_background_compactions`] and never
+/// re-evaluated, so write-stall behavior is a property of the
+/// configuration rather than of a runtime accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StallPolicy {
+    /// Background workers exist. Park on the stall condvar until a
+    /// worker reports progress, re-checking on a bounded timeout.
+    WaitForWorker,
+    /// No background worker exists. The stalling writer is the
+    /// compactor: it performs the compaction itself, on its own
+    /// thread, and never parks.
+    CompactInline,
 }
 
 impl LarkEngine {
     /// Open or create the database at the given path.
     pub(crate) fn open(db_dir: &Path, mut options: EngineOptions) -> std::io::Result<Arc<Self>> {
         options.read_only = false;
-        let db_lock = DbDirectoryLock::acquire_exclusive(db_dir)?;
+        let env = Arc::clone(&options.env);
+        let db_lock = env.lock_file(db_dir, true)?;
         let sst_dir = db_dir.join("sst");
         let wal_dir = db_dir.join("wal");
 
-        std::fs::create_dir_all(&sst_dir)?;
-        std::fs::create_dir_all(&wal_dir)?;
+        env.create_dir_all(&sst_dir)?;
+        env.create_dir_all(&wal_dir)?;
 
         let version_set =
             VersionSet::open_with_policy(db_dir, &sst_dir, options.metadata_policy())?;
+        let mut version_set = VersionSet::open_in(&env, db_dir, &sst_dir)?;
         let version = version_set.current();
         let mut latest_seq = version.last_seq;
 
@@ -412,13 +532,13 @@ impl LarkEngine {
 
         let wal_id = next_wal_id(version.next_file_id, &wal_files);
         let wal_path = wal_dir.join(wal_filename(wal_id));
-        let mut wal = Wal::create(&wal_path)?;
+        let mut wal = Wal::create_in(&env, &wal_path)?;
 
         rewrite_recovered_memtable_to_wal(&memtable, &mut wal)?;
 
         for replayed_wal_path in &wal_files {
             if replayed_wal_path != &wal_path {
-                match Wal::remove(replayed_wal_path) {
+                match Wal::remove_in(&*env, replayed_wal_path) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e),
@@ -472,11 +592,14 @@ impl LarkEngine {
         };
 
         let compaction_lock = Arc::new(RwLock::new(()));
-        let snapshot_registry = Arc::new(SnapshotRegistry::new());
+        let snapshot_registry = Arc::new(SnapshotRegistry::with_env(Arc::clone(&env)));
         let stall_signal = Arc::new(StallSignal::new());
-        // A platform that cannot spawn the worker (a single-threaded
-        // target) fails the open here instead of aborting; the
-        // directory lock and the fresh WAL drop with this return.
+        let compaction_in_progress = Arc::new(Mutex::new(HashSet::new()));
+        // `max_background_compactions == 0` starts no worker, which is
+        // how a single-threaded target opens at all. A platform that
+        // cannot spawn a worker it was asked for fails the open here
+        // instead of aborting; the directory lock and the fresh WAL
+        // drop with this return.
         let compaction = CompactionScheduler::start(
             Arc::clone(&compaction_lock),
             Arc::clone(&snapshot_registry),
@@ -485,6 +608,7 @@ impl LarkEngine {
             Arc::clone(&cache),
             compaction_opts,
             Arc::clone(&stall_signal),
+            Arc::clone(&compaction_in_progress),
         )?;
 
         let engine = Arc::new(Self {
@@ -503,6 +627,7 @@ impl LarkEngine {
             compaction: Mutex::new(compaction),
             compaction_lock,
             snapshot_registry,
+            stall_policy: options.stall_policy(),
             options,
             commit_ring: Self::new_commit_ring(),
             pipeline: Mutex::new(Pipeline::new()),
@@ -510,8 +635,17 @@ impl LarkEngine {
             wal_failed: AtomicBool::new(false),
             stall_signal,
             cached_stall_level: AtomicU8::new(0),
+            compaction_in_progress,
+            env,
             _db_lock: db_lock,
         });
+
+        // Arm write back-pressure before the first write. A database
+        // reopened with L0 already past its stop trigger would
+        // otherwise take the `cached_stall_level == 0` fast path and
+        // accept writes with no back-pressure until the first memtable
+        // rotation refreshed the cache.
+        engine.refresh_stall_level();
 
         Ok(engine)
     }
@@ -522,11 +656,12 @@ impl LarkEngine {
         db_dir: &Path,
         mut options: EngineOptions,
     ) -> std::io::Result<Arc<Self>> {
-        let db_lock = DbDirectoryLock::acquire_shared(db_dir)?;
+        let env = Arc::clone(&options.env);
+        let db_lock = env.lock_file(db_dir, false)?;
         let sst_dir = db_dir.join("sst");
         let wal_dir = db_dir.join("wal");
 
-        if !sst_dir.is_dir() {
+        if !env.is_dir(&sst_dir) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!(
@@ -535,7 +670,7 @@ impl LarkEngine {
                 ),
             ));
         }
-        if !wal_dir.is_dir() {
+        if !env.is_dir(&wal_dir) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!(
@@ -557,6 +692,12 @@ impl LarkEngine {
         );
         let memtable = Arc::new(MemTable::new(&memtable_config)?);
         let mut wal_files = list_wal_files(&wal_dir)?;
+        let version_set = VersionSet::open_read_only_in(&env, db_dir, &sst_dir)?;
+        let version = version_set.current();
+        let mut latest_seq = version.last_seq;
+
+        let memtable = Arc::new(MemTable::new());
+        let mut wal_files = list_wal_files(&*env, &wal_dir)?;
         wal_files.sort();
         wal_files.retain(|path| should_replay_wal(path, version.min_wal_id));
 
@@ -599,7 +740,7 @@ impl LarkEngine {
         }));
         versions.attach_view(Arc::clone(&view));
         let compaction_lock = Arc::new(RwLock::new(()));
-        let snapshot_registry = Arc::new(SnapshotRegistry::new());
+        let snapshot_registry = Arc::new(SnapshotRegistry::with_env(Arc::clone(&env)));
         let stall_signal = Arc::new(StallSignal::new());
         let wal_id = next_wal_id(version.next_file_id, &wal_files);
 
@@ -619,6 +760,12 @@ impl LarkEngine {
             compaction: Mutex::new(CompactionScheduler::disabled()),
             compaction_lock,
             snapshot_registry,
+            // A read-only engine has no worker, so a writer could never
+            // be woken. Writes are rejected before they reach the stall
+            // path, and inline compaction refuses a read-only engine,
+            // so this policy can only ever produce an error, never a
+            // wait that nobody will end.
+            stall_policy: StallPolicy::CompactInline,
             options,
             commit_ring: Self::new_commit_ring(),
             pipeline: Mutex::new(Pipeline::new()),
@@ -626,8 +773,31 @@ impl LarkEngine {
             wal_failed: AtomicBool::new(false),
             stall_signal,
             cached_stall_level: AtomicU8::new(0),
+            compaction_in_progress: Arc::new(Mutex::new(HashSet::new())),
+            env,
             _db_lock: db_lock,
         }))
+    }
+
+    /// What the installed environment can actually do.
+    pub(crate) fn capabilities(&self) -> Capabilities {
+        self.env.capabilities()
+    }
+
+    /// The environment this database runs on, for the wrappers
+    /// (checkpoints, TTL) that do filesystem or clock work of their
+    /// own and must do it on the same host.
+    pub(crate) fn env(&self) -> &Arc<dyn Env> {
+        &self.env
+    }
+
+    /// Microseconds elapsed since `start`, or `None` when this
+    /// platform has no monotonic clock.
+    ///
+    /// A `None` means "not measured". Callers skip the recording
+    /// rather than publishing a zero that reads like a measurement.
+    fn elapsed_micros(&self, start: Option<u64>) -> Option<u64> {
+        crate::env::elapsed_micros(&*self.env, start)
     }
 
     pub(crate) fn snapshot_seq(&self) -> u64 {
@@ -1514,7 +1684,31 @@ impl LarkEngine {
         // Stop conditions dominate over slowdown. An unconfigured
         // threshold (`0`) disables that particular trigger.
         if opts.level0_stop_writes_trigger > 0 && l0 >= opts.level0_stop_writes_trigger {
-            return Some(("stop: too many L0 files", true));
+            // The L0 *count* triggers are level-style back-pressure:
+            // only level compaction reduces the L0 file count in
+            // response to them. Under the other two styles the count
+            // can sit above the trigger with the picker correctly
+            // declining to merge, so name the real cause and the knob
+            // rather than pointing the caller at a compaction that
+            // provably cannot help.
+            return Some((
+                match opts.compaction_style {
+                    crate::options::CompactionStyle::Level => "stop: too many L0 files",
+                    crate::options::CompactionStyle::Fifo => {
+                        "stop: too many L0 files, and FIFO compaction never merges them - \
+                         set level0_stop_writes_trigger to 0 to disable this level-style \
+                         trigger, or lower fifo_compaction_options.max_table_files_size"
+                    }
+                    crate::options::CompactionStyle::Universal => {
+                        "stop: too many L0 files, and the universal picker's size-ratio and \
+                         size-amplification rules decline to merge them - set \
+                         level0_stop_writes_trigger to 0 to disable this level-style \
+                         trigger, or lower \
+                         universal_compaction_options.max_size_amplification_percent"
+                    }
+                },
+                true,
+            ));
         }
         if opts.max_write_buffer_number > 0
             && memtables >= opts.max_write_buffer_number.saturating_mul(2)
@@ -1565,6 +1759,102 @@ impl LarkEngine {
         self.cached_stall_level.store(level, Ordering::Release);
     }
 
+    /// How long a stalled writer parks before re-checking its
+    /// thresholds. The wait is bounded so a missed notification costs
+    /// one re-check rather than wedging the writer forever.
+    const STALL_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
+    /// Park until a compaction pass reports progress, or
+    /// [`Self::STALL_WAIT`] elapses.
+    ///
+    /// Shared by both stall policies: `WaitForWorker` waits on the
+    /// background worker, and `CompactInline` waits on whichever other
+    /// foreground thread currently holds the input files it needs.
+    fn wait_for_stall_signal(&self) {
+        let guard = self
+            .stall_signal
+            .lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _unused = self
+            .stall_signal
+            .cv
+            .wait_timeout(guard, Self::STALL_WAIT)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+
+    /// Upper bound on compaction jobs one stalled write will perform on
+    /// its own thread before giving up with [`crate::Error::Busy`].
+    ///
+    /// The bound exists to cap write latency, not to cap iterations for
+    /// their own sake: one L0 -> L1 pass normally drains the entire L0
+    /// pool, so a caller that needs more than this many passes is not
+    /// going to be rescued by another one on this thread.
+    const MAX_INLINE_PASSES: usize = 32;
+
+    /// How many times in a row an inline compaction pass may report
+    /// nothing to do while a stop-writes threshold is still active,
+    /// before the write is failed with [`crate::Error::Busy`].
+    ///
+    /// Not zero, because another thread can relieve the stall between
+    /// this thread's threshold check and its pick, and that races to
+    /// an `Idle` that means the opposite of stuck. Small, because a
+    /// picker that declines twice running while the threshold holds is
+    /// declining for a structural reason (see
+    /// [`crate::Options::level0_stop_writes_trigger`]) that another
+    /// pass will not change.
+    const MAX_IDLE_PASSES: usize = 2;
+
+    /// Run at most one pending compaction job on the calling thread and
+    /// report whether any work was done.
+    ///
+    /// Takes the read side of the engine-wide compaction lock, exactly
+    /// as a background worker does, and shares the engine's in-progress
+    /// file-id set, so a foreground pass and a worker can never pick
+    /// overlapping inputs.
+    ///
+    /// Lock-order invariant: the caller must not hold `write_lock`.
+    /// `ingest_external_files` holds the write side of the compaction
+    /// lock while it takes `write_lock`, so acquiring them in the
+    /// opposite order here would invert the hierarchy. The stall path
+    /// satisfies this because it runs before the write path takes
+    /// `write_lock`, never inside it.
+    pub(crate) fn run_one_compaction_pass(&self) -> std::io::Result<CompactionOutcome> {
+        self.ensure_writable()?;
+        let outcome = {
+            let _guard = self.compaction_lock.read();
+            self.ensure_writable()?;
+            // Recompute the GC horizon per pass: a snapshot may have
+            // dropped since the last one, unpinning more versions.
+            let pin_seq = self.oldest_live_seq();
+            compaction::pick_and_run_compaction(
+                &self.versions,
+                &self.sst_dir,
+                &self.cache,
+                &self.options.to_compaction_options(),
+                pin_seq,
+                &self.compaction_in_progress,
+            )?
+        };
+        // Mirror the worker loop's post-pass work so a writer parked on
+        // the condvar in `WaitForWorker` mode re-checks its thresholds.
+        self.stall_signal.notify_all();
+        self.refresh_stall_level();
+        Ok(outcome)
+    }
+
+    /// Write every memtable currently held in memory out to level-0
+    /// SSTables on the calling thread. A no-op when nothing is held.
+    ///
+    /// Shares [`Self::flush_all_memtables`] with the close path, so an
+    /// explicit flush and a close write memtables out the same way.
+    pub(crate) fn flush_active_memtable(&self) -> std::io::Result<()> {
+        self.ensure_writable()?;
+        self.flush_all_memtables()?;
+        self.refresh_stall_level();
+        Ok(())
+    }
+
     pub(crate) fn wait_for_write_capacity(&self, no_slowdown: bool) -> Result<u64, crate::Error> {
         if self.is_closed() {
             return Err(crate::Error::Closed);
@@ -1577,8 +1867,10 @@ impl LarkEngine {
             return Ok(0);
         }
 
-        let start = std::time::Instant::now();
+        let start = self.env.now_micros();
         let mut any_stall = false;
+        let mut inline_passes = 0usize;
+        let mut idle_passes = 0usize;
 
         loop {
             if self.is_closed() {
@@ -1596,17 +1888,77 @@ impl LarkEngine {
                         return Err(crate::Error::Busy(reason));
                     }
                     any_stall = true;
-                    // Bounded wait so a missed notification can't
-                    // wedge a writer forever.
-                    self.stall_signal
-                        .wait(std::time::Duration::from_millis(100));
+                    match self.stall_policy {
+                        StallPolicy::WaitForWorker => self.wait_for_stall_signal(),
+                        StallPolicy::CompactInline => {
+                            match self.run_one_compaction_pass()? {
+                                // Files came out of L0; the next
+                                // `stall_state()` sees it. Only real
+                                // work counts against the budget,
+                                // because only real work is latency
+                                // this thread is paying for.
+                                CompactionOutcome::DidWork => {
+                                    idle_passes = 0;
+                                    inline_passes += 1;
+                                    if inline_passes > Self::MAX_INLINE_PASSES {
+                                        return Err(crate::Error::Busy(reason));
+                                    }
+                                }
+                                // Another thread already holds the
+                                // inputs this writer needs. That thread
+                                // *is* the worker here, and it notifies
+                                // this signal when its job ends, so
+                                // wait for it exactly as
+                                // `WaitForWorker` does. Waiting is not
+                                // charged to the inline budget: a
+                                // contended wait is bounded by the
+                                // holder's job, which always terminates
+                                // and always deregisters, after which
+                                // this thread sees `DidWork` from its
+                                // own pass or `Idle` and gives up.
+                                CompactionOutcome::Contended => {
+                                    idle_passes = 0;
+                                    self.wait_for_stall_signal();
+                                }
+                                // Idle is ambiguous under
+                                // concurrency: it means "nothing to
+                                // compact right now", which is what a
+                                // wedged engine looks like *and* what
+                                // an engine another thread just
+                                // relieved looks like. Re-check the
+                                // thresholds from the top instead of
+                                // failing a write that no longer needs
+                                // to fail. Bounded so the genuinely
+                                // unrelievable case still returns
+                                // rather than spinning: a picker that
+                                // declines this many times in a row
+                                // while the stall persists is not
+                                // going to change its mind.
+                                CompactionOutcome::Idle => {
+                                    idle_passes += 1;
+                                    if idle_passes > Self::MAX_IDLE_PASSES {
+                                        return Err(crate::Error::Busy(reason));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 Some((reason, false)) => {
                     if no_slowdown {
                         return Err(crate::Error::Busy(reason));
                     }
                     any_stall = true;
-                    std::thread::sleep(Self::SLOWDOWN_DELAY);
+                    match self.stall_policy {
+                        StallPolicy::WaitForWorker => self.env.sleep(Self::SLOWDOWN_DELAY),
+                        // Sleeping accomplishes nothing with no worker.
+                        // The writer pays one compaction job instead,
+                        // which is what makes the write rate track
+                        // compaction on a single-threaded host.
+                        StallPolicy::CompactInline => {
+                            self.run_one_compaction_pass()?;
+                        }
+                    }
                     // One slowdown delay per call - don't loop, or
                     // a writer that just crossed the trigger would
                     // stall indefinitely at low rates.
@@ -1615,11 +1967,16 @@ impl LarkEngine {
             }
         }
 
-        let micros = start.elapsed().as_micros() as u64;
-        if any_stall && let Some(s) = self.statistics() {
-            s.add(crate::statistics::Ticker::WriteStallMicros, micros);
+        // No monotonic clock means nothing was measured. The ticker
+        // stays untouched rather than gaining a fabricated zero, and
+        // the caller is told the same thing.
+        let micros = self.elapsed_micros(start);
+        if any_stall {
+            if let (Some(micros), Some(s)) = (micros, self.statistics()) {
+                s.add(crate::statistics::Ticker::WriteStallMicros, micros);
+            }
         }
-        Ok(micros)
+        Ok(micros.unwrap_or(0))
     }
 
     pub(crate) fn commit_with_conflict_check(
@@ -1750,7 +2107,7 @@ impl LarkEngine {
         };
 
         let wal_path = self.wal_dir.join(wal_filename(new_wal_id));
-        let new_wal = Wal::create(&wal_path)?;
+        let new_wal = Wal::create_in(&self.env, &wal_path)?;
 
         let old_wal = {
             let mut wal = self.active_wal.lock();
@@ -1790,7 +2147,8 @@ impl LarkEngine {
         let sst_path = self.sst_dir.join(sst_filename(file_id));
 
         // Memtable flushes always land at L0 - pick L0's codec.
-        let mut writer = SsTableWriter::new(
+        let mut writer = SsTableWriter::new_in(
+            &self.env,
             &sst_path,
             self.options.block_size,
             self.options.bloom_bits_per_key,
@@ -1822,7 +2180,7 @@ impl LarkEngine {
             }
         };
 
-        let file_size = std::fs::metadata(&sst_path)?.len();
+        let file_size = self.env.metadata(&sst_path)?.len;
         let num_entries = summary.num_entries;
 
         // Throttle background I/O so bursts of flush writes don't
@@ -1867,10 +2225,9 @@ impl LarkEngine {
         if let Some(s) = self.statistics() {
             s.add(crate::statistics::Ticker::FlushCount, 1);
             s.add(crate::statistics::Ticker::FlushBytesWritten, file_size);
-            s.record(
-                crate::statistics::Histogram::FlushTime,
-                flush_start.elapsed().as_micros() as u64,
-            );
+            if let Some(micros) = self.elapsed_micros(flush_start) {
+                s.record(crate::statistics::Histogram::FlushTime, micros);
+            }
         }
 
         // Dispatch lifecycle events to any registered listeners.
@@ -1892,7 +2249,10 @@ impl LarkEngine {
                     (Vec::new(), Vec::new())
                 }
             };
-            let duration = flush_start.elapsed();
+            // Zero where the platform has no monotonic clock; the
+            // `FlushJobInfo::duration` doc says so.
+            let duration =
+                std::time::Duration::from_micros(self.elapsed_micros(flush_start).unwrap_or(0));
             let create_info = event_listener::TableFileCreationInfo {
                 file_id,
                 file_path: sst_path.clone(),
@@ -2258,7 +2618,8 @@ impl LarkEngine {
         let ingest_seq = self.latest_seq.fetch_add(1, Ordering::AcqRel) + 1;
 
         let dest_path = self.sst_dir.join(sst_filename(file_id));
-        let mut writer = SsTableWriter::new(
+        let mut writer = SsTableWriter::new_in(
+            &self.env,
             &dest_path,
             self.options.block_size,
             self.options.bloom_bits_per_key,
@@ -2286,7 +2647,7 @@ impl LarkEngine {
         let summary = match writer.finish()? {
             Some(s) => s,
             None => {
-                let _ = std::fs::remove_file(&dest_path);
+                let _ = self.env.remove_file(&dest_path);
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
@@ -2414,7 +2775,7 @@ impl LarkEngine {
             // reference files that are *not* in the captured
             // version. Copying them into a checkpoint manifest would
             // make recovery fail on the missing files.
-            manifest_len = std::fs::metadata(&manifest_path)?.len();
+            manifest_len = self.env.metadata(&manifest_path)?.len;
         }
 
         Ok(CheckpointSnapshot {
@@ -2628,7 +2989,7 @@ impl LarkEngine {
             let old_version = versions.current();
             let id = old_version.next_file_id;
             let wal_path = self.wal_dir.join(wal_filename(id));
-            let new_wal = Wal::create(&wal_path)?;
+            let new_wal = Wal::create_in(&self.env, &wal_path)?;
             versions.apply(&[VersionEdit::Reset {
                 next_file_id: id + 1,
                 min_wal_id: id,
@@ -2644,8 +3005,8 @@ impl LarkEngine {
 
         self.versions.lock().compact_manifest()?;
 
-        remove_obsolete_sst_files(&self.sst_dir, &old_version)?;
-        remove_obsolete_wal_files(&self.wal_dir, &wal_path)?;
+        remove_obsolete_sst_files(&*self.env, &self.sst_dir, &old_version)?;
+        remove_obsolete_wal_files(&*self.env, &self.wal_dir, &wal_path)?;
 
         Ok(())
     }
@@ -2734,7 +3095,7 @@ impl LarkEngine {
             return Ok(());
         }
 
-        self.flush_memtables_for_close()?;
+        self.flush_all_memtables()?;
 
         self.active_wal
             .lock()
@@ -2792,7 +3153,8 @@ impl LarkEngine {
                     versions.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
                     id
                 };
-                let wal_for_flush = Wal::create(&self.wal_dir.join(wal_filename(new_wal_id)))?;
+                let wal_for_flush =
+                    Wal::create_in(&self.env, &self.wal_dir.join(wal_filename(new_wal_id)))?;
 
                 if active_needs_flush {
                     // One publication for the seal and the enqueue: two
@@ -2952,53 +3314,60 @@ impl CheckpointSnapshot {
     }
 }
 
-fn list_wal_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+fn list_wal_files(env: &dyn Env, dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    if dir.exists() {
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path
+    if env.exists(dir) {
+        for entry in env.read_dir(dir)? {
+            if entry
+                .path
                 .extension()
                 .is_some_and(|ext| ext == "log" || ext == "wal")
             {
-                files.push(path);
+                files.push(entry.path);
             }
         }
     }
     Ok(files)
 }
 
-fn remove_obsolete_sst_files(sst_dir: &Path, version: &manifest::Version) -> std::io::Result<()> {
+fn remove_obsolete_sst_files(
+    env: &dyn Env,
+    sst_dir: &Path,
+    version: &manifest::Version,
+) -> std::io::Result<()> {
     let mut removed_any = false;
     for level in &version.levels {
         for file in level {
             let path = sst_dir.join(sst_filename(file.meta.file_id));
-            removed_any |= remove_file_if_exists(&path)?;
+            removed_any |= remove_file_if_exists(env, &path)?;
         }
     }
     if removed_any {
-        durability::sync_dir(sst_dir)?;
+        env.sync_dir(sst_dir)?;
     }
     Ok(())
 }
 
-fn remove_obsolete_wal_files(wal_dir: &Path, keep_path: &Path) -> std::io::Result<()> {
+fn remove_obsolete_wal_files(
+    env: &dyn Env,
+    wal_dir: &Path,
+    keep_path: &Path,
+) -> std::io::Result<()> {
     let mut removed_any = false;
-    for path in list_wal_files(wal_dir)? {
+    for path in list_wal_files(env, wal_dir)? {
         if path == keep_path {
             continue;
         }
-        removed_any |= remove_file_if_exists(&path)?;
+        removed_any |= remove_file_if_exists(env, &path)?;
     }
     if removed_any {
-        durability::sync_dir(wal_dir)?;
+        env.sync_dir(wal_dir)?;
     }
     Ok(())
 }
 
-fn remove_file_if_exists(path: &Path) -> std::io::Result<bool> {
-    match std::fs::remove_file(path) {
+fn remove_file_if_exists(env: &dyn Env, path: &Path) -> std::io::Result<bool> {
+    match env.remove_file(path) {
         Ok(()) => Ok(true),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err),

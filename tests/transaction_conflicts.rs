@@ -6,6 +6,11 @@
 //! a lost update shows up as a final count below the number of
 //! increments performed.
 
+// Native-only. wasm-pack builds every test target for wasm32, and these use
+// threads, the filesystem or proptest, none of which exist there. The browser
+// suite lives in tests/wasm_opfs*.rs.
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -127,8 +132,38 @@ fn a_write_batch_around_the_lock_manager_is_detected() {
     assert_eq!(db.db().get(b"k").unwrap(), Some(b"racer".to_vec()));
 }
 
+/// The property the storm test below races for, forced instead of
+/// raced: a plain `Db::put` landing between a transaction's
+/// `get_for_update` and its `commit` must abort that commit.
 #[test]
 #[ignore = "Stress test, run deliberately with --ignored. It races a raw-put storm against transactional read-modify-writes, so the number that notice is purely scheduling-dependent: most of them in isolation, sometimes ZERO under a loaded runner. Even asserting > 0 flaked. The property itself is proven deterministically by a_raw_put_between_read_and_commit_is_detected, which forces the interleaving instead of racing for it."]
+fn a_raw_put_between_read_and_commit_is_detected() {
+    let dir = TempDir::new().unwrap();
+    let db = pes_db(&dir);
+    db.db().put(b"k", &0u64.to_le_bytes()).unwrap();
+
+    let mut tx = db.begin_transaction();
+    let current = decode(tx.get_for_update(b"k").unwrap());
+    assert_eq!(current, 0);
+
+    // The bypassing writer, placed exactly in the window rather than
+    // left to a scheduler to hit by chance.
+    db.db().put(b"k", &1_000_000u64.to_le_bytes()).unwrap();
+
+    tx.put(b"k", &(current + 1).to_le_bytes()).unwrap();
+    assert!(
+        matches!(tx.commit(), Err(TransactionError::Conflict { .. })),
+        "a raw put inside the read-commit window must abort the transaction"
+    );
+    assert_eq!(
+        decode(db.db().get(b"k").unwrap()),
+        1_000_000,
+        "the bypassing write stands and the aborted increment did not land"
+    );
+}
+
+#[test]
+#[ignore = "Stress test, run deliberately with --ignored. It races a raw-put storm against transactional read-modify-writes, so how many notice is purely scheduling-dependent: most in isolation, sometimes zero under a loaded runner. The property is proven deterministically by a_raw_put_between_read_and_commit_is_detected, which forces the interleaving instead of racing for it."]
 fn a_raw_put_storm_aborts_the_read_modify_writes_it_races() {
     const ROUNDS: usize = 200;
     let dir = TempDir::new().unwrap();

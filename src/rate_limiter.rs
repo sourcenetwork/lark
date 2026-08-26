@@ -13,9 +13,14 @@
 //! the trait is public so callers can drop in their own (e.g. for test
 //! harnesses or a shared limiter across multiple databases).
 
+use crate::portability::{AtomicU64, Ordering};
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// The module's own tests measure real elapsed time to prove the
+// limiter actually blocks.
+#[cfg(test)]
+use std::time::Instant;
 
 use parking_lot::{Condvar, Mutex};
 
@@ -72,7 +77,8 @@ struct WaiterKey {
 struct State {
     bytes_per_second: u64,
     available: i128,
-    last_refill: Instant,
+    /// Nanoseconds from the platform clock at the last refill.
+    last_refill: u64,
     next_seq: u64,
     waiters: BTreeSet<WaiterKey>,
     shutdown: bool,
@@ -120,7 +126,7 @@ impl TokenBucketRateLimiter {
             state: Mutex::new(State {
                 bytes_per_second,
                 available: burst_bytes as i128,
-                last_refill: Instant::now(),
+                last_refill: crate::env::platform_nanos().unwrap_or(0),
                 next_seq: 0,
                 waiters: BTreeSet::new(),
                 shutdown: false,
@@ -145,13 +151,13 @@ impl TokenBucketRateLimiter {
 
     /// Refill the bucket based on elapsed time since `last_refill`.
     /// Caller holds the lock.
-    fn refill_locked(&self, state: &mut State, now: Instant) {
-        let elapsed = now.saturating_duration_since(state.last_refill);
-        if elapsed < self.refill_period {
+    fn refill_locked(&self, state: &mut State, now: u64) {
+        let elapsed = u128::from(now.saturating_sub(state.last_refill));
+        if elapsed < self.refill_period.as_nanos() {
             return;
         }
         let period_nanos: u128 = self.refill_period.as_nanos().max(1);
-        let periods = (elapsed.as_nanos() / period_nanos) as u64;
+        let periods = (elapsed / period_nanos) as u64;
         if periods == 0 {
             return;
         }
@@ -162,7 +168,9 @@ impl TokenBucketRateLimiter {
             .saturating_mul(periods as u128)
             / 1_000_000_000u128;
         state.available = (state.available + tokens as i128).min(self.burst_bytes as i128);
-        state.last_refill += self.refill_period * periods as u32;
+        state.last_refill = state
+            .last_refill
+            .saturating_add((period_nanos.saturating_mul(periods as u128)) as u64);
     }
 
     /// Internal: serve one chunk (at most `burst_bytes`).
@@ -170,6 +178,13 @@ impl TokenBucketRateLimiter {
         if bytes == 0 {
             return true;
         }
+        // Rate limiting is a function of elapsed time. A platform
+        // with no monotonic clock cannot measure it, so the limiter
+        // serves every request immediately instead of blocking on a
+        // bucket that could never refill.
+        let Some(mut now) = crate::env::platform_nanos() else {
+            return true;
+        };
         let class = pri.class();
         let mut state = self.state.lock();
         if state.shutdown {
@@ -185,7 +200,6 @@ impl TokenBucketRateLimiter {
                 break false;
             }
 
-            let now = Instant::now();
             self.refill_locked(&mut state, now);
 
             let Some(front) = state.waiters.iter().next().copied() else {
@@ -199,9 +213,10 @@ impl TokenBucketRateLimiter {
             // Either we aren't at the front or tokens aren't ready.
             // Compute how long until the next refill and sleep that
             // long - a spurious wakeup just re-enters the loop.
+            now = crate::env::platform_nanos().unwrap_or(now);
             let wait = self
                 .refill_period
-                .saturating_sub(Instant::now().saturating_duration_since(state.last_refill));
+                .saturating_sub(Duration::from_nanos(now.saturating_sub(state.last_refill)));
             let wait = if wait.is_zero() {
                 self.refill_period
             } else {
@@ -265,8 +280,9 @@ impl RateLimiter for TokenBucketRateLimiter {
         let mut state = self.state.lock();
         // Catch up on any pending refill at the old rate before
         // switching, so the change takes effect cleanly from "now".
-        let now = Instant::now();
-        self.refill_locked(&mut state, now);
+        if let Some(now) = crate::env::platform_nanos() {
+            self.refill_locked(&mut state, now);
+        }
         state.bytes_per_second = bytes_per_second;
         self.cv.notify_all();
     }

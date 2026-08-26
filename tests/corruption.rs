@@ -8,6 +8,11 @@
 //! gracefully with the expected partial data - never silent loss
 //! of earlier, uncorrupted data.
 
+// Native-only. wasm-pack builds every test target for wasm32, and these use
+// threads, the filesystem or proptest, none of which exist there. The browser
+// suite lives in tests/wasm_opfs*.rs.
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};

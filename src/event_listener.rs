@@ -66,6 +66,8 @@ pub struct FlushJobInfo {
     pub largest_key: Vec<u8>,
     /// Wall-clock duration of the flush, from memtable rotation
     /// through manifest apply.
+    /// Zero on a platform whose [`crate::env::Env`] has no
+    /// monotonic clock, where nothing was measured.
     pub duration: Duration,
 }
 
@@ -88,7 +90,9 @@ pub struct CompactionJobInfo {
     /// [`EventListener::on_compaction_completed`]; empty on
     /// [`EventListener::on_compaction_begin`].
     pub output_files: Vec<u64>,
-    /// Wall-clock duration of the compaction. Zero on begin.
+    /// Wall-clock duration of the compaction. Zero on begin, and
+    /// zero on a platform whose [`crate::env::Env`] has no monotonic
+    /// clock, where nothing was measured.
     pub duration: Duration,
 }
 

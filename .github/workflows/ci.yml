@@ -97,6 +97,120 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
 
+  # wasm32-wasip1 is a supported target, not a target that merely
+  # compiles. This job builds the probe and runs the whole database
+  # lifecycle under wasmtime with a host preopen - open, put, get,
+  # delete, batch, scan, snapshot, iterate, compact, close, reopen,
+  # read back - and the probe exits non-zero on the first byte that
+  # does not match what it wrote. The sustained phase then writes past
+  # the L0 stop trigger with a 32 KiB memtable and no explicit
+  # compaction, which is the case that wedges when nothing compacts on
+  # the calling thread.
+  wasm-wasip1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+      # Installs the current wasmtime release. The numbers in this
+      # job's summary were first measured against 47.0.3.
+      - uses: bytecodealliance/actions/wasmtime/setup@v1
+      - name: Build the probe for wasm32-wasip1
+        run: cargo build --release -p lark-wasm-probe --target wasm32-wasip1
+      - name: Full lifecycle under wasmtime
+        run: |
+          set -euo pipefail
+          d=$(mktemp -d)
+          wasmtime run --dir="$d::/data" \
+            target/wasm32-wasip1/release/lark-wasm-probe.wasm -- \
+            --profile embedded --records 5000 --sustained 20000 \
+            --probe-host --report-memory | tee wasip1-probe.txt
+          rm -rf "$d"
+      - name: Publish the wasm linear-memory high-water mark
+        run: |
+          {
+            echo "## wasm32-wasip1"
+            echo ""
+            echo '```'
+            cat wasip1-probe.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Tier A embedded: Linux-class targets with std (Cortex-A boards,
+  # ESP32-S3 under esp-idf). These compile today, and nothing stopped
+  # them regressing - a new `cfg(unix)` dependency or a
+  # `target_os = "linux"` assumption would break them silently between
+  # releases. Checking the examples too keeps the embedded measuring
+  # harness itself cross-compilable.
+  embedded-tier-a:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the library and tools
+        run: cargo check --workspace --target ${{ matrix.target }}
+      - name: Check the examples
+        run: cargo check --examples --target ${{ matrix.target }}
+
+  # The embedded budget is a measured claim, so it is re-measured on
+  # every run rather than quoted from a README. Both figures land in
+  # the job summary: memory high-water through a full lifecycle, and
+  # worst-case stack depth per code path.
+  embedded-budget:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Memory high-water, embedded profile
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/lark-mem"
+          cargo run --release --example embedded_profile -- \
+            "$RUNNER_TEMP/lark-mem" embedded 20000 | tee embedded-memory.txt
+      - name: Memory high-water, default profile for contrast
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/lark-mem-default"
+          cargo run --release --example embedded_profile -- \
+            "$RUNNER_TEMP/lark-mem-default" default 20000 | tee default-memory.txt
+      - name: Worst-case stack depth per path
+        run: |
+          set -euo pipefail
+          cargo run --release --example stack_depth -- \
+            "$RUNNER_TEMP/lark-stack" | tee stack-depth.txt
+      - name: Publish the embedded budget
+        run: |
+          {
+            echo "## Embedded budget"
+            echo ""
+            echo "### Memory high-water, Options::embedded()"
+            echo '```'
+            cat embedded-memory.txt
+            echo '```'
+            echo "### Memory high-water, Options::default()"
+            echo '```'
+            cat default-memory.txt
+            echo '```'
+            echo "### Stack depth"
+            echo '```'
+            cat stack-depth.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   deny:
     runs-on: ubuntu-latest
     steps:

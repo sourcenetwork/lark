@@ -5,6 +5,11 @@
 //! Each one reproduced an over-budget cache or a silently shrunken one
 //! before the accounting rework.
 
+// Native-only. wasm-pack builds every test target for wasm32, and these use
+// threads, the filesystem or proptest, none of which exist there. The browser
+// suite lives in tests/wasm_opfs*.rs.
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::sync::Arc;
 
 use lark_kv::{Db, Options, Statistics, Ticker};

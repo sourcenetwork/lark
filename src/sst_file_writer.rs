@@ -84,7 +84,8 @@ impl SstFileWriter {
     pub fn create<P: AsRef<Path>>(path: P, opts: &Options) -> crate::Result<Self> {
         opts.validate()?;
         let path = path.as_ref().to_path_buf();
-        let inner = SsTableWriter::new(
+        let inner = SsTableWriter::new_in(
+            &opts.env,
             &path,
             opts.block_size,
             opts.bloom_bits_per_key,

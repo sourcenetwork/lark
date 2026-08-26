@@ -120,12 +120,102 @@ let opts = Options {
 let db = lark_kv::Db::open("/path/to/db", opts)?;
 ```
 
+### Write back-pressure and compaction style
+
+`level0_slowdown_writes_trigger` and `level0_stop_writes_trigger` count L0 *files*, and
+only `CompactionStyle::Level` reduces that count in response. FIFO never merges L0 files
+at all, and universal merges on its own size-ratio and amplification rules, which a
+healthy size tier satisfies while holding more L0 files than the trigger allows. Under
+either of those styles the trigger can be reached and never relieved, and writes then fail
+with `Error::Busy` whose message names the style and the knob. Set both triggers to `0`
+with FIFO or universal, and bound memory with `max_write_buffer_number` and
+`hard_pending_compaction_bytes_limit`, which apply to every style. This is long-standing
+behaviour, not new; what changed is that the writer now returns rather than blocking
+forever.
+
 ### Value size
 
 `max_value_size` defaults to 64 MiB; a write above the limit is rejected with an error.
 Raising it works, but lark stores values inline with keys, with no key-value separation: a
 large value is rewritten in full by every compaction that touches its key, and writing a
 1 GiB value peaked at 3719 MiB RSS.
+
+### Embedded and small-memory hosts
+
+`Options::embedded()` is a profile for a host whose whole working set has to fit in
+roughly 1-4 MiB: a Linux-class board (Cortex-A, ESP32-S3 under esp-idf), or a wasm
+module, where linear memory grows in 64 KiB pages and never shrinks.
+
+```rust
+let db = lark_kv::Db::open("/path/to/db", lark_kv::Options::embedded())?;
+```
+
+It replaces the server-shaped defaults with values bounded by the budget rather than by
+throughput: a 256 KiB write buffer, no block cache at all, 4 KiB blocks, 256 KiB SSTables,
+an L0 stop trigger of 8, and `max_background_compactions: 0`, which runs compaction on the
+calling thread instead of a background worker. Every value and the reasoning behind it is
+documented on `Options::embedded` itself.
+
+#### Measured budget
+
+Both figures come from checked-in examples, re-run by the `embedded-budget` CI job rather
+than quoted from here. Reproduce them with:
+
+```sh
+cargo run --release --example embedded_profile -- /tmp/lark-mem embedded 20000
+cargo run --release --example stack_depth -- /tmp/lark-stack
+cargo run --release --example read_scaling -- /tmp/lark-scale 500000 3
+```
+
+Full lifecycle (open, 20k x 128 B puts, sampled reads, page scan, compact, close, reopen,
+read back), x86_64 Linux and wasm32-wasip1 under wasmtime:
+
+| profile      | Linux RSS attributable to lark | wasm linear memory high-water          |
+| ------------ | ------------------------------ | -------------------------------------- |
+| `embedded()` | 1.53 MiB                       | 2.00 MiB total, 0.94 MiB over baseline |
+| `default()`  | 10.2 MiB                       | 11.25 MiB total, 10.2 MiB over baseline |
+
+#### Stack requirement
+
+**A release build of lark needs at least 16 KiB of stack on any thread that calls it. A
+debug build needs at least 64 KiB.** Worst-case measured depth is 11.6 KiB for `Db::open`,
+on x86_64 with the release profile. Every measured path exceeds the 4 KiB that a small
+Cortex-M stack provides:
+
+| path                                 | bytes |
+| ------------------------------------ | ----- |
+| `Db::open` (multi-level, WAL replay) | 11840 |
+| 8000 puts crossing a flush boundary  | 11424 |
+| compaction merge (`compact_range`)   | 11400 |
+| iterator seek + 50-entry walk        |  8328 |
+| `scan_page` of 1000 rows             |  7695 |
+| point read                           |  4552 |
+
+The table is the release profile. An unoptimized build does not inline the same frames and
+measures roughly 4x deeper: `examples/stack_probe.rs` runs each path on a thread of a
+chosen size, and in debug every one of them overflows a 32 KiB stack and fits a 64 KiB one.
+That probe cannot resolve below 16 KiB, because `std::thread::Builder` raises any smaller
+request to the platform minimum; the table above comes from the painting harness, which
+can.
+Provision for the profile you are actually flashing, and remember that bring-up is
+usually the debug one.
+
+On Linux, where the default thread stack is 8 MiB, this costs nothing. On an esp-idf task
+it is a `CONFIG_ESP_MAIN_TASK_STACK_SIZE` you must set. These are host numbers: frame
+layout is target-specific, so re-run `stack_depth` on the target before treating any of
+them as a budget for it. They have not been measured on ARM or RISC-V.
+
+### Target tiers
+
+| tier | targets | status |
+| ---- | ------- | ------ |
+| Tier A, Linux-class with `std` | `aarch64-unknown-linux-gnu`, `armv7-unknown-linux-gnueabihf` | supported, checked in CI |
+| Tier A, same by construction | ESP32-S3 under esp-idf | unverified, no toolchain in CI |
+| wasm | `wasm32-wasip1` | supported, full lifecycle run under wasmtime in CI |
+| Tier B, bare metal | `thumbv7em-none-eabi`, `riscv32imac-unknown-none-elf` | not supported; lark is `std`-only |
+
+Tier B needs `no_std` plus `alloc`. lark does not build there today, and the first failure
+is a dependency (`crossbeam-utils`), not lark's own code.
 
 ## On-disk format
 

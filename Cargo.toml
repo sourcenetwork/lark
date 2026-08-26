@@ -1,5 +1,11 @@
 [workspace]
-members = [".", "tools/lark-bench", "tools/lark-stress", "tools/lark-ycsb"]
+members = [
+    ".",
+    "tools/lark-bench",
+    "tools/lark-stress",
+    "tools/lark-wasm-probe",
+    "tools/lark-ycsb",
+]
 resolver = "2"
 
 [package]
@@ -17,6 +23,12 @@ categories = ["database-implementations"]
 
 [features]
 fuzzing = []
+# Atomics for a target with no hardware compare-and-swap, such as
+# `thumbv6m-none-eabi`. `portable-atomic` then implements the missing
+# operations inside a critical section. The *binary* must also depend
+# on `critical-section` and select a platform implementation; a
+# library cannot choose one on the integrator's behalf.
+critical-section = ["portable-atomic/critical-section"]
 
 # `--cfg loom` swaps the memtable's atomics and locks for loom's mocks
 # (see `src/engine/sync.rs`). Declaring it keeps `unexpected_cfgs` quiet
@@ -31,6 +43,15 @@ crossbeam-epoch = "0.9"
 crossbeam-skiplist = "0.1"
 kovan-queue = "0.1.19"
 kovan-channel = "0.1.19"
+
+# `fallback` supplies `AtomicU64` on 32-bit targets that have no
+# 64-bit atomic instruction; `require-cas` turns a target with no
+# compare-and-swap into a named compile error pointing at the
+# `critical-section` feature above. See `src/portability.rs`.
+portable-atomic = { version = "1", default-features = false, features = [
+    "fallback",
+    "require-cas",
+] }
 lz4_flex = "0.11"
 snap = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
@@ -47,8 +68,16 @@ loom = "0.7"
 [target.'cfg(loom)'.dev-dependencies]
 loom = "0.7"
 
+# Browser wasm only. `wasm32-wasip1` has a working `std::fs` under a host
+# preopen and needs none of this; `wasm32-unknown-unknown` has no
+# filesystem at all and reaches storage through OPFS. The versions match
+# the ones defradb's OPFS backend already ships against.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+
 [dev-dependencies]
-proptest = "1"
 tempfile = "3.8"
 
 # tokio carries its own `cfg(loom)` arms and does not build under this
@@ -57,6 +86,21 @@ tempfile = "3.8"
 # tokio, so gating it out of the loom build costs nothing.
 [target.'cfg(not(loom))'.dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# The OPFS tests are `wasm_bindgen_test` functions driven by a real
+# browser; there is no other way to reach `navigator.storage`.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-test = "0.3"
+
+# `proptest` pulls in `wait-timeout`, which has no wasm implementation.
+# Dev-dependencies are linked into examples too, so leaving it
+# unconditional makes `cargo build --example --target wasm32-*` fail
+# before it reaches any lark code. The property tests it backs live in
+# `tests/` and only ever run on the host.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+proptest = "1"
 
 [profile.release]
 opt-level = 3

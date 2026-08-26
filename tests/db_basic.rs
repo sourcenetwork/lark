@@ -7,6 +7,11 @@
 //! tests or [`parity.rs`] are intentionally *not* re-ported here;
 //! this file is strictly additive coverage.
 
+// Native-only. wasm-pack builds every test target for wasm32, and these use
+// threads, the filesystem or proptest, none of which exist there. The browser
+// suite lives in tests/wasm_opfs*.rs.
+#![cfg(not(target_arch = "wasm32"))]
+
 use lark_kv::{Db, Options, Range, WriteBatch};
 use tempfile::TempDir;
 
