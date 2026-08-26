@@ -399,3 +399,33 @@ jobs:
       - run: cargo install cargo-fuzz --locked
       - name: Fuzz ${{ matrix.target }}
         run: just fuzz ${{ matrix.target }} 300
+
+  # Elle consistency checking. Its own job because it needs a JVM and the
+  # elle-cli distribution, and because it fails for a reason nothing else
+  # does: a history whose dependency graph has a cycle.
+  #
+  # elle-cli is not vendored (37 MB), so the job fetches a pinned release.
+  elle:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: extractions/setup-just@v2
+      - name: Fetch elle-cli
+        run: |
+          set -euo pipefail
+          v=0.1.7
+          curl -fsSL -o /tmp/elle-cli.zip \
+            "https://github.com/ligurio/elle-cli/releases/download/${v}/elle-cli-bin-${v}.zip"
+          unzip -q -o /tmp/elle-cli.zip -d /tmp/elle-cli
+          find /tmp/elle-cli -name '*.jar' -exec cp {} harness/elle/elle-cli.jar \;
+          test -s harness/elle/elle-cli.jar
+      - name: Every isolation level lark claims
+        run: just elle-matrix

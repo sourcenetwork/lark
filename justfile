@@ -204,19 +204,61 @@ stress secs="600":
 
 # ---------- consistency ----------
 
-# Elle consistency checking. NOT WIRED UP YET: needs `harness/elle`, a
-# history generator that drives lark and emits an Elle history, plus
-# `elle-cli.jar` beside it. Neither is in the tree, so this recipe fails
-# until they are added; it is here as the interface they must satisfy.
-elle model="list-append":
-    cargo run --release --manifest-path harness/elle/Cargo.toml -- \
-        --model {{model}} --out /tmp/lark-history.json
-    java -jar harness/elle/elle-cli.jar --model {{model}} /tmp/lark-history.json
+# Elle consistency checking. `model` is the workload (list-append or
+# rw-register); `level` is the consistency model to check it against.
+#
+# The two are separate axes and elle-cli spells both `--model`-ish, which
+# is easy to get wrong: passing an isolation level as --model throws
+# "No matching clause". Hence the explicit --consistency-models here.
+elle model="list-append" level="snapshot-isolation" isolation="repeatable-read":
+    cargo run --release --manifest-path harness/elle/Cargo.toml --bin elle-gen -- \
+        --model {{model}} --isolation {{isolation}} \
+        --threads 8 --txns 50 --keys 4 \
+        --out /tmp/lark-history.json --dir /tmp/lark-elle-db
+    java -jar harness/elle/elle-cli.jar --model {{model}} \
+        --consistency-models {{level}} /tmp/lark-history.json
 
-elle-fault model="list-append":
-    cargo run --release --manifest-path harness/elle/Cargo.toml -- \
-        --model {{model}} --faults --out /tmp/lark-history-fault.json
-    java -jar harness/elle/elle-cli.jar --model {{model}} /tmp/lark-history-fault.json
+# The same, with the fault injection the harness supports.
+elle-fault model="list-append" level="snapshot-isolation":
+    cargo run --release --manifest-path harness/elle/Cargo.toml --bin elle-gen -- \
+        --model {{model}} --isolation repeatable-read --faults \
+        --threads 8 --txns 50 --keys 4 \
+        --out /tmp/lark-history-fault.json --dir /tmp/lark-elle-fault-db
+    java -jar harness/elle/elle-cli.jar --model {{model}} \
+        --consistency-models {{level}} /tmp/lark-history-fault.json
+
+# Every level lark claims, checked in one go.
+#
+# Each line prints `true` or `false`; a `false` on a level lark claims is
+# a real failure and the recipe exits non-zero.
+elle-matrix:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    cd harness/elle
+    cargo build --release --bin elle-gen
+    fail=0
+    check() {
+        local name="$1" model="$2" level="$3"; shift 3
+        ./target/release/elle-gen --model "$model" "$@" \
+            --out "/tmp/elle-$name.json" --dir "/tmp/elle-db-$name" >/dev/null
+        # elle-cli prints "<path>\t<true|false>"; take the last field and
+        # strip surrounding whitespace, so a stray tab cannot read as a
+        # failure on a history that actually passed.
+        local v
+        v=$(java -jar elle-cli.jar --model "$model" \
+            --consistency-models "$level" "/tmp/elle-$name.json" \
+            | tail -1 | awk '{print $NF}')
+        printf '  %-42s %s\n' "$name [$level]" "$v"
+        if [ "$v" != "true" ]; then fail=1; fi
+    }
+    # Optimistic transactions are snapshot isolation. That is the level
+    # lark claims, so a false here is a defect.
+    check optimistic-si       list-append snapshot-isolation --isolation repeatable-read --threads 8 --txns 50 --keys 4 --seed 4
+    check optimistic-rw       rw-register snapshot-isolation --isolation repeatable-read --threads 8 --txns 50 --keys 4 --seed 5
+    # Pessimistic transactions are checked at the level they request.
+    check pessimistic-rc      list-append read-committed     --isolation read-committed --threads 8 --txns 50 --keys 4 --seed 2
+    check pessimistic-hotkey  list-append read-committed     --isolation read-committed --threads 8 --txns 50 --keys 1 --seed 1
+    exit $fail
 
 # ---------- portability ----------
 
