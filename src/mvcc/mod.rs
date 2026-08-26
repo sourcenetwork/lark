@@ -5,3 +5,5 @@
 //! so the transaction semantics come from one implementation rather than
 //! from two that have to agree.
 pub(crate) mod key;
+pub(crate) mod layout;
+pub(crate) mod storage;

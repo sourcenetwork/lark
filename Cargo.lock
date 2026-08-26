@@ -529,6 +529,7 @@ dependencies = [
  "crossbeam-skiplist",
  "js-sys",
  "kovan-channel",
+ "kovan-map",
  "kovan-mvcc",
  "kovan-queue",
  "loom",
