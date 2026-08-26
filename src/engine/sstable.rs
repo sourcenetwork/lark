@@ -1202,8 +1202,12 @@ impl SsTableReader {
 
     pub(crate) fn last_block_cursor(&self) -> io::Result<Option<SsTableBlockCursor>> {
         if !self.partitioned {
+            // `then`, not `then_some`: the argument to `then_some` is
+            // evaluated whether or not the condition holds, so the
+            // subtraction underflowed on an empty index despite the
+            // guard right next to it.
             return Ok(
-                (!self.index.is_empty()).then_some(SsTableBlockCursor::Flat(self.index.len() - 1))
+                (!self.index.is_empty()).then(|| SsTableBlockCursor::Flat(self.index.len() - 1))
             );
         }
 
