@@ -14,6 +14,43 @@
 //! stops making progress, so a lock-order inversion between the version
 //! store and the read view's publish mutex surfaces as a failure
 //! instead of a timeout.
+//!
+//! # A wedge this workload reaches on both trees
+//!
+//! At six concurrent instances and 700 versions the run sometimes stops
+//! making write progress for minutes. Measured with byte-identical test
+//! code on an otherwise idle 36-core box, 45s cap, the two trees
+//! alternating rep by rep: this tree 5 of 12, the pre-change tree 3 of
+//! 12. A separate non-interleaved pair gave 4 of 10 and 0 of 10. So the
+//! wedge is real and is **not** attributable to the read-view change;
+//! the rate is too noisy at these sample sizes to say more.
+//!
+//! What a wedged run looks like: writer threads parked in
+//! `LarkEngine::wait_for_write_capacity`'s hard-stop branch
+//! (`src/engine/mod.rs:1434`), `lark.num-files-at-level0` reading 0,
+//! `lark.num-entries-imm-mem-tables` reading 0, and a concurrent
+//! `put_opt` with `no_slowdown` returning `Ok`. Readers keep making
+//! progress throughout, so it is not a deadlock of the whole engine.
+//! Not root-caused.
+//!
+//! One of those symptoms has a plain explanation that is a code reading,
+//! not a measurement, and it is *not* a proposed cause of the wedge:
+//! `LarkEngine::wait_for_write_capacity` short-circuits on
+//! `cached_stall_level == 0` before it consults `stall_state()`, and it
+//! does so for `no_slowdown` callers too. A stale zero in that cache
+//! therefore lets a fresh `put_opt(no_slowdown)` return `Ok` while
+//! writers already inside the loop are still parked on a live stall
+//! condition. That makes the `Ok` uninformative about whether a stall is
+//! active; it does not say why the stall stays active. Left alone here:
+//! it is write-stall behaviour, not read-path behaviour, and none of the
+//! six fixes touches it.
+//!
+//! Knobs: `LARK_CHAOS_MASK` selects which chaos threads run (bit 0
+//! `compact_range`, 1 column families, 2 ingest, 3 checkpoint),
+//! `LARK_CHAOS_READERS` sets the reader count, and
+//! `LARK_CHAOS_MAX_MEMTABLES` / `LARK_CHAOS_L0_STOP` override the two
+//! write-stall triggers. Disabling either trigger did not remove the
+//! wedge.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -151,7 +188,7 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
     let bad: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let mask = env("LARK_CHAOS_MASK", 0b1111);
     let enabled = |bit: u64| mask & bit != 0;
-    let chaos_threads = 1 + [1u64, 2, 4, 8].iter().filter(|b| enabled(**b)).count();
+    let chaos_threads = [1u64, 2, 4, 8].iter().filter(|b| enabled(**b)).count();
     let gate = Arc::new(Barrier::new(WRITERS + readers() + chaos_threads + 1));
     let mut handles = Vec::new();
 
@@ -314,36 +351,6 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
                 progress.fetch_add(1, Ordering::Relaxed);
                 if round >= min_rounds && live.load(Ordering::Acquire) == 0 {
                     break;
-                }
-            }
-        }));
-    }
-
-    // Diagnostic: when the writers stop advancing, report what the
-    // engine's stall inputs look like, so a stalled run says which
-    // threshold is holding it rather than only that it is slow.
-    {
-        let (db, stop) = (Arc::clone(&db), Arc::clone(&stop));
-        let live = Arc::clone(&live);
-        handles.push(thread::spawn(move || {
-            let mut ticks = 0u32;
-            while !stop.load(Ordering::Relaxed) && live.load(Ordering::Acquire) > 0 {
-                thread::sleep(Duration::from_secs(5));
-                ticks += 1;
-                if ticks % 2 == 0 {
-                    // `no_slowdown` turns any active stall condition into
-                    // `Error::Busy(reason)`, which names the threshold.
-                    let mut probe_opts = lark_kv::WriteOptions::new();
-                    probe_opts.no_slowdown = true;
-                    let busy = db.put_opt(&probe_opts, b"__stall_probe", b"1");
-                    eprintln!("stall reason: {busy:?}");
-                    eprintln!(
-                        "stall probe: L0={:?} imm_memtables={:?} all_memtable_bytes={:?} live_writers={}",
-                        db.get_property("lark.num-files-at-level0"),
-                        db.get_property("lark.num-entries-imm-mem-tables"),
-                        db.get_property("lark.cur-size-all-mem-tables"),
-                        live.load(Ordering::Acquire),
-                    );
                 }
             }
         }));

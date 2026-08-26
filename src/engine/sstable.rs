@@ -48,12 +48,18 @@
 //! fields and its magic, so a damaged offset, size or entry count is
 //! caught before it is trusted.
 //!
-//! Two holes are deliberate and are not closed here. A V1/V2 table has
-//! no metadata checksum at all, which is the price of reading yesterday's
-//! files; it is protected only by the region-bound validation against the
-//! file size. And these are xxh3 checksums, an accidental-corruption
-//! guard and not a MAC: they catch bit rot and torn writes, not an
-//! attacker who can rewrite the file and its checksum together.
+//! Three holes are deliberate and are not closed here. A V1/V2 table
+//! has no metadata checksum at all, which is the price of reading
+//! yesterday's files; it is protected only by the region-bound
+//! validation against the file size, and the cost of that is measured in
+//! `tests/adversarial_sstable_flips.rs` rather than argued away. A
+//! checksum binds a region's bytes and its kind, not its position, so
+//! two regions of the same kind whose contents a misdirected write
+//! exchanged each still verify; data blocks and partitioned index leaves
+//! are the kinds a file holds more than one of. And these are xxh3
+//! checksums, an accidental-corruption guard and not a MAC: they catch
+//! bit rot and torn writes, not an attacker who can rewrite the file and
+//! its checksum together.
 
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
@@ -1610,34 +1616,42 @@ impl SsTableReader {
 }
 
 /// Whether `path` is a complete SSTable that carries data: at least one
-/// point entry or one range tombstone.
+/// point entry, one range tombstone, or one index entry.
 ///
-/// Only the footer is read, so probing a whole table directory costs one
-/// small read per file rather than one index and bloom load per file. An
-/// `Err` means the file is not a readable SSTable at all, which the
-/// caller must not read as "holds nothing": a file whose footer will not
-/// parse cannot be proved empty.
+/// The footer's own `num_entries` is not trusted on its own. It is
+/// checksummed only from `MAGIC_V3` on, so a damaged V1 or V2 footer can
+/// read back as "holds nothing" over a table that is full, and the
+/// caller uses this answer to decide whether opening would discard live
+/// data. The index block is the corroborating structure a table with
+/// data cannot be missing, and from V3 on it carries its own checksum,
+/// so damage to it is an error rather than a wrong answer.
+///
+/// An `Err` means the file is not a readable SSTable at all, which the
+/// caller must not read as "holds nothing": a file whose footer or index
+/// will not parse cannot be proved empty.
 pub(crate) fn table_carries_data(path: &Path) -> io::Result<bool> {
     let mut file = File::open(path)?;
     let file_size = file.metadata()?.len();
-    if file_size < 8 {
-        return Err(invalid_data(
-            "SSTable file too small to carry a magic number",
-        ));
-    }
-    file.seek(SeekFrom::End(-8))?;
-    let mut magic_buf = [0u8; 8];
-    file.read_exact(&mut magic_buf)?;
-    let footer_size = Footer::size_for_magic(u64::from_le_bytes(magic_buf))?;
-    let data_end = file_size
-        .checked_sub(footer_size as u64)
-        .ok_or_else(|| invalid_data("SSTable file too small for its footer"))?;
-    file.seek(SeekFrom::Start(data_end))?;
-    let mut footer_buf = vec![0u8; footer_size];
-    file.read_exact(&mut footer_buf)?;
-    let footer = Footer::decode(&footer_buf)?;
+    let footer = read_footer(&mut file, file_size)?;
+    let data_end = file_size - footer.size() as u64;
     validate_footer_regions(&footer, data_end)?;
-    Ok(footer.num_entries > 0 || footer.range_tombstone_size > 0)
+    if footer.num_entries > 0 || footer.range_tombstone_size > 0 {
+        return Ok(true);
+    }
+    let index_region = read_file_region(
+        &mut file,
+        footer.index_offset,
+        footer.index_size,
+        data_end,
+        "index block",
+    )?;
+    let index = decode_index_block(verify_meta_region(
+        &index_region,
+        checksum::META_KIND_INDEX,
+        footer.checksummed(),
+        "index block",
+    )?)?;
+    Ok(!index.is_empty())
 }
 
 /// Format an SSTable filename from a numeric ID.
@@ -2234,6 +2248,75 @@ mod tests {
         let path = dir.path().join("legacy-v2.sst");
         write_legacy_table(&path, &legacy_entries(), true).unwrap();
         assert_legacy_table_reads(&path, true);
+    }
+
+    fn write_probe_table(path: &Path, entries: &[(Vec<u8>, Vec<u8>)]) {
+        let mut writer = SsTableWriter::new(path, 256, 10, CompressionType::None, None, false, 0)
+            .expect("writer");
+        for (k, v) in entries {
+            writer.add(k, v).expect("add");
+        }
+        writer.finish().expect("finish");
+    }
+
+    /// A complete table whose tail a lost or misdirected write zeroed
+    /// must come back as an error, never as "holds nothing".
+    ///
+    /// The orphan-table guard reads this answer to decide whether
+    /// opening would discard live data, and the zeroed shape is
+    /// indistinguishable from an unfinished flush output. An `Err` makes
+    /// the guard count the file and refuse loudly, which is recoverable;
+    /// an `Ok(false)` would make it open silently without whatever the
+    /// table held, which is not.
+    #[test]
+    fn a_table_whose_tail_was_zeroed_cannot_be_proved_empty() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("zeroed-tail.sst");
+        write_probe_table(&path, &legacy_entries());
+        assert!(table_carries_data(&path).unwrap());
+
+        let bytes = fs::read(&path).unwrap();
+        // A sector and a block, the granularities a device actually
+        // loses, plus the bare footer length.
+        for zeroed in [FOOTER_SIZE_V1, 512, 4096] {
+            if zeroed >= bytes.len() {
+                continue;
+            }
+            let victim = dir.path().join(format!("zeroed-{zeroed}.sst"));
+            let mut damaged = bytes.clone();
+            let from = damaged.len() - zeroed;
+            damaged[from..].fill(0);
+            fs::write(&victim, &damaged).unwrap();
+            assert!(
+                table_carries_data(&victim).is_err(),
+                "a {zeroed}-byte zeroed tail must not read back as \"holds nothing\"",
+            );
+        }
+    }
+
+    /// A legacy footer carries no checksum, so its `num_entries` can read
+    /// back as zero over a table that is full. The index block is the
+    /// corroborating structure, and the guard must use it.
+    #[test]
+    fn a_legacy_footer_that_lies_about_its_entry_count_still_counts_as_carrying_data() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy-liar.sst");
+        write_legacy_table(&path, &legacy_entries(), false).unwrap();
+        assert!(table_carries_data(&path).unwrap());
+
+        let mut bytes = fs::read(&path).unwrap();
+        let footer_start = bytes.len() - FOOTER_SIZE_V1;
+        // num_entries lives at [48..56) of the footer, and range
+        // tombstones at [8..16). Zero both, the way damage would.
+        bytes[footer_start + 48..footer_start + 56].fill(0);
+        bytes[footer_start + 8..footer_start + 16].fill(0);
+        fs::write(&path, &bytes).unwrap();
+
+        assert!(
+            table_carries_data(&path).unwrap(),
+            "the index block still holds entries, so the table holds data \
+             whatever the unchecksummed footer claims",
+        );
     }
 
     /// The writer emits the checksummed form, and the reader agrees with

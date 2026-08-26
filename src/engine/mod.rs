@@ -361,12 +361,25 @@ impl LarkEngine {
         wal_files.sort();
         wal_files.retain(|path| should_replay_wal(path, version.min_wal_id));
 
+        let mut discarded_tails = Vec::new();
+        let mut entries_per_file = Vec::with_capacity(wal_files.len());
         for wal_path in &wal_files {
             tracing::info!(path = %wal_path.display(), "Replaying WAL");
-            let entries = Wal::replay(wal_path)?;
-            for entry in entries {
+            let replay = Wal::replay(wal_path)?;
+            if let Some(offset) = replay.truncated_at {
+                discarded_tails.push((wal_path.clone(), offset, replay.discarded_bytes));
+            }
+            entries_per_file.push(replay.entries.len());
+            for entry in replay.entries {
                 latest_seq = latest_seq.max(apply_replayed_wal_entry(&memtable, entry));
             }
+        }
+        reject_tail_discard_before_live_wal(&wal_files, &entries_per_file, &discarded_tails)?;
+        if let Some(stats) = options.statistics.as_ref() {
+            stats.add(
+                crate::statistics::Ticker::WalTailDiscarded,
+                discarded_tails.len() as u64,
+            );
         }
 
         let wal_id = next_wal_id(version.next_file_id, &wal_files);
@@ -509,12 +522,25 @@ impl LarkEngine {
         wal_files.sort();
         wal_files.retain(|path| should_replay_wal(path, version.min_wal_id));
 
+        let mut discarded_tails = Vec::new();
+        let mut entries_per_file = Vec::with_capacity(wal_files.len());
         for wal_path in &wal_files {
             tracing::info!(path = %wal_path.display(), "Replaying WAL for read-only open");
-            let entries = Wal::replay(wal_path)?;
-            for entry in entries {
+            let replay = Wal::replay(wal_path)?;
+            if let Some(offset) = replay.truncated_at {
+                discarded_tails.push((wal_path.clone(), offset, replay.discarded_bytes));
+            }
+            entries_per_file.push(replay.entries.len());
+            for entry in replay.entries {
                 latest_seq = latest_seq.max(apply_replayed_wal_entry(&memtable, entry));
             }
+        }
+        reject_tail_discard_before_live_wal(&wal_files, &entries_per_file, &discarded_tails)?;
+        if let Some(stats) = options.statistics.as_ref() {
+            stats.add(
+                crate::statistics::Ticker::WalTailDiscarded,
+                discarded_tails.len() as u64,
+            );
         }
 
         let cache = Arc::new(
@@ -772,6 +798,14 @@ impl LarkEngine {
     /// write applies into the active memtable of the view current at
     /// that moment and every later view still exposes that memtable's
     /// data, as `active`, as `frozen`, or folded into the version.
+    ///
+    /// The order rests on that argument rather than on a red test:
+    /// inverting it while leaving the published view in place did not
+    /// make `mvcc_invariants::a_repeated_read_of_one_key_never_travels_backwards`
+    /// or the focused
+    /// `a_user_thread_compact_range_never_makes_a_read_travel_backwards`
+    /// gate fail on the box it was measured on, so a regression of it
+    /// would not be caught by the suite.
     pub(crate) fn get_latest(&self, key: &[u8]) -> std::io::Result<Option<Vec<u8>>> {
         self.ensure_open()?;
         let view = self.view.load();
@@ -2111,12 +2145,13 @@ impl LarkEngine {
 
         // Pre-open every source file and compute its key range, so we
         // can reject bad inputs before we start mutating anything.
+        let source_cache = ingest_source_cache();
         let mut sources: Vec<IngestSource> = Vec::with_capacity(files.len());
-        for path in files {
-            let reader = SsTableReader::open(path, 0).map_err(|e| {
+        for (source_id, path) in files.iter().enumerate() {
+            let reader = SsTableReader::open(path, source_id as u64).map_err(|e| {
                 std::io::Error::new(e.kind(), format!("ingest: open {}: {e}", path.display()))
             })?;
-            let entries = reader.iter_internal(&self.cache)?;
+            let entries = reader.iter_internal(&source_cache)?;
             let rts = reader.range_tombstones();
             for (ik, value) in &entries {
                 let (user_key, _, _) = decode_internal_key(ik);
@@ -2223,7 +2258,7 @@ impl LarkEngine {
         self.ensure_writable()?;
 
         for source in &sources {
-            self.ingest_one(source, ingest_opts)?;
+            self.ingest_one(source, ingest_opts, &source_cache)?;
         }
 
         self.compaction.lock().notify();
@@ -2234,6 +2269,7 @@ impl LarkEngine {
         &self,
         source: &IngestSource,
         ingest_opts: &crate::sst_file_writer::IngestOptions,
+        source_cache: &BlockCache,
     ) -> std::io::Result<()> {
         use crate::engine::internal_key::{decode_internal_key, encode_internal_key};
 
@@ -2287,7 +2323,7 @@ impl LarkEngine {
         )?;
 
         // Re-encode every point entry with the ingest seq.
-        let entries = source.reader.iter_internal(&self.cache)?;
+        let entries = source.reader.iter_internal(source_cache)?;
         for (ik, value) in entries {
             let (uk, _old_seq, vt) = decode_internal_key(&ik);
             let new_ik = encode_internal_key(uk, ingest_seq, vt);
@@ -2383,11 +2419,22 @@ impl LarkEngine {
     /// Atomically capture a consistent snapshot of the on-disk state
     /// for checkpoint / backup purposes.
     ///
-    /// Flushes the active memtable (if non-empty) under the write
-    /// lock so every live byte is in an SSTable, compacts the
-    /// manifest so the on-disk form is a single rewrite of the
-    /// current version, and returns the captured `Arc<Version>` plus
-    /// the paths of the files a caller needs to copy or hard-link.
+    /// Drains every memtable, active and frozen, into SSTables whose
+    /// `AddFile` records have been applied, compacts the manifest so
+    /// the on-disk form is a single rewrite of the current version, and
+    /// returns the captured `Arc<Version>` plus the paths of the files
+    /// a caller needs to copy or hard-link.
+    ///
+    /// Draining the frozen list is load-bearing, not tidiness. Probing
+    /// the active memtable alone answers "nothing to flush" for a
+    /// memtable that a concurrent rotation has just sealed and is still
+    /// flushing; the capture then took a version from before that
+    /// flush's `AddFile` and the checkpoint silently lost every write
+    /// in it, including ones acknowledged long before the checkpoint
+    /// was asked for. [`Self::drain_memtables`] holds `write_lock` for
+    /// the whole drain, so a write acknowledged before this call is in
+    /// a memtable when the lock is taken and is in an SSTable when it
+    /// is released.
     ///
     /// The returned [`CheckpointSnapshot`] holds the engine's
     /// compaction lock, pinning every referenced file against
@@ -2399,22 +2446,7 @@ impl LarkEngine {
     /// snapshot holds).
     pub(crate) fn checkpoint_capture(&self) -> std::io::Result<CheckpointSnapshot> {
         self.ensure_writable()?;
-        {
-            let has_any = {
-                let view = self.view.load();
-                !view.active.is_empty() || !view.active.clone_range_tombstones().is_empty()
-            };
-            if has_any {
-                let _write_guard = self.write_lock.lock();
-                let still_has_any = {
-                    let view = self.view.load();
-                    !view.active.is_empty() || !view.active.clone_range_tombstones().is_empty()
-                };
-                if still_has_any {
-                    self.rotate_memtable()?;
-                }
-            }
-        }
+        self.drain_memtables()?;
 
         let compaction_guard = self.compaction_lock.write_arc();
         self.ensure_writable()?;
@@ -2701,7 +2733,7 @@ impl LarkEngine {
             return Ok(());
         }
 
-        self.flush_memtables_for_close()?;
+        self.drain_memtables()?;
 
         self.active_wal
             .lock()
@@ -2713,57 +2745,61 @@ impl LarkEngine {
         Ok(())
     }
 
-    fn flush_memtables_for_close(&self) -> std::io::Result<()> {
+    /// Flush every memtable, active and frozen, into SSTables whose
+    /// `AddFile` records have been applied, leaving the frozen list
+    /// empty.
+    ///
+    /// `write_lock` is held for the whole drain, and that is what makes
+    /// it terminate: no concurrent writer can refill the active
+    /// memtable or push another entry onto the frozen list while it
+    /// runs, so the loop runs at most `frozen.len() + 1` times.
+    /// Releasing the lock between turns would let a steady writer keep
+    /// it going indefinitely.
+    ///
+    /// Lock order: `write_lock` is taken and released here, before any
+    /// caller takes `compaction_lock`. `ingest` holds `compaction_lock`
+    /// while it takes `write_lock`, so a caller that inverted the order
+    /// around this call would deadlock against a concurrent ingest.
+    fn drain_memtables(&self) -> std::io::Result<()> {
+        let _write_guard = self.write_lock.lock();
         loop {
-            let should_flush = {
+            let (active_needs_flush, has_frozen) = {
                 let view = self.view.load();
-                memtable_needs_flush(&view.active) || !view.frozen.is_empty()
+                (memtable_needs_flush(&view.active), !view.frozen.is_empty())
             };
-            if !should_flush {
+            if !active_needs_flush && !has_frozen {
                 return Ok(());
             }
 
-            let old_wal = {
-                let _write_guard = self.write_lock.lock();
-                let view = self.view.load();
-                let active_needs_flush = memtable_needs_flush(&view.active);
-                let has_frozen = !view.frozen.is_empty();
-                drop(view);
-                if !active_needs_flush && !has_frozen {
-                    continue;
-                }
-
-                let new_wal_id = {
-                    let mut versions = self.versions.lock();
-                    let version = versions.current();
-                    let id = version.next_file_id;
-                    versions.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
-                    id
-                };
-                let wal_for_flush = Wal::create(&self.wal_dir.join(wal_filename(new_wal_id)))?;
-
-                if active_needs_flush {
-                    // One publication for the seal and the enqueue: two
-                    // would leave a window where the sealed memtable is
-                    // in neither the active slot nor the frozen list.
-                    self.view.update_memtables(|active, frozen| {
-                        let sealed = Arc::clone(active);
-                        let mut next_frozen = frozen.to_vec();
-                        if memtable_needs_flush(&sealed) {
-                            next_frozen.push(sealed);
-                        }
-                        (Arc::new(MemTable::new()), next_frozen, ())
-                    });
-                }
-
-                let old_wal = self
-                    .active_wal
-                    .lock()
-                    .replace(wal_for_flush)
-                    .ok_or_else(Self::read_only_error)?;
-                self.wal_id.store(new_wal_id, Ordering::Release);
-                old_wal
+            let new_wal_id = {
+                let mut versions = self.versions.lock();
+                let version = versions.current();
+                let id = version.next_file_id;
+                versions.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
+                id
             };
+            let wal_for_flush = Wal::create(&self.wal_dir.join(wal_filename(new_wal_id)))?;
+
+            if active_needs_flush {
+                // One publication for the seal and the enqueue: two
+                // would leave a window where the sealed memtable is
+                // in neither the active slot nor the frozen list.
+                self.view.update_memtables(|active, frozen| {
+                    let sealed = Arc::clone(active);
+                    let mut next_frozen = frozen.to_vec();
+                    if memtable_needs_flush(&sealed) {
+                        next_frozen.push(sealed);
+                    }
+                    (Arc::new(MemTable::new()), next_frozen, ())
+                });
+            }
+
+            let old_wal = self
+                .active_wal
+                .lock()
+                .replace(wal_for_flush)
+                .ok_or_else(Self::read_only_error)?;
+            self.wal_id.store(new_wal_id, Ordering::Release);
 
             self.flush_frozen_memtable(old_wal)?;
         }
@@ -2776,6 +2812,28 @@ struct IngestSource {
     reader: SsTableReader,
     smallest: Vec<u8>,
     largest: Vec<u8>,
+}
+
+/// A block cache private to one `ingest_external_files` call.
+///
+/// [`BlockCache`] is keyed by `(file_id, block_offset)`, so a reader's
+/// `file_id` is its identity inside whatever cache it is read through.
+/// An external source has no file id of its own: it is not in the
+/// manifest and has never been assigned one. Reading it through the
+/// engine's shared cache under a borrowed id therefore aliases it onto
+/// whatever live table already holds that id, and reading two sources
+/// under the same borrowed id aliases them onto each other, so the
+/// second source silently reads back the first source's blocks and the
+/// ingest re-encodes the wrong data while reporting success.
+///
+/// A capacity of zero stores nothing, which makes both collisions
+/// impossible by construction rather than by bookkeeping, and keeps the
+/// ingest from evicting the engine's live working set with blocks that
+/// are read once and never again. Each source is still opened under a
+/// distinct id so the identity invariant holds on its own terms and a
+/// later change of capacity here cannot quietly reintroduce the alias.
+fn ingest_source_cache() -> BlockCache {
+    BlockCache::with_config(0, 0, false)
 }
 
 /// Choose the target level for an ingest file covering the user-key
@@ -2915,6 +2973,48 @@ fn remove_file_if_exists(path: &Path) -> std::io::Result<bool> {
 fn wal_file_id(path: &Path) -> Option<u64> {
     let stem = path.file_stem()?.to_str()?;
     stem.strip_prefix("wal_")?.parse().ok()
+}
+
+/// Refuse an open where a WAL file dropped a tail while a *later* WAL
+/// file still yielded records.
+///
+/// `Wal::replay` judges one file's bytes and reports the discard rather
+/// than deciding, because the torn-tail rule is only sound for the newest
+/// file that contributes to replay. A torn write leaves nothing after it
+/// anywhere, so records in a later file are proof that the earlier file's
+/// missing tail is damage in the middle of the history. Opening on it
+/// would serve a state that never existed: later writes present, earlier
+/// acknowledged ones gone.
+fn reject_tail_discard_before_live_wal(
+    wal_files: &[PathBuf],
+    entries_per_file: &[usize],
+    discarded_tails: &[(PathBuf, u64, u64)],
+) -> std::io::Result<()> {
+    for (path, offset, discarded_bytes) in discarded_tails {
+        let Some(index) = wal_files.iter().position(|p| p == path) else {
+            continue;
+        };
+        let later = entries_per_file
+            .iter()
+            .enumerate()
+            .skip(index + 1)
+            .find(|(_, count)| **count > 0);
+        let Some((later_index, later_count)) = later else {
+            continue;
+        };
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} is corrupt: the WAL record at offset {offset} is incomplete, but {later_count} \
+                 later WAL record(s) follow it in {}, so the {discarded_bytes} discarded byte(s) \
+                 are damage in the middle of the history rather than a torn write. Refusing to \
+                 open rather than serve a state that never existed.",
+                path.display(),
+                wal_files[later_index].display(),
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn should_replay_wal(path: &Path, min_wal_id: u64) -> bool {

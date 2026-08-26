@@ -1,19 +1,21 @@
 //! G27 on the scan entry points, including the column-family ones.
 //!
-//! `Db::get`, `Db::multi_get` and `Db::iter` were changed to load the
-//! published read view **before** sampling the read horizon. Five
-//! callers in `src/lib.rs` still do it the other way round:
+//! `Db::get`, `Db::multi_get` and `Db::iter` load the published read
+//! view **before** sampling the read horizon. Five callers in
+//! `src/lib.rs` used to do it the other way round:
 //!
 //! ```text
 //! let seq = self.engine.snapshot_seq();          // horizon first
 //! collect_range(&self.engine, .., seq)?          // sources second
 //! ```
 //!
-//! `Db::scan` (lib.rs:867), `Db::scan_page` (894), `Db::scan_cf`
-//! (1413), `Db::scan_page_cf` (1439) and the CF-registry load (390).
-//! Between the two statements a compaction that no snapshot pins is
-//! free to drop the newest version at or below `seq`, and the scan then
-//! finds only versions it must filter out.
+//! `Db::scan`, `Db::scan_page`, `Db::scan_cf`, `Db::scan_page_cf` and
+//! the CF-registry load. Between the two statements a compaction that no
+//! snapshot pins was free to drop the newest version at or below `seq`,
+//! and the scan then found only versions it had to filter out.
+//! `collect_range` and `collect_page` now take the iterator itself, so
+//! the ordering is fixed at the one call that builds it and a caller
+//! cannot express the broken order. This file is the regression gate.
 //!
 //! Every key here has exactly one writer and is only ever overwritten,
 //! so "absent" and "went backwards" are both violations of the read

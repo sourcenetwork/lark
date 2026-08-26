@@ -387,12 +387,10 @@ impl Db {
         // disk. User-created CFs are the only thing that produces
         // on-disk metadata writes.
         let mut entries: Vec<(String, u32)> = Vec::new();
-        let seq = self.engine.snapshot_seq();
         let pairs = collect_range(
-            &self.engine,
+            self.engine.new_iter_latest(),
             Some(&meta::name_scan_prefix()),
             Some(&meta::name_scan_upper()),
-            seq,
         )?;
         for (key, value) in pairs {
             // A meta value that is not a 4-byte id is not one of ours.
@@ -864,8 +862,7 @@ impl Db {
             Some(e) => prefix_key(DEFAULT_CF_ID, e),
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
-        let seq = self.engine.snapshot_seq();
-        let raw = collect_range(&self.engine, Some(&lo), Some(&hi), seq)?;
+        let raw = collect_range(self.engine.new_iter_latest(), Some(&lo), Some(&hi))?;
         strip_cf_prefix_entries(raw)
     }
 
@@ -891,8 +888,7 @@ impl Db {
             Some(e) => prefix_key(DEFAULT_CF_ID, e),
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
-        let seq = self.engine.snapshot_seq();
-        collect_page(&self.engine, &lo, &hi, seq, limit).and_then(strip_cf_prefix_page)
+        collect_page(self.engine.new_iter_latest(), &lo, &hi, limit).and_then(strip_cf_prefix_page)
     }
 
     /// Create a streaming iterator over the default column family.
@@ -1255,7 +1251,11 @@ impl Db {
             return Ok(existing);
         }
         self.validate_prefixed_key_size(&meta::name_key(name))?;
-        let (handle, next_id) = self.cfs.allocate(name);
+        let Some((handle, next_id)) = self.cfs.allocate(name) else {
+            return Err(Error::invalid_argument(
+                "the column-family id space is exhausted",
+            ));
+        };
         let mut batch = BTreeMap::new();
         batch.insert(
             meta::name_key(name),
@@ -1410,8 +1410,7 @@ impl Db {
             Some(e) => prefix_key(cf.id(), e),
             None => cf_upper_bound(cf.id()),
         };
-        let seq = self.engine.snapshot_seq();
-        let raw = collect_range(&self.engine, Some(&lo), Some(&hi), seq)?;
+        let raw = collect_range(self.engine.new_iter_latest(), Some(&lo), Some(&hi))?;
         strip_cf_prefix_entries(raw)
     }
 
@@ -1436,8 +1435,7 @@ impl Db {
             Some(e) => prefix_key(cf.id(), e),
             None => cf_upper_bound(cf.id()),
         };
-        let seq = self.engine.snapshot_seq();
-        collect_page(&self.engine, &lo, &hi, seq, limit).and_then(strip_cf_prefix_page)
+        collect_page(self.engine.new_iter_latest(), &lo, &hi, limit).and_then(strip_cf_prefix_page)
     }
 
     /// Streaming iterator bounded to column family `cf`. The
@@ -1781,7 +1779,7 @@ impl Snapshot {
             Some(e) => prefix_key(DEFAULT_CF_ID, e),
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
-        let raw = collect_range(&self.engine, Some(&lo), Some(&hi), self.seq)?;
+        let raw = collect_range(self.engine.new_iter_at(self.seq), Some(&lo), Some(&hi))?;
         strip_cf_prefix_entries(raw)
     }
 
@@ -1804,7 +1802,8 @@ impl Snapshot {
             Some(e) => prefix_key(DEFAULT_CF_ID, e),
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
-        collect_page(&self.engine, &lo, &hi, self.seq, limit).and_then(strip_cf_prefix_page)
+        collect_page(self.engine.new_iter_at(self.seq), &lo, &hi, limit)
+            .and_then(strip_cf_prefix_page)
     }
 
     /// Create a streaming iterator anchored at this snapshot
@@ -1877,7 +1876,7 @@ impl Snapshot {
             Some(e) => prefix_key(cf.id(), e),
             None => cf_upper_bound(cf.id()),
         };
-        let raw = collect_range(&self.engine, Some(&lo), Some(&hi), self.seq)?;
+        let raw = collect_range(self.engine.new_iter_at(self.seq), Some(&lo), Some(&hi))?;
         strip_cf_prefix_entries(raw)
     }
 
@@ -1903,7 +1902,8 @@ impl Snapshot {
             Some(e) => prefix_key(cf.id(), e),
             None => cf_upper_bound(cf.id()),
         };
-        collect_page(&self.engine, &lo, &hi, self.seq, limit).and_then(strip_cf_prefix_page)
+        collect_page(self.engine.new_iter_at(self.seq), &lo, &hi, limit)
+            .and_then(strip_cf_prefix_page)
     }
 
     /// CF-scoped streaming iterator at this snapshot.
@@ -1921,13 +1921,20 @@ impl Snapshot {
 /// Collect a bounded range of `(user_key, value)` pairs via the streaming
 /// iterator. This is the engine of `Db::scan` / `Snapshot::scan`; the
 /// dedicated method exists so both callers share one merge implementation.
+/// Materialize `[start, end)` from an already-constructed iterator.
+///
+/// The iterator is the caller's choice, and that choice is the read's
+/// consistency contract: `LarkEngine::new_iter_latest` loads the read
+/// view before it samples the horizon (see `LarkEngine::get_latest`),
+/// while `LarkEngine::new_iter_at` carries a sequence a `Snapshot` has
+/// pinned in the registry. Taking the iterator rather than an engine
+/// and a sequence is what keeps a scan from re-introducing the
+/// sample-then-load order the point-read path was fixed to avoid.
 fn collect_range(
-    engine: &LarkEngine,
+    mut iter: engine::iterator::LarkIterator,
     start: Option<&[u8]>,
     end: Option<&[u8]>,
-    snapshot_seq: u64,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let mut iter = engine.new_iter_at(snapshot_seq);
     match start {
         Some(s) => iter.seek(s),
         None => iter.seek_to_first(),
@@ -1951,11 +1958,13 @@ fn collect_range(
     Ok(out)
 }
 
+/// Materialize at most `limit` entries of `[start, end)` from an
+/// already-constructed iterator. See [`collect_range`] for why the
+/// iterator, and not an engine plus a sequence, is the parameter.
 fn collect_page(
-    engine: &LarkEngine,
+    mut iter: engine::iterator::LarkIterator,
     start: &[u8],
     end: &[u8],
-    snapshot_seq: u64,
     limit: usize,
 ) -> Result<ScanPage> {
     if limit == 0 {
@@ -1964,7 +1973,6 @@ fn collect_page(
         ));
     }
 
-    let mut iter = engine.new_iter_at(snapshot_seq);
     iter.seek(start);
     iter.status().map_err(Error::from)?;
 

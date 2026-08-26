@@ -78,6 +78,13 @@ pub(crate) const META_CF_ID: u32 = 0;
 /// thereafter.
 pub(crate) const DEFAULT_CF_ID: u32 = 1;
 
+/// Largest CF id that can be allocated.
+///
+/// `u32::MAX` is excluded rather than reserved: [`cf_upper_bound`]
+/// needs an id strictly above the one it bounds, and there is no byte
+/// string above every key prefixed with `u32::MAX`.
+pub(crate) const MAX_CF_ID: u32 = u32::MAX - 1;
+
 /// Name of the default column family.
 pub const DEFAULT_CF_NAME: &str = "default";
 
@@ -123,8 +130,15 @@ pub(crate) fn prefix_key(cf_id: u32, key: &[u8]) -> Vec<u8> {
 /// with `cf_id`. Used by CF drop to issue a
 /// `delete_range(prefix, upper_bound)` and by `iter_cf` to bound
 /// the scan.
+///
+/// `cf_id` is never above [`MAX_CF_ID`]: no byte string is greater than
+/// every key prefixed with `u32::MAX`, because byte strings have no
+/// upper bound, so the id space stops one short of it and
+/// [`CfRegistry::allocate`] refuses to mint `u32::MAX`. The saturating
+/// add keeps the function total anyway, degrading to an empty range
+/// rather than wrapping to zero and aliasing the reserved metadata CF.
 pub(crate) fn cf_upper_bound(cf_id: u32) -> Vec<u8> {
-    (cf_id + 1).to_be_bytes().to_vec()
+    cf_id.saturating_add(1).to_be_bytes().to_vec()
 }
 
 /// Lower bound (inclusive) of the CF's key range.
@@ -242,19 +256,27 @@ impl CfRegistry {
     /// Allocate a fresh CF id for `name`. The caller is responsible
     /// for persisting `(next_id_after, name → id)` to the meta CF
     /// atomically before returning the handle to user code.
-    pub(crate) fn allocate(&self, name: &str) -> (ColumnFamilyHandle, u32) {
+    ///
+    /// `None` once the id space is exhausted. The last id is never
+    /// minted: [`cf_upper_bound`] cannot express an exclusive bound
+    /// above it, so a CF holding it could be neither iterated nor
+    /// dropped.
+    pub(crate) fn allocate(&self, name: &str) -> Option<(ColumnFamilyHandle, u32)> {
         let mut inner = self.inner.lock();
         let id = inner.next_id;
-        inner.next_id += 1;
+        if id > MAX_CF_ID {
+            return None;
+        }
+        inner.next_id = id + 1;
         inner.by_name.insert(name.to_string(), id);
         inner.by_id.insert(id, name.to_string());
-        (
+        Some((
             ColumnFamilyHandle {
                 name: Arc::new(name.to_string()),
                 id,
             },
             inner.next_id,
-        )
+        ))
     }
 
     /// Remove a CF from the in-memory registry. The caller is
@@ -319,10 +341,24 @@ mod tests {
     }
 
     #[test]
+    fn registry_refuses_to_mint_the_last_id() {
+        // `cf_upper_bound` cannot express an exclusive bound above
+        // `u32::MAX`, so a CF holding it could be neither iterated nor
+        // dropped. The registry stops one short instead.
+        let r = CfRegistry::new();
+        r.load(std::iter::empty(), MAX_CF_ID);
+        let (last, next) = r.allocate("last").expect("one id left");
+        assert_eq!(last.id, MAX_CF_ID);
+        assert_eq!(next, MAX_CF_ID + 1);
+        assert!(r.allocate("one too many").is_none());
+        assert!(cf_lower_bound(last.id) < cf_upper_bound(last.id));
+    }
+
+    #[test]
     fn registry_allocate_is_monotonic() {
         let r = CfRegistry::new();
-        let (a, _) = r.allocate("alpha");
-        let (b, _) = r.allocate("beta");
+        let (a, _) = r.allocate("alpha").expect("id space");
+        let (b, _) = r.allocate("beta").expect("id space");
         assert!(a.id < b.id);
         assert_eq!(r.get("alpha").unwrap(), a);
         assert_eq!(r.get("beta").unwrap(), b);
