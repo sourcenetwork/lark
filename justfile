@@ -25,8 +25,13 @@ deny:
     cargo deny check
 
 msrv:
-    cargo +1.82 check --workspace
+    cargo "+$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" check --workspace
 
+# The summary line CI annotates a build with.
+cov-summary:
+    cargo llvm-cov --summary-only
+
+# The browsable HTML report, for reading locally.
 cov:
     cargo llvm-cov --workspace --html
     @echo "report: target/llvm-cov/html/index.html"
@@ -96,7 +101,7 @@ test-lifecycle:
 # 0.5s, so every test in the fast set also runs in the default `cargo test`.
 
 test-slow:
-    cargo test --workspace -- --ignored --skip crash_child
+    cargo test --workspace --release -- --ignored --skip crash_child --nocapture
 
 # Rebuild the LD_PRELOAD fault shim from scratch by dropping its cache.
 
@@ -241,7 +246,7 @@ wasm-native records="5000" sustained="20000":
         --probe-host --report-memory
 
 wasm-browser:
-    wasm-pack test --headless --chrome
+    wasm-pack test --headless --firefox
 
 embedded:
     cargo run --release --bench memory -- --profile embedded

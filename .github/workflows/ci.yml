@@ -25,7 +25,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      - uses: extractions/setup-just@v2
+      - run: just test
 
   clippy:
     runs-on: ubuntu-latest
@@ -35,7 +36,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - uses: extractions/setup-just@v2
+      - run: just lint
 
   fmt:
     runs-on: ubuntu-latest
@@ -44,7 +46,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      - uses: extractions/setup-just@v2
+      - run: just fmt
 
   doc:
     runs-on: ubuntu-latest
@@ -54,7 +57,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --workspace --no-deps
+      - uses: extractions/setup-just@v2
+      - run: just doc
 
   alloc-budget:
     runs-on: ubuntu-latest
@@ -95,7 +99,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.90
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace
+      - uses: extractions/setup-just@v2
+      - run: just msrv
 
   # wasm32-wasip1 is a supported target, not a target that merely
   # compiles. This job builds the probe and runs the whole database
@@ -229,7 +234,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Run coverage
-        run: cargo llvm-cov --summary-only | tee coverage-summary.txt
+        run: just cov-summary | tee coverage-summary.txt
       - name: Publish coverage summary
         run: |
           {
@@ -310,7 +315,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run ignored tests (stress / soak / concurrency)
-        run: cargo test --workspace --release -- --ignored --nocapture
+        run: just test-slow
 
   # Durability, split out from `test` because it fails for different
   # reasons and is worth reading on its own: crash recovery, power loss,
@@ -323,15 +328,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Crash recovery
-        run: cargo test --test crash_recovery
+        run: just test-crash
       - name: Power loss
-        run: cargo test --test power_loss -- --skip crash_child --nocapture
+        run: just test-power
       - name: Fault injection smoke
-        run: cargo test --test fault_smoke
+        run: just test-fault
       - name: Lifecycle
-        run: cargo test --test lifecycle -- --skip crash_child
+        run: just test-lifecycle
       - name: MVCC invariants
-        run: cargo test --test mvcc_invariants -- --skip crash_child
+        run: just mvcc
 
   # The exhaustive halves of the same families. Every truncation offset
   # and every bit flip is a large cross product, so these run nightly
@@ -345,11 +350,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Exhaustive corruption sweep
-        run: cargo test --release --test corruption_exhaustive -- --ignored --skip crash_child --nocapture
+        run: just test-corruption-slow
       - name: Model-based durability proptest
-        run: cargo test --release --test proptest_durability -- --ignored --skip crash_child --nocapture
+        run: just test-durability-slow
       - name: Resource limits
-        run: cargo test --release --test resource_limits -- --ignored --nocapture --test-threads=1
+        run: just test-extremes
 
   # Browser wasm. `wasm-wasip1` above covers the wasi target, which has a
   # real `std::fs`; this covers `wasm32-unknown-unknown`, which has no
@@ -367,7 +372,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: jetli/wasm-pack-action@v0.4.0
       - name: OPFS round trip in headless Firefox
-        run: wasm-pack test --headless --firefox
+        run: just wasm-browser
 
   # Fuzz targets, smoke-run for a bounded time so a harness that stopped
   # building is caught. Finding new crashes is the nightly job's work,
@@ -393,4 +398,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-fuzz --locked
       - name: Fuzz ${{ matrix.target }}
-        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300
+        run: just fuzz ${{ matrix.target }} 300
