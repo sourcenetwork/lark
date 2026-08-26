@@ -36,6 +36,16 @@ fn db_options(env: &OpfsEnv) -> Options {
     options
 }
 
+/// The shipped wasm profile, pointed at OPFS. Unlike [`db_options`]
+/// this keeps a block cache, which is the whole reason the profile is
+/// separate from `Options::embedded`: a browser tab has no OS page
+/// cache to absorb a miss.
+fn wasm_profile_options(env: &OpfsEnv) -> Options {
+    let mut options = Options::wasm();
+    options.env = env.as_env();
+    options
+}
+
 #[wasm_bindgen_test]
 async fn a_worker_mount_selects_sync_access_handles() {
     let env = OpfsEnv::mount("lark-test-probe", OpfsOptions::default())
@@ -479,4 +489,87 @@ async fn a_stale_handle_reports_instead_of_corrupting_another_file() {
         .write_all(b"after")
         .expect_err("a stale handle must fail");
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[wasm_bindgen_test]
+async fn the_wasm_profile_survives_a_full_lifecycle_in_a_browser() {
+    let name = "lark-test-wasm-profile";
+    {
+        let env = OpfsEnv::mount(name, OpfsOptions::default())
+            .await
+            .expect("mount");
+        let options = wasm_profile_options(&env);
+        assert!(
+            options.block_cache_size > 0,
+            "the wasm profile must keep a block cache; there is no page cache behind it"
+        );
+        let db = Db::open(env.db_path(), options).expect("open with Options::wasm()");
+
+        // Enough distinct keys to fill blocks and make the cache do
+        // something, then read them back through it.
+        for i in 0..2000u32 {
+            db.put(format!("key-{i:06}").as_bytes(), &[b'v'; 128])
+                .expect("put");
+        }
+        db.flush().expect("flush");
+        db.compact_range(None, None).expect("compact");
+        while db.compact_step().expect("compact step") {}
+
+        for i in (0..2000u32).step_by(97) {
+            assert_eq!(
+                db.get(format!("key-{i:06}").as_bytes())
+                    .expect("get")
+                    .as_deref(),
+                Some(&[b'v'; 128][..]),
+                "key-{i:06} must read back through the block cache"
+            );
+        }
+        db.close().expect("close");
+    }
+
+    let env = OpfsEnv::mount(name, OpfsOptions::default())
+        .await
+        .expect("remount");
+    let db = Db::open(env.db_path(), wasm_profile_options(&env)).expect("reopen");
+    assert_eq!(
+        db.get(b"key-001000").expect("get").as_deref(),
+        Some(&[b'v'; 128][..]),
+        "the wasm profile must survive a close and remount"
+    );
+    db.close().expect("close");
+}
+
+#[wasm_bindgen_test]
+async fn a_background_compaction_worker_is_rejected_at_the_option() {
+    // wasm has no threads, so a worker count must fail at `validate`
+    // with the option named, not as an io error from inside `open`.
+    // This is the wasm-side half of the check; the library's own
+    // `#[cfg(test)]` tests cannot cover it because they only ever run
+    // on the host.
+    let env = OpfsEnv::mount("lark-test-wasm-workers", OpfsOptions::default())
+        .await
+        .expect("mount");
+
+    let mut options = wasm_profile_options(&env);
+    options.max_background_compactions = 1;
+    let message = options
+        .validate()
+        .expect_err("wasm has no threads, so a worker count must not validate")
+        .to_string();
+    assert!(
+        message.contains("max_background_compactions"),
+        "the error must name the option that caused it, got: {message}"
+    );
+
+    // And the rejection must reach `Db::open`, not just `validate`.
+    let mut options = wasm_profile_options(&env);
+    options.max_background_compactions = 1;
+    Db::open(env.db_path(), options).expect_err("open must refuse a worker count on wasm");
+
+    // Both shipped profiles must be openable as they ship.
+    assert_eq!(Options::wasm().max_background_compactions, 0);
+    assert_eq!(Options::default().max_background_compactions, 0);
+    Options::default()
+        .validate()
+        .expect("Options::default must be valid on wasm, or nothing opens without tuning");
 }
