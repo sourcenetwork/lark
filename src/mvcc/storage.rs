@@ -25,6 +25,7 @@ use parking_lot::Mutex;
 
 use super::layout;
 use crate::WriteBatchOp;
+use crate::column_family::{DEFAULT_CF_ID, prefix_key};
 use crate::engine::{DurabilityMode, LarkEngine};
 
 /// Ceiling on the keys one `delete_range` may cover.
@@ -188,12 +189,21 @@ impl Storage for LarkStorage {
     fn put_write(&self, key: &[u8], commit_ts: u64, info: WriteInfo) {
         // The data this record points at has to be durable first.
         self.flush_staged();
+        // Only now: `get_data` consults durable versions only, so the
+        // projection has to be read after the flush that makes this
+        // transaction's version durable, not before it.
+        let projection = self.projection(key, &info);
         let mut k = Vec::with_capacity(layout::composed_len(key));
         layout::write_key(key, commit_ts, &mut k);
         self.stage(WriteBatchOp::Put {
             key: k,
             value: encode_write_info(&info),
         });
+        // The user-visible copy goes out in the same batch as the write
+        // record, so a reader never sees one without the other.
+        if let Some(op) = projection {
+            self.stage(op);
+        }
         // A write record is the commit point, so it goes out now rather
         // than waiting for a later flush.
         self.flush_staged();
@@ -228,6 +238,41 @@ impl Storage for LarkStorage {
 }
 
 impl LarkStorage {
+    /// The user-keyspace write that mirrors a commit record.
+    ///
+    /// kovan-mvcc keeps its versions under `D | key | start_ts` and its
+    /// commit points under `W | key | !commit_ts`. Neither is a key any
+    /// non-transactional reader looks at, so without this a committed
+    /// transaction would be invisible to [`crate::Db::get`]: same
+    /// database, two disjoint namespaces.
+    ///
+    /// So each commit also writes the resolved value to the ordinary
+    /// key, in the same batch as the commit record. A `Put` projects
+    /// its value, a `Delete` projects a tombstone, and a `Rollback` is
+    /// not a commit and projects nothing.
+    ///
+    /// This is a copy, not a second source of truth: MVCC visibility,
+    /// conflict detection and the read set are decided entirely by the
+    /// `W` and `D` records. The projection only answers reads that
+    /// never entered a transaction.
+    fn projection(&self, key: &[u8], info: &WriteInfo) -> Option<WriteBatchOp> {
+        let user_key = prefix_key(DEFAULT_CF_ID, key);
+        match info.kind {
+            WriteKind::Put => {
+                // One copy of the value per key per commit: the engine
+                // batch owns its bytes and the version is behind an
+                // `Arc` shared with the reader that may still hold it.
+                let value = self.get_data(key, info.start_ts)?.as_ref().clone();
+                Some(WriteBatchOp::Put {
+                    key: user_key,
+                    value,
+                })
+            }
+            WriteKind::Delete => Some(WriteBatchOp::Delete { key: user_key }),
+            WriteKind::Rollback => None,
+        }
+    }
+
     /// Distinct user keys holding a live value in `[start, end)` at `ts`.
     ///
     /// Walks the write records, not the engine's raw keys: the write

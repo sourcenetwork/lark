@@ -291,6 +291,48 @@ mod tests {
     }
 
     #[test]
+    fn a_committed_transaction_is_visible_to_a_plain_db_read() {
+        // kovan-mvcc keeps its versions in its own keyspace, so a
+        // commit also projects the resolved value onto the ordinary
+        // key. Without that projection the two APIs would answer
+        // differently about the same database.
+        let dir = TempDir::new().unwrap();
+        let (db, txns) = txns(&dir);
+
+        let mut tx = txns.begin(IsolationLevel::SnapshotIsolation);
+        tx.put(b"projected", b"value").unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(
+            db.get(b"projected").unwrap().as_deref(),
+            Some(&b"value"[..]),
+            "a committed transactional write must be visible to Db::get"
+        );
+
+        let mut tx = txns.begin(IsolationLevel::SnapshotIsolation);
+        tx.delete(b"projected").unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(
+            db.get(b"projected").unwrap(),
+            None,
+            "a committed transactional delete must be visible to Db::get"
+        );
+    }
+
+    #[test]
+    fn a_rollback_record_projects_nothing() {
+        // A rollback is not a commit. Projecting it would publish a
+        // value the transaction never committed.
+        let dir = TempDir::new().unwrap();
+        let (db, txns) = txns(&dir);
+        let mut tx = txns.begin(IsolationLevel::SnapshotIsolation);
+        tx.put(b"abandoned", b"value").unwrap();
+        drop(tx);
+        assert_eq!(db.get(b"abandoned").unwrap(), None);
+    }
+
+    #[test]
     fn a_committed_write_is_visible_to_the_next_transaction() {
         let dir = TempDir::new().unwrap();
         let (_db, t) = txns(&dir);
