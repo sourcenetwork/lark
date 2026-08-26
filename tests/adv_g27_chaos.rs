@@ -412,10 +412,15 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
 
 #[test]
 fn the_read_view_survives_compaction_cf_churn_ingest_and_checkpoint() {
-    let instances = env("LARK_CHAOS_INSTANCES", 6) as usize;
-    let rounds = env("LARK_CHAOS_ROUNDS", 2);
-    let versions = env("LARK_CHAOS_VERSIONS", 400);
-    let min_rounds = env("LARK_CHAOS_MIN_ROUNDS", 40);
+    // Defaults sized for the ordinary gate, measured at 5s. The full
+    // workload (6 / 2 / 400 / 40) is `just chaos`, and it is over 20
+    // minutes wall and 4h of CPU unoptimized, which is why it is not
+    // what `cargo test` runs. Every value is overridable, so a wedge
+    // can be reproduced at whatever size exposed it.
+    let instances = env("LARK_CHAOS_INSTANCES", 2) as usize;
+    let rounds = env("LARK_CHAOS_ROUNDS", 1);
+    let versions = env("LARK_CHAOS_VERSIONS", 50);
+    let min_rounds = env("LARK_CHAOS_MIN_ROUNDS", 10);
 
     let mut bad = Vec::new();
     for _ in 0..rounds {

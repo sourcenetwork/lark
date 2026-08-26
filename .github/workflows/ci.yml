@@ -208,6 +208,36 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # Loom model checking. Exhaustive over the C11 interleavings the
+  # memtable's publication protocol and the read horizon permit, which
+  # no amount of stress testing covers. Both profiles run: the skip
+  # list's single-writer guard is a `debug_assert`, so its calibration
+  # only exists in a debug build.
+  loom:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v2
+      - name: Loom models, release and debug
+        run: just loom-all
+
+  # The G27 chaos workload at full size. `cargo test` runs a smaller
+  # default so the ordinary gate stays fast; this job is what covers
+  # the full one.
+  chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v2
+      - name: Chaos workload, full size
+        run: just chaos
+
   deny:
     runs-on: ubuntu-latest
     steps:

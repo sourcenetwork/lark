@@ -230,6 +230,43 @@ ycsb-all: loadguard
 stress secs="600":
     cargo run --release -p lark-stress -- --duration {{secs}}
 
+# ---------- model checking ----------
+
+# Loom model checks for the arena memtable, read horizon and version
+# handoffs. `--cfg loom` swaps the primitives in `src/engine/sync.rs`
+# for loom's instrumented ones; without it the whole target compiles
+# away, so an ordinary `cargo test` neither builds loom nor runs these.
+#
+# | recipe        | models | profile | measured |
+# |---------------|--------|---------|----------|
+# | `loom`        | 14     | release | 19.7s    |
+# | `loom-debug`  | 15     | debug   | 133s     |
+# | `loom-all`    | both   | both    | ~153s    |
+#
+# The debug run carries one extra calibration: the skip list's
+# single-writer guard (S2) is a `debug_assert`, so the model proving it
+# fires is compiled out of a release build. Six of the models are
+# `should_panic` calibrations that deliberately get the ordering wrong;
+# they are what make the passes mean anything.
+
+loom:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_memtable
+
+loom-debug:
+    RUSTFLAGS="--cfg loom" cargo test --test loom_memtable
+
+loom-all: loom loom-debug
+
+# The G27 chaos workload at full size: 6 instances x 2 rounds x 400
+# versions. Measured at over 20 minutes wall and 4h of CPU unoptimized,
+# which is why `cargo test` runs a smaller default and this recipe
+# carries the full one. Release, because debug is where the cost is.
+
+chaos instances="6" rounds="2" versions="400" min_rounds="40":
+    LARK_CHAOS_INSTANCES={{instances}} LARK_CHAOS_ROUNDS={{rounds}} \
+    LARK_CHAOS_VERSIONS={{versions}} LARK_CHAOS_MIN_ROUNDS={{min_rounds}} \
+        cargo test --release --test adv_g27_chaos -- --nocapture
+
 # ---------- consistency ----------
 
 # Elle consistency checking. `model` is the workload (list-append or
