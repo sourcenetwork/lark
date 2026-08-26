@@ -2661,28 +2661,26 @@ impl LarkEngine {
         self.ensure_writable()?;
 
         let version;
-        let manifest_path;
-        let manifest_len;
+        let manifest_bytes;
         {
             let mut versions = self.versions.lock();
+            // Rewritten first, so what is captured is the canonical form
+            // of exactly this version rather than a log of every edit
+            // that ever reached it.
             versions.compact_manifest()?;
             version = versions.current();
-            manifest_path = versions.manifest_path().to_path_buf();
-            // Record the manifest's on-disk size immediately after
-            // compaction so a later copy can truncate at the exact
-            // captured boundary. Concurrent flushes still append
-            // `AddFile` records (they take `versions.lock()` but not
-            // the compaction lock we're holding), and those records
-            // reference files that are *not* in the captured
-            // version. Copying them into a checkpoint manifest would
-            // make recovery fail on the missing files.
-            manifest_len = self.env.metadata(&manifest_path)?.len;
+            // Read here, under the same lock that produced `version`, so
+            // the two cannot disagree. A concurrent flush takes this lock
+            // but not the compaction lock held above, so it is free to
+            // append `AddFile` records naming files this checkpoint will
+            // not copy, and a rewrite can replace the file entirely.
+            let path = versions.manifest_path().to_path_buf();
+            manifest_bytes = self.env.read(&path)?;
         }
 
         Ok(CheckpointSnapshot {
             version,
-            manifest_path,
-            manifest_len,
+            manifest_bytes,
             sst_dir: self.sst_dir.clone(),
             _compaction_guard: compaction_guard,
         })
@@ -3020,6 +3018,31 @@ impl LarkEngine {
     /// result. Sealing without waiting is not enough either, because a
     /// sealed memtable is flushed by a background worker and the capture
     /// would race it.
+    /// Whether no memtable holds anything a flush would write out.
+    ///
+    /// The postcondition of [`Self::drain_memtables`] with
+    /// [`ActiveFlush::Always`], and what a checkpoint depends on: the
+    /// capture names SSTables, so anything left in a memtable would be
+    /// absent from it.
+    /// Rewrite the manifest now, the way growth does on its own.
+    #[cfg(test)]
+    pub(crate) fn force_manifest_rewrite(&self) -> std::io::Result<()> {
+        self.versions.lock().compact_manifest()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn frozen_depth(&self) -> usize {
+        self.view.load().frozen.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn memtables_hold_no_data(&self) -> bool {
+        let view = self.view.load();
+        view.frozen.is_empty()
+            && view.active.is_empty()
+            && view.active.clone_range_tombstones().is_empty()
+    }
+
     fn drain_memtables(&self, active: ActiveFlush) -> std::io::Result<()> {
         let active_pending = |view: &ReadView| match active {
             ActiveFlush::WhenFull => memtable_needs_flush(&view.active),
@@ -3193,12 +3216,21 @@ fn compute_target_level(
 /// lock the snapshot holds).
 pub(crate) struct CheckpointSnapshot {
     pub(crate) version: Arc<manifest::Version>,
-    pub(crate) manifest_path: PathBuf,
-    /// Number of bytes at the start of `manifest_path` that belong
-    /// to this captured version. Copiers must truncate at this
-    /// length to avoid picking up `AddFile` records written by
-    /// concurrent flushes after the capture.
-    pub(crate) manifest_len: u64,
+    /// The manifest exactly as it described `version`, captured under
+    /// the same lock.
+    ///
+    /// The bytes are held rather than a path and a length. A concurrent
+    /// flush takes `versions.lock()` but not the compaction lock this
+    /// snapshot holds, so it can append `AddFile` records naming files
+    /// this checkpoint will not copy, and a manifest rewrite can replace
+    /// the file wholesale. Re-reading the path later would then pick up
+    /// a different manifest, and truncating it at a length measured
+    /// against the old one can land mid-record. Copying what was read
+    /// under the lock removes both.
+    ///
+    /// The manifest is rewritten once it grows past a multiple of its
+    /// canonical size, so this is bounded by the live SSTable count.
+    pub(crate) manifest_bytes: Vec<u8>,
     pub(crate) sst_dir: PathBuf,
     /// Compaction lock guard, scoped to the snapshot's lifetime.
     _compaction_guard: parking_lot::ArcRwLockWriteGuard<parking_lot::RawRwLock, ()>,
