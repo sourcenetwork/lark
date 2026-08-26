@@ -19,12 +19,12 @@ categories = ["database-implementations"]
 fuzzing = []
 
 [dependencies]
+crossbeam-epoch = "0.9"
 crossbeam-skiplist = "0.1"
 lz4_flex = "0.11"
 snap = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 parking_lot = { version = "0.12", features = ["arc_lock"] }
-lru = "0.16"
 tracing = "0.1"
 thiserror = "1.0"
 
