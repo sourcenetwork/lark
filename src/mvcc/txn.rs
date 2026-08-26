@@ -193,9 +193,7 @@ impl MvccTxn<'_> {
         let merged = op
             .full_merge(k, existing.as_deref(), std::slice::from_ref(&operand))
             .ok_or_else(|| {
-                TransactionError::Io(std::io::Error::other(
-                    "merge operator rejected the operand",
-                ))
+                TransactionError::Io(std::io::Error::other("merge operator rejected the operand"))
             })?;
         self.staged.insert(k.to_vec(), Some(merged));
         Ok(())

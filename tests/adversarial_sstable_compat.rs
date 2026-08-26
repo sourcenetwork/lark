@@ -1,6 +1,6 @@
-//! Backward compatibility of the checksummed SSTable format (G24).
+//! Backward compatibility of the checksummed SSTable format (the metadata checksum fix).
 //!
-//! G24 changed the on-disk SSTable format: V3/V4 carry a 72-byte footer
+//! the metadata checksum fix changed the on-disk SSTable format: V3/V4 carry a 72-byte footer
 //! with a metadata checksum where V1/V2 carried 64 bytes and none.
 //! Reading yesterday's files is not a nice-to-have there; a table lark
 //! can no longer open is the whole database gone, so it is data loss and

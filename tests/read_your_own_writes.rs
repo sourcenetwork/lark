@@ -1,5 +1,5 @@
 //! Read-your-own-writes and lock-order probes for the published read
-//! view (G27).
+//! view (the published read view).
 //!
 //! The view is published under a mutex that a version edit also takes
 //! while it still holds the version-set mutex. Any path that took those

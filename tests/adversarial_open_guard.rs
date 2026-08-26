@@ -1,4 +1,4 @@
-//! Adversarial probes for the discarded-table open guard (G28).
+//! Adversarial probes for the discarded-table open guard (the discarded-table open guard).
 //!
 //! The guard's job is a two-sided one, and both sides are data loss when
 //! they go wrong:

@@ -1,4 +1,4 @@
-//! Adversarial byte-substitution sweep over a real WAL (G25).
+//! Adversarial byte-substitution sweep over a real WAL (the torn-tail rule).
 //!
 //! The shipped tests flip single bits and cut at every offset. This sets
 //! every offset to `0x00` and to `0xFF`, which reaches the length field

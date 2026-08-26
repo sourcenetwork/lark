@@ -1,4 +1,4 @@
-//! Independent bit-rot sweeps over an SSTable (G24).
+//! Independent bit-rot sweeps over an SSTable (the metadata checksum fix).
 //!
 //! `tests/corruption_exhaustive.rs` sweeps a flat-index table with no
 //! range tombstones, so two of the four checksummed metadata regions -

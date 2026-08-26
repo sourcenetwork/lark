@@ -1,4 +1,4 @@
-//! Chaos probe for the published read view (G27), against the
+//! Chaos probe for the published read view (the published read view), against the
 //! background operations the shipped adversarial suite does not run
 //! alongside its readers: column-family creation and drop, external SST
 //! ingestion, checkpoint capture, and a block cache small enough that

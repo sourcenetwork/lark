@@ -1,4 +1,4 @@
-//! Adversarial differential probe for reverse iteration (G29).
+//! Adversarial differential probe for reverse iteration (reverse iteration).
 //!
 //! Every iteration surface is compared against a `BTreeMap` oracle over
 //! adversarial key sets: all-`0xff` keys at every length around the

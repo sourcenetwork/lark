@@ -291,7 +291,10 @@ impl LarkStorage {
         ts: u64,
     ) -> std::io::Result<Vec<Vec<u8>>> {
         let mut iter = self.engine.new_iter_latest();
-        with_key(|b| layout::write_prefix(start, b), |target| iter.seek(target));
+        with_key(
+            |b| layout::write_prefix(start, b),
+            |target| iter.seek(target),
+        );
 
         let mut keys: Vec<Vec<u8>> = Vec::new();
         let mut last: Option<Vec<u8>> = None;

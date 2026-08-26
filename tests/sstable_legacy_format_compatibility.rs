@@ -1,4 +1,4 @@
-//! Independent backward-compatibility probe for G24, against bytes this
+//! Independent backward-compatibility probe for the metadata checksum fix, against bytes this
 //! tree did not write.
 //!
 //! The fixtures under `tests/fixtures/legacy_from_base/` were produced by

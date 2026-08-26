@@ -1,4 +1,4 @@
-//! Extra G26 probes: mutating surfaces the shipped sweep does not name.
+//! Extra the mutating-surface sweep probes: mutating surfaces the shipped sweep does not name.
 //!
 //! The contract is that refusing a write must not depend on whether the
 //! write carries work. These cover the TTL wrapper, the transaction

@@ -181,13 +181,13 @@ bench-one name: loadguard
 soak secs="360" wb="64" cache="64" shard_bits="6" tag="default": loadguard
     cargo run --release --bench soak -- {{secs}} {{wb}} {{cache}} {{shard_bits}} {{tag}}
 
-# The two soak variants section 1.2 compares. Deterministic: no loadguard needed.
+# The two soak variants compared. Deterministic: no loadguard needed.
 
 soak-pair:
     just soak 360 64 64 6 default
     just soak 360 64 64 0 cache-budgeted
 
-# Binary size, native and both wasm targets, against the section 6.5 budget.
+# Binary size, native and both wasm targets, against the budget.
 
 size:
     cargo run --release --bench size
@@ -213,12 +213,12 @@ wasm-budget puts="20000":
         rm -rf "$d"
     done
 
-# Point memory probes from section 6.5.
+# Point memory probes.
 
 mem:
     cargo run --release --bench memory
 
-# The MVCC regression probes from section 6.1. Must stay at zero violations.
+# The MVCC regression probes. Must stay at zero violations.
 
 ycsb workload="a" records="1000000" ops="1000000": loadguard
     cargo run --release -p lark-ycsb -- \
@@ -257,7 +257,7 @@ loom-debug:
 
 loom-all: loom loom-debug
 
-# The G27 chaos workload at full size: 6 instances x 2 rounds x 400
+# The the published read view chaos workload at full size: 6 instances x 2 rounds x 400
 # versions. Measured at over 20 minutes wall and 4h of CPU unoptimized,
 # which is why `cargo test` runs a smaller default and this recipe
 # carries the full one. Release, because debug is where the cost is.
@@ -265,7 +265,7 @@ loom-all: loom loom-debug
 chaos instances="6" rounds="2" versions="400" min_rounds="40":
     LARK_CHAOS_INSTANCES={{instances}} LARK_CHAOS_ROUNDS={{rounds}} \
     LARK_CHAOS_VERSIONS={{versions}} LARK_CHAOS_MIN_ROUNDS={{min_rounds}} \
-        cargo test --release --test adv_g27_chaos -- --nocapture
+        cargo test --release --test read_view_chaos_workload -- --nocapture
 
 # ---------- consistency ----------
 

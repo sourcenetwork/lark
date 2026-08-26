@@ -10,7 +10,7 @@
 //! Three invariants outrank throughput here, and every design choice below
 //! is subordinate to them.
 //!
-//! * **G1 - the horizon trails durability.** `visible_seq` moves only after
+//! * **the lost-update fix - the horizon trails durability.** `visible_seq` moves only after
 //!   every record in the group is on stable storage *and* every operation
 //!   is in the memtable, and always before any follower is released. A
 //!   snapshot therefore cannot observe a torn batch.
@@ -392,7 +392,7 @@ impl LarkEngine {
     /// Commit the staged group, then release every follower in it.
     ///
     /// Completion happens after [`Self::run_group`] has published the read
-    /// horizon (G1) and hands the same outcome to every member (G2).
+    /// horizon (the lost-update fix) and hands the same outcome to every member (G2).
     fn run_and_complete(&self, pipe: &mut Pipeline) -> io::Result<u64> {
         let Pipeline { stage, group } = pipe;
         let result = self.run_group(stage, group);
@@ -511,7 +511,7 @@ impl LarkEngine {
             }
         }
 
-        // G1: the horizon moves only now that every record is durable and
+        // the lost-update fix: the horizon moves only now that every record is durable and
         // every operation is applied, and `run_and_complete` releases the
         // followers only after this returns.
         self.visible_seq.publish(base_seq + total_ops - 1);
@@ -787,7 +787,7 @@ mod tests {
 
     #[test]
     fn a_group_publishes_the_horizon_only_after_every_member_is_applied() {
-        // G1: `snapshot_seq` must cover every operation in the group or
+        // the lost-update fix: `snapshot_seq` must cover every operation in the group or
         // none of it, never a prefix.
         let dir = TempDir::new().unwrap();
         let engine = open_engine(&dir);

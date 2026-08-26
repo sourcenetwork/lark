@@ -1,4 +1,4 @@
-//! Adversarial probe for the discarded-table open guard (G28) under the
+//! Adversarial probe for the discarded-table open guard (the discarded-table open guard) under the
 //! tear modes a real filesystem produces that are not `Truncate`.
 //!
 //! The shipped fix dismisses a *zero-length* orphan SSTable. A power cut

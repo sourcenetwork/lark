@@ -1,4 +1,4 @@
-//! Adversarial probe for G25 under the tear modes a power cut can leave
+//! Adversarial probe for the torn-tail rule under the tear modes a power cut can leave
 //! inside a WAL record.
 //!
 //! `Wal::replay` treats an *incomplete* trailing record as the end of

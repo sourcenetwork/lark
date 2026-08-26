@@ -139,9 +139,11 @@ pub mod fuzzing {
     /// Replay arbitrary bytes as a WAL file.
     pub fn replay_wal(data: &[u8]) {
         with_temp_file("wal", "log", data, |path| {
-            let Ok(mut iter) =
-                crate::engine::wal_replay::WalReplayIter::open(&*crate::env::std_env(), path, crate::engine::wal_replay::WalPosition::Newest)
-            else {
+            let Ok(mut iter) = crate::engine::wal_replay::WalReplayIter::open(
+                &*crate::env::std_env(),
+                path,
+                crate::engine::wal_replay::WalPosition::Newest,
+            ) else {
                 return;
             };
             while matches!(iter.next_entry(), Ok(Some(_))) {}

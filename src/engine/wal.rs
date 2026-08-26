@@ -329,7 +329,11 @@ impl Wal {
     /// [`WalReplayIter`]: super::wal_replay::WalReplayIter
     #[cfg(test)]
     pub(crate) fn replay(path: &Path) -> io::Result<Vec<WalEntry>> {
-        let mut iter = super::wal_replay::WalReplayIter::open(&*crate::env::std_env(), path, super::wal_replay::WalPosition::Newest)?;
+        let mut iter = super::wal_replay::WalReplayIter::open(
+            &*crate::env::std_env(),
+            path,
+            super::wal_replay::WalPosition::Newest,
+        )?;
         let mut entries = Vec::new();
         while let Some(entry) = iter.next_entry()? {
             entries.push(entry);
@@ -1985,7 +1989,7 @@ mod tests {
 
     #[test]
     fn replay_keeps_every_whole_record_before_a_cut_at_any_offset() {
-        // The G25 contract at unit scale: a crash costs at most the
+        // The the torn-tail rule contract at unit scale: a crash costs at most the
         // record it landed in. Cutting at every byte offset, including
         // inside the first header and at zero, must always yield exactly
         // the records that survived whole.

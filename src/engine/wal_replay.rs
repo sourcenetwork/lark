@@ -91,11 +91,7 @@ impl WalReplayIter {
     /// same filesystem the database was written to, and for an OPFS
     /// database in a browser `std::fs` is not merely the wrong file,
     /// it reports `Unsupported` and no reopen can ever replay.
-    pub(crate) fn open(
-        env: &dyn Env,
-        path: &Path,
-        position: WalPosition,
-    ) -> io::Result<Self> {
+    pub(crate) fn open(env: &dyn Env, path: &Path, position: WalPosition) -> io::Result<Self> {
         let cursor = ReadFileCursor::new(env.open_read(path)?)?;
         let file_len = cursor.len();
         let mut reader = BufReader::new(cursor);
@@ -154,7 +150,9 @@ impl WalReplayIter {
             // tail reads back.
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                 if self.position == WalPosition::Earlier {
-                    return Err(self.damage_in_a_closed_file(record_start, "carries an unusable record"));
+                    return Err(
+                        self.damage_in_a_closed_file(record_start, "carries an unusable record")
+                    );
                 }
                 self.tail = Some(classify_unusable_record(&self.path, record_start)?);
                 Ok(None)
@@ -387,7 +385,8 @@ mod tests {
         bytes.truncate(bytes.len() - 3);
         std::fs::write(&path, &bytes).unwrap();
 
-        let mut iter = WalReplayIter::open(&*crate::env::std_env(), &path, WalPosition::Newest).unwrap();
+        let mut iter =
+            WalReplayIter::open(&*crate::env::std_env(), &path, WalPosition::Newest).unwrap();
         assert!(
             iter.next_entry().unwrap().is_some(),
             "first record is whole"
@@ -416,7 +415,8 @@ mod tests {
         bytes[last] ^= 0xFF;
         std::fs::write(&path, &bytes).unwrap();
 
-        let mut iter = WalReplayIter::open(&*crate::env::std_env(), &path, WalPosition::Newest).unwrap();
+        let mut iter =
+            WalReplayIter::open(&*crate::env::std_env(), &path, WalPosition::Newest).unwrap();
         let err = iter.next_entry().expect_err("checksum must not pass");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
@@ -430,7 +430,8 @@ mod tests {
         bytes.push(RECORD_PUT);
         std::fs::write(&path, &bytes).unwrap();
 
-        let mut iter = WalReplayIter::open(&*crate::env::std_env(), &path, WalPosition::Newest).unwrap();
+        let mut iter =
+            WalReplayIter::open(&*crate::env::std_env(), &path, WalPosition::Newest).unwrap();
         // Nothing follows the bogus length, so it reads as a torn tail.
         // The point of the test is the allocation, not the verdict.
         assert!(iter.next_entry().unwrap().is_none());
@@ -452,7 +453,8 @@ mod tests {
             }
             wal.sync_data().unwrap();
         }
-        let mut iter = WalReplayIter::open(&*crate::env::std_env(), &path, WalPosition::Newest).unwrap();
+        let mut iter =
+            WalReplayIter::open(&*crate::env::std_env(), &path, WalPosition::Newest).unwrap();
         let mut count = 0;
         while iter.next_entry().unwrap().is_some() {
             count += 1;

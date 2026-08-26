@@ -1,4 +1,4 @@
-//! G27 on the scan entry points, including the column-family ones.
+//! the published read view on the scan entry points, including the column-family ones.
 //!
 //! `Db::get`, `Db::multi_get` and `Db::iter` were changed to load the
 //! published read view **before** sampling the read horizon. Five

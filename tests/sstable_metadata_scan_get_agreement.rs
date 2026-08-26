@@ -1,4 +1,4 @@
-//! Adversarial probe for G24's actual symptom: `scan` and `get`
+//! Adversarial probe for the metadata checksum fix's actual symptom: `scan` and `get`
 //! disagreeing after a corrupted SSTable is served.
 //!
 //! The shipped sweeps flip single bits and assert "refused or correct".
@@ -213,7 +213,7 @@ fn probe(db: &Path, label: &str) -> Verdict {
 
     // Every surviving surface agreed; it must also be the truth. A
     // surface that answered at all and answered something the workload
-    // never wrote is the silent-wrong-data case G24 is about.
+    // never wrote is the silent-wrong-data case the metadata checksum fix is about.
     for (name, got) in &views {
         if *got != want {
             return Verdict::Violation(format!(

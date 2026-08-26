@@ -291,7 +291,11 @@ mod nul_key_tests {
         // all report absence rather than a plausible wrong key.
         let mut data = Vec::new();
         data_key(b"a", 1, &mut data);
-        assert_eq!(user_key_of(&data), None, "a data record is not a write record");
+        assert_eq!(
+            user_key_of(&data),
+            None,
+            "a data record is not a write record"
+        );
         assert_eq!(user_key_of(b"W"), None);
         assert_eq!(user_key_of(&[WRITE, b'a', 0, 0, 0, 0, 0, 0][..]), None);
     }

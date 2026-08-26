@@ -1,5 +1,5 @@
 //! Adversarial probes for the "a write that carries no work is still a
-//! write" contract (G26).
+//! write" contract (the mutating-surface sweep).
 //!
 //! The contract has to hold for **every** mutating entry point and for
 //! both refusal reasons, otherwise a caller can probe a handle with an

@@ -224,7 +224,7 @@ jobs:
       - name: Loom models, release and debug
         run: just loom-all
 
-  # The G27 chaos workload at full size. `cargo test` runs a smaller
+  # The the published read view chaos workload at full size. `cargo test` runs a smaller
   # default so the ordinary gate stays fast; this job is what covers
   # the full one.
   chaos:

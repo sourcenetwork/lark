@@ -330,7 +330,7 @@ fn a_read_only_handle_refuses_every_mutation_and_still_reads() {
 /// read-only handle with an empty batch, get `Ok(())`, and conclude the
 /// handle is writable.
 ///
-/// Regression gate for G26. `write_opt`, `delete_range_opt` and
+/// Regression gate for the mutating-surface sweep. `write_opt`, `delete_range_opt` and
 /// `delete_range_cf` each used to check `ensure_open` before their
 /// no-op short-circuit and `ensure_writable` after it, so all three
 /// answered `Ok(())` on a read-only handle. They now check

@@ -1,4 +1,4 @@
-//! Adversarial probes for the WAL torn-tail rule (G25).
+//! Adversarial probes for the WAL torn-tail rule (the torn-tail rule).
 //!
 //! The rule under test: an incomplete *trailing* record is the ordinary
 //! shape of a crash and must be discarded, keeping every whole record

@@ -1,4 +1,4 @@
-//! Adversarial probes for the published-read-view contract (G27).
+//! Adversarial probes for the published-read-view contract (the published read view).
 //!
 //! Each test drives one public read surface against the same
 //! workload: every key has exactly one writer, which only ever
@@ -412,9 +412,9 @@ fn multi_get_never_travels_backwards() {
 /// `Db::iter` and `Db::scan` run the same iterator over the same
 /// workload and differ only in that ordering, and removing the
 /// user-thread `compact_range` from the `Db::scan` workload takes it to
-/// 0 violations over 5625360 reads, which is the G27 mechanism exactly.
+/// 0 violations over 5625360 reads, which is the the published read view mechanism exactly.
 #[test]
-#[ignore = "records an unfixed instance of G27 in Db::scan; un-ignore when the scan entry points load the view before sampling the horizon"]
+#[ignore = "records an unfixed instance of the published read view in Db::scan; un-ignore when the scan entry points load the view before sampling the horizon"]
 fn scan_never_travels_backwards() {
     drive(Surface::Scan);
 }
@@ -426,7 +426,7 @@ fn scan_never_travels_backwards() {
 /// single-call `Db::scan` fails the same way, and a page walk over a key
 /// set that is never inserted into or deleted from cannot skip a key.
 #[test]
-#[ignore = "records an unfixed instance of G27 in Db::scan_page; un-ignore with scan_never_travels_backwards"]
+#[ignore = "records an unfixed instance of the published read view in Db::scan_page; un-ignore with scan_never_travels_backwards"]
 fn scan_page_never_travels_backwards() {
     drive(Surface::ScanPage);
 }

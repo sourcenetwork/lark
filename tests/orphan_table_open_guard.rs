@@ -1,8 +1,8 @@
-//! Cross-fix probe: G28's "an orphan table that records no entry is a
+//! Cross-fix probe: the discarded-table open guard's "an orphan table that records no entry is a
 //! crash artifact" rule reads the footer's `num_entries` and
 //! `range_tombstone_size`. A V3/V4 footer is checksummed, so a damaged
-//! one is refused. A V1/V2 footer is not, which is G24's stated
-//! deliberate hole, and here that hole feeds the G28 guard: two zeroed
+//! one is refused. A V1/V2 footer is not, which is the metadata checksum fix's stated
+//! deliberate hole, and here that hole feeds the the discarded-table open guard guard: two zeroed
 //! `u64`s in a legacy footer make a table that holds 200 keys claim to
 //! hold none, and the guard then lets the open discard it.
 //!
@@ -99,8 +99,8 @@ fn a_modern_table_that_lies_about_its_entry_count_is_still_refused() {
 }
 
 /// The same forgery on a legacy table. A failure here is not a new
-/// defect on its own: it is G24's un-checksummed legacy footer reaching
-/// G28's guard, and the consequence is that the open succeeds while a
+/// defect on its own: it is the metadata checksum fix's un-checksummed legacy footer reaching
+/// the discarded-table open guard's guard, and the consequence is that the open succeeds while a
 /// table holding 200 keys is discarded.
 #[test]
 fn a_legacy_table_that_lies_about_its_entry_count_is_still_refused() {
@@ -122,7 +122,7 @@ fn a_legacy_table_that_lies_about_its_entry_count_is_still_refused() {
             panic!(
                 "a legacy table holding 200 keys claimed to hold none and the open went \
                  through, serving {served} entries and leaving the table unreferenced. The \
-                 legacy footer carries no checksum (G24's stated hole), and G28's guard \
+                 legacy footer carries no checksum (the metadata checksum fix's stated hole), and the discarded-table open guard's guard \
                  trusts it."
             );
         }
