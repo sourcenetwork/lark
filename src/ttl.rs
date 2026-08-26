@@ -25,7 +25,13 @@ use crate::options::{CompactionDecision, CompactionFilter};
 use crate::{Db, DbSlice, Error, Options, Result, WriteBatch, WriteBatchOp};
 
 const LEGACY_TS_LEN: usize = 4;
-const TTL_MAGIC: [u8; 4] = *b"LTTL";
+/// Identifier stamped into a TTL-carrying value. Values written by an
+/// earlier build carry `LTTL` and are still read, so a TTL database
+/// opens and migrates as its values are rewritten.
+const TTL_MAGIC: [u8; 4] = *b"RTTL";
+
+/// The identifier earlier builds wrote. Read, never written.
+const TTL_MAGIC_LEGACY: [u8; 4] = *b"LTTL";
 const TTL_MAGIC_LEN: usize = 4;
 const TTL_FORMAT_VERSION: u8 = 1;
 const TTL_TS_LEN: usize = 8;
@@ -255,7 +261,8 @@ fn decode_ttl_suffix(stamped: &[u8]) -> Option<DecodedTtlSuffix> {
     if stamped.len() >= TTL_SUFFIX_LEN {
         let suffix_start = stamped.len() - TTL_SUFFIX_LEN;
         let suffix = &stamped[suffix_start..];
-        if suffix[..TTL_MAGIC_LEN] == TTL_MAGIC {
+        let magic: [u8; TTL_MAGIC_LEN] = suffix[..TTL_MAGIC_LEN].try_into().unwrap();
+        if magic == TTL_MAGIC || magic == TTL_MAGIC_LEGACY {
             if suffix[TTL_MAGIC_LEN] != TTL_FORMAT_VERSION {
                 return None;
             }

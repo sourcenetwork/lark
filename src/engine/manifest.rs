@@ -256,10 +256,41 @@ fn validate_level_index(level: usize) -> io::Result<()> {
     ))
 }
 
+/// Identifier at the head of a MANIFEST: `REGOMAN` plus a format byte.
+const MANIFEST_MAGIC: [u8; 7] = *b"REGOMAN";
+
+/// On-disk MANIFEST format this build writes.
+const MANIFEST_FORMAT_V1: u8 = 1;
+
+/// Stamp layout: magic, format, checksum.
+const MANIFEST_STAMP_LEN: usize = 12;
+
+/// How far past its canonical size a MANIFEST may grow before it is
+/// rewritten.
+///
+/// The log is append-only, so without this it grows for the life of the
+/// database and recovery replays every edit ever made. Rewriting costs
+/// one record per live SSTable, and only after the log has grown to a
+/// multiple of that, so the amortized cost per edit is constant while
+/// the file stays within a bounded factor of its minimum.
+const MANIFEST_COMPACT_FACTOR: u64 = 4;
+
+/// Floor for the rewrite trigger, so a small database does not rewrite
+/// its manifest on almost every edit.
+const MANIFEST_COMPACT_FLOOR: u64 = 64 * 1024;
+
+/// Rough size of one `AddFile` record, used only to size the rewrite
+/// trigger. Being approximate costs a slightly different trigger point,
+/// never correctness: the rewrite is driven by the real file length.
+const APPROX_ADD_FILE_RECORD_BYTES: u64 = 256;
+
 /// Manages the current version and persists version edits to a manifest log.
 pub(crate) struct VersionSet {
     current: Arc<RwLock<Arc<Version>>>,
     manifest_path: PathBuf,
+    /// Bytes the manifest holds on disk, tracked rather than stat'ed so
+    /// the rewrite check costs nothing on the common path.
+    manifest_bytes: u64,
     manifest_writer: Option<BufWriter<File>>,
 }
 
@@ -325,6 +356,7 @@ impl VersionSet {
     ) -> io::Result<Self> {
         let manifest_path = db_dir.join("MANIFEST");
 
+        let mut manifest_bytes = 0u64;
         let (version, writer) = if manifest_path.exists() {
             let data = fs::read(&manifest_path)?;
             let replay = Self::replay_manifest(&data, sst_dir, policy)?;
@@ -335,18 +367,22 @@ impl VersionSet {
                 file.set_len(replay.valid_len as u64)?;
                 file.sync_all()?;
             }
+            manifest_bytes = replay.valid_len as u64;
             (replay.version, BufWriter::new(file))
         } else {
             let version = Version::new();
-            let file = File::create(&manifest_path)?;
+            let mut file = File::create(&manifest_path)?;
+            file.write_all(&Self::encode_stamp())?;
             file.sync_all()?;
             durability::sync_parent_dir(&manifest_path)?;
+            manifest_bytes = MANIFEST_STAMP_LEN as u64;
             (version, BufWriter::new(file))
         };
 
         Ok(Self {
             current: Arc::new(RwLock::new(Arc::new(version))),
             manifest_path,
+            manifest_bytes,
             manifest_writer: Some(writer),
         })
     }
@@ -369,6 +405,7 @@ impl VersionSet {
         Ok(Self {
             current: Arc::new(RwLock::new(Arc::new(replay.version))),
             manifest_path,
+            manifest_bytes: replay.valid_len as u64,
             manifest_writer: None,
         })
     }
@@ -436,9 +473,28 @@ impl VersionSet {
             }
         }
 
+        let live_files: u64 = version.levels.iter().map(|l| l.len() as u64).sum();
         *self.current.write() = Arc::new(version);
+        self.manifest_bytes += encoded.len() as u64;
+
+        // The log is append-only, so a database that runs for years
+        // replays every edit it ever made unless the file is rewritten.
+        // Rewriting costs one record per live table and happens only once
+        // the log has grown to a multiple of that, so the cost per edit
+        // is constant and the file stays within a bounded factor of its
+        // smallest possible size.
+        if self.manifest_bytes > Self::compact_threshold(live_files) {
+            self.compact_manifest()?;
+        }
 
         Ok(())
+    }
+
+    /// Size at which the manifest is rewritten, from the number of live
+    /// SSTables it has to name.
+    fn compact_threshold(live_files: u64) -> u64 {
+        let canonical = MANIFEST_STAMP_LEN as u64 + live_files * APPROX_ADD_FILE_RECORD_BYTES;
+        MANIFEST_COMPACT_FLOOR.max(canonical.saturating_mul(MANIFEST_COMPACT_FACTOR))
     }
 
     /// Rewrite the manifest from scratch, emitting the current version as
@@ -465,16 +521,57 @@ impl VersionSet {
         let tmp_path = self.manifest_path.with_extension("tmp");
         {
             let mut file = File::create(&tmp_path)?;
+            file.write_all(&Self::encode_stamp())?;
             file.write_all(&encoded)?;
             file.sync_all()?;
         }
         fs::rename(&tmp_path, &self.manifest_path)?;
         durability::sync_parent_dir(&self.manifest_path)?;
+        self.manifest_bytes = (MANIFEST_STAMP_LEN + encoded.len()) as u64;
 
         let file = OpenOptions::new().append(true).open(&self.manifest_path)?;
         self.manifest_writer = Some(BufWriter::new(file));
 
         Ok(())
+    }
+
+    /// Encode the stamp a manifest begins with.
+    fn encode_stamp() -> [u8; MANIFEST_STAMP_LEN] {
+        let mut out = [0u8; MANIFEST_STAMP_LEN];
+        out[0..7].copy_from_slice(&MANIFEST_MAGIC);
+        out[7] = MANIFEST_FORMAT_V1;
+        let checksum = checksum::manifest_record(0, &out[0..8]);
+        out[8..12].copy_from_slice(&checksum.to_le_bytes());
+        out
+    }
+
+    /// Length of the stamp at the head of `data`, or `None` when the
+    /// manifest predates the stamp and begins directly with a record.
+    fn stamp_len(data: &[u8]) -> io::Result<usize> {
+        if data.len() < MANIFEST_STAMP_LEN || data[0..7] != MANIFEST_MAGIC {
+            // A manifest written before the stamp existed. It is read as
+            // it was written, and the next compaction rewrites it with a
+            // stamp, so a database migrates by being used.
+            return Ok(0);
+        }
+        let format = data[7];
+        let stored = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+        if stored != checksum::manifest_record(0, &data[0..8]) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MANIFEST stamp checksum mismatch",
+            ));
+        }
+        if format > MANIFEST_FORMAT_V1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "MANIFEST format {format} was written by a newer lark than this build, \
+                     which understands up to {MANIFEST_FORMAT_V1}"
+                ),
+            ));
+        }
+        Ok(MANIFEST_STAMP_LEN)
     }
 
     fn encode_records(records: &[ManifestRecord]) -> Vec<u8> {
@@ -629,8 +726,12 @@ impl VersionSet {
         let mut last_seq: u64 = 0;
         let mut next_file_id: u64 = 1;
         let mut min_wal_id: u64 = 0;
-        let mut offset = 0;
-        let mut valid_len = 0;
+        // The stamp is not a record. `valid_len` starts past it so a
+        // clean replay ends exactly at the file length, which is what
+        // `reject_discarded_tables` compares against.
+        let stamp = Self::stamp_len(data)?;
+        let mut offset = stamp;
+        let mut valid_len = stamp;
 
         while offset < data.len() {
             if offset + 4 > data.len() {
@@ -758,8 +859,10 @@ mod tests {
 
     fn second_record_checksum_offset(path: &Path) -> usize {
         let data = std::fs::read(path).unwrap();
-        let first_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-        let second_start = 4 + first_len + 4;
+        // Records begin after the stamp.
+        let base = MANIFEST_STAMP_LEN;
+        let first_len = u32::from_le_bytes(data[base..base + 4].try_into().unwrap()) as usize;
+        let second_start = base + 4 + first_len + 4;
         let second_len =
             u32::from_le_bytes(data[second_start..second_start + 4].try_into().unwrap()) as usize;
         second_start + 4 + second_len
@@ -1174,6 +1277,78 @@ mod tests {
 
         let vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
         assert_eq!(vs.current().last_seq, 99);
+    }
+
+    /// The manifest is an append-only log, so without a rewrite trigger a
+    /// database that runs for years replays every edit it ever made. This
+    /// applies far more edits than the trigger allows and asserts the
+    /// file stays bounded rather than growing with the history.
+    #[test]
+    fn a_long_running_manifest_stays_bounded_instead_of_growing_forever() {
+        let dir = TempDir::new().unwrap();
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+        let path = dir.path().join("MANIFEST");
+
+        let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+        // No files are ever added, so the canonical form stays tiny and
+        // the floor is the whole budget.
+        for seq in 0..20_000u64 {
+            vs.apply(&[VersionEdit::SetLastSeq(seq)]).unwrap();
+        }
+        drop(vs);
+
+        let len = std::fs::metadata(&path).unwrap().len();
+        let bound = VersionSet::compact_threshold(0);
+        assert!(
+            len <= bound,
+            "manifest grew to {len} bytes against a {bound}-byte bound: \
+             an append-only log that is never rewritten grows without limit"
+        );
+
+        // And it still replays to the state those edits describe.
+        let reopened = VersionSet::open(dir.path(), &sst_dir).unwrap();
+        assert_eq!(reopened.current().last_seq, 19_999);
+    }
+
+    /// A manifest written before the stamp existed still opens, and is
+    /// rewritten with a stamp once it is compacted.
+    #[test]
+    fn an_unstamped_manifest_opens_and_gains_a_stamp_when_rewritten() {
+        let dir = TempDir::new().unwrap();
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+        let path = dir.path().join("MANIFEST");
+
+        // A manifest in the pre-stamp shape: records, no header.
+        let records = [ManifestRecord::SetLastSeq(42)];
+        std::fs::write(&path, VersionSet::encode_records(&records)).unwrap();
+
+        let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+        assert_eq!(vs.current().last_seq, 42, "an unstamped manifest must open");
+
+        vs.compact_manifest().unwrap();
+        let data = std::fs::read(&path).unwrap();
+        assert_eq!(&data[0..7], b"REGOMAN", "a rewrite must stamp the file");
+        assert_eq!(
+            VersionSet::stamp_len(&data).unwrap(),
+            MANIFEST_STAMP_LEN,
+            "the written stamp must validate"
+        );
+        drop(vs);
+        let reopened = VersionSet::open(dir.path(), &sst_dir).unwrap();
+        assert_eq!(reopened.current().last_seq, 42);
+    }
+
+    #[test]
+    fn a_manifest_from_a_newer_format_is_refused() {
+        let mut stamp = VersionSet::encode_stamp();
+        stamp[7] = MANIFEST_FORMAT_V1 + 1;
+        let checksum = checksum::manifest_record(0, &stamp[0..8]);
+        stamp[8..12].copy_from_slice(&checksum.to_le_bytes());
+
+        let err = VersionSet::stamp_len(&stamp).expect_err("a newer format must not be parsed");
+        assert!(err.to_string().contains("newer lark"), "{err}");
     }
 
     #[test]

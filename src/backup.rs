@@ -88,8 +88,16 @@ struct BackupManifest {
     last_seq: u64,
 }
 
-const BACKUP_MANIFEST_MAGIC: u32 = 0x4C4B_4250; // "LKBP"
-const BACKUP_MANIFEST_VERSION: u32 = 1;
+/// Identifier at the head of a backup manifest: `REGOMBKP`.
+const BACKUP_MANIFEST_MAGIC: [u8; 8] = *b"REGOMBKP";
+
+/// The 4-byte identifier earlier builds wrote (`LKBP`). Read, never
+/// written, so an existing backup repository still restores.
+const BACKUP_MANIFEST_MAGIC_LEGACY: u32 = 0x4C4B_4250;
+
+/// Bumped with the identifier: a manifest carrying `REGOMBKP` is v2.
+const BACKUP_MANIFEST_VERSION: u32 = 2;
+const BACKUP_MANIFEST_VERSION_LEGACY: u32 = 1;
 
 impl BackupEngine {
     /// Open or create a backup repository at `backup_dir`.
@@ -404,7 +412,7 @@ fn parse_backup_id(name: &str) -> Option<u64> {
 
 fn encode_manifest(m: &BackupManifest) -> Vec<u8> {
     let mut body = Vec::new();
-    body.extend_from_slice(&BACKUP_MANIFEST_MAGIC.to_le_bytes());
+    body.extend_from_slice(&BACKUP_MANIFEST_MAGIC);
     body.extend_from_slice(&BACKUP_MANIFEST_VERSION.to_le_bytes());
     body.extend_from_slice(&m.created_at_unix.to_le_bytes());
     body.extend_from_slice(&m.next_file_id.to_le_bytes());
@@ -444,15 +452,24 @@ fn decode_manifest(data: &[u8]) -> io::Result<BackupManifest> {
         ));
     }
     let mut p = 0usize;
-    let magic = read_u32(body, &mut p)?;
-    if magic != BACKUP_MANIFEST_MAGIC {
+    // `REGOMBKP` is eight bytes; the identifier earlier builds wrote is
+    // four. Reading eight and falling back keeps an existing repository
+    // restorable instead of stranding it.
+    let expected_version = if body.len() >= BACKUP_MANIFEST_MAGIC.len()
+        && body[..BACKUP_MANIFEST_MAGIC.len()] == BACKUP_MANIFEST_MAGIC
+    {
+        p = BACKUP_MANIFEST_MAGIC.len();
+        BACKUP_MANIFEST_VERSION
+    } else if read_u32(body, &mut p)? == BACKUP_MANIFEST_MAGIC_LEGACY {
+        BACKUP_MANIFEST_VERSION_LEGACY
+    } else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "backup manifest bad magic",
         ));
-    }
+    };
     let version = read_u32(body, &mut p)?;
-    if version != BACKUP_MANIFEST_VERSION {
+    if version != expected_version {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported backup manifest version {version}"),

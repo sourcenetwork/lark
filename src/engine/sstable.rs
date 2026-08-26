@@ -26,6 +26,13 @@
 //! MAGIC_V2 (version byte 0x02) partitioned index, 64-byte footer, no metadata checksum
 //! MAGIC_V3 (version byte 0x03) flat index,        72-byte footer, metadata checksummed
 //! MAGIC_V4 (version byte 0x04) partitioned index, 72-byte footer, metadata checksummed
+//! MAGIC_V5 (version byte 0x05) flat index,        72-byte footer, metadata checksummed
+//! MAGIC_V6 (version byte 0x06) partitioned index, 72-byte footer, metadata checksummed
+//!
+//! The first four carry the `LARKSST` identifier and the last two carry
+//! `REGOSST`. Only the `REGOSST` pair is written; the others are read so
+//! that a database written by an earlier build opens, and migrates as
+//! compaction rewrites its tables.
 //! ```
 //!
 //! lark writes V3 or V4 and reads all four. A table written by an older
@@ -97,8 +104,21 @@ const MAGIC_V2: u64 = 0x4C41524B_53535402;
 const MAGIC_V3: u64 = 0x4C41524B_53535403;
 
 /// SSTable magic number: "LARKSST\x04" - partitioned index, 72-byte
-/// footer, metadata regions checksummed. Written by lark today.
+/// footer, metadata regions checksummed. Legacy: read, never written.
 const MAGIC_V4: u64 = 0x4C41524B_53535404;
+
+/// SSTable magic number: "REGOSST\x05" - flat index, 72-byte footer,
+/// metadata regions checksummed. Written by lark today.
+///
+/// Same layout as [`MAGIC_V3`] under the current identifier. A table is
+/// migrated by being rewritten, which compaction does in the ordinary
+/// course of running, so a database moves to the new magic without a
+/// conversion step and without a version in which it cannot be opened.
+const MAGIC_V5: u64 = 0x5245474F_53535405;
+
+/// SSTable magic number: "REGOSST\x06" - partitioned index, 72-byte
+/// footer, metadata regions checksummed. Written by lark today.
+const MAGIC_V6: u64 = 0x5245474F_53535406;
 
 /// Footer size for [`MAGIC_V1`] and [`MAGIC_V2`].
 const FOOTER_SIZE_V1: usize = 64;
@@ -156,13 +176,13 @@ struct Footer {
 impl Footer {
     /// Whether a table carrying `magic` checksums its metadata regions.
     fn magic_is_checksummed(magic: u64) -> bool {
-        magic == MAGIC_V3 || magic == MAGIC_V4
+        matches!(magic, MAGIC_V3 | MAGIC_V4 | MAGIC_V5 | MAGIC_V6)
     }
 
     /// Whether `magic` names the partitioned index layout, where the
     /// footer's index handle points at a top-level index of leaves.
     fn magic_is_partitioned(magic: u64) -> bool {
-        magic == MAGIC_V2 || magic == MAGIC_V4
+        matches!(magic, MAGIC_V2 | MAGIC_V4 | MAGIC_V6)
     }
 
     /// Footer byte length implied by `magic`, or an error naming the
@@ -170,7 +190,7 @@ impl Footer {
     fn size_for_magic(magic: u64) -> io::Result<usize> {
         match magic {
             MAGIC_V1 | MAGIC_V2 => Ok(FOOTER_SIZE_V1),
-            MAGIC_V3 | MAGIC_V4 => Ok(FOOTER_SIZE_V2),
+            MAGIC_V3 | MAGIC_V4 | MAGIC_V5 | MAGIC_V6 => Ok(FOOTER_SIZE_V2),
             other => Err(invalid_data(format!(
                 "invalid SSTable magic number: {other:#018x}"
             ))),
@@ -925,7 +945,7 @@ impl SsTableWriter {
                 &top_data,
                 checksum::META_KIND_INDEX,
             )?;
-            (top_offset, top_size, MAGIC_V4)
+            (top_offset, top_size, MAGIC_V6)
         } else {
             let index_data = encode_index_block(&self.index_entries);
             let idx_offset = self.current_offset;
@@ -935,7 +955,7 @@ impl SsTableWriter {
                 &index_data,
                 checksum::META_KIND_INDEX,
             )?;
-            (idx_offset, idx_size, MAGIC_V3)
+            (idx_offset, idx_size, MAGIC_V5)
         };
 
         let footer = Footer {
@@ -2624,7 +2644,17 @@ mod tests {
             writer.finish().unwrap().unwrap();
 
             let on_disk = fs::read(&path).unwrap();
-            assert_eq!(on_disk[on_disk.len() - 8], if partitioned { 4 } else { 3 });
+            let magic = u64::from_le_bytes(on_disk[on_disk.len() - 8..].try_into().unwrap());
+            assert_eq!(
+                magic,
+                if partitioned { MAGIC_V6 } else { MAGIC_V5 },
+                "a fresh table must carry the REGOSST magic, not a legacy one"
+            );
+            assert_eq!(
+                &magic.to_be_bytes()[..7],
+                b"REGOSST",
+                "the identifier itself must read as REGOSST"
+            );
             let reader = SsTableReader::open(&path, 1).unwrap();
             assert!(reader.meta_checksummed);
             assert_eq!(reader.partitioned, partitioned);
