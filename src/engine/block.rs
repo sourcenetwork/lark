@@ -13,7 +13,7 @@
 use std::io;
 use std::ops::ControlFlow;
 
-use super::internal_key::{compare_internal_keys, INTERNAL_KEY_SUFFIX_LEN};
+use super::internal_key::{INTERNAL_KEY_SUFFIX_LEN, compare_internal_keys};
 
 /// Entries per restart point. Smaller = faster lookups, larger = better compression.
 pub(crate) const RESTART_INTERVAL: usize = 16;

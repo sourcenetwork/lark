@@ -160,7 +160,7 @@ fn every_publisher_of_the_read_view_running_at_once_stays_live() {
             let mut n = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 n += 1;
-                if n % 64 == 0 {
+                if n.is_multiple_of(64) {
                     db.drop_all().expect("drop_all");
                 }
                 db.put(b"churn", &n.to_be_bytes()).expect("put");

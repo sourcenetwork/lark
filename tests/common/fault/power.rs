@@ -333,12 +333,11 @@ fn replay(journal: &Journal, cut_seq: u64) -> (HashMap<PathBuf, FileState>, usiz
             OpKind::Sync => {
                 if r.path.is_dir() {
                     for (p, st) in files.iter_mut() {
-                        if p.parent() == Some(r.path.as_path()) {
-                            if let Some(at) = st.created_at {
-                                if at < r.seq {
-                                    st.dir_synced_after_create = true;
-                                }
-                            }
+                        if p.parent() == Some(r.path.as_path())
+                            && let Some(at) = st.created_at
+                            && at < r.seq
+                        {
+                            st.dir_synced_after_create = true;
                         }
                     }
                 } else if let Some(st) = files.get_mut(&r.path) {

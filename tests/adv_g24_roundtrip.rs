@@ -141,8 +141,13 @@ fn a_checksummed_external_table_ingests_and_reads_back() {
         let bytes = fs::read(&path).expect("read");
         let magic = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().expect("8"));
         assert!(
-            magic == 0x4C41524B_53535403 || magic == 0x4C41524B_53535404,
-            "the writer must emit a checksummed format, got {magic:#018x}",
+            magic == 0x5245474F_53535405 || magic == 0x5245474F_53535406,
+            "the writer must emit a checksummed REGOSST format, got {magic:#018x}",
+        );
+        assert_eq!(
+            &magic.to_be_bytes()[..7],
+            b"REGOSST",
+            "an externally written table must carry the current identifier"
         );
 
         let dir = TempDir::new().expect("tempdir");

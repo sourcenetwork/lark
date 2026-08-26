@@ -97,4 +97,4 @@
 //! blocking wait has to be replaced by the caller doing the work
 //! itself rather than by a different condvar.
 
-pub(crate) use portable_atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+pub(crate) use portable_atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};

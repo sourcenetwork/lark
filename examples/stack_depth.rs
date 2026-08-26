@@ -91,7 +91,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let results = handle.join().map_err(|_| "measuring thread panicked")??;
 
     println!("lark stack depth, {} profile", profile_name());
-    println!("  method     paint 0x{PATTERN:02X}, {PAINT_LEVELS} x {PAINT_CHUNK} B window, gap-cancelled diff");
+    println!(
+        "  method     paint 0x{PATTERN:02X}, {PAINT_LEVELS} x {PAINT_CHUNK} B window, gap-cancelled diff"
+    );
     println!("  build      {}", build_profile());
     println!(
         "  host       {} / {}",
@@ -207,10 +209,10 @@ fn level_shape(db: &Db) -> String {
     let mut parts = Vec::new();
     for level in 0..7 {
         let name = format!("lark.num-files-at-level{level}");
-        if let Some(n) = db.get_int_property(&name) {
-            if n > 0 {
-                parts.push(format!("L{level}={n}"));
-            }
+        if let Some(n) = db.get_int_property(&name)
+            && n > 0
+        {
+            parts.push(format!("L{level}={n}"));
         }
     }
     if parts.is_empty() {

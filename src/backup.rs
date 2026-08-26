@@ -35,7 +35,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::fs;
 
-use crate::engine::{checksum, CheckpointSnapshot};
+use crate::engine::{CheckpointSnapshot, checksum};
 use crate::env::{Env, ReadFileCursor, WriteMode};
 use crate::{Db, Error, Result};
 
@@ -295,11 +295,11 @@ impl BackupEngine {
             if parse_backup_id(&entry.file_name()).is_none() {
                 continue;
             }
-            if let Ok(bytes) = self.env.read(&entry.path) {
-                if let Ok(m) = decode_manifest(&bytes) {
-                    for f in m.files {
-                        still_referenced.insert(f.hash);
-                    }
+            if let Ok(bytes) = self.env.read(&entry.path)
+                && let Ok(m) = decode_manifest(&bytes)
+            {
+                for f in m.files {
+                    still_referenced.insert(f.hash);
                 }
             }
         }
@@ -325,10 +325,10 @@ impl BackupEngine {
     fn next_backup_id(&self) -> Result<u64> {
         let mut max_id = 0u64;
         for entry in self.env.read_dir(&self.meta_dir).map_err(Error::from)? {
-            if let Some(id) = parse_backup_id(&entry.file_name()) {
-                if id > max_id {
-                    max_id = id;
-                }
+            if let Some(id) = parse_backup_id(&entry.file_name())
+                && id > max_id
+            {
+                max_id = id;
             }
         }
         Ok(max_id + 1)

@@ -193,10 +193,11 @@ impl Env for MemEnv {
 
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         let mut fs = self.fs.lock();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() && !fs.dirs.contains(parent) {
-                return Err(not_found(parent));
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && !fs.dirs.contains(parent)
+        {
+            return Err(not_found(parent));
         }
         let data = fs.files.entry(path.to_path_buf()).or_default().clone();
         drop(fs);

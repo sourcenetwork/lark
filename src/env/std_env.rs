@@ -6,7 +6,7 @@
 //! native user sees no behavior change at all.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::Duration;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -221,7 +221,7 @@ impl ReadFile for StdReadFile {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "failed to fill whole buffer",
-                    ))
+                    ));
                 }
                 Ok(n) => {
                     written += n;
@@ -272,7 +272,11 @@ impl WriteFile for StdWriteFile {
     }
 
     fn set_len(&mut self, len: u64) -> io::Result<()> {
-        self.file.set_len(len)
+        self.file.set_len(len)?;
+        // `set_len` does not move the cursor, so without this the next
+        // write lands past the new end and leaves a hole behind it.
+        self.file.seek(SeekFrom::Start(len))?;
+        Ok(())
     }
 
     fn len(&self) -> io::Result<u64> {
@@ -411,8 +415,8 @@ mod tests {
 
     #[test]
     fn spawn_runs_the_body_and_join_waits_for_it() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         let env = std_env();
         let done = Arc::new(AtomicBool::new(false));

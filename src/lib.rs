@@ -81,8 +81,8 @@ pub use options::{
     ArenaProfile, CompactionDecision, CompactionFilter, CompactionStyle, CompressionType,
     DEFAULT_MAX_BACKGROUND_COMPACTIONS, DEFAULT_MAX_KEY_SIZE, DEFAULT_MAX_VALUE_SIZE,
     DurabilityMode, FifoCompactionOptions, FixedLengthPrefix, MAX_BLOCK_CACHE_SHARD_BITS,
-    MAX_BLOOM_BITS_PER_KEY, MergeOperator, Options, PrefixExtractor,
-    UniversalCompactionOptions, WriteOptions,
+    MAX_BLOOM_BITS_PER_KEY, MergeOperator, Options, PrefixExtractor, UniversalCompactionOptions,
+    WriteOptions,
 };
 pub use perf_context::{PerfContext, PerfContextSnapshot, PerfLevel};
 pub use rate_limiter::{Priority, RateLimiter, TokenBucketRateLimiter};

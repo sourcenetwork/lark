@@ -15,8 +15,8 @@ pub mod loom_model;
 pub(crate) mod manifest;
 pub(crate) mod memtable;
 pub(crate) mod range_tombstone;
-pub(crate) mod read_view;
 pub(crate) mod read_horizon;
+pub(crate) mod read_view;
 pub(crate) mod skiplist;
 pub(crate) mod snapshot_registry;
 pub(crate) mod sstable;
@@ -24,10 +24,10 @@ pub(crate) mod sync;
 pub(crate) mod wal;
 pub(crate) mod wal_replay;
 
+use crate::portability::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use crate::portability::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use kovan_queue::array_queue::ArrayQueue;
 use parking_lot::{Mutex, RwLock};
@@ -416,7 +416,6 @@ pub(crate) struct LarkEngine {
     env: Arc<dyn Env>,
     _db_lock: Box<dyn FileLock>,
 }
-
 
 /// How a writer that has hit a "stop writes" threshold makes room.
 ///
@@ -1891,10 +1890,8 @@ impl LarkEngine {
         // stays untouched rather than gaining a fabricated zero, and
         // the caller is told the same thing.
         let micros = self.elapsed_micros(start);
-        if any_stall {
-            if let (Some(micros), Some(s)) = (micros, self.statistics()) {
-                s.add(crate::statistics::Ticker::WriteStallMicros, micros);
-            }
+        if any_stall && let (Some(micros), Some(s)) = (micros, self.statistics()) {
+            s.add(crate::statistics::Ticker::WriteStallMicros, micros);
         }
         Ok(micros.unwrap_or(0))
     }
@@ -2344,15 +2341,14 @@ impl LarkEngine {
             // top of the space, which `next_file_id` counts up from 1 and
             // never reaches.
             let cache_id = ingest_probe_file_id(source_idx);
-            let reader = SsTableReader::open_with(
-                &self.env,
-                path,
-                cache_id,
-                self.options.metadata_policy(),
-            )
-            .map_err(|e| {
-                std::io::Error::new(e.kind(), format!("ingest: open {}: {e}", path.display()))
-            })?;
+            let reader =
+                SsTableReader::open_with(&self.env, path, cache_id, self.options.metadata_policy())
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!("ingest: open {}: {e}", path.display()),
+                        )
+                    })?;
             // Stream the source instead of materialising it: the
             // validation pass holds one entry and one data block, and
             // tracks the key range as it goes.
@@ -2886,8 +2882,7 @@ impl LarkEngine {
         // readers: a concurrent reader may still briefly observe
         // pre-drop SSTable data, exactly as before this view existed.
         let fresh = Arc::new(MemTable::new(&self.memtable_config)?);
-        self.view
-            .update_memtables(|_, _| (fresh, Vec::new(), ()));
+        self.view.update_memtables(|_, _| (fresh, Vec::new(), ()));
 
         let (old_version, wal_id, wal_path, new_wal) = {
             let mut versions = self.versions.lock();

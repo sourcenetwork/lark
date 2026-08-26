@@ -18,8 +18,8 @@
 //! cargo invocation, which builds every test target in the package, and
 //! the rest of `tests/` is native-only.
 
-use lark_kv::env::opfs::{OpfsEnv, OpfsError, OpfsMode, OpfsOptions};
 use lark_kv::env::Env;
+use lark_kv::env::opfs::{OpfsEnv, OpfsError, OpfsMode, OpfsOptions};
 use lark_kv::{Db, Options};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 

@@ -86,7 +86,10 @@ fn assert_shard_invariants(cache: &BlockCache, context: &str) {
 
         let guard = epoch::pin();
         for (i, entry) in &live {
-            assert_eq!(entry.slot as usize, *i, "{context}: shard {idx} slot index drifted");
+            assert_eq!(
+                entry.slot as usize, *i,
+                "{context}: shard {idx} slot index drifted"
+            );
             let found = shard
                 .map
                 .get()
@@ -323,11 +326,20 @@ fn reinserting_a_key_with_a_different_size_reprices_it() {
     let small = block_with(1, 256);
     let large = block_with(2, 64 * 1024);
     cache.insert(4, 0, Arc::clone(&small));
-    assert_eq!(cache.usage(), entry_charge(&CacheEntry::Data(Arc::clone(&small))));
+    assert_eq!(
+        cache.usage(),
+        entry_charge(&CacheEntry::Data(Arc::clone(&small)))
+    );
     cache.insert(4, 0, Arc::clone(&large));
-    assert_eq!(cache.usage(), entry_charge(&CacheEntry::Data(Arc::clone(&large))));
+    assert_eq!(
+        cache.usage(),
+        entry_charge(&CacheEntry::Data(Arc::clone(&large)))
+    );
     cache.insert(4, 0, Arc::clone(&small));
-    assert_eq!(cache.usage(), entry_charge(&CacheEntry::Data(Arc::clone(&small))));
+    assert_eq!(
+        cache.usage(),
+        entry_charge(&CacheEntry::Data(Arc::clone(&small)))
+    );
     assert_eq!(cache.entry_count(), 1);
     assert_shard_invariants(&cache, "re-insert repricing");
 }

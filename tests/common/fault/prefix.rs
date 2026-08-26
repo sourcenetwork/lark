@@ -210,7 +210,10 @@ impl fmt::Display for PrefixViolation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PrefixViolation::NotAPrefix { detail } => {
-                write!(f, "recovered state is not a prefix of the write history: {detail}")
+                write!(
+                    f,
+                    "recovered state is not a prefix of the write history: {detail}"
+                )
             }
             PrefixViolation::HalfAppliedBatch {
                 batch,
@@ -228,11 +231,15 @@ impl fmt::Display for PrefixViolation {
                 keys.len(),
                 keys,
             ),
-            PrefixViolation::OrderBroken { detail } => write!(f, "iteration order broken: {detail}"),
+            PrefixViolation::OrderBroken { detail } => {
+                write!(f, "iteration order broken: {detail}")
+            }
             PrefixViolation::PointScanDisagree { detail } => {
                 write!(f, "point lookup disagreed with the scan: {detail}")
             }
-            PrefixViolation::Engine(e) => write!(f, "engine error while reading recovered state: {e}"),
+            PrefixViolation::Engine(e) => {
+                write!(f, "engine error while reading recovered state: {e}")
+            }
         }
     }
 }
@@ -249,16 +256,16 @@ pub fn recovered_state(db: &Db) -> Result<KeyValues, PrefixViolation> {
     while it.valid() {
         let k = it.key().expect("valid iterator has a key").to_vec();
         let v = it.value().expect("valid iterator has a value").to_vec();
-        if let Some((prev, _)) = forward.last() {
-            if prev >= &k {
-                return Err(PrefixViolation::OrderBroken {
-                    detail: format!(
-                        "forward scan returned {:?} after {:?}",
-                        String::from_utf8_lossy(&k),
-                        String::from_utf8_lossy(prev),
-                    ),
-                });
-            }
+        if let Some((prev, _)) = forward.last()
+            && prev >= &k
+        {
+            return Err(PrefixViolation::OrderBroken {
+                detail: format!(
+                    "forward scan returned {:?} after {:?}",
+                    String::from_utf8_lossy(&k),
+                    String::from_utf8_lossy(prev),
+                ),
+            });
         }
         forward.push((k, v));
         it.next();
@@ -300,7 +307,7 @@ pub fn recovered_state(db: &Db) -> Result<KeyValues, PrefixViolation> {
                         v.len(),
                         other.map(|b| b.len()),
                     ),
-                })
+                });
             }
             Err(e) => return Err(PrefixViolation::Engine(e.to_string())),
         }

@@ -38,8 +38,8 @@
 //! *process* on a target with no file locking, and there lark says so
 //! through `Capabilities::file_lock` instead of pretending.
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -253,7 +253,7 @@ mod real {
         if existing.is_empty() {
             (&*file).seek(SeekFrom::Start(0))?;
             (&*file).write_all(LOCK_STAMP)?;
-            (&*file).sync_data()?;
+            file.sync_data()?;
         }
         Ok(())
     }

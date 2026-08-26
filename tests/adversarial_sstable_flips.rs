@@ -202,7 +202,7 @@ fn probe(fx: &Fixture, db_dir: &Path) -> Outcome {
                     String::from_utf8_lossy(k),
                     String::from_utf8_lossy(v),
                     other.map(|b| String::from_utf8_lossy(&b).into_owned()),
-                ))
+                ));
             }
         }
     }

@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use lark_kv::{Db, DurabilityMode, Options, WriteBatch};
 
-use super::journal::{journal_path_for, root_filter_for, Journal};
+use super::journal::{Journal, journal_path_for, root_filter_for};
 use super::prefix::{History, OpValue};
 use super::shim;
 
@@ -656,7 +656,7 @@ pub fn plan(spec: &ChildSpec) -> History {
 }
 
 fn is_delete(spec: &ChildSpec, idx: usize) -> bool {
-    spec.delete_every > 0 && idx > 0 && idx % spec.delete_every == 0
+    spec.delete_every > 0 && idx > 0 && idx.is_multiple_of(spec.delete_every)
 }
 
 fn key_for(idx: usize) -> Vec<u8> {

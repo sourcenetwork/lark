@@ -56,19 +56,6 @@ impl BufferedWriter {
     }
 
     /// Drain the buffer and make every byte written so far durable.
-    /// Flush the buffer, then make the data durable without the
-    /// metadata round trip. See [`WriteFile::sync_data`].
-    pub(crate) fn sync_data(&mut self) -> io::Result<()> {
-        self.flush()?;
-        self.inner.sync_data()
-    }
-
-    /// Truncate to `len`, discarding anything still buffered past it.
-    pub(crate) fn set_len(&mut self, len: u64) -> io::Result<()> {
-        self.flush()?;
-        self.inner.set_len(len)
-    }
-
     pub(crate) fn sync_all(&mut self) -> io::Result<()> {
         self.drain()?;
         self.inner.sync_all()
@@ -99,7 +86,7 @@ impl Drop for BufferedWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::env::{std_env, WriteMode};
+    use crate::env::{WriteMode, std_env};
     use tempfile::TempDir;
 
     fn open(dir: &TempDir, name: &str) -> BufferedWriter {

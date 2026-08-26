@@ -330,7 +330,7 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
             while !stop.load(Ordering::Relaxed) && live.load(Ordering::Acquire) > 0 {
                 thread::sleep(Duration::from_secs(5));
                 ticks += 1;
-                if ticks % 2 == 0 {
+                if ticks.is_multiple_of(2) {
                     // `no_slowdown` turns any active stall condition into
                     // `Error::Busy(reason)`, which names the threshold.
                     let mut probe_opts = lark_kv::WriteOptions::new();

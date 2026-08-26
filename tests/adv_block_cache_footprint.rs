@@ -24,32 +24,40 @@ struct Counting;
 // exactly `System`'s.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let p = System.alloc(layout);
-        if !p.is_null() {
-            LIVE.fetch_add(layout.size() as isize, Ordering::Relaxed);
+        unsafe {
+            let p = System.alloc(layout);
+            if !p.is_null() {
+                LIVE.fetch_add(layout.size() as isize, Ordering::Relaxed);
+            }
+            p
         }
-        p
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE.fetch_sub(layout.size() as isize, Ordering::Relaxed);
-        System.dealloc(ptr, layout)
+        unsafe {
+            LIVE.fetch_sub(layout.size() as isize, Ordering::Relaxed);
+            System.dealloc(ptr, layout)
+        }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let p = System.realloc(ptr, layout, new_size);
-        if !p.is_null() {
-            LIVE.fetch_add(
-                new_size as isize - layout.size() as isize,
-                Ordering::Relaxed,
-            );
+        unsafe {
+            let p = System.realloc(ptr, layout, new_size);
+            if !p.is_null() {
+                LIVE.fetch_add(
+                    new_size as isize - layout.size() as isize,
+                    Ordering::Relaxed,
+                );
+            }
+            p
         }
-        p
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let p = System.alloc_zeroed(layout);
-        if !p.is_null() {
-            LIVE.fetch_add(layout.size() as isize, Ordering::Relaxed);
+        unsafe {
+            let p = System.alloc_zeroed(layout);
+            if !p.is_null() {
+                LIVE.fetch_add(layout.size() as isize, Ordering::Relaxed);
+            }
+            p
         }
-        p
     }
 }
 
@@ -63,10 +71,10 @@ const CHILD_ENV: &str = "LARK_ADV_FOOTPRINT_BITS";
 fn vm_rss_kib() -> u64 {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("VmRSS:") {
-            if let Some(kib) = rest.split_whitespace().next() {
-                return kib.parse().unwrap_or(0);
-            }
+        if let Some(rest) = line.strip_prefix("VmRSS:")
+            && let Some(kib) = rest.split_whitespace().next()
+        {
+            return kib.parse().unwrap_or(0);
         }
     }
     0

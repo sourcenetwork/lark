@@ -495,7 +495,7 @@ impl LarkEngine {
             let memtable = &view.active;
             let mut seq = base_seq;
             for ticket in group {
-                ticket.request.apply(&memtable, &mut seq);
+                ticket.request.apply(memtable, &mut seq);
             }
         }
 

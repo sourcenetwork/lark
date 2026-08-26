@@ -77,16 +77,16 @@ pub use bytes::{
     newest_wal, overwrite_range, truncate_at,
 };
 pub use child::{
-    builtin_workload, child_entrypoint, kill_self, plan, run_child, started_path_for, ChildOutcome,
-    ChildSpec, CrashRun, DieKind, Phase, Trigger, CHILD_ENV, CHILD_TEST, DEFAULT_SEED,
+    CHILD_ENV, CHILD_TEST, ChildOutcome, ChildSpec, CrashRun, DEFAULT_SEED, DieKind, Phase,
+    Trigger, builtin_workload, child_entrypoint, kill_self, plan, run_child, started_path_for,
 };
-pub use journal::{journal_path_for, Journal, OpKind, Record};
+pub use journal::{Journal, OpKind, Record, journal_path_for};
 pub use power::{
-    simulate_power_loss, simulate_power_loss_modelled, simulate_power_loss_with, CutPoint,
-    PowerLossOptions, PowerLossReport, TearMode,
+    CutPoint, PowerLossOptions, PowerLossReport, TearMode, simulate_power_loss,
+    simulate_power_loss_modelled, simulate_power_loss_with,
 };
 pub use prefix::{
-    assert_acked_survived, assert_valid_prefix, recover_and_validate, recovered_state,
-    validate_prefix, validate_prefix_of_state, History, OpValue, PrefixReport, PrefixViolation,
-    Recovery, WriteOp,
+    History, OpValue, PrefixReport, PrefixViolation, Recovery, WriteOp, assert_acked_survived,
+    assert_valid_prefix, recover_and_validate, recovered_state, validate_prefix,
+    validate_prefix_of_state,
 };

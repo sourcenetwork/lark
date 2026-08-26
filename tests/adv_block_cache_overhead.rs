@@ -25,32 +25,40 @@ struct Counting;
 // `System`'s.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let p = System.alloc(layout);
-        if !p.is_null() {
-            LIVE.fetch_add(layout.size() as isize, Ordering::Relaxed);
+        unsafe {
+            let p = System.alloc(layout);
+            if !p.is_null() {
+                LIVE.fetch_add(layout.size() as isize, Ordering::Relaxed);
+            }
+            p
         }
-        p
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE.fetch_sub(layout.size() as isize, Ordering::Relaxed);
-        System.dealloc(ptr, layout)
+        unsafe {
+            LIVE.fetch_sub(layout.size() as isize, Ordering::Relaxed);
+            System.dealloc(ptr, layout)
+        }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let p = System.realloc(ptr, layout, new_size);
-        if !p.is_null() {
-            LIVE.fetch_add(
-                new_size as isize - layout.size() as isize,
-                Ordering::Relaxed,
-            );
+        unsafe {
+            let p = System.realloc(ptr, layout, new_size);
+            if !p.is_null() {
+                LIVE.fetch_add(
+                    new_size as isize - layout.size() as isize,
+                    Ordering::Relaxed,
+                );
+            }
+            p
         }
-        p
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let p = System.alloc_zeroed(layout);
-        if !p.is_null() {
-            LIVE.fetch_add(layout.size() as isize, Ordering::Relaxed);
+        unsafe {
+            let p = System.alloc_zeroed(layout);
+            if !p.is_null() {
+                LIVE.fetch_add(layout.size() as isize, Ordering::Relaxed);
+            }
+            p
         }
-        p
     }
 }
 

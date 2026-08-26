@@ -212,7 +212,6 @@ impl Drop for CompactionScheduler {
     }
 }
 
-
 /// Spawn one named compaction worker.
 ///
 /// Split out of [`CompactionScheduler::start`] so tests can force the
@@ -1894,7 +1893,12 @@ impl<'a> StreamingCompactionWriter<'a> {
             self.opts.env.drop_page_cache(&path);
         }
 
-        let reader = Arc::new(SsTableReader::open_with(&self.opts.env, &path, file_id, self.opts.metadata_policy())?);
+        let reader = Arc::new(SsTableReader::open_with(
+            &self.opts.env,
+            &path,
+            file_id,
+            self.opts.metadata_policy(),
+        )?);
         let new_file = LiveSst::new(
             SsTableMeta {
                 file_id,

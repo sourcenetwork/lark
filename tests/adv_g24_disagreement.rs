@@ -307,7 +307,7 @@ fn relabelling_a_tables_format_version_is_never_served_as_data() {
         let version_byte = original.len() - 8;
         let current = original[version_byte];
         assert!(
-            (1..=4).contains(&current),
+            (1..=6).contains(&current),
             "the fixture's version byte is {current:#04x}, not a known version",
         );
 
@@ -315,12 +315,20 @@ fn relabelling_a_tables_format_version_is_never_served_as_data() {
         let db = root.path().join("db");
         let mut bad = Vec::new();
         let mut refused = 0usize;
-        for v in [0x01u8, 0x02, 0x03, 0x04] {
+        // Every other known version, plus the identifier swap: a
+        // `REGOSST` table relabelled `LARKSST` keeps a valid-looking
+        // magic while naming a different footer layout.
+        for v in [0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06] {
             if v == current {
                 continue;
             }
             let mut bytes = original.clone();
             bytes[version_byte] = v;
+            // The identifier occupies the seven bytes before the version
+            // byte, big-endian, so a legacy version needs the legacy name
+            // for the magic to resolve at all.
+            let identifier: &[u8; 7] = if v <= 0x04 { b"LARKSST" } else { b"REGOSST" };
+            bytes[version_byte - 7..version_byte].copy_from_slice(identifier);
             plant(&files, &db);
             fs::write(db.join(&rel), &bytes).expect("write sst");
             match probe(&db, &format!("version {current:#04x} relabelled {v:#04x}")) {
@@ -333,7 +341,7 @@ fn relabelling_a_tables_format_version_is_never_served_as_data() {
             }
         }
         println!(
-            "partitioned={partitioned}: version {current:#04x} relabelled 3 ways, {refused} refused"
+            "partitioned={partitioned}: version {current:#04x} relabelled 5 ways, {refused} refused"
         );
         assert!(bad.is_empty(), "{}", bad.join("\n  "));
     }

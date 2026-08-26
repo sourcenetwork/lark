@@ -76,7 +76,6 @@ use std::sync::{Arc, OnceLock};
 
 use std::ops::ControlFlow;
 
-
 use super::block::{Block, BlockBuilder, BlockHandle, RESTART_INTERVAL, decode_entry_at};
 use super::block_cache::BlockCache;
 use super::bloom::{BloomFilterBuilder, encode_bloom_block};
@@ -1255,7 +1254,7 @@ impl SsTableReader {
             Vec::new()
         } else {
             let rt_region = read_file_region(
-            &*file,
+                &*file,
                 footer.range_tombstone_offset,
                 footer.range_tombstone_size,
                 data_end,
@@ -1356,7 +1355,8 @@ impl SsTableReader {
         if let Some(block) = cache.get_filter(self.file_id, handle.offset) {
             return Ok(MetaRef::Owned(block));
         }
-        let region = self.read_metadata_region(handle, checksum::META_KIND_BLOOM, "bloom region")?;
+        let region =
+            self.read_metadata_region(handle, checksum::META_KIND_BLOOM, "bloom region")?;
         let block = Arc::new(FilterBlock::decode(&region)?);
         if !cache.insert_filter(self.file_id, handle.offset, Arc::clone(&block)) {
             let _ = self.filter_fallback.set(Arc::clone(&block));
@@ -1378,11 +1378,9 @@ impl SsTableReader {
         kind: u8,
         name: &'static str,
     ) -> io::Result<Vec<u8>> {
-        let mut region = {
-                read_file_region(&*self.file, handle.offset, handle.size, self.data_end, name)?
-        };
-        let payload_len =
-            verify_meta_region(&region, kind, self.meta_checksummed, name)?.len();
+        let mut region =
+            { read_file_region(&*self.file, handle.offset, handle.size, self.data_end, name)? };
+        let payload_len = verify_meta_region(&region, kind, self.meta_checksummed, name)?.len();
         region.truncate(payload_len);
         Ok(region)
     }
@@ -1406,7 +1404,11 @@ impl SsTableReader {
         #[cfg(test)]
         self.index_leaf_reads.fetch_add(1, Ordering::Relaxed);
 
-        let buf = self.read_metadata_region(handle, checksum::META_KIND_INDEX_LEAF, "partitioned index leaf")?;
+        let buf = self.read_metadata_region(
+            handle,
+            checksum::META_KIND_INDEX_LEAF,
+            "partitioned index leaf",
+        )?;
         let leaf = Arc::new(IndexBlock::decode(buf)?);
         cache.insert_index(self.file_id, handle.offset, Arc::clone(&leaf));
         Ok(leaf)
@@ -2612,7 +2614,11 @@ mod tests {
             let key = format!("key_{i:04}");
             assert_eq!(
                 with_key_scratch(|buf| {
-                    reader.get(&LookupKey::from_prefixed(key.as_bytes(), u64::MAX), buf, &cache)
+                    reader.get(
+                        &LookupKey::from_prefixed(key.as_bytes(), u64::MAX),
+                        buf,
+                        &cache,
+                    )
                 })
                 .unwrap()
                 .map_value(|v| v.to_vec()),
@@ -2625,7 +2631,11 @@ mod tests {
         }
         assert_eq!(
             with_key_scratch(|buf| {
-                reader.get(&LookupKey::from_prefixed(b"key_9999", u64::MAX), buf, &cache)
+                reader.get(
+                    &LookupKey::from_prefixed(b"key_9999", u64::MAX),
+                    buf,
+                    &cache,
+                )
             })
             .unwrap()
             .map_value(|v| v.to_vec()),
@@ -3445,8 +3455,12 @@ mod tests {
 
             let pinned_cache = BlockCache::new(1024 * 1024);
             let cached_cache = BlockCache::new(1024 * 1024);
-            let pinned = SsTableReader::open_with(&crate::env::std_env(), &path, 1, MetadataPolicy::Pinned).unwrap();
-            let cached = SsTableReader::open_with(&crate::env::std_env(), &path, 1, MetadataPolicy::Cached).unwrap();
+            let pinned =
+                SsTableReader::open_with(&crate::env::std_env(), &path, 1, MetadataPolicy::Pinned)
+                    .unwrap();
+            let cached =
+                SsTableReader::open_with(&crate::env::std_env(), &path, 1, MetadataPolicy::Cached)
+                    .unwrap();
 
             for probe in ["k_0000", "k_0123", "k_0299", "k_9999"] {
                 let a = probe_get(&pinned, probe.as_bytes(), u64::MAX, &pinned_cache).unwrap();
@@ -3466,8 +3480,12 @@ mod tests {
         let path = dir.path().join("charge.sst");
         write_flat_fixture(&path);
 
-        let pinned = SsTableReader::open_with(&crate::env::std_env(), &path, 1, MetadataPolicy::Pinned).unwrap();
-        let cached = SsTableReader::open_with(&crate::env::std_env(), &path, 2, MetadataPolicy::Cached).unwrap();
+        let pinned =
+            SsTableReader::open_with(&crate::env::std_env(), &path, 1, MetadataPolicy::Pinned)
+                .unwrap();
+        let cached =
+            SsTableReader::open_with(&crate::env::std_env(), &path, 2, MetadataPolicy::Cached)
+                .unwrap();
         assert!(
             pinned.pinned_metadata_bytes() > cached.pinned_metadata_bytes(),
             "the cached reader must hold less outside the budget"
@@ -3517,7 +3535,9 @@ mod tests {
         // region of a 500-entry file are both larger than that, so both
         // inserts are refused.
         let cache = BlockCache::with_config(512, 0, true);
-        let reader = SsTableReader::open_with(&crate::env::std_env(), &path, 1, MetadataPolicy::Cached).unwrap();
+        let reader =
+            SsTableReader::open_with(&crate::env::std_env(), &path, 1, MetadataPolicy::Cached)
+                .unwrap();
         assert_eq!(reader.pinned_metadata_bytes(), 0);
 
         for i in 0..64 {

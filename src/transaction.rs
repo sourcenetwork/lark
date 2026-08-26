@@ -623,10 +623,8 @@ impl<'db> Transaction<'db> {
         match self.mode {
             TxMode::Optimistic => self.snapshot_seq,
             TxMode::Pessimistic { .. } => {
-                if already_held {
-                    if let Some(state) = self.tracked.get(key) {
-                        return state.read_seq;
-                    }
+                if already_held && let Some(state) = self.tracked.get(key) {
+                    return state.read_seq;
                 }
                 self.engine.snapshot_seq()
             }

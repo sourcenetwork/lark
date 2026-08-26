@@ -11,10 +11,10 @@ use crate::env::{BufferedWriter, Env, WriteMode};
 
 use parking_lot::RwLock;
 
+use super::checksum;
 use super::sstable::{
     LiveSst, MetadataPolicy, SsTableMeta, SsTableReader, sst_filename, table_carries_data,
 };
-use super::checksum;
 
 /// Maximum number of levels in the LSM tree.
 pub(crate) const MAX_LEVELS: usize = 7;
@@ -340,13 +340,9 @@ fn describe_suspects(suspects: &[SuspectTable]) -> String {
 }
 
 impl VersionSet {
-    /// Create or recover a VersionSet from the given directory. During
-    /// recovery every SSTable referenced by the manifest is opened
-    /// eagerly so the returned version is fully populated with live
-    /// readers.
-
-    /// [`VersionSet::open`] with an explicit policy for how the readers
-    /// it opens hold their index and filter blocks.
+    /// Create or recover a VersionSet from the given directory, with an
+    /// explicit policy for how the readers it opens hold their index and
+    /// filter blocks.
     ///
     /// Recovery is where this matters most: it opens a reader for every
     /// SSTable the manifest references, so the policy decides whether
@@ -840,7 +836,6 @@ impl VersionSet {
 
         Ok(ManifestReplay { version, valid_len })
     }
-
 }
 
 #[cfg(test)]
@@ -925,8 +920,13 @@ mod tests {
         data.extend_from_slice(&record);
         data.extend_from_slice(&checksum::legacy_payload_u32(&record).to_le_bytes());
 
-        let replay =
-            VersionSet::replay_manifest(&crate::env::std_env(), &data, dir.path(), MetadataPolicy::Pinned).unwrap();
+        let replay = VersionSet::replay_manifest(
+            &crate::env::std_env(),
+            &data,
+            dir.path(),
+            MetadataPolicy::Pinned,
+        )
+        .unwrap();
         assert_eq!(replay.version.last_seq, 7);
         assert_eq!(replay.valid_len, data.len());
     }

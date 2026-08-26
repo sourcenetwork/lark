@@ -173,11 +173,11 @@ impl ClockRing {
 
     /// Release `slot` and the bytes the entry it held charged.
     fn release(&mut self, slot: usize, charge: usize) {
-        if let Some(held) = self.slots.get_mut(slot) {
-            if held.take().is_some() {
-                self.free.push(slot);
-                self.used = self.used.saturating_sub(charge);
-            }
+        if let Some(held) = self.slots.get_mut(slot)
+            && held.take().is_some()
+        {
+            self.free.push(slot);
+            self.used = self.used.saturating_sub(charge);
         }
     }
 
@@ -285,10 +285,10 @@ impl CacheShard {
             };
             ring.free.push(hand);
             ring.used = ring.used.saturating_sub(entry.charge);
-            if let Some(map) = self.map.get() {
-                if let Some(found) = map.get(&entry.key, guard) {
-                    found.remove();
-                }
+            if let Some(map) = self.map.get()
+                && let Some(found) = map.get(&entry.key, guard)
+            {
+                found.remove();
             }
             return true;
         }

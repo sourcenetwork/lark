@@ -272,7 +272,14 @@ pub trait WriteFile: Send {
         self.sync_all()
     }
 
-    /// Truncate or extend the file to exactly `len` bytes.
+    /// Truncate or extend the file to exactly `len` bytes, leaving the
+    /// write position at `len`.
+    ///
+    /// The position matters: WAL rollback truncates a partly written
+    /// group and then appends again, so a writer that left its cursor
+    /// past the new end would write into a hole. An implementation whose
+    /// writes always append satisfies this for free; one that carries an
+    /// explicit offset has to move it.
     fn set_len(&mut self, len: u64) -> io::Result<()>;
 
     /// Length of the file in bytes, counting only what has reached

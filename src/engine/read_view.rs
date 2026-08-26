@@ -201,7 +201,11 @@ mod tests {
     /// A memtable arena sized for the unit tests here: small enough to
     /// stay cheap, large enough that nothing in these tests rotates.
     fn test_memtable_config() -> crate::engine::memtable::MemTableConfig {
-        crate::engine::memtable::MemTableConfig::new(crate::engine::arena::ArenaProfile::EMBEDDED, 64 * 1024, 2)
+        crate::engine::memtable::MemTableConfig::new(
+            crate::engine::arena::ArenaProfile::EMBEDDED,
+            64 * 1024,
+            2,
+        )
     }
 
     fn store_with_view() -> (tempfile::TempDir, Arc<VersionStore>, Arc<ReadViewCell>) {
@@ -228,7 +232,11 @@ mod tests {
         cell.update_memtables(|active, frozen| {
             let mut next = frozen.to_vec();
             next.push(Arc::clone(active));
-            (Arc::new(MemTable::new(&test_memtable_config()).unwrap()), next, ())
+            (
+                Arc::new(MemTable::new(&test_memtable_config()).unwrap()),
+                next,
+                (),
+            )
         });
 
         let after = cell.load();
