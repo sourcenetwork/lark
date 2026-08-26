@@ -5,8 +5,8 @@ resolver = "2"
 [package]
 name = "lark-kv"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.82"
+edition = "2024"
+rust-version = "1.90"
 license = "Apache-2.0 OR MIT"
 description = "A pure Rust, embedded LSM-tree key-value store built from scratch"
 repository = "https://github.com/sourcenetwork/lark"
@@ -21,6 +21,7 @@ fuzzing = []
 [dependencies]
 crossbeam-epoch = "0.9"
 crossbeam-skiplist = "0.1"
+kovan = "0.1.19"
 lz4_flex = "0.11"
 snap = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
@@ -34,7 +35,21 @@ rustix = { version = "1.1", features = ["fs"] }
 [dev-dependencies]
 proptest = "1"
 tempfile = "3.8"
+
+# tokio reads `cfg(loom)` itself and does not build when RUSTFLAGS sets
+# it, so it is kept out of the loom dependency graph. Unchanged in every
+# normal build.
+[target.'cfg(not(loom))'.dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# Model checker for the read-view publication protocol. Pulled in only
+# under `RUSTFLAGS="--cfg loom"`, which is also the only configuration
+# in which tests/loom_read_view.rs has any content.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [profile.release]
 opt-level = 3

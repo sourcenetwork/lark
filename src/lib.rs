@@ -70,10 +70,10 @@ pub use event_listener::{
 };
 pub use iter::Iter;
 pub use options::{
-    CompactionDecision, CompactionFilter, CompactionStyle, CompressionType, DurabilityMode,
-    FifoCompactionOptions, FixedLengthPrefix, MergeOperator, Options, PrefixExtractor,
-    UniversalCompactionOptions, WriteOptions, DEFAULT_MAX_KEY_SIZE, DEFAULT_MAX_VALUE_SIZE,
-    MAX_BLOCK_CACHE_SHARD_BITS, MAX_BLOOM_BITS_PER_KEY,
+    CompactionDecision, CompactionFilter, CompactionStyle, CompressionType, DEFAULT_MAX_KEY_SIZE,
+    DEFAULT_MAX_VALUE_SIZE, DurabilityMode, FifoCompactionOptions, FixedLengthPrefix,
+    MAX_BLOCK_CACHE_SHARD_BITS, MAX_BLOOM_BITS_PER_KEY, MergeOperator, Options, PrefixExtractor,
+    UniversalCompactionOptions, WriteOptions,
 };
 pub use perf_context::{PerfContext, PerfContextSnapshot, PerfLevel};
 pub use rate_limiter::{Priority, RateLimiter, TokenBucketRateLimiter};
@@ -83,7 +83,7 @@ pub use tailing::TailingIter;
 pub use transaction::{
     OptimisticTransactionDb, Transaction, TransactionDb, TransactionError, TxResult,
 };
-pub use ttl::{strip_timestamp, DbWithTtl, TtlCompactionFilter};
+pub use ttl::{DbWithTtl, TtlCompactionFilter, strip_timestamp};
 
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
@@ -157,7 +157,7 @@ pub mod fuzzing {
 }
 
 use column_family::{
-    cf_lower_bound, cf_upper_bound, meta, prefix_key, CfRegistry, DEFAULT_CF_ID, META_CF_ID,
+    CfRegistry, DEFAULT_CF_ID, META_CF_ID, cf_lower_bound, cf_upper_bound, meta, prefix_key,
 };
 
 use std::collections::BTreeMap;
@@ -387,12 +387,10 @@ impl Db {
         // disk. User-created CFs are the only thing that produces
         // on-disk metadata writes.
         let mut entries: Vec<(String, u32)> = Vec::new();
-        let seq = self.engine.snapshot_seq();
         let pairs = collect_range(
-            &self.engine,
+            self.engine.new_iter_latest(),
             Some(&meta::name_scan_prefix()),
             Some(&meta::name_scan_upper()),
-            seq,
         )?;
         for (key, value) in pairs {
             // A meta value that is not a 4-byte id is not one of ours.
@@ -864,8 +862,7 @@ impl Db {
             Some(e) => prefix_key(DEFAULT_CF_ID, e),
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
-        let seq = self.engine.snapshot_seq();
-        let raw = collect_range(&self.engine, Some(&lo), Some(&hi), seq)?;
+        let raw = collect_range(self.engine.new_iter_latest(), Some(&lo), Some(&hi))?;
         strip_cf_prefix_entries(raw)
     }
 
@@ -891,8 +888,7 @@ impl Db {
             Some(e) => prefix_key(DEFAULT_CF_ID, e),
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
-        let seq = self.engine.snapshot_seq();
-        collect_page(&self.engine, &lo, &hi, seq, limit).and_then(strip_cf_prefix_page)
+        collect_page(self.engine.new_iter_latest(), &lo, &hi, limit).and_then(strip_cf_prefix_page)
     }
 
     /// Create a streaming iterator over the default column family.
@@ -1410,8 +1406,7 @@ impl Db {
             Some(e) => prefix_key(cf.id(), e),
             None => cf_upper_bound(cf.id()),
         };
-        let seq = self.engine.snapshot_seq();
-        let raw = collect_range(&self.engine, Some(&lo), Some(&hi), seq)?;
+        let raw = collect_range(self.engine.new_iter_latest(), Some(&lo), Some(&hi))?;
         strip_cf_prefix_entries(raw)
     }
 
@@ -1436,8 +1431,7 @@ impl Db {
             Some(e) => prefix_key(cf.id(), e),
             None => cf_upper_bound(cf.id()),
         };
-        let seq = self.engine.snapshot_seq();
-        collect_page(&self.engine, &lo, &hi, seq, limit).and_then(strip_cf_prefix_page)
+        collect_page(self.engine.new_iter_latest(), &lo, &hi, limit).and_then(strip_cf_prefix_page)
     }
 
     /// Streaming iterator bounded to column family `cf`. The
@@ -1781,7 +1775,7 @@ impl Snapshot {
             Some(e) => prefix_key(DEFAULT_CF_ID, e),
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
-        let raw = collect_range(&self.engine, Some(&lo), Some(&hi), self.seq)?;
+        let raw = collect_range(self.engine.new_iter_at(self.seq), Some(&lo), Some(&hi))?;
         strip_cf_prefix_entries(raw)
     }
 
@@ -1804,7 +1798,8 @@ impl Snapshot {
             Some(e) => prefix_key(DEFAULT_CF_ID, e),
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
-        collect_page(&self.engine, &lo, &hi, self.seq, limit).and_then(strip_cf_prefix_page)
+        collect_page(self.engine.new_iter_at(self.seq), &lo, &hi, limit)
+            .and_then(strip_cf_prefix_page)
     }
 
     /// Create a streaming iterator anchored at this snapshot
@@ -1877,7 +1872,7 @@ impl Snapshot {
             Some(e) => prefix_key(cf.id(), e),
             None => cf_upper_bound(cf.id()),
         };
-        let raw = collect_range(&self.engine, Some(&lo), Some(&hi), self.seq)?;
+        let raw = collect_range(self.engine.new_iter_at(self.seq), Some(&lo), Some(&hi))?;
         strip_cf_prefix_entries(raw)
     }
 
@@ -1903,7 +1898,8 @@ impl Snapshot {
             Some(e) => prefix_key(cf.id(), e),
             None => cf_upper_bound(cf.id()),
         };
-        collect_page(&self.engine, &lo, &hi, self.seq, limit).and_then(strip_cf_prefix_page)
+        collect_page(self.engine.new_iter_at(self.seq), &lo, &hi, limit)
+            .and_then(strip_cf_prefix_page)
     }
 
     /// CF-scoped streaming iterator at this snapshot.
@@ -1922,12 +1918,10 @@ impl Snapshot {
 /// iterator. This is the engine of `Db::scan` / `Snapshot::scan`; the
 /// dedicated method exists so both callers share one merge implementation.
 fn collect_range(
-    engine: &LarkEngine,
+    mut iter: crate::engine::iterator::LarkIterator,
     start: Option<&[u8]>,
     end: Option<&[u8]>,
-    snapshot_seq: u64,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let mut iter = engine.new_iter_at(snapshot_seq);
     match start {
         Some(s) => iter.seek(s),
         None => iter.seek_to_first(),
@@ -1939,10 +1933,10 @@ fn collect_range(
         let (Some(k), Some(v)) = (iter.key(), iter.value()) else {
             break;
         };
-        if let Some(e) = end {
-            if k >= e {
-                break;
-            }
+        if let Some(e) = end
+            && k >= e
+        {
+            break;
         }
         out.push((k.to_vec(), v.to_vec()));
         iter.next();
@@ -1952,10 +1946,9 @@ fn collect_range(
 }
 
 fn collect_page(
-    engine: &LarkEngine,
+    mut iter: crate::engine::iterator::LarkIterator,
     start: &[u8],
     end: &[u8],
-    snapshot_seq: u64,
     limit: usize,
 ) -> Result<ScanPage> {
     if limit == 0 {
@@ -1964,7 +1957,6 @@ fn collect_page(
         ));
     }
 
-    let mut iter = engine.new_iter_at(snapshot_seq);
     iter.seek(start);
     iter.status().map_err(Error::from)?;
 
@@ -5519,9 +5511,10 @@ mod tests {
         writer.put_cf(&stale, b"k", b"ghost").unwrap();
         writer.finish().unwrap();
 
-        assert!(db
-            .ingest_external_files(&[path], IngestOptions::default())
-            .is_err());
+        assert!(
+            db.ingest_external_files(&[path], IngestOptions::default())
+                .is_err()
+        );
         let live = db.create_column_family("tmp").unwrap();
         assert_eq!(db.get_cf(&live, b"k").unwrap(), None);
     }

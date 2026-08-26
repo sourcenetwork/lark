@@ -230,7 +230,7 @@ pub fn run_snapshot_stability(scale: &StabilityScale) -> StabilityCounts {
             gate.wait();
             for n in 1..=ops as u64 {
                 let k = key_at(next_rand(&mut seed) as usize % keys);
-                if next_rand(&mut seed) % 4 == 0 {
+                if next_rand(&mut seed).is_multiple_of(4) {
                     db.delete(&k).unwrap();
                 } else {
                     db.put(&k, &stamped_value(n)).unwrap();

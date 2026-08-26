@@ -90,9 +90,9 @@ use std::time::Duration;
 use common::fault::{self, ChildSpec, CrashRun, CutPoint, Phase, Trigger};
 use lark_kv::{Db, DurabilityMode};
 use model::{
+    CRASH_PHASE, CRASH_VALUE_LEN, KEYS, Model, Op, SUFFIX_LOOKALIKE, Unit, WRITE_BUFFER,
     apply_to_db, apply_to_model, closest_prefix, first_difference, kill_after, matching_prefixes,
-    model_state, ops_from_seed, opts, show, Model, Op, Unit, CRASH_PHASE, CRASH_VALUE_LEN, KEYS,
-    SUFFIX_LOOKALIKE, WRITE_BUFFER,
+    model_state, ops_from_seed, opts, show,
 };
 use proptest::prelude::*;
 use tempfile::TempDir;

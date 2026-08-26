@@ -10,8 +10,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::column_family::{prefix_key, ColumnFamilyHandle, DEFAULT_CF_ID};
-use crate::engine::internal_key::{encode_internal_key, VALUE_TYPE_DELETION, VALUE_TYPE_VALUE};
+use crate::column_family::{ColumnFamilyHandle, DEFAULT_CF_ID, prefix_key};
+use crate::engine::internal_key::{VALUE_TYPE_DELETION, VALUE_TYPE_VALUE, encode_internal_key};
 use crate::engine::sstable::SsTableWriter;
 use crate::options::Options;
 
@@ -153,12 +153,12 @@ impl SstFileWriter {
                 self.max_value_size
             )));
         }
-        if let Some(last) = &self.last_user_key {
-            if key <= last.as_slice() {
-                return Err(crate::Error::invalid_argument(
-                    "SstFileWriter keys must arrive in strictly ascending order",
-                ));
-            }
+        if let Some(last) = &self.last_user_key
+            && key <= last.as_slice()
+        {
+            return Err(crate::Error::invalid_argument(
+                "SstFileWriter keys must arrive in strictly ascending order",
+            ));
         }
         let internal = encode_internal_key(key, 0, value_type);
         self.inner

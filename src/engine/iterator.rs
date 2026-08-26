@@ -60,11 +60,11 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use super::block::encoded_entry_size;
-use super::block::{decode_entry_at, Block, RESTART_INTERVAL};
+use super::block::{Block, RESTART_INTERVAL, decode_entry_at};
 use super::block_cache::BlockCache;
 use super::internal_key::{
-    compare_internal_keys, decode_internal_key, lookup_key, user_key_of, INTERNAL_KEY_SUFFIX_LEN,
-    VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE,
+    INTERNAL_KEY_SUFFIX_LEN, VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE,
+    compare_internal_keys, decode_internal_key, lookup_key, user_key_of,
 };
 use super::manifest::Version;
 use super::memtable::MemTable;
@@ -1366,10 +1366,10 @@ impl LarkIterator {
                 return;
             }
 
-            if let Some(ub) = self.upper_bound.as_deref() {
-                if uk >= ub {
-                    return;
-                }
+            if let Some(ub) = self.upper_bound.as_deref()
+                && uk >= ub
+            {
+                return;
             }
 
             if seq > self.snapshot_seq {

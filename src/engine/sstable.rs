@@ -58,20 +58,20 @@
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use super::block::{decode_entry_at, Block, BlockBuilder, BlockHandle, RESTART_INTERVAL};
+use super::block::{Block, BlockBuilder, BlockHandle, RESTART_INTERVAL, decode_entry_at};
 use super::block_cache::BlockCache;
-use super::bloom::{decode_bloom_block, encode_bloom_block, BloomFilter, BloomFilterBuilder};
+use super::bloom::{BloomFilter, BloomFilterBuilder, decode_bloom_block, encode_bloom_block};
 use super::checksum;
 use super::durability;
 use super::internal_key::{
-    compare_internal_keys, decode_internal_key, lookup_key, user_key_of, VALUE_TYPE_DELETION,
-    VALUE_TYPE_MERGE,
+    VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, compare_internal_keys, decode_internal_key, lookup_key,
+    user_key_of,
 };
 use super::range_tombstone::{RangeTombstone, RangeTombstoneSet};
 use crate::options::{CompressionType, PrefixExtractor};
@@ -715,16 +715,15 @@ impl SsTableWriter {
             if let (Some(extractor), Some(builder)) = (
                 self.prefix_extractor.as_ref(),
                 self.prefix_bloom_builder.as_mut(),
-            ) {
-                if let Some(prefix) = extractor.extract(user_key) {
-                    let changed = match &self.last_prefix {
-                        Some(p) => p.as_slice() != prefix,
-                        None => true,
-                    };
-                    if changed {
-                        builder.add_key(prefix);
-                        self.last_prefix = Some(prefix.to_vec());
-                    }
+            ) && let Some(prefix) = extractor.extract(user_key)
+            {
+                let changed = match &self.last_prefix {
+                    Some(p) => p.as_slice() != prefix,
+                    None => true,
+                };
+                if changed {
+                    builder.add_key(prefix);
+                    self.last_prefix = Some(prefix.to_vec());
                 }
             }
         }
@@ -1599,7 +1598,7 @@ impl SsTableReader {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("unknown compression type: {}", compression_type),
-                ))
+                ));
             }
         };
 
@@ -1653,7 +1652,7 @@ pub(crate) fn remove_sst(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::internal_key::{encode_internal_key, VALUE_TYPE_VALUE};
+    use crate::engine::internal_key::{VALUE_TYPE_VALUE, encode_internal_key};
     use tempfile::TempDir;
 
     fn ik(key: &[u8], seq: u64) -> Vec<u8> {

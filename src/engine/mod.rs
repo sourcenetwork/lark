@@ -17,8 +17,8 @@ pub(crate) mod wal;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use parking_lot::{Condvar, Mutex, RwLock};
 
@@ -30,9 +30,9 @@ use memtable::MemTable;
 use read_view::{ReadView, ReadViewCell, VersionStore};
 use snapshot_registry::SnapshotRegistry;
 
-use crate::{event_listener, WriteBatchOp};
-use sstable::{sst_filename, LiveSst, LookupResult, SsTableMeta, SsTableReader, SsTableWriter};
-use wal::{wal_filename, Wal, WalEntry};
+use crate::{WriteBatchOp, event_listener};
+use sstable::{LiveSst, LookupResult, SsTableMeta, SsTableReader, SsTableWriter, sst_filename};
+use wal::{Wal, WalEntry, wal_filename};
 
 /// Controls when data is flushed to disk after a commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,11 +144,7 @@ fn key_range_for_file(entries: &[MultiGetEntry], file: &LiveSst) -> std::ops::Ra
 }
 
 fn resolve_multi_get_value(pseq: u64, popt: Option<Vec<u8>>, rt_seq: u64) -> Option<Vec<u8>> {
-    if pseq > rt_seq {
-        popt
-    } else {
-        None
-    }
+    if pseq > rt_seq { popt } else { None }
 }
 
 fn set_multi_get_result(
@@ -260,9 +256,11 @@ const CLOSE_STATE_CLOSED: u8 = 2;
 pub(crate) struct LarkEngine {
     /// The published read view: the active memtable, the frozen
     /// memtables and the version every read resolves against. Loading
-    /// it is the whole of a read's source acquisition - one shared lock
-    /// acquisition and one `Arc` clone - and the three sources it hands
-    /// back are consistent with each other by construction.
+    /// it is the whole of a read's source acquisition - one acquire
+    /// load of the published pointer and an epoch check, no refcount
+    /// and (see `read_view`'s module doc for the targets where that
+    /// holds) no lock - and the three sources it hands back are
+    /// consistent with each other by construction.
     view: Arc<ReadViewCell>,
     /// The version set, together with the publication of every version
     /// it installs into `view`.
@@ -765,6 +763,11 @@ impl LarkEngine {
     /// that had already been flushed into the version being published,
     /// so a horizon sampled after the view is always at least that
     /// newer version's sequence and the read finds it.
+    ///
+    /// The acquire that makes this work is `Atom::load`'s acquire read
+    /// of the published pointer, which pairs with the publisher's
+    /// `AcqRel` compare-exchange; the horizon load below is
+    /// program-ordered after it and cannot be hoisted above it.
     ///
     /// The read linearizes at the moment it loads the view: a write
     /// that lands between the load and the horizon sample is simply
@@ -1294,8 +1297,8 @@ impl LarkEngine {
 
     /// The version the last applied edit published.
     ///
-    /// Cheaper than `versions.lock().current()` - one shared lock
-    /// acquisition instead of the version set's exclusive one - and it
+    /// Cheaper than `versions.lock().current()` - no lock at all
+    /// instead of the version set's exclusive one - and it
     /// is the same version, because every [`VersionStore`] guard
     /// publishes what its critical section installed before it
     /// releases the mutex.
@@ -1306,11 +1309,20 @@ impl LarkEngine {
     /// Retire the oldest frozen memtable in one publication. Called
     /// only once its contents are durable in an SSTable the published
     /// version already references, or once they proved to be empty.
+    ///
+    /// Idempotent under a publication retry: rotation only ever pushes
+    /// to the tail of `frozen`, so index 0 is still the oldest on a
+    /// re-read.
     fn retire_oldest_frozen(&self) {
         self.view.update_memtables(|active, frozen| {
             let next = frozen.get(1..).map(<[_]>::to_vec).unwrap_or_default();
-            (Arc::clone(active), next, ())
+            (Arc::clone(active), next)
         });
+        // This publication drops the last reference to a whole
+        // memtable, but the reference lives in the retired view. The
+        // caller has just written an SSTable, so one bounded slot scan
+        // is free, and it is not on the read path.
+        read_view::quiesce();
     }
 
     /// Snapshot the current write-stall inputs: L0 file count,
@@ -1448,10 +1460,8 @@ impl LarkEngine {
         }
 
         let micros = start.elapsed().as_micros() as u64;
-        if any_stall {
-            if let Some(s) = self.statistics() {
-                s.add(crate::statistics::Ticker::WriteStallMicros, micros);
-            }
+        if any_stall && let Some(s) = self.statistics() {
+            s.add(crate::statistics::Ticker::WriteStallMicros, micros);
         }
         Ok(micros)
     }
@@ -1663,16 +1673,22 @@ impl LarkEngine {
         // the key in between.
         let view = self.view.load();
         for (key, observed_seq) in conflict_keys {
-            if let Some(latest_seq) = self.latest_version_seq_in_view(key, &view)? {
-                if latest_seq > *observed_seq {
-                    return Ok(CommitOutcome::Conflict {
-                        key: key.clone(),
-                        observed_seq: *observed_seq,
-                        latest_seq,
-                    });
-                }
+            if let Some(latest_seq) = self.latest_version_seq_in_view(key, &view)?
+                && latest_seq > *observed_seq
+            {
+                return Ok(CommitOutcome::Conflict {
+                    key: key.clone(),
+                    observed_seq: *observed_seq,
+                    latest_seq,
+                });
             }
         }
+
+        // Released before the write: `apply_batch_locked` can rotate
+        // the memtable, create a WAL and write an SSTable, and holding
+        // the view guard across that would keep this thread's epoch
+        // pinned for the whole of it.
+        drop(view);
 
         let ops = grouped_batch_ops(point_ops, range_deletes, merges);
         self.apply_batch_locked(ops, durability, false)?;
@@ -1777,10 +1793,17 @@ impl LarkEngine {
         // One publication: the sealed memtable joins `frozen` in the
         // same view that hands writers the fresh active one, so no
         // reader can catch it in neither.
+        //
+        // The fresh memtable is allocated outside the closure so every
+        // publication attempt installs the *same* one, making a retry
+        // idempotent rather than merely balanced. One that loses a CAS
+        // was never published and so was never written to: writers only
+        // ever reach a memtable through the view.
+        let fresh = Arc::new(MemTable::new());
         self.view.update_memtables(|active, frozen| {
             let mut next_frozen = frozen.to_vec();
             next_frozen.push(Arc::clone(active));
-            (Arc::new(MemTable::new()), next_frozen, ())
+            (Arc::clone(&fresh), next_frozen)
         });
 
         let new_wal_id = {
@@ -2588,8 +2611,13 @@ impl LarkEngine {
         // `drop_all` holds `write_lock`, which excludes writers but not
         // readers: a concurrent reader may still briefly observe
         // pre-drop SSTable data, exactly as before this view existed.
+        let fresh = Arc::new(MemTable::new());
         self.view
-            .update_memtables(|_, _| (Arc::new(MemTable::new()), Vec::new(), ()));
+            .update_memtables(|_, _| (Arc::clone(&fresh), Vec::new()));
+        // The retired view held the last reference to every dropped
+        // memtable; submit this thread's batch so they are freed now
+        // rather than at the next publication that fills it.
+        read_view::quiesce();
 
         let (old_version, wal_id, wal_path, new_wal) = {
             let mut versions = self.versions.lock();
@@ -2723,8 +2751,15 @@ impl LarkEngine {
                 return Ok(());
             }
 
+            // `flush_frozen_memtable` reads `frozen.first()`, writes it
+            // out, and then retires index 0 unconditionally. Two of them
+            // running at once would each flush the same memtable and
+            // each retire one entry, dropping an unflushed memtable. The
+            // other caller (`rotate_memtable`) runs under `write_lock`,
+            // so this one holds it across the flush too rather than only
+            // across the WAL swap.
+            let _write_guard = self.write_lock.lock();
             let old_wal = {
-                let _write_guard = self.write_lock.lock();
                 let view = self.view.load();
                 let active_needs_flush = memtable_needs_flush(&view.active);
                 let has_frozen = !view.frozen.is_empty();
@@ -2746,13 +2781,21 @@ impl LarkEngine {
                     // One publication for the seal and the enqueue: two
                     // would leave a window where the sealed memtable is
                     // in neither the active slot nor the frozen list.
+                    //
+                    // `memtable_needs_flush` stays inside the closure so
+                    // the predicate is evaluated on the value actually
+                    // installed. It is pure, and stable across attempts
+                    // here because `write_lock` is held and only this
+                    // path and `rotate_memtable` seal the active
+                    // memtable, both under that lock.
+                    let fresh = Arc::new(MemTable::new());
                     self.view.update_memtables(|active, frozen| {
                         let sealed = Arc::clone(active);
                         let mut next_frozen = frozen.to_vec();
                         if memtable_needs_flush(&sealed) {
                             next_frozen.push(sealed);
                         }
-                        (Arc::new(MemTable::new()), next_frozen, ())
+                        (Arc::clone(&fresh), next_frozen)
                     });
                 }
 

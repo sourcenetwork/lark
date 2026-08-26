@@ -44,11 +44,11 @@
 
 use std::sync::Arc;
 
-use crate::column_family::{cf_upper_bound, prefix_key, ColumnFamilyHandle, DEFAULT_CF_ID};
-use crate::engine::iterator::LarkIterator;
-use crate::engine::LarkEngine;
-use crate::statistics::{Histogram, Statistics, Ticker, TimeScope};
 use crate::Result;
+use crate::column_family::{ColumnFamilyHandle, DEFAULT_CF_ID, cf_upper_bound, prefix_key};
+use crate::engine::LarkEngine;
+use crate::engine::iterator::LarkIterator;
+use crate::statistics::{Histogram, Statistics, Ticker, TimeScope};
 
 /// Forward-only tailing iterator. See the module docs.
 ///
@@ -219,10 +219,11 @@ impl TailingIter {
     }
 
     fn record_current(&mut self) {
-        if self.inner.valid() && self.within_cf() {
-            if let Some(k) = self.inner.key() {
-                self.last_returned = Some(k.to_vec());
-            }
+        if self.inner.valid()
+            && self.within_cf()
+            && let Some(k) = self.inner.key()
+        {
+            self.last_returned = Some(k.to_vec());
         }
     }
 

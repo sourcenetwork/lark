@@ -1,19 +1,22 @@
 //! G27 on the scan entry points, including the column-family ones.
 //!
-//! `Db::get`, `Db::multi_get` and `Db::iter` were changed to load the
-//! published read view **before** sampling the read horizon. Five
-//! callers in `src/lib.rs` still do it the other way round:
+//! `Db::get`, `Db::multi_get` and `Db::iter` load the published read
+//! view **before** sampling the read horizon. `Db::scan`,
+//! `Db::scan_page`, `Db::scan_cf`, `Db::scan_page_cf` and the
+//! CF-registry load once did the opposite:
 //!
 //! ```text
 //! let seq = self.engine.snapshot_seq();          // horizon first
 //! collect_range(&self.engine, .., seq)?          // sources second
 //! ```
 //!
-//! `Db::scan` (lib.rs:867), `Db::scan_page` (894), `Db::scan_cf`
-//! (1413), `Db::scan_page_cf` (1439) and the CF-registry load (390).
-//! Between the two statements a compaction that no snapshot pins is
+//! Between those two statements a compaction that no snapshot pins is
 //! free to drop the newest version at or below `seq`, and the scan then
-//! finds only versions it must filter out.
+//! finds only versions it must filter out. All five now build their
+//! iterator with `new_iter_latest()`, which loads the view and samples
+//! the horizon in that order; the collectors take the iterator rather
+//! than a sequence, so there is no longer a way to spell the inverted
+//! order at a call site.
 //!
 //! Every key here has exactly one writer and is only ever overwritten,
 //! so "absent" and "went backwards" are both violations of the read

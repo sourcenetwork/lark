@@ -4,8 +4,8 @@ use crossbeam_skiplist::SkipMap;
 use parking_lot::Mutex;
 
 use super::internal_key::{
-    decode_internal_key, encode_internal_key, lookup_key, InternalKey, VALUE_TYPE_DELETION,
-    VALUE_TYPE_MERGE, VALUE_TYPE_VALUE,
+    InternalKey, VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE, decode_internal_key,
+    encode_internal_key, lookup_key,
 };
 use super::range_tombstone::{RangeTombstone, RangeTombstoneSet};
 
@@ -286,7 +286,7 @@ mod tests {
         assert_eq!(mt.covering_range_tombstone_seq(b"b", 10), 5);
         assert_eq!(mt.covering_range_tombstone_seq(b"c", 10), 5);
         assert_eq!(mt.covering_range_tombstone_seq(b"d", 10), 0); // end exclusive
-                                                                  // Invisible to snapshot older than the tombstone.
+        // Invisible to snapshot older than the tombstone.
         assert_eq!(mt.covering_range_tombstone_seq(b"c", 4), 0);
     }
 

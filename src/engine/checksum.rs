@@ -8,7 +8,7 @@
 
 use std::io::{self, Read};
 
-use xxhash_rust::xxh3::{xxh3_64, Xxh3Default};
+use xxhash_rust::xxh3::{Xxh3Default, xxh3_64};
 
 const WAL_RECORD_DOMAIN: &[u8] = b"lark/wal-record/v2";
 const MANIFEST_RECORD_DOMAIN: &[u8] = b"lark/manifest-record/v2";

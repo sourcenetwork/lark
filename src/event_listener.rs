@@ -245,8 +245,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Listener that counts every callback it receives. Used to
     /// verify that `dispatch` reaches every registered listener

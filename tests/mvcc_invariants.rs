@@ -62,10 +62,10 @@ use common::fault;
 mod harness;
 
 use harness::{
-    assert_background_work_happened, assert_same_view, drain_iter, instrumented, key_at,
-    open_instrumented, run_batch_atomicity, run_monotonic_reads, run_monotonic_reads_in_parallel,
-    run_snapshot_stability, stamp_of, stamped_value, AtomicityScale, Entries, Live, MonotonicScale,
-    StabilityScale,
+    AtomicityScale, Entries, Live, MonotonicScale, StabilityScale, assert_background_work_happened,
+    assert_same_view, drain_iter, instrumented, key_at, open_instrumented, run_batch_atomicity,
+    run_monotonic_reads, run_monotonic_reads_in_parallel, run_snapshot_stability, stamp_of,
+    stamped_value,
 };
 
 /// Child-process entry point required of every test crate that links
