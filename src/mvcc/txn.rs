@@ -1,18 +1,42 @@
 //! The transaction surface, driven by kovan-mvcc.
 //!
-//! Not yet reachable from the public API: `OptimisticTransactionDb` and
-//! `TransactionDb` still run the native path. The allow below goes when
-//! the default flips, and not before, so a genuinely unused item here is
-//! still caught then.
+//! This is the transaction path. `OptimisticTransactionDb` and
+//! `TransactionDb` both run through it.
 //!
 //! Everything about isolation, conflict detection, timestamps and the
-//! two-phase commit belongs to kovan-mvcc. This module is the adapter:
-//! byte keys straight through, `MvccError` mapped onto regolith's error
-//! type, and the storage layer's out-of-band I/O failure checked before
-//! a commit is reported as successful.
+//! two-phase commit belongs to kovan-mvcc. Nothing here reimplements
+//! any of it. This module is the adapter, and it does four things:
+//!
+//! - byte keys straight through, with no encoding layer;
+//! - `MvccError` mapped onto regolith's error type;
+//! - the storage layer's out-of-band I/O failure checked before a
+//!   commit is reported as successful;
+//! - the parts of regolith's surface Percolator has no verb for
+//!   (savepoints, `delete_range`, `merge`) expressed *in terms of*
+//!   kovan-mvcc's `read` / `write` / `delete`, never alongside them.
+//!
+//! # Why operations are staged
+//!
+//! kovan-mvcc's `Txn` owns its local write set and does not expose it,
+//! so a savepoint cannot be taken by snapshotting it. Point writes are
+//! therefore staged here and flushed into the transaction at commit.
+//! A read consults the staging map first, so a transaction still sees
+//! its own writes; a key in the staging map is written at commit and
+//! so is conflict-checked as a write regardless, which is why
+//! answering it locally costs no conflict coverage.
+//!
+//! # Serializable is BOCC
+//!
+//! At [`IsolationLevel::Serializable`] kovan-mvcc records every key a
+//! transaction reads, including keys that were *absent*, and validates
+//! the whole read set under its SSI commit lock before the commit is
+//! allowed. That is backward-oriented optimistic concurrency control,
+//! and it is what turns snapshot isolation into serializability by
+//! closing the anti-dependency edge that admits write skew. It is
+//! kovan-mvcc's, not regolith's: this adapter only has to make sure
+//! every read a caller performs actually reaches `Txn::read`.
 
-#![allow(dead_code)]
-
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use kovan_mvcc::{IsolationLevel as MvccIsolation, KovanMVCC, MvccError};
@@ -40,6 +64,8 @@ impl MvccTransactions {
         MvccTxn {
             inner: self.mvcc.begin_with_isolation(map_isolation(isolation)),
             storage: &self.storage,
+            staged: BTreeMap::new(),
+            savepoints: Vec::new(),
         }
     }
 }
@@ -56,10 +82,29 @@ fn map_isolation(level: IsolationLevel) -> MvccIsolation {
 pub(crate) struct MvccTxn<'db> {
     inner: kovan_mvcc::Txn,
     storage: &'db Arc<LarkStorage>,
+    /// Point writes not yet handed to kovan-mvcc. `Some` is a put,
+    /// `None` a delete. Ordered so a multi-key failure always reports
+    /// the same key. Flushed by [`MvccTxn::commit`].
+    staged: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    /// Savepoint stack, each a copy of `staged` at the time it was set.
+    savepoints: Vec<BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
 }
 
 impl MvccTxn<'_> {
+    /// The transaction's own staged write for `key`, if any.
+    ///
+    /// A staged key is written at commit and so is conflict-checked as
+    /// a write; answering it from here rather than from `Txn::read`
+    /// therefore costs no conflict coverage, and it is what makes a
+    /// transaction see its own writes.
+    fn staged(&self, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        self.staged.get(key).cloned()
+    }
+
     pub(crate) fn get(&mut self, k: &[u8]) -> TxResult<Option<Vec<u8>>> {
+        if let Some(local) = self.staged(k) {
+            return Ok(local);
+        }
         let value = self.inner.read(k);
         // `read` cannot report an I/O error through its signature, so a
         // miss might be a failure. Checking here turns a wrong answer
@@ -70,16 +115,124 @@ impl MvccTxn<'_> {
         Ok(value)
     }
 
+    /// Read `key` and guarantee it is validated at commit whatever the
+    /// isolation level.
+    ///
+    /// A plain [`MvccTxn::get`] enters the read set only at
+    /// `Serializable`. This forces the key into the transaction's
+    /// footprint at every level by staging its current value back as a
+    /// write, so a concurrent writer of the same key loses the
+    /// prewrite race. That is what stops a lost update at
+    /// `SnapshotIsolation`.
+    pub(crate) fn get_for_update(&mut self, k: &[u8]) -> TxResult<Option<Vec<u8>>> {
+        let current = self.get(k)?;
+        match &current {
+            Some(v) => self.staged.insert(k.to_vec(), Some(v.clone())),
+            // Re-staging an absent key as a delete keeps it in the
+            // write set, so a concurrent insert is still a conflict.
+            None => self.staged.insert(k.to_vec(), None),
+        };
+        Ok(current)
+    }
+
     pub(crate) fn put(&mut self, k: &[u8], value: &[u8]) -> TxResult<()> {
-        self.inner.write(k, value.to_vec()).map_err(map_error)
+        self.staged.insert(k.to_vec(), Some(value.to_vec()));
+        Ok(())
     }
 
     pub(crate) fn delete(&mut self, k: &[u8]) -> TxResult<()> {
-        self.inner.delete(k).map_err(map_error)
+        self.staged.insert(k.to_vec(), None);
+        Ok(())
+    }
+
+    /// Delete every key in `[start, end)`.
+    ///
+    /// Expanded into point deletes against the transaction's own read
+    /// snapshot rather than handed down as a range. That is what makes
+    /// a range delete visible to conflict detection: each key becomes
+    /// an ordinary write, so kovan-mvcc's prewrite takes a lock on it
+    /// and a concurrent writer of any key in the range conflicts. A
+    /// range passed through whole would commit against a concurrent
+    /// write silently.
+    ///
+    /// The cost is that the transaction holds one staged entry per key
+    /// in the range, which is the price of the guarantee: a range
+    /// delete that is not enumerated cannot be conflict-checked.
+    pub(crate) fn delete_range(&mut self, start: &[u8], end: &[u8]) -> TxResult<()> {
+        if start >= end {
+            return Ok(());
+        }
+        let keys = self
+            .storage
+            .keys_in_range(start, end, self.inner.start_ts())
+            .map_err(TransactionError::Io)?;
+        for key in keys {
+            self.staged.insert(key, None);
+        }
+        Ok(())
+    }
+
+    /// Apply `operand` to `key` through the configured merge operator.
+    ///
+    /// Resolved here, against the value the transaction can see, so
+    /// what reaches kovan-mvcc is an ordinary write. The read is a real
+    /// read, so at `Serializable` it enters the read set and the
+    /// read-modify-write is validated as one.
+    pub(crate) fn merge(
+        &mut self,
+        merge_operator: Option<&Arc<dyn crate::options::MergeOperator>>,
+        k: &[u8],
+        operand: &[u8],
+    ) -> TxResult<()> {
+        let op = merge_operator.ok_or_else(|| {
+            TransactionError::Io(std::io::Error::other(
+                "merge called with no merge operator configured; set Options::merge_operator",
+            ))
+        })?;
+        let existing = self.get(k)?;
+        let merged = op
+            .full_merge(k, existing.as_deref(), std::slice::from_ref(&operand))
+            .ok_or_else(|| {
+                TransactionError::Io(std::io::Error::other(
+                    "merge operator rejected the operand",
+                ))
+            })?;
+        self.staged.insert(k.to_vec(), Some(merged));
+        Ok(())
+    }
+
+    /// Mark a point the transaction can be rewound to.
+    pub(crate) fn set_savepoint(&mut self) {
+        self.savepoints.push(self.staged.clone());
+    }
+
+    /// Undo every staged write back to the last savepoint.
+    ///
+    /// Reads are not rewound. A read that already happened is a read
+    /// the transaction performed, and at `Serializable` it stays in
+    /// kovan-mvcc's read set: rewinding it would hide a real
+    /// anti-dependency and quietly weaken the isolation level.
+    pub(crate) fn rollback_to_savepoint(&mut self) -> bool {
+        match self.savepoints.pop() {
+            Some(saved) => {
+                self.staged = saved;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Commit, reporting the sequence the transaction committed at.
-    pub(crate) fn commit(self) -> TxResult<u64> {
+    pub(crate) fn commit(mut self) -> TxResult<u64> {
+        // Staged writes reach kovan-mvcc only now, in key order, so the
+        // prewrite lock order is deterministic across transactions.
+        let staged = std::mem::take(&mut self.staged);
+        for (key, value) in staged {
+            match value {
+                Some(v) => self.inner.write(&key, v).map_err(map_error)?,
+                None => self.inner.delete(&key).map_err(map_error)?,
+            }
+        }
         let storage = self.storage;
         let commit_ts = self.inner.commit().map_err(map_error)?;
         // A storage failure during the commit's own writes would

@@ -27,6 +27,15 @@ use super::layout;
 use crate::WriteBatchOp;
 use crate::engine::{DurabilityMode, LarkEngine};
 
+/// Ceiling on the keys one `delete_range` may cover.
+///
+/// A range delete is expanded into one staged write per key so that
+/// kovan-mvcc's prewrite locks cover it, which is what makes it visible
+/// to conflict detection. That expansion is linear in the range, so it
+/// is bounded, and exceeding the bound is an error rather than a
+/// truncation.
+pub(crate) const MAX_RANGE_DELETE_KEYS: usize = 1 << 20;
+
 /// Locks live here rather than on disk. See [`super::layout`].
 type LockTable = kovan_map::HashMap<Vec<u8>, LockInfo>;
 
@@ -219,6 +228,62 @@ impl Storage for LarkStorage {
 }
 
 impl LarkStorage {
+    /// Distinct user keys holding a live value in `[start, end)` at `ts`.
+    ///
+    /// Walks the write records, not the engine's raw keys: the write
+    /// records *are* the committed key set, and reading them at `ts`
+    /// is what makes the answer the transaction's own snapshot rather
+    /// than whatever is newest. A key whose newest write at or before
+    /// `ts` is a delete or a rollback is absent and is left out.
+    ///
+    /// Bounded by [`MAX_RANGE_DELETE_KEYS`] and reported, not
+    /// truncated: a range delete that silently covered part of its
+    /// range would be worse than one that refuses.
+    pub(crate) fn keys_in_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        ts: u64,
+    ) -> std::io::Result<Vec<Vec<u8>>> {
+        let mut iter = self.engine.new_iter_latest();
+        with_key(|b| layout::write_prefix(start, b), |target| iter.seek(target));
+
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        let mut last: Option<Vec<u8>> = None;
+        while iter.valid() {
+            let Some(composed) = iter.key() else { break };
+            let Some(user_key) = layout::user_key_of(composed) else {
+                break;
+            };
+            if user_key.as_slice() >= end {
+                break;
+            }
+            // Records are newest-first within a key, so the first one
+            // seen for a key is the one visible at `ts`; the rest are
+            // older versions of a decision already made.
+            if last.as_deref() != Some(user_key.as_slice()) {
+                if let Some(ts_of) = layout::commit_ts_of(composed)
+                    && ts_of <= ts
+                    && let Some(info) = iter.value().and_then(decode_write_info)
+                {
+                    if info.kind == WriteKind::Put {
+                        if keys.len() == MAX_RANGE_DELETE_KEYS {
+                            return Err(std::io::Error::other(format!(
+                                "delete_range covers more than {MAX_RANGE_DELETE_KEYS} keys; \
+                                 every key is taken as a write so the range is \
+                                 conflict-checked, so narrow the range or delete in batches"
+                            )));
+                        }
+                        keys.push(user_key.clone());
+                    }
+                    last = Some(user_key);
+                }
+            }
+            iter.next();
+        }
+        Ok(keys)
+    }
+
     /// One seek for "newest write at or before `ts`".
     ///
     /// `skip_rollbacks` is the difference between `get_latest_write` and

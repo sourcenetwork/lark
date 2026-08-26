@@ -119,6 +119,32 @@ pub(crate) fn data_key(key: &[u8], start_ts: u64, out: &mut Vec<u8>) {
     compose(DATA, key, start_ts.to_be_bytes(), out);
 }
 
+/// Recover the user key from a composed write record key, undoing the
+/// escaping [`push_escaped`] applied.
+///
+/// `None` when the bytes are not a write record: wrong prefix, no
+/// terminator, or too short to carry a timestamp.
+pub(crate) fn user_key_of(composed: &[u8]) -> Option<Vec<u8>> {
+    let body = composed.strip_prefix(&[WRITE])?;
+    let body = body.get(..body.len().checked_sub(8)?)?;
+    let mut out = Vec::with_capacity(body.len());
+    let mut i = 0;
+    while i < body.len() {
+        if body[i] != SEP {
+            out.push(body[i]);
+            i += 1;
+            continue;
+        }
+        match body.get(i + 1)? {
+            &SEP => return (i + 2 == body.len()).then_some(out),
+            &ESCAPE => out.push(SEP),
+            _ => return None,
+        }
+        i += 2;
+    }
+    None
+}
+
 /// Recover the commit timestamp from a write record's key.
 pub(crate) fn commit_ts_of(write_key: &[u8]) -> Option<u64> {
     let ts = write_key.get(write_key.len().checked_sub(8)?..)?;
@@ -243,6 +269,31 @@ mod nul_key_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_user_key_survives_the_round_trip_through_a_composed_key() {
+        for k in AWKWARD {
+            let mut composed = Vec::new();
+            write_key(k, 7, &mut composed);
+            assert_eq!(
+                user_key_of(&composed).as_deref(),
+                Some(&k[..]),
+                "{k:?} did not survive compose then decompose"
+            );
+            assert_eq!(commit_ts_of(&composed), Some(7));
+        }
+    }
+
+    #[test]
+    fn user_key_of_rejects_bytes_that_are_not_a_write_record() {
+        // A data record, a truncated key and an unterminated one must
+        // all report absence rather than a plausible wrong key.
+        let mut data = Vec::new();
+        data_key(b"a", 1, &mut data);
+        assert_eq!(user_key_of(&data), None, "a data record is not a write record");
+        assert_eq!(user_key_of(b"W"), None);
+        assert_eq!(user_key_of(&[WRITE, b'a', 0, 0, 0, 0, 0, 0][..]), None);
     }
 
     #[test]
