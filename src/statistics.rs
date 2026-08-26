@@ -94,9 +94,14 @@ pub enum Ticker {
     /// Number of snapshots released (dropped or explicitly
     /// released).
     SnapshotsReleased = 23,
+    /// Number of incomplete trailing WAL records discarded during
+    /// recovery. A non-zero value means a crash left a partly written
+    /// record behind and the bytes from it to end-of-file were dropped;
+    /// the discard is also logged with the file and the offset.
+    WalTailDiscarded = 24,
 }
 
-const NUM_TICKERS: usize = 24;
+const NUM_TICKERS: usize = 25;
 
 /// Every defined ticker, in discriminant order. Used by
 /// [`Statistics::dump`] to iterate all slots. Keep this in sync
@@ -127,6 +132,7 @@ const ALL_TICKERS: &[Ticker] = &[
     Ticker::WriteStallMicros,
     Ticker::SnapshotsRegistered,
     Ticker::SnapshotsReleased,
+    Ticker::WalTailDiscarded,
 ];
 
 impl Ticker {
@@ -157,6 +163,7 @@ impl Ticker {
             Ticker::WriteStallMicros => "lark.write_stall_micros",
             Ticker::SnapshotsRegistered => "lark.snapshots_registered",
             Ticker::SnapshotsReleased => "lark.snapshots_released",
+            Ticker::WalTailDiscarded => "lark.wal_tail_discarded",
         }
     }
 }

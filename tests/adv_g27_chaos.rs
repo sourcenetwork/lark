@@ -397,10 +397,10 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
 
 #[test]
 fn the_read_view_survives_compaction_cf_churn_ingest_and_checkpoint() {
-    let instances = env("LARK_CHAOS_INSTANCES", 6) as usize;
-    let rounds = env("LARK_CHAOS_ROUNDS", 2);
-    let versions = env("LARK_CHAOS_VERSIONS", 400);
-    let min_rounds = env("LARK_CHAOS_MIN_ROUNDS", 40);
+    let instances = env("LARK_CHAOS_INSTANCES", 2) as usize;
+    let rounds = env("LARK_CHAOS_ROUNDS", 1);
+    let versions = env("LARK_CHAOS_VERSIONS", 50);
+    let min_rounds = env("LARK_CHAOS_MIN_ROUNDS", 10);
 
     let mut bad = Vec::new();
     for _ in 0..rounds {

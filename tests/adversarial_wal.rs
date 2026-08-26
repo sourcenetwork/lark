@@ -559,15 +559,17 @@ fn plant_split(fx: &Fixture, db: &Path, split_at: usize, cut_first_to: Option<us
 /// out of the middle of the history and serves a state that never
 /// existed.
 ///
-/// **Currently FAILS.** `Wal::replay` judges each file on its own bytes,
-/// so the torn-tail rule, which is only sound for the newest WAL file,
-/// is applied to every one of them. `LarkEngine::open` replays the files
-/// in id order and has the evidence the rule needs, but does not use it.
+/// `Wal::replay` judges each file on its own bytes and *reports* the
+/// tail it dropped instead of deciding what the drop means;
+/// `LarkEngine::open` replays the files in id order and refuses when a
+/// file that dropped a tail is followed by one that still yielded
+/// records.
 ///
-/// Measured: 54 cut offsets inside the earlier file's last record, 54 of
-/// them opened on a state matching no prefix of the write history. The
-/// control, the same split with no cut, opens on the full history, so
-/// the split itself is invisible and the cut is the only variable.
+/// Measured before that guard existed: 54 cut offsets inside the earlier
+/// file's last record, 54 of them opened on a state matching no prefix
+/// of the write history. The control, the same split with no cut, opens
+/// on the full history, so the split itself is invisible and the cut is
+/// the only variable.
 ///
 /// Reaching it needs two WAL files at open, which is the window between
 /// a rotation and the flush that removes the old file, plus damage to
@@ -576,7 +578,6 @@ fn plant_split(fx: &Fixture, db: &Path, split_at: usize, cut_first_to: Option<us
 /// media rot rather than a torn write: exactly the class the
 /// benign/malignant split exists to refuse.
 #[test]
-#[ignore = "records the unfixed cross-WAL-file half of G25; un-ignore when replay knows whether the file it is reading is the newest one"]
 fn a_torn_tail_in_an_earlier_wal_file_is_not_the_end_of_the_log() {
     let fx = fixture();
     let bytes = fx
