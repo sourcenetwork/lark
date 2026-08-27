@@ -60,6 +60,7 @@ fn many_writers_never_let_a_snapshot_see_a_torn_batch() {
     }
 
     let torn = Arc::new(AtomicUsize::new(0));
+    const MIN_READS: usize = 100_000;
     let reads = Arc::new(AtomicUsize::new(0));
     let mut readers = Vec::new();
     for _ in 0..4 {
@@ -69,7 +70,12 @@ fn many_writers_never_let_a_snapshot_see_a_torn_batch() {
         let torn = Arc::clone(&torn);
         let reads = Arc::clone(&reads);
         readers.push(thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
+            // Stop only once the writers are done AND the read floor is
+            // cleared. The writers have a quota, so without this the
+            // count below is just the ratio of the two sides' throughput
+            // on whatever host is running, and a slow one fails a probe
+            // that has nothing to do with the property.
+            while !stop.load(Ordering::Relaxed) || reads.load(Ordering::Relaxed) < MIN_READS {
                 let snap = db.snapshot();
                 for w in 0..writers {
                     let at = frontier[w].load(Ordering::Acquire);
@@ -121,7 +127,10 @@ fn many_writers_never_let_a_snapshot_see_a_torn_batch() {
         torn, 0,
         "{torn} torn batches observed across {reads} snapshot reads and {rounds} compactions"
     );
-    assert!(reads > 100_000, "probe was too weak: only {reads} reads");
+    assert!(
+        reads >= MIN_READS,
+        "probe was too weak: only {reads} reads against a floor of {MIN_READS}"
+    );
 
     for w in 0..writers {
         for round in [0usize, batches_per_writer / 2, batches_per_writer - 1] {
