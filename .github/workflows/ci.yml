@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+  # Every branch, not just `main`. The work ships as a stack, so every
+  # PR but the bottom one targets another PR's branch; restricting the
+  # trigger to `main` meant CI never ran on any of them.
   pull_request:
-    branches: [main]
   schedule:
     # Nightly at 07:00 UTC — drives the long-running stress/soak jobs.
     - cron: '0 7 * * *'
