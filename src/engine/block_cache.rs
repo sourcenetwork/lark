@@ -331,7 +331,7 @@ impl CacheShard {
         let Some(map) = self.map.get() else {
             return;
         };
-        if let Some(entry) = map.force_remove(key).as_ref().and_then(Weak::upgrade) {
+        if let Some(entry) = map.remove(key).as_ref().and_then(Weak::upgrade) {
             ring.release(entry.slot as usize, entry.charge);
             ring.record_removal();
         }
@@ -367,7 +367,7 @@ impl CacheShard {
             ring.free.push(hand);
             ring.used = ring.used.saturating_sub(entry.charge);
             if let Some(map) = self.map.get() {
-                map.force_remove(&entry.key);
+                map.remove(&entry.key);
             }
             ring.record_removal();
             return true;
@@ -457,7 +457,7 @@ impl CacheShard {
                 continue;
             }
             let (key, charge) = (entry.key, entry.charge);
-            map.force_remove(&key);
+            map.remove(&key);
             ring.release(slot, charge);
             ring.record_removal();
         }

@@ -366,7 +366,18 @@ pub(crate) mod fault {
     /// slot because tests run in parallel in one process: with one slot,
     /// arming for a second directory silently disarms the first and
     /// disarming from either clears both, which makes both tests flaky.
-    static ARMED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    static ARMED: Mutex<Vec<Arm>> = Mutex::new(Vec::new());
+
+    /// One armed directory and how its syncs fail.
+    struct Arm {
+        dir: PathBuf,
+        /// `0` fails every sync. `n > 0` fails every sync except each
+        /// `n`th one, so `2` alternates fail, succeed, fail, succeed.
+        period: u64,
+        /// Syncs matched under `dir` so far, which is what `period`
+        /// counts against.
+        seen: u64,
+    }
 
     /// Make every `sync_data` on a WAL under `dir` fail until disarmed.
     ///
@@ -378,12 +389,39 @@ pub(crate) mod fault {
     /// "the fault must produce a mix" assertion rather than on anything
     /// the engine did.
     pub(crate) fn arm_sync_failure(dir: &Path) {
+        arm(dir, 0);
+    }
+
+    /// Make every sync under `dir` fail except each `period`th one.
+    ///
+    /// A test that needs both outcomes cannot get them from a fault that
+    /// only ever fails: it has to rely on something else to supply the
+    /// successes, and the only thing available is which writers happen
+    /// to land in the same commit group. That is decided by thread
+    /// timing, so on a slower machine every group can contain a writer
+    /// that asked for a sync, every group fails, and the test that
+    /// wanted a mix gets none. Alternating here makes the mix a property
+    /// of the fault rather than of the scheduler.
+    pub(crate) fn arm_flapping_sync_failure(dir: &Path, period: u64) {
+        assert!(period > 1, "a flapping fault needs a period above one");
+        arm(dir, period);
+    }
+
+    fn arm(dir: &Path, period: u64) {
         let mut armed = ARMED.lock();
-        armed.push(dir.to_path_buf());
+        armed.push(Arm {
+            dir: dir.to_path_buf(),
+            period,
+            seen: 0,
+        });
         if let Some(real) = resolved(dir)
             && real != dir
         {
-            armed.push(real);
+            armed.push(Arm {
+                dir: real,
+                period,
+                seen: 0,
+            });
         }
     }
 
@@ -412,20 +450,27 @@ pub(crate) mod fault {
     pub(crate) fn disarm_sync_failure(dir: &Path) {
         let mut armed = ARMED.lock();
         let real = resolved(dir);
-        armed.retain(|d| d != dir && Some(d) != real.as_ref());
+        armed.retain(|a| a.dir != dir && Some(&a.dir) != real.as_ref());
     }
 
     pub(super) fn should_fail_sync(path: &Path) -> bool {
-        let armed = ARMED.lock();
-        if armed.iter().any(|dir| path.starts_with(dir)) {
-            return true;
-        }
+        let mut armed = ARMED.lock();
         // The log itself may not exist yet, so the resolved form is
         // taken from its directory.
-        match path.parent().and_then(resolved) {
-            Some(real) => armed.iter().any(|dir| real.starts_with(dir)),
-            None => false,
+        let real = path.parent().and_then(resolved);
+        for arm in armed.iter_mut() {
+            let matched = path.starts_with(&arm.dir)
+                || real.as_ref().is_some_and(|r| r.starts_with(&arm.dir));
+            if !matched {
+                continue;
+            }
+            if arm.period == 0 {
+                return true;
+            }
+            arm.seen += 1;
+            return arm.seen % arm.period != 0;
         }
+        false
     }
 }
 
