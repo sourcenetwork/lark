@@ -200,7 +200,10 @@ impl OpfsStore for MirrorStore {
             path: path.to_path_buf(),
             offset: match mode {
                 WriteMode::Append => offset,
-                WriteMode::Truncate => 0,
+                // `Update` keeps the contents and writes from the
+                // start, which is what a caller that is about to
+                // `set_len` needs.
+                WriteMode::Truncate | WriteMode::Update => 0,
             },
         }))
     }

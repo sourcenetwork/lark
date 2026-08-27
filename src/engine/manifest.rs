@@ -362,11 +362,18 @@ impl VersionSet {
             let replay = Self::replay_manifest(env, &data, sst_dir, policy)?;
             Self::reject_discarded_tables(&**env, &replay, data.len(), sst_dir, &manifest_path)?;
 
-            let mut file = env.open_write(&manifest_path, WriteMode::Append)?;
+            // Trim through its own handle, and close it before the
+            // append handle is opened. A torn or corrupt tail is the
+            // ordinary shape of a crash, so this runs on a normal
+            // reopen; shortening a file needs write access that an
+            // append handle does not carry on every platform, which is
+            // what [`WriteMode::Update`] exists for.
             if replay.valid_len < data.len() {
-                file.set_len(replay.valid_len as u64)?;
-                file.sync_all()?;
+                let mut trim = env.open_write(&manifest_path, WriteMode::Update)?;
+                trim.set_len(replay.valid_len as u64)?;
+                trim.sync_all()?;
             }
+            let file = env.open_write(&manifest_path, WriteMode::Append)?;
             manifest_bytes = replay.valid_len as u64;
             (replay.version, BufferedWriter::new(file))
         } else {

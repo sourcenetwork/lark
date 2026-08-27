@@ -84,25 +84,14 @@ impl Env for StdEnv {
                 .write(true)
                 .truncate(true)
                 .open(path)?,
-            // `.write(true)` alongside `.append(true)` is not redundant.
-            // On Windows the two differ in the access mask Rust asks
-            // for: append alone requests `FILE_GENERIC_WRITE` with
-            // `FILE_WRITE_DATA` cleared, and `SetEndOfFile`, which
-            // backs [`WriteFile::set_len`], needs exactly that bit.
-            // Without it, truncating a torn manifest tail on reopen
-            // fails with "Access is denied", so a Windows database
-            // could not be reopened after the ordinary kind of crash.
-            // On Unix the pair is what the docs say it is, identical to
-            // append alone, because `ftruncate` only needs a writable
-            // descriptor and `O_APPEND` is one.
-            // `clippy::ineffective_open_options` is reasoning from the
-            // Unix semantics quoted above, where the pair really is
-            // redundant. It is not on Windows, which is the whole point.
-            #[allow(clippy::ineffective_open_options)]
-            WriteMode::Append => OpenOptions::new()
+            WriteMode::Append => OpenOptions::new().create(true).append(true).open(path)?,
+            // `truncate(false)` is stated rather than left to default:
+            // keeping the contents is the whole difference between this
+            // mode and `Truncate`.
+            WriteMode::Update => OpenOptions::new()
                 .create(true)
                 .write(true)
-                .append(true)
+                .truncate(false)
                 .open(path)?,
         };
         Ok(Box::new(StdWriteFile { file }))
@@ -339,6 +328,56 @@ impl JoinHandle for StdJoinHandle {
         // has already been reported on its own thread, and shutdown
         // must not turn it into a second one here.
         let _ = self.0.join();
+    }
+}
+
+#[cfg(test)]
+mod update_mode_tests {
+    use super::*;
+    use crate::env::WriteMode;
+
+    /// The regression this guards: manifest recovery trims a torn tail
+    /// with `set_len`, and it used to do that through the same append
+    /// handle it then wrote through. On Windows an append handle is
+    /// opened without `FILE_WRITE_DATA`, which `SetEndOfFile` needs, so
+    /// every reopen of a database whose MANIFEST had a torn tail failed
+    /// with "Access is denied" - which is to say, every reopen after the
+    /// ordinary kind of crash.
+    #[test]
+    fn a_file_opened_for_update_keeps_its_contents_and_can_be_shortened() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("log");
+        let env = StdEnv::new();
+
+        {
+            let mut w = Env::open_write(&env, &path, WriteMode::Truncate).expect("create");
+            w.write_all(b"0123456789").expect("write");
+            w.sync_all().expect("sync");
+        }
+
+        {
+            let mut w = Env::open_write(&env, &path, WriteMode::Update).expect("open update");
+            w.set_len(4).expect(
+                "shortening through an Update handle is what manifest recovery does on every \
+                 reopen after a crash",
+            );
+            w.sync_all().expect("sync");
+        }
+
+        assert_eq!(
+            Env::read(&env, &path).expect("read"),
+            b"0123456789"[..4].to_vec(),
+            "Update must keep what it did not remove",
+        );
+
+        // And the log is still appendable afterwards, which is the next
+        // thing recovery does.
+        {
+            let mut w = Env::open_write(&env, &path, WriteMode::Append).expect("open append");
+            w.write_all(b"xy").expect("append");
+            w.sync_all().expect("sync");
+        }
+        assert_eq!(Env::read(&env, &path).expect("read"), b"0123xy".to_vec());
     }
 }
 
