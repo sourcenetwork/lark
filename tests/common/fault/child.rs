@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use lark_kv::{Db, DurabilityMode, Options, WriteBatch};
 
-use super::journal::{journal_path_for, root_filter_for, Journal};
+use super::journal::{Journal, journal_path_for, root_filter_for};
 use super::prefix::{History, OpValue};
 use super::shim;
 

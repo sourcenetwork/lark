@@ -156,7 +156,9 @@ fn point_read_scaling() {
         line.push_str(&format!("{threads}t={ops:.0}/{cpu_per_m:.2}cpu "));
     }
     let scaling = rates[rates.len() - 1] / rates[0];
-    println!("POINT_READ_SCALING {line}scaling_8t={scaling:.2}x (ops/s per thread count, and CPU seconds per million reads)");
+    println!(
+        "POINT_READ_SCALING {line}scaling_8t={scaling:.2}x (ops/s per thread count, and CPU seconds per million reads)"
+    );
 }
 
 #[test]

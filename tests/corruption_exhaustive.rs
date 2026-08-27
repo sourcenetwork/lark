@@ -52,9 +52,10 @@ use common::fault::{
     validate_prefix_of_state,
 };
 use harness::{
+    BLOOM, DATA, FOOTER, INDEX, Recovered, SAMPLE, SEED, TAG_ADD_FILE, Tally,
     assert_engine_never_panicked, batch_fixture, every, exactly, manifest_frames, never_invents,
     read_state, region, sample, sst_regions, table_fixture, trial, valid_prefix, wal_fixture,
-    wal_frames, watch, Recovered, Tally, BLOOM, DATA, FOOTER, INDEX, SAMPLE, SEED, TAG_ADD_FILE,
+    wal_frames, watch,
 };
 
 // ─── WAL: truncation ────────────────────────────────────────────────────

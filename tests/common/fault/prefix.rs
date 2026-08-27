@@ -210,7 +210,10 @@ impl fmt::Display for PrefixViolation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PrefixViolation::NotAPrefix { detail } => {
-                write!(f, "recovered state is not a prefix of the write history: {detail}")
+                write!(
+                    f,
+                    "recovered state is not a prefix of the write history: {detail}"
+                )
             }
             PrefixViolation::HalfAppliedBatch {
                 batch,
@@ -228,11 +231,15 @@ impl fmt::Display for PrefixViolation {
                 keys.len(),
                 keys,
             ),
-            PrefixViolation::OrderBroken { detail } => write!(f, "iteration order broken: {detail}"),
+            PrefixViolation::OrderBroken { detail } => {
+                write!(f, "iteration order broken: {detail}")
+            }
             PrefixViolation::PointScanDisagree { detail } => {
                 write!(f, "point lookup disagreed with the scan: {detail}")
             }
-            PrefixViolation::Engine(e) => write!(f, "engine error while reading recovered state: {e}"),
+            PrefixViolation::Engine(e) => {
+                write!(f, "engine error while reading recovered state: {e}")
+            }
         }
     }
 }
@@ -300,7 +307,7 @@ pub fn recovered_state(db: &Db) -> Result<KeyValues, PrefixViolation> {
                         v.len(),
                         other.map(|b| b.len()),
                     ),
-                })
+                });
             }
             Err(e) => return Err(PrefixViolation::Engine(e.to_string())),
         }

@@ -8,8 +8,8 @@
 //! sampled there skips the flush and then records the manifest length
 //! before the flush's `AddFile` lands.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use lark_kv::{Db, Options, WriteBatch};

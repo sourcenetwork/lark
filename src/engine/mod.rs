@@ -17,8 +17,8 @@ pub mod loom_model;
 pub(crate) mod manifest;
 pub(crate) mod memtable;
 pub(crate) mod range_tombstone;
-pub(crate) mod read_view;
 pub(crate) mod read_horizon;
+pub(crate) mod read_view;
 pub(crate) mod skiplist;
 pub(crate) mod snapshot_registry;
 pub(crate) mod sstable;
@@ -2620,8 +2620,7 @@ impl LarkEngine {
         // readers: a concurrent reader may still briefly observe
         // pre-drop SSTable data, exactly as before this view existed.
         let fresh = Arc::new(MemTable::new(&self.memtable_config)?);
-        self.view
-            .update_memtables(|_, _| (fresh, Vec::new(), ()));
+        self.view.update_memtables(|_, _| (fresh, Vec::new(), ()));
 
         let (old_version, wal_id, wal_path, new_wal) = {
             let mut versions = self.versions.lock();

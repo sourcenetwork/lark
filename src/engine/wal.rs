@@ -608,7 +608,10 @@ fn frame_at(bytes: &[u8], offset: usize) -> Option<Frame<'_>> {
 /// discarded, with the offset and byte count logged. `Err` means whole
 /// records follow the damage, so the tail is loss rather than a torn
 /// write, and the open is refused.
-pub(super) fn classify_incomplete_record(path: &Path, record_start: u64) -> io::Result<TailVerdict> {
+pub(super) fn classify_incomplete_record(
+    path: &Path,
+    record_start: u64,
+) -> io::Result<TailVerdict> {
     let bytes = fs::read(path)?;
     let pos = usize::try_from(record_start)
         .unwrap_or(usize::MAX)
@@ -1583,7 +1586,11 @@ mod tests {
     fn offset_tracks_every_appended_byte() {
         let dir = TempDir::new().unwrap();
         let (mut wal, path) = new_wal(&dir);
-        assert_eq!(wal.offset(), WAL_STAMP_LEN as u64, "a fresh log holds its stamp");
+        assert_eq!(
+            wal.offset(),
+            WAL_STAMP_LEN as u64,
+            "a fresh log holds its stamp"
+        );
 
         wal.append_put(b"k", b"v", 1).unwrap();
         let after_one = wal.offset();

@@ -141,8 +141,15 @@ fn a_checksummed_external_table_ingests_and_reads_back() {
         let bytes = fs::read(&path).expect("read");
         let magic = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().expect("8"));
         assert!(
-            magic == 0x4C41524B_53535403 || magic == 0x4C41524B_53535404,
-            "the writer must emit a checksummed format, got {magic:#018x}",
+            magic == 0x4C41524B_53535403
+                || magic == 0x4C41524B_53535404
+                || magic == 0x5245474F_53535405
+                || magic == 0x5245474F_53535406,
+            "the writer must emit a checksummed format, got {magic:#018x}. \
+             LARKSST v3 and v4 are the older checksummed footers; REGOSST v5 \
+             and v6 are the stamped flat and partitioned ones the writer emits \
+             now. An unchecksummed v1 or v2 here would mean the writer had \
+             regressed to a footer the reader cannot verify.",
         );
 
         let dir = TempDir::new().expect("tempdir");

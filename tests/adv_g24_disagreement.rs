@@ -307,15 +307,18 @@ fn relabelling_a_tables_format_version_is_never_served_as_data() {
         let version_byte = original.len() - 8;
         let current = original[version_byte];
         assert!(
-            (1..=4).contains(&current),
-            "the fixture's version byte is {current:#04x}, not a known version",
+            (1..=6).contains(&current),
+            "the fixture's version byte is {current:#04x}, not a known version. \
+             v1 and v2 are the unchecksummed LARKSST footers, v3 and v4 the \
+             checksummed ones, v5 and v6 the stamped REGOSST flat and \
+             partitioned ones.",
         );
 
         let root = TempDir::new().expect("tempdir");
         let db = root.path().join("db");
         let mut bad = Vec::new();
         let mut refused = 0usize;
-        for v in [0x01u8, 0x02, 0x03, 0x04] {
+        for v in [0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06] {
             if v == current {
                 continue;
             }
@@ -333,7 +336,8 @@ fn relabelling_a_tables_format_version_is_never_served_as_data() {
             }
         }
         println!(
-            "partitioned={partitioned}: version {current:#04x} relabelled 3 ways, {refused} refused"
+            "partitioned={partitioned}: version {current:#04x} relabelled 5 ways, \
+             {refused} refused"
         );
         assert!(bad.is_empty(), "{}", bad.join("\n  "));
     }

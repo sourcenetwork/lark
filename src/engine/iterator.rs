@@ -64,8 +64,7 @@ use super::block::{Block, RESTART_INTERVAL, decode_entry_at};
 use super::block_cache::BlockCache;
 use super::internal_key::{
     INTERNAL_KEY_SUFFIX_LEN, VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE,
-    encode_internal_key,
-    compare_internal_keys, decode_internal_key, user_key_of,
+    compare_internal_keys, decode_internal_key, encode_internal_key, user_key_of,
 };
 use super::lookup_key::LookupKey;
 use super::manifest::Version;

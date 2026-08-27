@@ -15,11 +15,10 @@ use std::path::{Path, PathBuf};
 
 use super::checksum;
 use super::wal::{
-    RECORD_BATCH, RECORD_DELETE, RECORD_DELETE_RANGE, RECORD_MERGE, RECORD_PUT, WalEntry,
+    RECORD_BATCH, RECORD_DELETE, RECORD_DELETE_RANGE, RECORD_MERGE, RECORD_PUT, TailVerdict,
+    WAL_STAMP_LEN, WalEntry, classify_incomplete_record, classify_unusable_record,
     parse_batch_record, parse_delete_range_record, parse_delete_record, parse_merge_record,
-    TailVerdict, WAL_STAMP_LEN, classify_incomplete_record, classify_unusable_record,
-    parse_put_record,
-    read_exact_or_truncated, read_wal_header,
+    parse_put_record, read_exact_or_truncated, read_wal_header,
 };
 
 /// Reads a WAL file record by record.
@@ -83,7 +82,11 @@ impl WalReplayIter {
         let consumed = stamped.unwrap_or(0) as u64;
         // Nothing but a stamp-less empty log can leave records unread
         // here, so an unstamped file yields no entries at all.
-        let file_len = if stamped.is_some() { file_len } else { consumed };
+        let file_len = if stamped.is_some() {
+            file_len
+        } else {
+            consumed
+        };
 
         Ok(Self {
             reader,

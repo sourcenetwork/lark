@@ -185,7 +185,6 @@ impl Drop for CompactionScheduler {
     }
 }
 
-
 /// Spawn one named compaction worker.
 ///
 /// Split out of [`CompactionScheduler::start`] so tests can force the

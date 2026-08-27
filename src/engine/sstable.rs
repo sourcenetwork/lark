@@ -1316,7 +1316,8 @@ impl SsTableReader {
         if let Some(block) = cache.get_filter(self.file_id, handle.offset) {
             return Ok(MetaRef::Owned(block));
         }
-        let region = self.read_metadata_region(handle, checksum::META_KIND_BLOOM, "bloom region")?;
+        let region =
+            self.read_metadata_region(handle, checksum::META_KIND_BLOOM, "bloom region")?;
         let block = Arc::new(FilterBlock::decode(&region)?);
         if !cache.insert_filter(self.file_id, handle.offset, Arc::clone(&block)) {
             let _ = self.filter_fallback.set(Arc::clone(&block));
@@ -1342,8 +1343,7 @@ impl SsTableReader {
             let mut file = self.file.lock();
             read_file_region(&mut file, handle.offset, handle.size, self.data_end, name)?
         };
-        let payload_len =
-            verify_meta_region(&region, kind, self.meta_checksummed, name)?.len();
+        let payload_len = verify_meta_region(&region, kind, self.meta_checksummed, name)?.len();
         region.truncate(payload_len);
         Ok(region)
     }
@@ -1367,7 +1367,11 @@ impl SsTableReader {
         #[cfg(test)]
         self.index_leaf_reads.fetch_add(1, Ordering::Relaxed);
 
-        let buf = self.read_metadata_region(handle, checksum::META_KIND_INDEX_LEAF, "partitioned index leaf")?;
+        let buf = self.read_metadata_region(
+            handle,
+            checksum::META_KIND_INDEX_LEAF,
+            "partitioned index leaf",
+        )?;
         let leaf = Arc::new(IndexBlock::decode(buf)?);
         cache.insert_index(self.file_id, handle.offset, Arc::clone(&leaf));
         Ok(leaf)
@@ -2577,7 +2581,11 @@ mod tests {
             let key = format!("key_{i:04}");
             assert_eq!(
                 with_key_scratch(|buf| {
-                    reader.get(&LookupKey::from_prefixed(key.as_bytes(), u64::MAX), buf, &cache)
+                    reader.get(
+                        &LookupKey::from_prefixed(key.as_bytes(), u64::MAX),
+                        buf,
+                        &cache,
+                    )
                 })
                 .unwrap()
                 .map_value(|v| v.to_vec()),
@@ -2590,7 +2598,11 @@ mod tests {
         }
         assert_eq!(
             with_key_scratch(|buf| {
-                reader.get(&LookupKey::from_prefixed(b"key_9999", u64::MAX), buf, &cache)
+                reader.get(
+                    &LookupKey::from_prefixed(b"key_9999", u64::MAX),
+                    buf,
+                    &cache,
+                )
             })
             .unwrap()
             .map_value(|v| v.to_vec()),
