@@ -15,6 +15,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # The profile written for CI: a slower, noisier host gets a looser
+  # slow-timeout than a workstation, and one retry so a genuinely flaky
+  # test is reported as flaky rather than as a failure. See
+  # `.config/nextest.toml`.
+  NEXTEST_PROFILE: ci
   RUSTFLAGS: -D warnings
 
 # Every `run` step goes through `bash -eo pipefail` rather than
