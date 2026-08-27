@@ -309,10 +309,11 @@ impl LarkStorage {
             // Records are newest-first within a key, so the first one
             // seen for a key is the one visible at `ts`; the rest are
             // older versions of a decision already made.
-            if last.as_deref() != Some(user_key.as_slice()) {
-                if let Some(ts_of) = layout::commit_ts_of(composed)
-                    && ts_of <= ts
-                    && let Some(info) = iter.value().and_then(decode_write_info)
+            if last.as_deref() != Some(user_key.as_slice())
+                && let Some(ts_of) = layout::commit_ts_of(composed)
+                && ts_of <= ts
+                && let Some(info) = iter.value().and_then(decode_write_info)
+            {
                 {
                     if info.kind == WriteKind::Put {
                         if keys.len() == MAX_RANGE_DELETE_KEYS {

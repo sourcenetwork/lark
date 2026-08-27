@@ -1,4 +1,4 @@
-//! Adversarial coverage for the the foreground-compaction work foreground-compaction stall path.
+//! Adversarial coverage for the foreground-compaction stall path.
 //!
 //! Every test that could wedge runs its workload on a helper thread and
 //! fails on a deadline instead of hanging the harness.

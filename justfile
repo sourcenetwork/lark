@@ -257,7 +257,7 @@ loom-debug:
 
 loom-all: loom loom-debug
 
-# The the published read view chaos workload at full size: 6 instances x 2 rounds x 400
+# The read-view chaos workload at full size: 6 instances x 2 rounds x 400
 # versions. Measured at over 20 minutes wall and 4h of CPU unoptimized,
 # which is why `cargo test` runs a smaller default and this recipe
 # carries the full one. Release, because debug is where the cost is.

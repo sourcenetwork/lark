@@ -1,7 +1,13 @@
 //! The transaction surface, driven by kovan-mvcc.
 //!
-//! This is the transaction path. `OptimisticTransactionDb` and
-//! `TransactionDb` both run through it.
+//! The transaction path, driven by kovan-mvcc.
+//!
+//! **Not the default yet.** `OptimisticTransactionDb` and
+//! `TransactionDb` still construct the native `Transaction`. The
+//! adapter below is complete and tested; flipping those two entry
+//! points over is the remaining step, and the `allow` under this
+//! comment goes with it, so a genuinely unused item is still caught
+//! once the module is reachable.
 //!
 //! Everything about isolation, conflict detection, timestamps and the
 //! two-phase commit belongs to kovan-mvcc. Nothing here reimplements
@@ -35,6 +41,8 @@
 //! closing the anti-dependency edge that admits write skew. It is
 //! kovan-mvcc's, not regolith's: this adapter only has to make sure
 //! every read a caller performs actually reaches `Txn::read`.
+
+#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

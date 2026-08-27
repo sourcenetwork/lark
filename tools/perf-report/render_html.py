@@ -363,6 +363,36 @@ def detail_sections(cur, base):
             f'<p class="note">The number a memory budget has to cover.</p>'
             f'{spark_bars(rows)}</div></div>')
 
+    ci = cur.get("metrics", {}).get("isolation", {})
+    cells = ci.get("matrix", [])
+    if cells:
+        bmap = {(c.get("flavor"), c.get("isolation")): c
+                for c in (base or {}).get("metrics", {}).get("isolation", {}).get("matrix", [])}
+        cards = []
+        for metric, title, note in (
+            ("uncontended_commits_per_s", "Uncontended commits/s",
+             "One writer per key. What the isolation level costs when nothing is racing."),
+            ("contended_commits_per_s", "Contended commits/s",
+             "Every thread on one key. What the level costs when everything is racing."),
+        ):
+            rows = []
+            for c in cells:
+                label = f'{c.get("flavor","?")} / {c.get("isolation","?")}'
+                prev = bmap.get((c.get("flavor"), c.get("isolation")), {})
+                rows.append((label, prev.get(metric), c.get(metric), "ops/s"))
+            cards.append(f'<div class="card"><h3>{title}{pill(ci.get("trust"))}</h3>'
+                         f'<p class="note">{esc(note)}</p>{spark_bars(rows)}</div>')
+        rows = [(f'{c.get("flavor","?")} / {c.get("isolation","?")}',
+                 bmap.get((c.get("flavor"), c.get("isolation")), {}).get("conflict_rate_pct"),
+                 c.get("conflict_rate_pct"), "%") for c in cells]
+        cards.append('<div class="card"><h3>Conflict rate</h3>'
+                     '<p class="note">Share of attempts a level refused. A stricter level '
+                     'refuses more, and that is the work it is doing, not waste.</p>'
+                     f'{spark_bars(rows)}</div>')
+        out.append('<h2>Transaction isolation</h2>'
+                   f'<p class="note">{esc(ci.get("note",""))}</p>'
+                   '<div class="grid">' + "".join(cards) + "</div>")
+
     cs = cur.get("metrics", {}).get("binary_size", {})
     if cs.get("rows"):
         bmap = {r.get("artifact"): r.get("lark_cost_kib")

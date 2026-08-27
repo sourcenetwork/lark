@@ -412,7 +412,7 @@ fn multi_get_never_travels_backwards() {
 /// `Db::iter` and `Db::scan` run the same iterator over the same
 /// workload and differ only in that ordering, and removing the
 /// user-thread `compact_range` from the `Db::scan` workload takes it to
-/// 0 violations over 5625360 reads, which is the the published read view mechanism exactly.
+/// 0 violations over 5625360 reads, which is the published read view mechanism exactly.
 #[test]
 #[ignore = "records an unfixed instance of the published read view in Db::scan; un-ignore when the scan entry points load the view before sampling the horizon"]
 fn scan_never_travels_backwards() {

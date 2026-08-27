@@ -2,7 +2,7 @@
 //! crash artifact" rule reads the footer's `num_entries` and
 //! `range_tombstone_size`. A V3/V4 footer is checksummed, so a damaged
 //! one is refused. A V1/V2 footer is not, which is the metadata checksum fix's stated
-//! deliberate hole, and here that hole feeds the the discarded-table open guard guard: two zeroed
+//! deliberate hole, and here that hole feeds the discarded-table open guard: two zeroed
 //! `u64`s in a legacy footer make a table that holds 200 keys claim to
 //! hold none, and the guard then lets the open discard it.
 //!

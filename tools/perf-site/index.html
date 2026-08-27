@@ -1,0 +1,327 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>regolith performance</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Funnel+Display:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#000; --panel:#0a0c0a; --line:#1c211c; --ink:#e8ece8; --mute:#7d857d;
+  --green:#06b250; --red:#e0503a; --amber:#c08a2e;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--ink)}
+body{font-family:"Funnel Display",system-ui,sans-serif;font-size:15px;line-height:1.45}
+code,.mono,td.num{font-family:"JetBrains Mono",ui-monospace,monospace;font-variant-numeric:tabular-nums}
+header{padding:22px 26px;border-bottom:1px solid var(--line);display:flex;flex-wrap:wrap;gap:16px;align-items:center}
+h1{font-size:19px;font-weight:700;margin:0;letter-spacing:-.01em}
+h2{font-size:15px;font-weight:600;margin:26px 26px 10px;letter-spacing:.02em;text-transform:uppercase;color:var(--mute)}
+main{padding-bottom:60px}
+.controls{margin-left:auto;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+label{font-size:12px;color:var(--mute);display:block;margin-bottom:3px}
+select{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+  padding:6px 9px;font-family:"JetBrains Mono",monospace;font-size:12px;min-width:210px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px;padding:0 26px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}
+.card h3{margin:0 0 3px;font-size:14px;font-weight:600}
+.note{margin:0 0 12px;font-size:12px;color:var(--mute);line-height:1.4}
+.headline{font-size:26px;font-weight:700;letter-spacing:-.02em;margin:2px 0 10px}
+.headline small{font-size:13px;font-weight:400;color:var(--mute)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--mute);
+  font-weight:500;padding:6px 8px;border-bottom:1px solid var(--line)}
+td{padding:6px 8px;border-bottom:1px solid var(--line)}
+td.num{text-align:right}
+tr:last-child td{border-bottom:none}
+.up{color:var(--green)} .down{color:var(--red)} .flat{color:var(--mute)}
+.pill{display:inline-block;font-size:10px;padding:1px 7px;border-radius:99px;margin-left:7px;
+  vertical-align:middle;border:1px solid var(--line);color:var(--mute);text-transform:uppercase;letter-spacing:.04em}
+.pill.clean{color:var(--green);border-color:#0b3a1f}
+.pill.contaminated{color:var(--amber);border-color:#3a2f0b}
+.pill.absent{color:var(--mute)}
+.bar{height:9px;border-radius:99px;background:#141814;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--green)}
+.bar i.regress{background:var(--red)}
+.scroll{overflow-x:auto}
+.empty{padding:26px;color:var(--mute);font-size:13px}
+svg{display:block;width:100%;height:auto}
+.legend{display:flex;gap:14px;font-size:11px;color:var(--mute);margin-top:8px}
+.legend b{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:middle}
+</style>
+<header>
+  <h1>regolith performance</h1>
+  <div class="controls">
+    <div><label for="cur">This run</label><select id="cur"></select></div>
+    <div><label for="base">Compared with</label><select id="base"></select></div>
+    <div><label for="thresh">Highlight changes over</label>
+      <select id="thresh"><option value="1">1%</option><option value="3" selected>3%</option>
+      <option value="5">5%</option><option value="10">10%</option></select></div>
+  </div>
+</header>
+<main id="main"><div class="empty">Loading runs...</div></main>
+<script>
+const GREEN="#06b250", RED="#e0503a", DIM="#333833";
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+function fmt(n,unit){
+  if(n===null||n===undefined||Number.isNaN(n))return"n/a";
+  const a=Math.abs(n);
+  if(unit==="%")return n.toFixed(2)+"%";
+  if(a>=1e9)return (n/1e9).toFixed(2)+"B";
+  if(a>=1e6)return (n/1e6).toFixed(2)+"M";
+  if(a>=1e4)return (n/1e3).toFixed(1)+"k";
+  if(a>=100)return Math.round(n).toLocaleString();
+  return (Math.round(n*100)/100).toString();
+}
+// Higher is better for rates; lower is better for size, memory and latency.
+const LOWER_BETTER=/rss|size|mib|kib|bytes|latency|ns|us|ms|alloc/i;
+function delta(cur,base,name,unit){
+  if(base===null||base===undefined||cur===null||cur===undefined||!base)return null;
+  const pct=100*(cur-base)/Math.abs(base);
+  const lower=LOWER_BETTER.test(name+" "+(unit||""));
+  return {pct, good:lower? pct<0 : pct>0};
+}
+function pill(t){return t?`<span class="pill ${esc(t)}">${esc(t)}</span>`:""}
+
+function lineChart(series,{w=560,h=230,xlab="threads",ylab=""}={}){
+  const all=series.flatMap(s=>s.pts);
+  if(!all.length)return `<p class="note">not measured yet</p>`;
+  const xs=all.map(p=>p[0]), ys=all.map(p=>p[1]);
+  const x0=Math.min(...xs), x1=Math.max(...xs)||1;
+  const y1=Math.max(...ys)||1;
+  const L=54,R=12,T=12,B=30;
+  const px=v=>L+(x1===x0?0:(v-x0)/(x1-x0))*(w-L-R);
+  const py=v=>T+(1-v/y1)*(h-T-B);
+  let g="";
+  for(let i=0;i<=4;i++){
+    const v=y1*i/4, y=py(v);
+    g+=`<line x1="${L}" x2="${w-R}" y1="${y}" y2="${y}" stroke="#141814"/>`
+      +`<text x="${L-8}" y="${y+4}" fill="#7d857d" font-size="10" text-anchor="end">${fmt(v)}</text>`;
+  }
+  let body="";
+  for(const s of series){
+    if(!s.pts.length)continue;
+    const p=[...s.pts].sort((a,b)=>a[0]-b[0]);
+    const d=p.map((q,i)=>`${i?"L":"M"}${px(q[0]).toFixed(1)},${py(q[1]).toFixed(1)}`).join("");
+    body+=`<path d="${d}" fill="none" stroke="${s.color}" stroke-width="${s.thick?2.2:1.4}"
+      ${s.dash?'stroke-dasharray="4 3"':""}/>`;
+    body+=p.map(q=>`<circle cx="${px(q[0]).toFixed(1)}" cy="${py(q[1]).toFixed(1)}" r="${s.thick?2.6:2}" fill="${s.color}"/>`).join("");
+  }
+  const ticks=[...new Set(xs)].sort((a,b)=>a-b).slice(0,12)
+    .map(v=>`<text x="${px(v).toFixed(1)}" y="${h-10}" fill="#7d857d" font-size="10" text-anchor="middle">${v}</text>`).join("");
+  const leg=series.filter(s=>s.pts.length)
+    .map(s=>`<span><b style="background:${s.color}"></b>${esc(s.name)}</span>`).join("");
+  return `<svg viewBox="0 0 ${w} ${h}" role="img" aria-label="${esc(ylab||xlab)}">${g}${body}${ticks}
+    <text x="${w-R}" y="${h-10}" fill="#7d857d" font-size="10" text-anchor="end">${esc(xlab)}</text></svg>
+    <div class="legend">${leg}</div>`;
+}
+
+function bars(rows,unit,threshold){
+  if(!rows.length)return `<p class="note">not measured yet</p>`;
+  const max=Math.max(...rows.map(r=>Math.abs(r.cur||0)),1);
+  return `<div class="scroll"><table><thead><tr><th>${esc(unit?"":"item")}</th>
+    <th class="num">baseline</th><th class="num">this run</th><th class="num">delta</th><th style="width:34%"></th></tr></thead><tbody>`
+    + rows.map(r=>{
+        const d=delta(r.cur,r.base,r.name,unit);
+        const cls=!d?"flat":Math.abs(d.pct)<threshold?"flat":d.good?"up":"down";
+        const txt=!d?"":(d.pct>0?"+":"")+d.pct.toFixed(1)+"%";
+        const regress=d&&!d.good&&Math.abs(d.pct)>=threshold;
+        return `<tr><td>${esc(r.name)}</td>
+          <td class="num">${fmt(r.base,unit)}</td>
+          <td class="num">${fmt(r.cur,unit)}</td>
+          <td class="num ${cls}">${txt}</td>
+          <td><div class="bar"><i class="${regress?"regress":""}" style="width:${(100*Math.abs(r.cur||0)/max).toFixed(1)}%"></i></div></td></tr>`;
+      }).join("")
+    + `</tbody></table></div>`;
+}
+
+function card(title,note,body,trust){
+  return `<div class="card"><h3>${esc(title)}${pill(trust)}</h3>
+    ${note?`<p class="note">${esc(note)}</p>`:""}${body}</div>`;
+}
+
+function throughputSection(cur,base,threshold){
+  const cw=cur?.metrics?.throughput?.workloads||{};
+  const bw=base?.metrics?.throughput?.workloads||{};
+  const names=Object.keys(cw);
+  if(!names.length)return "";
+  const cards=names.map(n=>{
+    const pts=(cw[n].points||[]).map(p=>[p.threads,p.ops]);
+    const bpts=((bw[n]||{}).points||[]).map(p=>[p.threads,p.ops]);
+    const top=pts.length?pts.reduce((a,b)=>b[0]>a[0]?b:a):null;
+    const one=Object.fromEntries(pts)[1];
+    const head=top?`<div class="headline">${fmt(top[1])} <small>ops/s @ ${top[0]}t</small>
+      ${one?`<small>&nbsp;${(top[1]/one).toFixed(2)}x scaling</small>`:""}</div>`:"";
+    return card(n.replace(/_/g," "),cw[n].note||"",
+      head+lineChart([{name:"baseline",color:DIM,pts:bpts,dash:true},
+                      {name:"this run",color:GREEN,pts,thick:true}],{ylab:"ops/s"}),
+      cw[n].trust);
+  }).join("");
+  return `<h2>Throughput</h2><div class="grid">${cards}</div>`;
+}
+
+function isolationSection(cur,base,threshold){
+  const ci=cur?.metrics?.isolation||{}, cells=ci.matrix||[];
+  if(!cells.length)return "";
+  const bmap={};
+  for(const c of (base?.metrics?.isolation?.matrix)||[]) bmap[c.flavor+"/"+c.isolation]=c;
+  const mk=(key,unit)=>cells.map(c=>({
+    name:`${c.flavor} / ${c.isolation}`, cur:c[key],
+    base:(bmap[c.flavor+"/"+c.isolation]||{})[key]}));
+  const levels=[...new Set(cells.map(c=>c.isolation))];
+  const flavors=[...new Set(cells.map(c=>c.flavor))];
+  const idx=l=>levels.indexOf(l)+1;
+  const series=flavors.map((f,i)=>({
+    name:f,color:i?GREEN:DIM,thick:!!i,
+    pts:cells.filter(c=>c.flavor===f).map(c=>[idx(c.isolation),c.contended_commits_per_s])}));
+  return `<h2>Transaction isolation</h2><div class="grid">
+    ${card("Uncontended commits/s",
+        "One writer per key. What the level costs when nothing is racing.",
+        bars(mk("uncontended_commits_per_s"),"",threshold),ci.trust)}
+    ${card("Contended commits/s",
+        "Every thread on one key. What the level costs when everything is racing.",
+        bars(mk("contended_commits_per_s"),"",threshold))}
+    ${card("Conflict rate",
+        "Share of attempts the level refused. A stricter level refuses more, and that refusal is the work it is doing.",
+        bars(mk("conflict_rate_pct"),"%",threshold))}
+    ${card("Cost of strictness",
+        "Contended throughput across "+levels.join(" -> ")+", left to right.",
+        lineChart(series,{xlab:levels.join("  |  "),ylab:"commits/s"}))}
+  </div>`;
+}
+
+function rssSection(cur,base,threshold){
+  const cr=cur?.metrics?.rss||{}, soaks=cr.soaks||[];
+  if(!soaks.length)return "";
+  const series=soaks.map((s,i)=>({name:s.label||s.variant||("soak "+i),
+    color:/after/.test(s.variant||"")?GREEN:DIM, thick:/after/.test(s.variant||""),
+    pts:(s.samples_t_rss_ops||[]).filter(r=>Array.isArray(r)&&r.length>=2).map(r=>[r[0],r[1]])}));
+  const bmap={};
+  for(const s of (base?.metrics?.rss?.soaks)||[]) bmap[s.label||s.variant]=s.rss_peak_mib;
+  const rows=soaks.filter(s=>s.rss_peak_mib!=null)
+    .map(s=>({name:(s.label||s.variant)+" peak RSS",cur:s.rss_peak_mib,base:bmap[s.label||s.variant]}));
+  return `<h2>Resident memory</h2><div class="grid">
+    ${card("RSS over a sustained workload",cr.workload||"",
+        lineChart(series,{xlab:"seconds",ylab:"MiB"}),cr.trust)}
+    ${card("Peak RSS","The number a memory budget has to cover. Lower is better.",
+        bars(rows,"MiB",threshold))}</div>`;
+}
+
+function sizeSection(cur,base,threshold){
+  const cs=cur?.metrics?.binary_size||{}, rows=cs.rows||[];
+  if(!rows.length)return "";
+  const bmap={};
+  for(const r of (base?.metrics?.binary_size?.rows)||[]) bmap[r.artifact]=r.lark_cost_kib;
+  return `<h2>Binary size</h2><div class="grid">${card("regolith's own contribution",
+    cs.note||"Lower is better.",
+    bars(rows.map(r=>({name:r.artifact,cur:r.lark_cost_kib,base:bmap[r.artifact]})),"KiB",threshold),
+    cs.trust)}</div>`;
+}
+
+function trendSection(all,metricPick){
+  // The reason the history is kept: one run answers "is this fast",
+  // the series answers "when did this change".
+  const pts={};
+  for(const r of all){
+    const t=Date.parse(r.doc?.run?.timestamp||"")||0;
+    const w=r.doc?.metrics?.throughput?.workloads||{};
+    for(const [n,v] of Object.entries(w)){
+      const top=(v.points||[]).reduce((a,p)=>!a||p.threads>a.threads?p:a,null);
+      if(top){ (pts[n]=pts[n]||[]).push([t,top.ops]); }
+    }
+  }
+  const names=Object.keys(pts);
+  if(!names.length)return "";
+  const norm=n=>{
+    const p=pts[n].sort((a,b)=>a[0]-b[0]);
+    const x0=p[0][0];
+    return p.map(q=>[(q[0]-x0)/86400000,q[1]]);
+  };
+  const series=names.map((n,i)=>({name:n,color:i?[GREEN,"#3b7f5a","#6fae8c","#9ed0b4"][i%4]:GREEN,
+    thick:i===0,pts:norm(n)}));
+  return `<h2>Trend across every recorded run</h2><div class="grid">
+    ${card("Peak throughput over time",
+      "Each line is one workload at its highest thread count, across all "+all.length+" runs on file. This is what the history is for: a step in this line is where the change happened.",
+      lineChart(series,{xlab:"days since first run",ylab:"ops/s",w:1100,h:280}))}</div>`;
+}
+
+function overview(cur,base,threshold){
+  // No verdict. This page exists to show what the numbers did, and a
+  // pass/fail badge only hides the shape of the change behind a word.
+  const rows=[];
+  const cw=cur?.metrics?.throughput?.workloads||{}, bw=base?.metrics?.throughput?.workloads||{};
+  for(const [n,v] of Object.entries(cw)){
+    const top=(v.points||[]).reduce((a,p)=>!a||p.threads>a.threads?p:a,null);
+    const bt=((bw[n]||{}).points||[]).reduce((a,p)=>!a||p.threads>a.threads?p:a,null);
+    if(top)rows.push({name:n.replace(/_/g," ")+" ops/s",cur:top.ops,base:bt?bt.ops:null});
+  }
+  for(const s of (cur?.metrics?.rss?.soaks)||[]){
+    if(s.rss_peak_mib!=null)rows.push({name:(s.label||s.variant)+" peak RSS MiB",cur:s.rss_peak_mib,
+      base:((base?.metrics?.rss?.soaks)||[]).find(b=>(b.label||b.variant)===(s.label||s.variant))?.rss_peak_mib});
+  }
+  for(const r of (cur?.metrics?.binary_size?.rows)||[]){
+    rows.push({name:r.artifact+" KiB",cur:r.lark_cost_kib,
+      base:((base?.metrics?.binary_size?.rows)||[]).find(b=>b.artifact===r.artifact)?.lark_cost_kib});
+  }
+  const bIso={};
+  for(const c of (base?.metrics?.isolation?.matrix)||[]) bIso[c.flavor+"/"+c.isolation]=c;
+  for(const c of (cur?.metrics?.isolation?.matrix)||[]){
+    const b=bIso[c.flavor+"/"+c.isolation]||{};
+    rows.push({name:`${c.flavor}/${c.isolation} uncontended commits/s`,
+      cur:c.uncontended_commits_per_s,base:b.uncontended_commits_per_s});
+    rows.push({name:`${c.flavor}/${c.isolation} contended commits/s`,
+      cur:c.contended_commits_per_s,base:b.contended_commits_per_s});
+  }
+  const r=cur?.run||{};
+  const guard=r.loadguard?.passed;
+  const meta=`<table><tbody>
+    <tr><td>commit</td><td class="num">${esc((r.commit||"").slice(0,12))}</td></tr>
+    <tr><td>label</td><td class="num">${esc(r.label||"")}</td></tr>
+    <tr><td>recorded</td><td class="num">${esc(r.timestamp||"")}</td></tr>
+    <tr><td>toolchain</td><td class="num">${esc(r.toolchain||"")}</td></tr>
+    <tr><td>load guard</td><td class="num ${guard===false?"down":""}">${guard===false?"did not pass":guard===true?"passed":"n/a"}</td></tr>
+  </tbody></table>`;
+  const warn=guard===false?`<p class="note" style="color:var(--amber)">The load guard did not pass, so the timings on this run were taken on a busy machine and are not comparable.</p>`:"";
+  return `<div class="grid" style="padding-top:16px">
+    ${card("This run","",meta+warn)}
+    ${card("Every number, side by side",
+      "Higher is better for rates, lower for memory and size; the delta column already accounts for which.",
+      bars(rows,"",threshold))}
+  </div>`;
+}
+
+let RUNS=[];
+async function boot(){
+  let manifest;
+  try{
+    manifest=await (await fetch("runs/index.json",{cache:"no-store"})).json();
+  }catch(e){
+    $("#main").innerHTML=`<div class="empty">No runs published yet. The first CI run on the default branch will create <code>runs/index.json</code>.</div>`;
+    return;
+  }
+  const list=manifest.runs||[];
+  if(!list.length){$("#main").innerHTML=`<div class="empty">The manifest is empty.</div>`;return;}
+  RUNS=await Promise.all(list.map(async m=>{
+    try{ return {meta:m, doc:await (await fetch("runs/"+m.file,{cache:"no-store"})).json()}; }
+    catch(e){ return {meta:m, doc:null}; }
+  }));
+  RUNS=RUNS.filter(r=>r.doc);
+  const opt=r=>`<option value="${esc(r.meta.file)}">${esc((r.meta.commit||"").slice(0,10))} ${esc(r.meta.label||"")} ${esc((r.meta.timestamp||"").slice(0,16))}</option>`;
+  $("#cur").innerHTML=RUNS.map(opt).join("");
+  $("#base").innerHTML=`<option value="">(none)</option>`+RUNS.map(opt).join("");
+  if(RUNS.length>1)$("#base").value=RUNS[1].meta.file;
+  for(const el of ["#cur","#base","#thresh"])$(el).addEventListener("change",draw);
+  draw();
+}
+function draw(){
+  const cur=RUNS.find(r=>r.meta.file===$("#cur").value)?.doc;
+  const base=RUNS.find(r=>r.meta.file===$("#base").value)?.doc||null;
+  const th=parseFloat($("#thresh").value);
+  $("#main").innerHTML=overview(cur,base,th)+throughputSection(cur,base,th)
+    +isolationSection(cur,base,th)+rssSection(cur,base,th)+sizeSection(cur,base,th)
+    +trendSection(RUNS,null);
+}
+boot();
+</script>

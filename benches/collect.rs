@@ -40,6 +40,7 @@ const SOAK: &[&str] = &["soak"];
 const MEMORY: &[&str] = &["memory", "rss"];
 const BINARY_SIZE: &[&str] = &["size", "binary_size"];
 const CORRECTNESS: &[&str] = &["transaction", "correctness"];
+const ISOLATION: &[&str] = &["isolation"];
 const VIABILITY: &[&str] = &["viability"];
 const RETRACTION: &[&str] = &["retraction"];
 
@@ -79,6 +80,7 @@ fn main() {
             "correctness",
             deterministic(&mut bag, CORRECTNESS, "% of committed updates surviving"),
         ),
+        ("isolation", deterministic(&mut bag, ISOLATION, "commits/s")),
         ("viability", deterministic(&mut bag, VIABILITY, "")),
     ]);
     let retractions = Json::Arr(bag.take_all(RETRACTION));
@@ -192,6 +194,7 @@ fn accepted_names() -> Vec<&'static str> {
         MEMORY,
         BINARY_SIZE,
         CORRECTNESS,
+        ISOLATION,
         VIABILITY,
         RETRACTION,
     ] {

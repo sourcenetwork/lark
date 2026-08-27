@@ -84,17 +84,6 @@ jobs:
   # single-writer guard (invariant S2) exists at all, because it is a
   # `debug_assert`, so the calibration that proves the guard fires on an
   # unserialized insert only runs there.
-  loom:
-    runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: --cfg loom -D warnings
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --release --test loom_memtable -- --nocapture
-      - run: cargo test --test loom_memtable -- --nocapture
-
   msrv:
     runs-on: ubuntu-latest
     steps:
@@ -226,7 +215,7 @@ jobs:
       - name: Loom models, release and debug
         run: just loom-all
 
-  # The the published read view chaos workload at full size. `cargo test` runs a smaller
+  # The read-view chaos workload at full size. `cargo test` runs a smaller
   # default so the ordinary gate stays fast; this job is what covers
   # the full one.
   chaos:
@@ -463,13 +452,29 @@ jobs:
   # count, which is the only retention GitHub offers; the prune step
   # below deletes older ones explicitly so the count is what was asked
   # for rather than what the calendar happened to leave.
-  perf-report:
+  # Each family on its own runner. A sweep that runs every benchmark in
+  # one job takes as long as the sum of them and reports nothing until
+  # the slowest finishes; split, the wall clock is the slowest single
+  # family and a failure names which one.
+  bench:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [test, clippy, fmt, doc, deny]
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-    permissions:
-      actions: write
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        family:
+          - point_read
+          - write_buffered
+          - write_durable
+          - scan
+          - batch
+          - large_value
+          - transaction
+          - memory
+          - size
+          - allocs
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -479,44 +484,75 @@ jobs:
         id: guard
         run: just loadguard
         continue-on-error: true
-      - name: Benchmark sweep
+      - name: Run ${{ matrix.family }}
         env:
-          LARK_BENCH_OUT: ${{ github.workspace }}/bench-out.jsonl
-        run: just bench-collect
-      - name: Assemble the run file
-        env:
-          LARK_BENCH_OUT: ${{ github.workspace }}/bench-out.jsonl
-          # A run measured on a runner the guard flagged is recorded as
-          # contaminated rather than dropped, so the page says so.
-          LARK_RUN_TRUST: ${{ steps.guard.outcome == 'success' && 'clean' || 'contaminated' }}
-        run: |
-          cargo run --release --bench collect -- \
-            --out "run-${GITHUB_SHA::12}.json" \
-            --commit "${GITHUB_SHA::12}" --label main
-      - name: Render the page
-        run: |
-          python3 tools/perf-report/render_html.py \
-            --current "run-${GITHUB_SHA::12}.json" \
-            --out "perf-${GITHUB_SHA::12}.html"
+          LARK_BENCH_OUT: ${{ github.workspace }}/bench-${{ matrix.family }}.jsonl
+        run: cargo bench --bench ${{ matrix.family }}
       - uses: actions/upload-artifact@v4
         with:
-          name: perf-${{ github.sha }}
-          path: |
-            perf-*.html
-            run-*.json
-          retention-days: 90
+          name: bench-${{ matrix.family }}
+          path: bench-${{ matrix.family }}.jsonl
           if-no-files-found: error
-      - name: Keep only the newest 30 perf artifacts
-        env:
-          GH_TOKEN: ${{ github.token }}
+          retention-days: 7
+
+  # Assemble every family into one run document, file it alongside every
+  # earlier run, and publish the dashboard that reads the whole set.
+  #
+  # The run documents are the artifact, not a rendered page. A page
+  # regenerated per run shows one run and loses the comparison the
+  # moment it is replaced; keeping the documents is what lets the
+  # dashboard plot a metric across every run ever recorded.
+  perf-site:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [bench]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bench-*
+          path: bench-artifacts
+          merge-multiple: true
+      - name: Assemble the run document
         run: |
           set -euo pipefail
-          # Newest first; everything past the 30th goes.
-          gh api --paginate \
-            "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
-            --jq '.artifacts[] | select(.name | startswith("perf-")) | "\(.created_at) \(.id)"' \
-            | sort -r | tail -n +31 | awk '{print $2}' \
-            | while read -r id; do
-                echo "deleting artifact $id"
-                gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}"
-              done
+          cat bench-artifacts/*.jsonl > bench-out.jsonl
+          LARK_BENCH_OUT="$PWD/bench-out.jsonl" \
+            cargo run --release --bench collect -- \
+              --out "run-${GITHUB_SHA::12}.json" \
+              --commit "${GITHUB_SHA}" --label main
+      - name: Fetch the runs already published
+        run: |
+          set -euo pipefail
+          mkdir -p site
+          # `keep_files` on the publish step preserves what is already
+          # there, so only this run's document has to be produced here.
+          cp tools/perf-site/index.html site/index.html
+      - name: Fetch the existing history
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          git fetch origin gh-pages --depth=1
+          git --work-tree=site checkout origin/gh-pages -- runs 2>/dev/null || true
+      - name: File this run
+        run: python3 tools/perf-site/publish.py "run-${GITHUB_SHA::12}.json" site
+      - name: Publish
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          publish_branch: gh-pages
+          keep_files: true
+          commit_message: "perf: record run ${{ github.sha }}"
+      - name: Link
+        run: |
+          {
+            echo "## Performance dashboard"
+            echo ""
+            echo "https://${GITHUB_REPOSITORY%%/*}.github.io/${GITHUB_REPOSITORY##*/}/"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -15,7 +15,9 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use lark_kv::{OptimisticTransactionDb, Transaction, TransactionDb, TransactionError};
+use lark_kv::{
+    IsolationLevel, OptimisticTransactionDb, Transaction, TransactionDb, TransactionError,
+};
 
 const COUNTER_KEY: &[u8] = b"txn/counter";
 const RACE_THREADS: usize = 8;
@@ -72,15 +74,37 @@ impl Flavor {
     }
 }
 
-fn with_db<R>(flavor: Flavor, tag: &str, f: impl FnOnce(&dyn TxnDb) -> R) -> R {
+/// The isolation levels the benchmark sweeps.
+///
+/// The level decides how much of a transaction's footprint is
+/// validated at commit, so it is the knob that trades throughput for
+/// the anomalies it refuses. Sweeping it is what makes that trade
+/// visible as a number rather than an assertion: `ReadCommitted`
+/// validates only what was written, `SnapshotIsolation` adds the keys
+/// read for update, and `Serializable` adds the whole read set and so
+/// pays for the anti-dependency check that refuses write skew.
+const LEVELS: [(IsolationLevel, &str); 3] = [
+    (IsolationLevel::ReadCommitted, "read-committed"),
+    (IsolationLevel::SnapshotIsolation, "snapshot"),
+    (IsolationLevel::Serializable, "serializable"),
+];
+
+fn with_db<R>(
+    flavor: Flavor,
+    isolation: IsolationLevel,
+    tag: &str,
+    f: impl FnOnce(&dyn TxnDb) -> R,
+) -> R {
     let tmp = common::TempDb::new(tag);
     let opts = common::default_opts();
     let dir = tmp.dir.display().to_string();
     match flavor {
         Flavor::Pessimistic => f(&TransactionDb::open(tmp.path(), opts)
-            .unwrap_or_else(|e| panic!("open pessimistic db at {dir}: {e}"))),
+            .unwrap_or_else(|e| panic!("open pessimistic db at {dir}: {e}"))
+            .with_isolation(isolation)),
         Flavor::Optimistic => f(&OptimisticTransactionDb::open(tmp.path(), opts)
-            .unwrap_or_else(|e| panic!("open optimistic db at {dir}: {e}"))),
+            .unwrap_or_else(|e| panic!("open optimistic db at {dir}: {e}"))
+            .with_isolation(isolation)),
     }
 }
 
@@ -236,17 +260,18 @@ fn counter_race(db: &dyn TxnDb) -> Race {
 
 /// The outcome is a thread interleaving, so one sample is not a measurement.
 /// Every run is reported alongside the median and the observed spread.
-fn correctness(flavor: Flavor) -> String {
+fn correctness(flavor: Flavor, isolation: IsolationLevel, level: &str) -> String {
     let mut runs = Vec::with_capacity(RACE_RUNS);
     let mut pcts = Vec::with_capacity(RACE_RUNS);
     for run in 0..RACE_RUNS {
         let race = with_db(
             flavor,
-            &format!("txn-race-{}-{run}", flavor.name()),
+            isolation,
+            &format!("txn-race-{}-{level}-{run}", flavor.name()),
             counter_race,
         );
         println!(
-            "{:<12} run {run}: {}/{EXPECTED} increments survived ({:.1}%), \
+            "{:<12} {level:<15} run {run}: {}/{EXPECTED} increments survived ({:.1}%), \
              attempts: {} commits / {} conflicts / {} busy / {} abandoned",
             flavor.name(),
             race.survived,
@@ -357,22 +382,51 @@ fn timing(db: &dyn TxnDb, reps: usize, uncontended_ops: u64, contended_ops: u64)
     }
 }
 
-fn run(flavor: Flavor, reps: usize, uncontended_ops: u64, contended_ops: u64) -> (String, String) {
-    let correctness_json = correctness(flavor);
+fn run(
+    flavor: Flavor,
+    isolation: IsolationLevel,
+    level: &str,
+    reps: usize,
+    uncontended_ops: u64,
+    contended_ops: u64,
+) -> (String, String, String) {
+    let correctness_json = correctness(flavor, isolation, level);
 
-    let mut rates = with_db(flavor, &format!("txn-rate-{}", flavor.name()), |db| {
-        timing(db, reps, uncontended_ops, contended_ops)
-    });
+    let mut rates = with_db(
+        flavor,
+        isolation,
+        &format!("txn-rate-{}-{level}", flavor.name()),
+        |db| timing(db, reps, uncontended_ops, contended_ops),
+    );
     let timing_json = rates.json();
     println!(
-        "{:<12} commits/s: uncontended {:.0}, contended x{} {:.0}",
+        "{:<12} {level:<15} commits/s: uncontended {:.0}, contended x{} {:.0}",
         flavor.name(),
         common::median(&mut rates.uncontended),
         CONTENDED_THREADS,
         common::median(&mut rates.contended)
     );
 
-    (correctness_json, timing_json)
+    // One flat row per matrix cell, so the dashboard can graph the
+    // levels against each other without reaching into the nested
+    // correctness and timing documents.
+    let a = &rates.contended_attempts;
+    let decided = a.commits + a.conflicts + a.busy;
+    let conflict_rate = if decided == 0 {
+        0.0
+    } else {
+        100.0 * (a.conflicts + a.busy) as f64 / decided as f64
+    };
+    let cell_json = format!(
+        "{{\"flavor\":\"{}\",\"isolation\":\"{level}\",\
+         \"uncontended_commits_per_s\":{:.1},\"contended_commits_per_s\":{:.1},\
+         \"conflict_rate_pct\":{conflict_rate:.2}}}",
+        flavor.name(),
+        common::median(&mut rates.uncontended),
+        common::median(&mut rates.contended),
+    );
+
+    (correctness_json, timing_json, cell_json)
 }
 
 fn main() {
@@ -386,17 +440,45 @@ fn main() {
     println!(
         "transaction bench: {RACE_THREADS} threads x {RACE_INCREMENTS} increments of one counter"
     );
-    let (pessimistic_correctness, pessimistic_timing) =
-        run(Flavor::Pessimistic, reps, uncontended_ops, contended_ops);
-    let (optimistic_correctness, optimistic_timing) =
-        run(Flavor::Optimistic, reps, uncontended_ops, contended_ops);
+    // The full matrix: every flavor against every isolation level. The
+    // point of sweeping both is that they are not independent. A
+    // pessimistic lock and a serializable read set refuse overlapping
+    // sets of anomalies, so the cost of the stricter level depends on
+    // which flavor is already paying for part of it.
+    let mut cells = Vec::with_capacity(2 * LEVELS.len());
+    let mut rows = Vec::with_capacity(2 * LEVELS.len());
+    for flavor in [Flavor::Pessimistic, Flavor::Optimistic] {
+        for (isolation, level) in LEVELS {
+            let (correctness_json, timing_json, cell_json) = run(
+                flavor,
+                isolation,
+                level,
+                reps,
+                uncontended_ops,
+                contended_ops,
+            );
+            cells.push(format!(
+                "{{\"flavor\":\"{}\",\"isolation\":\"{level}\",\
+                 \"correctness\":{correctness_json},\"throughput\":{timing_json}}}",
+                flavor.name()
+            ));
+            rows.push(cell_json);
+        }
+    }
 
     common::write_family(
         "transaction",
+        &format!("{{\"quick\":{quick},\"matrix\":[{}]}}", cells.join(",")),
+    );
+    common::write_family(
+        "isolation",
         &format!(
-            "{{\"quick\":{quick},\
-             \"correctness\":{{\"pessimistic\":{pessimistic_correctness},\"optimistic\":{optimistic_correctness}}},\
-             \"throughput\":{{\"pessimistic\":{pessimistic_timing},\"optimistic\":{optimistic_timing}}}}}"
+            "{{\"unit\":\"commits/s\",\"quick\":{quick},\
+             \"note\":\"Every transaction flavor against every isolation level. The level \
+             decides how much of a transaction's footprint is validated at commit, so a \
+             stricter level refuses more and commits fewer; that refusal is the work it is \
+             doing.\",\"matrix\":[{}]}}",
+            rows.join(",")
         ),
     );
 }

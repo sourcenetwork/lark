@@ -135,9 +135,9 @@ pub(crate) fn user_key_of(composed: &[u8]) -> Option<Vec<u8>> {
             i += 1;
             continue;
         }
-        match body.get(i + 1)? {
-            &SEP => return (i + 2 == body.len()).then_some(out),
-            &ESCAPE => out.push(SEP),
+        match *body.get(i + 1)? {
+            SEP => return (i + 2 == body.len()).then_some(out),
+            ESCAPE => out.push(SEP),
             _ => return None,
         }
         i += 2;
