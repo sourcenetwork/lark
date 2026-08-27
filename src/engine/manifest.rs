@@ -1335,7 +1335,17 @@ mod tests {
         let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
         // No files are ever added, so the canonical form stays tiny and
         // the floor is the whole budget.
-        for seq in 0..20_000u64 {
+        //
+        // 8,000 rather than more: `SetLastSeq` is a syncing edit, so
+        // every one of these is an fsync, and the count is what the test
+        // costs. At roughly 17 bytes a record this appends about 136 KiB
+        // against a 64 KiB rewrite threshold, so the assertion below can
+        // only pass if the log was rewritten at least twice, which is
+        // the property. Raising it buys no coverage and cost 20,000
+        // fsyncs, which timed out at five minutes on a Windows runner
+        // while finishing in under a second on Linux.
+        const EDITS: u64 = 8_000;
+        for seq in 0..EDITS {
             vs.apply(&[VersionEdit::SetLastSeq(seq)]).unwrap();
         }
         drop(vs);
@@ -1350,7 +1360,7 @@ mod tests {
 
         // And it still replays to the state those edits describe.
         let reopened = VersionSet::open(dir.path(), &sst_dir).unwrap();
-        assert_eq!(reopened.current().last_seq, 19_999);
+        assert_eq!(reopened.current().last_seq, EDITS - 1);
     }
 
     /// A manifest written before the stamp existed still opens, and is
