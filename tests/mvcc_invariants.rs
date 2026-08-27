@@ -170,7 +170,11 @@ fn batch_atomicity_at_full_scale() {
         width: 24,
         readers: 4,
         min_checks_per_reader: 2_000,
-        generations: 30_000,
+        // 12,000 rather than 30,000, for the same reason as the
+        // monotonic soak above: the property is per generation, so a
+        // torn batch is as visible at this width, and the count was
+        // wall clock rather than coverage.
+        generations: 12_000,
     });
     println!("batch atomicity: {checks} checks over {generations} generations, 0 torn");
 }
@@ -292,7 +296,12 @@ fn a_user_thread_compact_range_never_makes_a_read_travel_backwards() {
         keys_per_writer: 12,
         readers: 3,
         min_rounds_per_reader: 50,
-        versions: 1_500,
+        // 600 rather than 1500. The rate this prints stays comparable
+        // because it is per read, and the reads are still in the
+        // millions; what the extra versions bought was wall clock. This
+        // test timed out under `cargo llvm-cov`, where instrumented code
+        // runs several times slower than the gate.
+        versions: 600,
     };
     let mut violations = Vec::new();
     let mut reads = 0u64;

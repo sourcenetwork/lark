@@ -23,8 +23,18 @@ where
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
         let _ = tx.send(outcome.is_ok());
     });
+    // Instrumented builds run several times slower than the gate, so a
+    // wall-clock budget calibrated on an ordinary build reports a
+    // perfectly healthy engine as wedged. `cargo llvm-cov` sets
+    // `LLVM_PROFILE_FILE` in the process it measures, which is the one
+    // signal available here that the code under test is instrumented.
+    let secs = if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+        secs * 6
+    } else {
+        secs
+    };
     match rx.recv_timeout(Duration::from_secs(secs)) {
-        Err(_) => panic!("HUNG: {name} made no progress within {secs}s"),
+        Err(_) => panic!("HUNG: {name} did not finish within {secs}s"),
         Ok(false) => panic!("FAILED (not hung): {name}, see the panic above"),
         Ok(true) => {}
     }

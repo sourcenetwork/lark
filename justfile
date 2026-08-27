@@ -37,7 +37,10 @@ msrv:
 # test fails on the profile's slow-timeout instead of holding the whole
 # instrumented run open until the job's ceiling.
 cov-summary:
-    cargo llvm-cov nextest --summary-only --workspace
+    # The `ci` profile, not the default: instrumented code runs several
+    # times slower, and the default profile's 60s slow-timeout turns the
+    # heavier soaks into timeouts that say nothing about the code.
+    cargo llvm-cov nextest --summary-only --workspace --profile ci
 
 # The browsable HTML report, for reading locally.
 cov:
