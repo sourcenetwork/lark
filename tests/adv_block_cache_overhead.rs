@@ -69,6 +69,7 @@ const KEYS: u32 = 60_000;
 const DIR_ENV: &str = "LARK_ADV_OVERHEAD_DIR";
 const CACHE_ENV: &str = "LARK_ADV_OVERHEAD_CACHE";
 const BS_ENV: &str = "LARK_ADV_OVERHEAD_BS";
+const ROUNDS_ENV: &str = "LARK_ADV_OVERHEAD_ROUNDS";
 
 fn key(i: u32) -> Vec<u8> {
     format!("k{i:07}").into_bytes()
@@ -99,8 +100,12 @@ fn adv_overhead_child() {
     )
     .unwrap();
 
+    let rounds: u32 = std::env::var(ROUNDS_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
     let heap_open = LIVE.load(Ordering::Relaxed);
-    for _ in 0..2 {
+    for _ in 0..rounds {
         for i in 0..KEYS {
             assert!(db.get(&key(i)).unwrap().is_some());
         }
@@ -153,11 +158,12 @@ fn a_cached_entry_costs_no_more_heap_than_it_is_charged() {
         capacity: i64,
         adds: i64,
     }
-    let run_in = |data: &std::path::Path, cache_bytes: usize| -> Row {
+    let run_rounds = |data: &std::path::Path, cache_bytes: usize, rounds: u32| -> Row {
         let out = std::process::Command::new(&exe)
             .args(["--exact", "adv_overhead_child", "--nocapture"])
             .env(DIR_ENV, data)
             .env(CACHE_ENV, cache_bytes.to_string())
+            .env(ROUNDS_ENV, rounds.to_string())
             .output()
             .expect("spawn child");
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -185,6 +191,7 @@ fn a_cached_entry_costs_no_more_heap_than_it_is_charged() {
             adds: field("adds="),
         }
     };
+    let run_in = |data: &std::path::Path, cache_bytes: usize| run_rounds(data, cache_bytes, 2);
     let run = |cache_bytes: usize| run_in(dir.path(), cache_bytes);
 
     // Baseline: the same reads with no cache at all. A disabled cache
@@ -252,13 +259,44 @@ charged_per_entry={:.1} over_capacity={} ratio={:.4}",
         "an unevicted entry costs {} heap bytes more than the charge it is charged",
         roomy_excess as f64 / roomy.adds as f64
     );
+    // The margin a saturated cache carries over its byte budget: the
+    // bookkeeping `ENTRY_OVERHEAD` charges but `usage()` reports outside
+    // the block bytes, plus whatever the map's deferred reclamation has
+    // retired and not yet freed. Measured at 1.24x with 1 KiB blocks and
+    // 1.31x with 256-byte ones; the ceiling below leaves room for
+    // allocator size-class rounding and is far under the 3.8x that
+    // leaving the reclamation undrained produces.
     for (label, real, capacity) in [
         ("1 KiB blocks", tight_real, tight.capacity),
         ("256 B blocks", tiny_real, tiny.capacity),
     ] {
         assert!(
-            real <= capacity * 5 / 4,
+            real <= capacity * 7 / 5,
             "a saturated cache with {label} holds {real} heap bytes against a {capacity}-byte budget"
         );
     }
+
+    // The margin has to be a constant, not a leak. Tripling the churn
+    // through the same budget must not move resident memory: if it does,
+    // something the cache evicted is never being freed, and the byte
+    // budget bounds only what the cache accounts rather than what it
+    // holds.
+    let churned = run_rounds(small_dir.path(), 2 * 1024 * 1024, 6);
+    let churned_real = churned.heap - tiny_off.heap;
+    println!(
+        "ADVOVERHEAD churn_flat rounds=2 real={tiny_real} adds={} | rounds=6 real={churned_real} adds={} ratio={:.4}",
+        tiny.adds,
+        churned.adds,
+        churned_real as f64 / tiny_real as f64
+    );
+    assert!(
+        churned.adds > tiny.adds,
+        "the longer run cached no more entries than the short one, so it is not more churn:          {} against {}",
+        churned.adds,
+        tiny.adds
+    );
+    assert!(
+        churned_real <= tiny_real + tiny_real / 10,
+        "tripling the churn through the same budget grew resident memory from {tiny_real} to          {churned_real} bytes: the cache is retaining what it evicts"
+    );
 }

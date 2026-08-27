@@ -546,11 +546,24 @@ impl CacheShard {
 ///   allocation and never the block's bytes: those are freed under the
 ///   ring mutex the moment the hand takes the slot.
 ///
-/// Together those put live heap a few percent above the budget at
-/// saturation: 3.9% measured with 1 KiB blocks, 2.5% with 256-byte
-/// blocks. The overshoot is flat in the number of entries churned
-/// through the cache (1x, 3x, 10x and 30x the budget all measure the
-/// same), so it is a constant margin rather than a leak.
+/// Together those put live heap above the budget at saturation by a
+/// fixed margin: 24% measured with 1 KiB blocks, 30% with 256-byte
+/// blocks, where a byte of block payload carries the most bookkeeping.
+/// The margin is a constant, not a leak, and
+/// `tests/adv_block_cache_overhead.rs` proves it on every run by
+/// tripling the churn through the same budget and requiring resident
+/// memory not to move: 40,000 and 120,000 inserts through a 2 MiB cache
+/// measure within 0.4% of each other.
+///
+/// The margin is only constant because both halves are drained. A map
+/// node that nothing drains grows without bound in churn rather than in
+/// working set: the same probe measured 3.8x the budget after 40,000
+/// inserts and rising. Two things keep it flat, and both are load-
+/// bearing. [`EVICTIONS_PER_RECLAIM`] drains the removing thread. And
+/// the compaction worker drains itself before it parks, because a
+/// thread that has taken a reclamation guard and then idles pins every
+/// batch holding a node born before its last published epoch - which,
+/// for a worker between compactions, is nearly all of them.
 ///
 /// The map's reclamation guard is taken and dropped inside each map
 /// call, so no guard is ever held across a lock acquisition or a wait,
