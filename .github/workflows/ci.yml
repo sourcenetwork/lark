@@ -313,7 +313,7 @@ jobs:
         with:
           components: miri
       - uses: Swatinem/rust-cache@v2
-      - run: cargo miri test --lib -- --test-threads=1 engine::arena:: engine::skiplist:: engine::memtable:: engine::block:: slice::tests::
+      - run: "cargo miri test --lib -- --test-threads=1 engine::arena:: engine::skiplist:: engine::memtable:: engine::block:: slice::tests::"
 
   # Long-running stress, soak, and fault-injection tests. Gated behind
   # `#[ignore]` in the main crate so `cargo test` stays fast for PRs;
