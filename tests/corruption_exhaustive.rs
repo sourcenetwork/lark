@@ -53,10 +53,15 @@ use common::fault::{
 };
 use harness::{
     BLOOM, DATA, FOOTER, INDEX, Recovered, SAMPLE, SEED, TAG_ADD_FILE, Tally,
-    assert_engine_never_panicked, batch_fixture, every, exactly, manifest_frames, never_invents,
-    read_state, region, sample, sst_regions, table_fixture, trial, valid_prefix, wal_fixture,
-    wal_frames, watch,
+    assert_engine_never_panicked, every, exactly, manifest_frames, never_invents, read_state,
+    region, sample, sst_regions, table_fixture, trial, valid_prefix, wal_frames, watch,
 };
+// The WAL fixtures are built by killing a child process, so they exist
+// only where "was it killed" has an answer. The SSTable and MANIFEST
+// sweeps below use `table_fixture`, which spawns nothing, and run
+// everywhere.
+#[cfg(target_os = "linux")]
+use harness::{batch_fixture, wal_fixture};
 
 // ─── WAL: truncation ────────────────────────────────────────────────────
 
