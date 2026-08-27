@@ -16,6 +16,17 @@ struct CacheKey {
     offset: u64,
 }
 
+// `deny.toml` ignores RUSTSEC-2026-0253 on the grounds that this key
+// cannot have a panicking destructor. `Copy` and `Drop` are mutually
+// exclusive in Rust, so requiring `Copy` here is the whole proof, and
+// it is checked at compile time: give `CacheKey` a field with a
+// destructor and this stops compiling rather than silently making the
+// ignore a lie.
+const _: fn() = || {
+    fn assert_copy<T: Copy>() {}
+    assert_copy::<CacheKey>();
+};
+
 /// Hard upper bound on the number of shards the cache will ever
 /// create. A 32-bit shard-bit config of 8 → 256 shards is plenty
 /// for a single-process embedded store.
