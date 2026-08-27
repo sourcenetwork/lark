@@ -23,16 +23,20 @@ where
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
         let _ = tx.send(outcome.is_ok());
     });
-    // Instrumented builds run several times slower than the gate, so a
-    // wall-clock budget calibrated on an ordinary build reports a
-    // perfectly healthy engine as wedged. `cargo llvm-cov` sets
-    // `LLVM_PROFILE_FILE` in the process it measures, which is the one
-    // signal available here that the code under test is instrumented.
-    let secs = if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
-        secs * 6
-    } else {
-        secs
-    };
+    // A backstop against a wedge, not a performance gate. Its only job
+    // is to turn a hang into a named failure rather than a bare harness
+    // timeout, so it has to sit under nextest's own bound and well above
+    // anything a merely slow host produces. The per-call numbers below
+    // were calibrated on this workstation and are kept only as
+    // documentation of what each body ought to cost: at 180s one of them
+    // fired on a Windows runner where the engine was working fine, and
+    // it fired before the harness could say anything more useful.
+    //
+    // 480s against the `ci` profile's 600s kill (.config/nextest.toml),
+    // which also covers `cargo llvm-cov`, where instrumented code runs
+    // several times slower than the gate.
+    const WEDGE_BUDGET_SECS: u64 = 480;
+    let secs = secs.max(WEDGE_BUDGET_SECS);
     match rx.recv_timeout(Duration::from_secs(secs)) {
         Err(_) => panic!("HUNG: {name} did not finish within {secs}s"),
         Ok(false) => panic!("FAILED (not hung): {name}, see the panic above"),
@@ -185,14 +189,23 @@ fn disabling_the_l0_count_trigger_unblocks_fifo_and_universal() {
 
 #[test]
 fn concurrent_writers_with_zero_workers_never_return_busy() {
-    with_deadline("concurrent_zero_workers", 180, || {
+    with_deadline("concurrent_zero_workers", 480, || {
         let dir = tempfile::tempdir().unwrap();
         let db = std::sync::Arc::new(Db::open(dir.path(), zero_worker_opts()).unwrap());
         let mut handles = Vec::new();
         for t in 0..4usize {
             let db = std::sync::Arc::clone(&db);
             handles.push(std::thread::spawn(move || {
-                for i in 0..4000usize {
+                // 1,500 rather than 4,000. With zero background
+                // workers every flush and every level promotion runs on
+                // these threads, so the cost is dominated by durable
+                // operations, which a Windows CI disk serves about two
+                // orders of magnitude slower than a Linux tmpfs. The
+                // property is that a writer never sees `Busy`, and a
+                // writer that survives 1,500 rotations of a 16 KiB
+                // buffer has already crossed every stall threshold
+                // `zero_worker_opts` sets.
+                for i in 0..1500usize {
                     let k = format!("t{t}k{i:08}");
                     if let Err(e) = db.put(k.as_bytes(), &val(i)) {
                         return Err(format!("thread {t} put {i}: {e:?}"));

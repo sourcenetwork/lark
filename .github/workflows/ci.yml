@@ -43,7 +43,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    # Windows is the slow one: it serves an fsync about two orders of
+    # magnitude slower than a Linux tmpfs, and the `ci` nextest profile
+    # retries a failure once, so one slow test can cost twice. Exceeding
+    # this reports as a cancelled job, which reads like someone pressed a
+    # button rather than like a budget being hit.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
