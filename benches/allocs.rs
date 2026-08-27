@@ -24,6 +24,8 @@
 //! subtraction and no control can flatter it. The gate uses whichever of
 //! the two is larger.
 
+mod common;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::hint::black_box;
@@ -140,6 +142,48 @@ fn key_control(ops: usize, key: fn(usize) -> String) -> Counts {
         }
     })
     .1
+}
+
+/// Emit the measured budgets as a metric family, so this bench feeds the
+/// run document the perf site is built from like every other one.
+///
+/// Without this the family is missing from the run: the harness writes it
+/// only when a bench asks, and `allocs` was the one that never did, so its
+/// CI job printed a perfect table and then failed with "No files were
+/// found with the provided path".
+fn emit_family(rows: &[Row]) {
+    let paths: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            format!(
+                "{{\"path\":\"{}\",\"budget\":{},\"achieved\":{},\"bytes_per_op\":{},\
+                 \"met\":{}}}",
+                r.path,
+                fmt_f64(r.budget),
+                fmt_f64(r.achieved()),
+                fmt_f64(r.direct().1),
+                r.met(),
+            )
+        })
+        .collect();
+    common::write_family(
+        "allocs",
+        &format!(
+            "{{\"ops\":{},\"paths\":[{}]}}",
+            rows.first().map_or(0, |r| r.ops),
+            paths.join(",")
+        ),
+    );
+}
+
+/// JSON has no NaN or infinity, so a value that is not finite is emitted
+/// as null rather than as a token no parser accepts.
+fn fmt_f64(v: f64) -> String {
+    if v.is_finite() {
+        format!("{v:.4}")
+    } else {
+        "null".to_string()
+    }
 }
 
 /// One measured path: what it cost, measured two independent ways, and
@@ -607,6 +651,8 @@ fn main() -> ExitCode {
     write_path_breakdown();
     iterator_disclosure();
     rotation_disclosure();
+
+    emit_family(&rows);
 
     if failed.is_empty() {
         println!("\nAll {} allocation budgets met.", rows.len());
