@@ -79,6 +79,9 @@ fn open_on_a_regular_file_path_errors() {
     assert!(Db::open(&path, Options::default()).is_err());
 }
 
+// POSIX permission bits: Windows has no equivalent of a mode that
+// makes a directory unreadable or unsearchable to its owner.
+#[cfg(unix)]
 #[test]
 fn open_inside_a_read_only_parent_errors() {
     use std::os::unix::fs::PermissionsExt;
@@ -93,6 +96,9 @@ fn open_inside_a_read_only_parent_errors() {
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+// POSIX permission bits: Windows has no equivalent of a mode that
+// makes a directory unreadable or unsearchable to its owner.
+#[cfg(unix)]
 #[test]
 fn open_under_an_unsearchable_parent_errors() {
     use std::os::unix::fs::PermissionsExt;

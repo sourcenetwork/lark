@@ -27,6 +27,13 @@
 //! measures its cost rather than hiding it, and is the regression gate
 //! for that contract.
 
+// The whole file drives the `LD_PRELOAD` syscall shim, which exists
+// only on Linux: on macOS the loader equivalent is blocked by system
+// integrity protection, and on Windows there is none. Gated at the file
+// level, like the other shim-backed suites, so the tests are absent
+// rather than failing where the substrate cannot run.
+#![cfg(target_os = "linux")]
+
 mod common;
 
 use common::fault::{
