@@ -163,6 +163,92 @@ fn slice_traits_cover_the_documented_surface() {
     assert_eq!(owned, b"abc");
 }
 
+/// The zero-copy surface has to cover every iterator the crate hands
+/// out, not just the point read. A tailing iterator is the one that
+/// refreshes its own cursor as writes land, so a value borrowed from it
+/// is the easiest to invalidate: the slice must survive both the `next`
+/// and the refresh.
+#[test]
+fn a_tailing_iterator_hands_out_values_that_outlive_its_cursor() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = Db::open(dir.path(), Options::default()).expect("open");
+    for i in 0..64u32 {
+        db.put(
+            format!("t{i:04}").as_bytes(),
+            format!("value-{i}").as_bytes(),
+        )
+        .expect("put");
+    }
+
+    let mut iter = db.iter_tailing();
+    iter.seek_to_first();
+    assert!(iter.valid(), "the iterator must land on the first entry");
+
+    // Take the slice, then move the cursor and write past it, so the
+    // entry the slice came from is no longer the one under the cursor
+    // and the iterator has had a reason to rebuild its view.
+    let first = iter.value_slice().expect("value_slice on a valid entry");
+    assert_eq!(&*first, b"value-0");
+    iter.next();
+    for i in 64..128u32 {
+        db.put(format!("t{i:04}").as_bytes(), b"later")
+            .expect("put");
+    }
+    while iter.valid() {
+        iter.next();
+    }
+
+    assert_eq!(
+        &*first, b"value-0",
+        "a slice taken from a tailing iterator must not follow the cursor",
+    );
+}
+
+/// `value_slice` and `value` must never disagree, on any iterator.
+#[test]
+fn every_iterator_value_slice_agrees_with_its_borrowed_value() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = open(&dir);
+    fill_sequential(&db, 400);
+    force_compaction(&db);
+    // Half in SSTables, half still in the memtable, so both owner
+    // variants are exercised in one walk.
+    for i in 400..600usize {
+        db.put(
+            format!("key_{i:06}").as_bytes(),
+            format!("val_{i:06}").as_bytes(),
+        )
+        .expect("put");
+    }
+
+    let mut checked = 0usize;
+    let mut iter = db.iter();
+    iter.seek_to_first();
+    while iter.valid() {
+        let borrowed = iter.value().expect("value").to_vec();
+        let owned = iter.value_slice().expect("value_slice").to_vec();
+        assert_eq!(borrowed, owned, "iter value and value_slice disagree");
+        checked += 1;
+        iter.next();
+    }
+    assert_eq!(checked, 600, "the walk did not cover every key");
+
+    let mut tail = db.iter_tailing();
+    tail.seek_to_first();
+    let mut tail_checked = 0usize;
+    while tail.valid() {
+        let borrowed = tail.value().expect("value").to_vec();
+        let owned = tail.value_slice().expect("value_slice").to_vec();
+        assert_eq!(borrowed, owned, "tailing value and value_slice disagree");
+        tail_checked += 1;
+        tail.next();
+    }
+    assert_eq!(
+        tail_checked, 600,
+        "the tailing walk did not cover every key"
+    );
+}
+
 #[test]
 fn try_subslice_narrows_a_read_value() {
     let dir = TempDir::new().unwrap();
