@@ -687,7 +687,6 @@ proptest! {
     /// Linux and would panic the default run elsewhere. Run it with
     /// `just test-durability-slow`.
     #[test]
-    #[ignore = "spawns a child process per case; run with `just test-durability-slow`"]
     fn a_power_cut_at_a_random_point_leaves_a_prefix_of_the_model(
         seed in any::<u64>(),
         count in 60usize..=140,

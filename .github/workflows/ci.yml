@@ -28,12 +28,17 @@ defaults:
 
 jobs:
 
+  # All three desktop and server hosts. Windows is not a formality here:
+  # it is the only one of the three without `rustix`, so its file
+  # locking, directory sync and positioned reads take different code in
+  # `src/env/std_env.rs`, and nothing else in the matrix exercises them.
   test:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

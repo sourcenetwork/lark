@@ -281,7 +281,6 @@ fn reads_during_compaction_return_correct_values() {
 // ── long soak, gated behind --ignored ──────────────────────────
 
 #[test]
-#[ignore = "soak - runs for ~10s; unlocked by nightly-stress CI"]
 fn writer_compactor_contention_soak() {
     // db_stress-style mixed workload soak: N threads each do a
     // random mix of put/delete/get over a 10-second window while

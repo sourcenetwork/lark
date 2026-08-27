@@ -519,7 +519,6 @@ fn the_locators_find_the_wal_manifest_and_sstable() {
 ///
 /// Runtime: measured at 0.04s of test time; it spawns two child processes.
 #[test]
-#[ignore = "spawns child processes; run with `just test-fault-slow`"]
 fn a_crash_inside_one_write_batch_applies_all_of_it_or_none() {
     let tmp = TempDir::new().unwrap();
 
@@ -580,7 +579,6 @@ fn a_crash_inside_one_write_batch_applies_all_of_it_or_none() {
 ///
 /// Runtime: measured at 0.2s of test time; it spawns one child process.
 #[test]
-#[ignore = "spawns a child process; run with `just test-fault-slow`"]
 fn a_crash_during_a_background_sstable_write_recovers_to_a_valid_prefix() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("db");

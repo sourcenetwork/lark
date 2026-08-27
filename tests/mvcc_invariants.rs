@@ -112,7 +112,6 @@ fn a_snapshots_view_is_byte_identical_for_its_whole_life() {
 /// Measured runtime is in the `#[ignore]` reason. Kept out of the
 /// default run so `cargo test` stays fast; `just mvcc-slow` runs it.
 #[test]
-#[ignore = "full-scale MVCC soak, measured at 13.8s; run with `just mvcc-slow`"]
 fn snapshot_stability_at_full_scale() {
     let counts = run_snapshot_stability(&StabilityScale {
         keys: 2_000,
@@ -167,7 +166,6 @@ fn a_reader_never_observes_a_write_batch_half_applied() {
 /// Measured runtime is in the `#[ignore]` reason. Run with
 /// `just mvcc-slow`.
 #[test]
-#[ignore = "full-scale batch-atomicity soak, measured at 9.3s; run with `just mvcc-slow`"]
 fn batch_atomicity_at_full_scale() {
     let (checks, generations) = run_batch_atomicity(&AtomicityScale {
         width: 24,
@@ -233,7 +231,6 @@ fn a_repeated_read_of_one_key_never_travels_backwards() {
 /// Measured runtime is in the `#[ignore]` reason. Run with
 /// `just mvcc-slow`.
 #[test]
-#[ignore = "full-scale monotonic-read soak, measured at 4.5s; run with `just mvcc-slow`"]
 fn monotonic_reads_at_full_scale() {
     let outcome = run_monotonic_reads(&MonotonicScale {
         writers: 4,
@@ -287,7 +284,6 @@ fn monotonic_reads_at_full_scale() {
 /// a gate for the view and not for that order. See the note on
 /// [`a_repeated_read_of_one_key_never_travels_backwards`].
 #[test]
-#[ignore = "focused regression gate for the user-thread compact_range read race, measured at 14s; run with `just mvcc-slow`"]
 fn a_user_thread_compact_range_never_makes_a_read_travel_backwards() {
     // 15 rounds of 4 concurrent databases: the exact shape the defect
     // was measured on, so the rate this prints is comparable with the

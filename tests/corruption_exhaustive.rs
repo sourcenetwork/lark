@@ -126,7 +126,6 @@ fn a_wal_truncated_at_a_sampled_offset_replays_whole_records_or_refuses() {
 /// The exhaustive twin of the sampled sweep: every byte offset of the
 /// WAL, with no sampling to hide behind.
 #[test]
-#[ignore = "exhaustive sweep, measured at 0.04s: run `just test-corruption-slow`"]
 fn a_wal_truncated_at_every_offset_replays_whole_records_or_refuses() {
     watch("wal truncation exhaustive", |progress| {
         let fixture = wal_fixture();
@@ -239,7 +238,6 @@ fn a_sampled_bit_flip_anywhere_in_the_wal_is_caught_by_the_record_checksum() {
 
 /// The exhaustive twin: every bit of every byte of the WAL.
 #[test]
-#[ignore = "exhaustive sweep, measured at 0.23s: run `just test-corruption-slow`"]
 fn every_bit_flip_in_the_wal_is_caught_by_the_record_checksum() {
     watch("wal bit flips exhaustive", |progress| {
         let fixture = wal_fixture();
@@ -443,7 +441,6 @@ fn an_sstable_truncated_at_a_sampled_offset_refuses_to_open_and_keeps_the_file()
 
 /// The exhaustive twin: every byte offset of the table.
 #[test]
-#[ignore = "exhaustive sweep, measured at 0.04s: run `just test-corruption-slow`"]
 fn an_sstable_truncated_at_every_offset_refuses_to_open_and_keeps_the_file() {
     watch("sst truncation exhaustive", |progress| {
         let fixture = table_fixture();
@@ -580,7 +577,6 @@ fn a_bit_flip_in_the_sstable_footer_is_caught_or_harmless() {
 /// The exhaustive twin: every bit of every byte of the table, tallied by
 /// region so an unprotected region is named rather than merely counted.
 #[test]
-#[ignore = "exhaustive sweep, measured at 1.3s: run `just test-corruption-slow`"]
 fn every_bit_flip_in_an_sstable_is_caught_or_harmless() {
     watch("sst flips exhaustive", |progress| {
         let fixture = table_fixture();
@@ -677,7 +673,6 @@ fn a_manifest_truncated_at_a_sampled_offset_never_serves_invented_data() {
 
 /// The exhaustive twin: every byte offset of the MANIFEST.
 #[test]
-#[ignore = "exhaustive sweep, measured at 0.06s: run `just test-corruption-slow`"]
 fn a_manifest_truncated_at_every_offset_never_serves_invented_data() {
     watch("manifest truncation exhaustive", |progress| {
         let fixture = table_fixture();
@@ -728,7 +723,6 @@ fn a_sampled_bit_flip_in_the_manifest_stops_replay_without_inventing_data() {
 
 /// The exhaustive twin: every bit of every byte of the MANIFEST.
 #[test]
-#[ignore = "exhaustive sweep, measured at 0.45s: run `just test-corruption-slow`"]
 fn every_bit_flip_in_the_manifest_stops_replay_without_inventing_data() {
     watch("manifest flips exhaustive", |progress| {
         let fixture = table_fixture();
