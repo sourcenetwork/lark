@@ -24,9 +24,26 @@ if (!site) {
 const html = readFileSync(`${site}/index.html`, "utf8");
 const script = html.slice(html.indexOf("<script>") + 8, html.lastIndexOf("</script>"));
 
+// Enough of a <select> for the page's own boot path to run unchanged: a
+// browser adopts the selected option's value the moment the options are
+// written, and `boot` depends on that to pick the run it draws. Setting
+// the values from here instead would test a path the browser never takes.
 const nodes = {};
 const node = (id) =>
-  (nodes[id] ??= { innerHTML: "", value: "", style: {}, addEventListener() {} });
+  (nodes[id] ??= {
+    _html: "",
+    value: id === "#thresh" ? "3" : "",
+    style: {},
+    addEventListener() {},
+    set innerHTML(v) {
+      this._html = v;
+      const opts = [...v.matchAll(/<option value="([^"]*)"([^>]*)>/g)];
+      if (opts.length) this.value = (opts.find((o) => /\bselected\b/.test(o[2])) || opts[0])[1];
+    },
+    get innerHTML() {
+      return this._html;
+    },
+  });
 
 globalThis.document = { querySelector: (sel) => node(sel) };
 globalThis.fetch = async (path) => {
@@ -49,11 +66,6 @@ if (!index.runs?.length) {
   console.error("render check: runs/index.json lists no runs");
   process.exit(1);
 }
-
-// Newest against the next newest, which is what the page defaults to.
-node("#cur").value = index.runs[0].file;
-node("#base").value = index.runs[1]?.file ?? "";
-node("#thresh").value = "3";
 
 new Function(script)();
 await new Promise((r) => setTimeout(r, 250));
