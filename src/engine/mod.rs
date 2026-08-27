@@ -3493,7 +3493,7 @@ fn remove_obsolete_sst_files(
     for level in &version.levels {
         for file in level {
             let path = sst_dir.join(sst_filename(file.meta.file_id));
-            removed_any |= remove_file_if_exists(env, &path)?;
+            removed_any |= remove_file_if_exists(env, &path);
         }
     }
     if removed_any {
@@ -3512,7 +3512,7 @@ fn remove_obsolete_wal_files(
         if path == keep_path {
             continue;
         }
-        removed_any |= remove_file_if_exists(env, &path)?;
+        removed_any |= remove_file_if_exists(env, &path);
     }
     if removed_any {
         env.sync_dir(wal_dir)?;
@@ -3520,18 +3520,33 @@ fn remove_obsolete_wal_files(
     Ok(())
 }
 
-fn remove_file_if_exists(env: &dyn Env, path: &Path) -> std::io::Result<bool> {
+/// Unlink an obsolete file, reporting whether anything was removed.
+///
+/// Best effort by design, and the two callers are the only ones: an
+/// obsolete SSTable or WAL is already unreachable through the manifest,
+/// so failing to unlink it costs disk until the next sweep and costs
+/// correctness nothing. Propagating the failure instead would fail the
+/// operation that happened to trigger the sweep, which is how a
+/// `drop_all` or a compaction came to return "Access is denied".
+///
+/// Windows is why this is not merely defensive. A file unlinked while
+/// something still holds it open stays delete-pending: the name is still
+/// there, and both a second unlink and an open of it are refused with
+/// `ACCESS_DENIED` rather than the `NotFound` unix answers with. A sweep
+/// that races a reader therefore sees an error for a file that is
+/// already on its way out.
+fn remove_file_if_exists(env: &dyn Env, path: &Path) -> bool {
     match env.remove_file(path) {
-        Ok(()) => Ok(true),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        // Named, because a bare "Access is denied" from a filesystem
-        // call says nothing about which file the engine could not
-        // unlink, and the answer is usually that something still holds
-        // it open.
-        Err(err) => Err(std::io::Error::new(
-            err.kind(),
-            format!("removing {}: {err}", path.display()),
-        )),
+        Ok(()) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => {
+            tracing::debug!(
+                path = %path.display(),
+                error = %err,
+                "could not unlink an obsolete file; leaving it for the next sweep"
+            );
+            false
+        }
     }
 }
 
