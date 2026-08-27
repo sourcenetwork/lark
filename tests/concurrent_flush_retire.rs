@@ -86,15 +86,12 @@ fn a_checkpoint_drain_racing_a_rotation_never_loses_an_acknowledged_write() {
             let mut round = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 let into = target.join(format!("cp{round}"));
-                match db.checkpoint(&into) {
-                    Ok(()) => {
-                        drains.fetch_add(1, Ordering::Relaxed);
-                        let _ = std::fs::remove_dir_all(&into);
-                    }
-                    // A checkpoint can legitimately refuse while the
-                    // engine is busy; the race is in the drain it ran
-                    // before refusing, so keep going.
-                    Err(_) => {}
+                // A checkpoint can legitimately refuse while the
+                // engine is busy; the race is in the drain it ran
+                // before refusing, so a refusal is not a failure here.
+                if db.checkpoint(&into).is_ok() {
+                    drains.fetch_add(1, Ordering::Relaxed);
+                    let _ = std::fs::remove_dir_all(&into);
                 }
                 round += 1;
             }
