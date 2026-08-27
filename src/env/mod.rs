@@ -389,15 +389,15 @@ pub(crate) fn remove_file_and_sync_parent(env: &dyn Env, path: &Path) -> io::Res
 ///
 /// Bridges the positional read model to the byte-stream helpers that
 /// hash and copy whole files.
-pub(crate) struct ReadFileCursor<'a> {
-    file: &'a dyn ReadFile,
+pub(crate) struct ReadFileCursor<F> {
+    file: F,
     offset: u64,
     end: u64,
 }
 
-impl<'a> ReadFileCursor<'a> {
+impl<F: std::ops::Deref<Target = dyn ReadFile>> ReadFileCursor<F> {
     /// Read the whole file, from byte zero.
-    pub(crate) fn new(file: &'a dyn ReadFile) -> io::Result<Self> {
+    pub(crate) fn new(file: F) -> io::Result<Self> {
         let end = file.len()?;
         Ok(Self {
             file,
@@ -405,9 +405,14 @@ impl<'a> ReadFileCursor<'a> {
             end,
         })
     }
+
+    /// Length of the underlying file, read once at construction.
+    pub(crate) fn len(&self) -> u64 {
+        self.end
+    }
 }
 
-impl io::Read for ReadFileCursor<'_> {
+impl<F: std::ops::Deref<Target = dyn ReadFile>> io::Read for ReadFileCursor<F> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let remaining = self.end.saturating_sub(self.offset);
         if remaining == 0 || buf.is_empty() {

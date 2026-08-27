@@ -466,7 +466,7 @@ impl LarkEngine {
         let mut entries_per_file = Vec::with_capacity(wal_files.len());
         for wal_path in &wal_files {
             tracing::info!(path = %wal_path.display(), "Replaying WAL");
-            let mut replay = WalReplayIter::open(wal_path)?;
+            let mut replay = WalReplayIter::open(&*env, wal_path)?;
             let mut entries = 0usize;
             while let Some(entry) = replay.next_entry()? {
                 entries += 1;
@@ -633,7 +633,7 @@ impl LarkEngine {
         let mut entries_per_file = Vec::with_capacity(wal_files.len());
         for wal_path in &wal_files {
             tracing::info!(path = %wal_path.display(), "Replaying WAL for read-only open");
-            let mut replay = WalReplayIter::open(wal_path)?;
+            let mut replay = WalReplayIter::open(&*env, wal_path)?;
             let mut entries = 0usize;
             while let Some(entry) = replay.next_entry()? {
                 entries += 1;

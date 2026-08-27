@@ -663,7 +663,7 @@ fn footer_size(bytes: &[u8]) -> u64 {
     // offsets this harness uses hold for them too.
     match magic & 0xFF {
         1 | 2 => 64,
-        3 | 4 | 5 | 6 => 72,
+        3..=6 => 72,
         other => panic!(
             "the SSTable fixture carries format version {other}, which this harness does not know"
         ),

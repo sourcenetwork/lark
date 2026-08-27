@@ -104,7 +104,7 @@ fn regions(bytes: &[u8]) -> Regions {
     // offsets below hold for all of them.
     let footer_size = match magic & 0xff {
         0x01 | 0x02 => 64usize,
-        0x03 | 0x04 | 0x05 | 0x06 => 72,
+        0x03..=0x06 => 72,
         v => panic!("unknown format version {v:#04x} (magic {magic:#018x})"),
     };
     let f = n - footer_size;

@@ -113,7 +113,7 @@ fn main() {
     let start = Instant::now();
 
     loop {
-        if ops % SAMPLE_EVERY_OPS == 0 {
+        if ops.is_multiple_of(SAMPLE_EVERY_OPS) {
             let elapsed = start.elapsed().as_secs_f64();
             let rss_mib = common::rss_kib() as f64 / 1024.0;
             samples.push((elapsed, rss_mib, ops));

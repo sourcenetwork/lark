@@ -138,7 +138,9 @@ pub mod fuzzing {
     /// Replay arbitrary bytes as a WAL file.
     pub fn replay_wal(data: &[u8]) {
         with_temp_file("wal", "log", data, |path| {
-            let Ok(mut iter) = crate::engine::wal_replay::WalReplayIter::open(path) else {
+            let Ok(mut iter) =
+                crate::engine::wal_replay::WalReplayIter::open(&*crate::env::std_env(), path)
+            else {
                 return;
             };
             while matches!(iter.next_entry(), Ok(Some(_))) {}
@@ -525,27 +527,6 @@ impl Db {
         self.lookup_size_latest(cf.id(), key)
     }
 
-    /// The one point-read implementation every `get*` entry point
-    /// projects from, so statistics and perf counters are recorded
-    /// identically no matter which one the caller used.
-    fn lookup_slice(&self, lk: &LookupKey) -> Result<Option<DbSlice>> {
-        let stats = self.stats();
-        let _scope = statistics::TimeScope::new(stats, Histogram::DbGet);
-        if let Some(s) = stats {
-            s.add(Ticker::KeysRead, 1);
-        }
-        perf_context::record_get_call();
-        let result = self
-            .engine
-            .get_slice(lk)
-            .map_err(|err| map_point_read_error(err, lk.prefixed_user_key()));
-        if let (Some(s), Ok(Some(v))) = (stats, &result) {
-            s.add(Ticker::BytesRead, v.len() as u64);
-            s.record(Histogram::BytesPerRead, v.len() as u64);
-        }
-        result
-    }
-
     /// [`Db::lookup_slice`] for a read of the newest visible value.
     ///
     /// The engine samples the read horizon against the view it walks,
@@ -582,21 +563,6 @@ impl Db {
         self.engine
             .get_size_latest(cf_id, key)
             .map_err(|err| map_point_read_error_for(err, key))
-    }
-
-    /// The length-only twin of [`Db::lookup_slice`], sharing the
-    /// engine's single source walk. `Ticker::BytesRead` is deliberately
-    /// not recorded: no bytes were handed to the caller.
-    fn lookup_size(&self, lk: &LookupKey) -> Result<Option<usize>> {
-        let stats = self.stats();
-        let _scope = statistics::TimeScope::new(stats, Histogram::DbGet);
-        if let Some(s) = stats {
-            s.add(Ticker::KeysRead, 1);
-        }
-        perf_context::record_get_call();
-        self.engine
-            .get_size(lk)
-            .map_err(|err| map_point_read_error(err, lk.prefixed_user_key()))
     }
 
     /// Helper that exposes a borrowed reference to the engine's
