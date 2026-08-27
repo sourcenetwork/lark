@@ -220,6 +220,23 @@ function sizeSection(cur,base,threshold){
     cs.trust)}</div>`;
 }
 
+function allocsSection(cur,base,threshold){
+  const ca=cur?.metrics?.allocs||{}, paths=ca.paths||[];
+  if(!paths.length)return "";
+  const bmap={};
+  for(const p of (base?.metrics?.allocs?.paths)||[]) bmap[p.path]=p.achieved;
+  const rows=paths.map(p=>({name:p.path,cur:p.achieved,base:bmap[p.path]}));
+  const over=paths.filter(p=>p.met===false);
+  const note=over.length
+    ? over.length+" path(s) over budget: "+over.map(p=>p.path).join(", ")
+    : "Every path is inside its budget. Lower is better.";
+  const budgets=paths.map(p=>({name:p.path,cur:p.budget,base:null}));
+  return `<h2>Allocations per operation</h2><div class="grid">${card("measured",
+    note, bars(rows,"allocs/op",threshold), ca.trust)}${card("budget",
+    "The ceiling each path is gated against, for reference against the measured column.",
+    bars(budgets,"allocs/op",threshold), ca.trust)}</div>`;
+}
+
 function trendSection(all,metricPick){
   // The reason the history is kept: one run answers "is this fast",
   // the series answers "when did this change".
@@ -273,6 +290,10 @@ function overview(cur,base,threshold){
       cur:c.uncontended_commits_per_s,base:b.uncontended_commits_per_s});
     rows.push({name:`${c.flavor}/${c.isolation} contended commits/s`,
       cur:c.contended_commits_per_s,base:b.contended_commits_per_s});
+  }
+  for(const p of (cur?.metrics?.allocs?.paths)||[]){
+    rows.push({name:p.path+" allocs/op",cur:p.achieved,
+      base:((base?.metrics?.allocs?.paths)||[]).find(b=>b.path===p.path)?.achieved});
   }
   const r=cur?.run||{};
   const guard=r.loadguard?.passed;
@@ -361,7 +382,7 @@ function draw(){
   const th=parseFloat($("#thresh").value);
   $("#main").innerHTML=overview(cur,base,th)+throughputSection(cur,base,th)
     +isolationSection(cur,base,th)+rssSection(cur,base,th)+sizeSection(cur,base,th)
-    +trendSection(RUNS,null);
+    +allocsSection(cur,base,th)+trendSection(RUNS,null);
 }
 boot();
 </script>

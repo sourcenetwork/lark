@@ -43,6 +43,9 @@ const CORRECTNESS: &[&str] = &["transaction", "correctness"];
 const ISOLATION: &[&str] = &["isolation"];
 const VIABILITY: &[&str] = &["viability"];
 const RETRACTION: &[&str] = &["retraction"];
+/// Per-operation allocation budgets. Deterministic: a count, not a rate,
+/// so a busy runner cannot move it.
+const ALLOCS: &[&str] = &["allocs"];
 
 /// Sub-metrics of the rss family that the memory bench contributes.
 const RSS_PARTS: &[&str] = &["shard_sweep", "block_sweep", "point"];
@@ -81,6 +84,7 @@ fn main() {
             deterministic(&mut bag, CORRECTNESS, "% of committed updates surviving"),
         ),
         ("isolation", deterministic(&mut bag, ISOLATION, "commits/s")),
+        ("allocs", deterministic(&mut bag, ALLOCS, "allocations/op")),
         ("viability", deterministic(&mut bag, VIABILITY, "")),
     ]);
     let retractions = Json::Arr(bag.take_all(RETRACTION));
@@ -197,6 +201,7 @@ fn accepted_names() -> Vec<&'static str> {
         ISOLATION,
         VIABILITY,
         RETRACTION,
+        ALLOCS,
     ] {
         v.extend(group.iter().copied());
     }
