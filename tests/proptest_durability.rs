@@ -681,10 +681,9 @@ proptest! {
     ///
     /// Runtime: measured at 1.1s for the 128 cases configured here, one
     /// child process each (2.5s for 300 cases when the count is raised
-    /// by hand). `#[ignore]`d for two reasons: it spawns a process per
-    /// case, and it needs the `LD_PRELOAD` shim, which exists only on
-    /// Linux and would panic the default run elsewhere. Run it with
-    /// `just test-durability-slow`.
+    /// by hand). It spawns a process per case and needs the
+    /// `LD_PRELOAD` shim, so it is Linux-only: the whole module is
+    /// gated on that rather than on the test being switched off.
     #[test]
     fn a_power_cut_at_a_random_point_leaves_a_prefix_of_the_model(
         seed in any::<u64>(),

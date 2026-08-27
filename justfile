@@ -269,8 +269,16 @@ loom-all: loom loom-debug
 # versions. Measured at over 20 minutes wall and 4h of CPU unoptimized,
 # which is why `cargo test` runs a smaller default and this recipe
 # carries the full one. Release, because debug is where the cost is.
+#
+# Sized to finish, not to be maximal. Cost is roughly
+# instances x rounds x versions x compaction passes, and the compaction
+# passes each rewrite a database that grows with the version count, so
+# raising `versions` raises the run time faster than linearly: 400 does
+# not complete inside seven minutes, 120 completes in seconds. What the
+# workload is hunting is overlap between a compaction and a read, and
+# the overlap count is already in the thousands per instance here.
 
-chaos instances="6" rounds="2" versions="400" min_rounds="40":
+chaos instances="4" rounds="2" versions="120" min_rounds="20":
     LARK_CHAOS_INSTANCES={{instances}} LARK_CHAOS_ROUNDS={{rounds}} \
     LARK_CHAOS_VERSIONS={{versions}} LARK_CHAOS_MIN_ROUNDS={{min_rounds}} \
         cargo test --release --test read_view_chaos_workload -- --nocapture

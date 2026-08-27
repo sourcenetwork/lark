@@ -37,9 +37,16 @@ const INGESTS_PER_INSTANCE: u64 = 32;
 /// compaction lock while it copies the whole table set, so an unbounded
 /// loop starves the writers instead of racing them.
 const CHECKPOINTS_PER_INSTANCE: u64 = 32;
-/// Foreground `compact_range` passes per instance, bounded for the same
-/// reason.
-const COMPACT_PASSES_PER_INSTANCE: u64 = 256;
+/// Foreground `compact_range` passes per instance.
+///
+/// Each pass rewrites the whole database, and the database grows with
+/// the version count, so the product of this bound and
+/// `LARK_CHAOS_VERSIONS` is the run's dominant cost and it is quadratic.
+/// 64 rather than 256: the race this workload hunts is between one
+/// compaction and one read, so it is the number of *chances* that
+/// matters, and 64 passes against four reader threads sweeping
+/// continuously already gives thousands of overlaps per instance.
+const COMPACT_PASSES_PER_INSTANCE: u64 = 64;
 
 fn key_of(w: usize, i: usize) -> Vec<u8> {
     format!("w{w:03}k{i:04}").into_bytes()

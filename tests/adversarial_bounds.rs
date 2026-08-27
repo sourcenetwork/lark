@@ -199,21 +199,113 @@ fn measure_with(
     }
 }
 
-/// The same overshoot expressed as total live memtable bytes, across
-/// the budgets a deployment might actually pick.
+/// Bytes one `batch_ops`x`value_len` batch adds to the active memtable,
+/// measured in a db whose `write_buffer_size` is large enough that this one
+/// batch can never trigger a rotation.
+///
+/// This is the same quantity `admit_from_ring` bounds a group's overshoot
+/// by: the first ticket is always admitted whatever it costs, so the active
+/// memtable holds at most `write_buffer_size` plus one request. Measuring it
+/// in-process rather than hard-coding a byte count cancels the per-entry
+/// arena overhead (node header, tower, internal key, alignment), which
+/// differs by allocator and platform, out of the bound that uses it.
+fn one_request_cost(batch_ops: usize, value_len: usize) -> u64 {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open(
+        dir.path(),
+        Options {
+            write_buffer_size: 64 * 1024 * 1024,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let value = vec![b'v'; value_len];
+    let mut batch = WriteBatch::new();
+    for k in 0..batch_ops {
+        batch.put(format!("w00_00000_{k:03}").as_bytes(), &value);
+    }
+    db.write(batch).unwrap();
+    active_bytes(&db)
+}
+
+/// The same overshoot expressed as total live memtable bytes, across the
+/// budgets a deployment might actually pick.
+///
+/// Three structural bounds, none of them wall-clock:
+///
+/// * `peak_active <= write_buffer_size + 2 * one_request_cost`, exactly the
+///   overshoot [`Options::write_buffer_size`] documents and exactly what
+///   `admit_from_ring` implements (admission stops once `projected >= room`,
+///   the first ticket is always admitted, `run_group` rotates before it
+///   applies).
+/// * `peak_all <= max_write_buffer_number * (write_buffer_size +
+///   2 * one_request_cost)`, the same claim over every live memtable.
+/// * `peak_reserved <= documented_high_water(&opts)`, the same bound the
+///   neighbouring `the_published_high_water_mark_holds_under_many_concurrent_writers`
+///   test asserts for `Options::embedded` and a 64 KiB config, extended here
+///   to the 4 KiB and 1 MiB budgets that test does not cover.
+///
+/// `rounds` used to be pinned at 300 regardless of budget, so every config
+/// wrote the same ~78 MB: about 4800 rotations at the 4 KiB budget even
+/// though the peak is reached in the first two. Scaling `rounds` to the
+/// budget instead drives roughly four fill-and-rotate cycles per config
+/// (with a floor so the 16-writer arm still forms multi-writer commit
+/// groups), which cut the measured sweep from 75s to 0.22s with every peak
+/// identical to the full-fat run.
 #[test]
-#[ignore = "reports numbers rather than asserting a threshold"]
 fn memtable_footprint_across_budgets() {
+    const BATCH_OPS: usize = 64;
+    const VALUE_LEN: usize = 256;
+
+    // Measured on this machine: 20112 B, identical across 20 consecutive
+    // opens, so skiplist tower randomness does not move it in aggregate.
+    let one_request = one_request_cost(BATCH_OPS, VALUE_LEN);
+
     for buffer in [4 * 1024usize, 64 * 1024, 1024 * 1024] {
         for writers in [1usize, 16] {
-            let p = measure(buffer, writers, 64, 256);
+            let rounds = (4 * buffer as u64)
+                .div_ceil(writers as u64 * one_request)
+                .max(16) as usize;
+            let opts = Options {
+                write_buffer_size: buffer,
+                ..Options::default()
+            };
+            let bound_active = buffer as u64 + 2 * one_request;
+            let bound_all = opts.max_write_buffer_number as u64 * bound_active;
+            let bound_reserved = documented_high_water(&opts);
+
+            let p = measure_with(opts, writers, BATCH_OPS, VALUE_LEN, rounds);
             println!(
-                "budget={buffer:>8} writers={writers:>2} peak_active={:>9} ({:>6.1}x) \
-                 peak_all={:>9} peak_reserved={:>9}",
+                "budget={buffer:>8} writers={writers:>2} rounds={rounds:>4} \
+                 peak_active={:>9} ({:>5.2}x, bound={:>9}) \
+                 peak_all={:>9} (bound={:>9}) \
+                 peak_reserved={:>9} (bound={:>9}, {:.2}x)",
                 p.peak_active,
                 p.peak_active as f64 / buffer as f64,
+                bound_active,
                 p.peak_all,
-                p.peak_reserved
+                bound_all,
+                p.peak_reserved,
+                bound_reserved,
+                p.peak_reserved as f64 / bound_reserved as f64,
+            );
+            assert!(
+                p.peak_active <= bound_active,
+                "budget={buffer} writers={writers}: peak_active {} exceeded \
+                 write_buffer_size + 2 * one_request_cost = {bound_active}",
+                p.peak_active,
+            );
+            assert!(
+                p.peak_all <= bound_all,
+                "budget={buffer} writers={writers}: peak_all {} exceeded \
+                 max_write_buffer_number * (write_buffer_size + 2 * one_request_cost) = {bound_all}",
+                p.peak_all,
+            );
+            assert!(
+                p.peak_reserved <= bound_reserved,
+                "budget={buffer} writers={writers}: peak_reserved {} exceeded \
+                 documented_high_water = {bound_reserved}",
+                p.peak_reserved,
             );
         }
     }

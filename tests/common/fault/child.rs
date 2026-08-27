@@ -549,7 +549,7 @@ impl CrashRun {
         assert!(
             started_path.is_file(),
             "the child never entered the workload. The test crate needs the entry point:\n\n    \
-             #[test]\n    #[ignore = \"child process entry point\"]\n    fn {}() {{\n        \
+             #[test]\n    fn {}() {{\n        \
              common::fault::child_entrypoint(common::fault::builtin_workload);\n    }}\n\n\
              child stdout:\n{}\nchild stderr:\n{}",
             self.entry_test,

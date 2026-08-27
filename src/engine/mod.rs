@@ -2177,6 +2177,7 @@ impl LarkEngine {
             next_frozen.push(Arc::clone(&sealed));
             (fresh, next_frozen, sealed)
         });
+        sealed.seal_seq(self.latest_seq.load(Ordering::Acquire));
 
         let new_wal_id = {
             let mut versions = self.versions.lock();
@@ -2333,7 +2334,15 @@ impl LarkEngine {
             reader,
         );
 
-        let seq = self.latest_seq.load(Ordering::Acquire);
+        // The sequence this memtable was sealed at, not the engine's
+        // current one. `last_seq` is read back as "every write at or
+        // below this is in an SSTable", and a checkpoint copies tables
+        // and no WAL, so stamping the global counter here would make a
+        // checkpoint claim writes that are still only in a memtable it
+        // did not flush.
+        let seq = memtable
+            .sealed_seq()
+            .unwrap_or_else(|| self.latest_seq.load(Ordering::Acquire));
         let edits = vec![
             VersionEdit::AddFile { level: 0, file },
             VersionEdit::SetLastSeq(seq),
@@ -3290,6 +3299,7 @@ impl LarkEngine {
                     next_frozen.push(Arc::clone(&sealed));
                     (fresh, next_frozen, sealed)
                 });
+                sealed.seal_seq(self.latest_seq.load(Ordering::Acquire));
 
                 let old_wal = self
                     .active_wal

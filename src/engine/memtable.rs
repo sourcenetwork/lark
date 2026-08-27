@@ -93,6 +93,18 @@ pub(crate) struct MemTable {
     /// caller's log would delete the only durable copy of a memtable
     /// nobody has flushed yet. A crash then loses every write in it.
     sealed_wal: OnceLock<PathBuf>,
+    /// The highest sequence number this memtable can contain, recorded
+    /// when it is sealed.
+    ///
+    /// Exact, and free. Sealing happens under the commit pipeline's
+    /// mutex, so every write acknowledged before the seal is already in
+    /// this memtable and no later write can enter it: the global
+    /// sequence counter read at that instant is precisely this
+    /// memtable's ceiling. A flush stamps it into the manifest, which is
+    /// what makes `last_seq` mean "durable in an SSTable through here"
+    /// rather than "the newest sequence the engine had handed out when
+    /// the flush happened to finish".
+    sealed_seq: OnceLock<u64>,
 }
 
 impl MemTable {
@@ -117,6 +129,7 @@ impl MemTable {
             range_tombstones: Mutex::new(RangeTombstoneSet::default()),
             range_tombstone_bytes: AtomicUsize::new(0),
             sealed_wal: OnceLock::new(),
+            sealed_seq: OnceLock::new(),
         })
     }
 
@@ -137,6 +150,18 @@ impl MemTable {
     /// written through never changes after that.
     pub(crate) fn seal_wal(&self, path: PathBuf) {
         let _ = self.sealed_wal.set(path);
+    }
+
+    /// Record this memtable's sequence ceiling, at the moment it is
+    /// sealed. Set once, like the log.
+    pub(crate) fn seal_seq(&self, seq: u64) {
+        let _ = self.sealed_seq.set(seq);
+    }
+
+    /// The highest sequence this memtable can hold, if it has been
+    /// sealed.
+    pub(crate) fn sealed_seq(&self) -> Option<u64> {
+        self.sealed_seq.get().copied()
     }
 
     /// The log this memtable's records were written through, if it has

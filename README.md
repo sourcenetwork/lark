@@ -3,7 +3,7 @@
 </h1>
 <div align="center">
  <strong>
-   ACID, performance oriented, embedded key-value database for edge systems
+   ACID, performance oriented, embedded key-value database engine for edge systems
  </strong>
 <hr>
 
