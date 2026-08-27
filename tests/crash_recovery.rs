@@ -39,6 +39,17 @@
 //! is `crash_child`, which is the child entry point and not a test. Run
 //! the file on its own with `just test-crash`.
 
+//! # Linux only
+//!
+//! Every test here re-executes a child under the `LD_PRELOAD` fault
+//! shim so the harness can record which bytes actually reached the
+//! kernel. `LD_PRELOAD` interposition is a glibc mechanism, so on any
+//! other target the shim cannot be built and the child cannot be
+//! observed. The file is compiled out there rather than failing at
+//! run time: a test that panics because the platform cannot host its
+//! mechanism reports a defect that does not exist.
+#![cfg(target_os = "linux")]
+
 mod common;
 
 use std::collections::BTreeSet;
