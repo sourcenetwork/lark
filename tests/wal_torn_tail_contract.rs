@@ -18,7 +18,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use lark_kv::{Db, DurabilityMode, Options};
+use regolith::{Db, DurabilityMode, Options};
 use tempfile::TempDir;
 
 fn opts() -> Options {

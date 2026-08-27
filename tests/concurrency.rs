@@ -131,7 +131,7 @@ fn concurrent_batch_writers_are_atomic() {
     // db_test.cc::ConcurrentBatchWriters - each thread writes its
     // own batch; every batch's contents must be either fully
     // visible or fully absent when observed from another thread.
-    use lark_kv::WriteBatch;
+    use regolith::WriteBatch;
 
     let dir = TempDir::new().unwrap();
     let db = Arc::new(open(&dir));
@@ -181,7 +181,7 @@ fn snapshot_never_observes_a_torn_batch() {
     // only after the whole batch is applied, so a snapshot at that horizon
     // cannot catch the memtable mid-batch. Before that fix the sequence was
     // advanced up front, and a reader could observe a prefix of the batch.
-    use lark_kv::WriteBatch;
+    use regolith::WriteBatch;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as O};
 
     let dir = TempDir::new().unwrap();

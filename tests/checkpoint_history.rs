@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use lark_kv::{Checkpoint, Db, Options, WriteBatch};
+use regolith::{Checkpoint, Db, Options, WriteBatch};
 use tempfile::TempDir;
 
 fn key(i: u64) -> Vec<u8> {

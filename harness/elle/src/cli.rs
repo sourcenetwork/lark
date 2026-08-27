@@ -19,7 +19,7 @@ impl Model {
 
 /// Requested isolation level.
 ///
-/// lark exposes snapshot isolation only, through two transaction
+/// regolith exposes snapshot isolation only, through two transaction
 /// flavors, so not every level is soundly reachable today. Snapshot
 /// isolation is strictly stronger than read-committed, so checking a
 /// snapshot-isolated history against read-committed is a sound
@@ -27,7 +27,7 @@ impl Model {
 /// It is incomparable with repeatable-read (snapshot isolation permits
 /// write skew, which repeatable-read forbids) and strictly weaker than
 /// serializable, so for those two the harness runs the closest engine
-/// mode and warns that the verdict cannot be read as a lark bug.
+/// mode and warns that the verdict cannot be read as a regolith bug.
 /// README.md carries the full reachability table.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Isolation {
@@ -105,7 +105,7 @@ impl Default for Config {
 }
 
 pub const USAGE: &str = "\
-elle-gen - generate a Jepsen history from concurrent lark transactions
+elle-gen - generate a Jepsen history from concurrent regolith transactions
 
 Usage: elle-gen [options]
 

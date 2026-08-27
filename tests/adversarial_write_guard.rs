@@ -8,7 +8,7 @@
 //! gate names, and pair each no-work call with a loaded control so a
 //! rejection that happens for the wrong reason is visible.
 
-use lark_kv::{Db, Error, Options, WriteBatch, WriteOptions};
+use regolith::{Db, Error, Options, WriteBatch, WriteOptions};
 use tempfile::TempDir;
 
 fn opts() -> Options {
@@ -18,14 +18,14 @@ fn opts() -> Options {
     }
 }
 
-fn assert_read_only(what: &str, got: lark_kv::Result<()>) {
+fn assert_read_only(what: &str, got: regolith::Result<()>) {
     match got {
         Err(Error::ReadOnly) => {}
         other => panic!("{what}: expected Error::ReadOnly, got {other:?}"),
     }
 }
 
-fn assert_closed(what: &str, got: lark_kv::Result<()>) {
+fn assert_closed(what: &str, got: regolith::Result<()>) {
     match got {
         Err(Error::Closed) => {}
         other => panic!("{what}: expected Error::Closed, got {other:?}"),

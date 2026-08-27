@@ -395,10 +395,10 @@ def detail_sections(cur, base):
 
     cs = cur.get("metrics", {}).get("binary_size", {})
     if cs.get("rows"):
-        bmap = {r.get("artifact"): r.get("lark_cost_kib")
+        bmap = {r.get("artifact"): r.get("regolith_cost_kib")
                 for r in (base or {}).get("metrics", {}).get("binary_size", {}).get("rows", [])}
         rows = [(r.get("artifact", "?"), bmap.get(r.get("artifact")),
-                 r.get("lark_cost_kib"), "KiB") for r in cs["rows"]]
+                 r.get("regolith_cost_kib"), "KiB") for r in cs["rows"]]
         out.append(f'<h2>Binary size</h2><div class="grid"><div class="card">'
                    f'<h3>regolith\'s own contribution{pill(cs.get("trust"))}</h3>'
                    f'<p class="note">{esc(cs.get("note",""))}</p>{spark_bars(rows)}</div></div>')

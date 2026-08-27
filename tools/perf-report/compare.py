@@ -140,17 +140,17 @@ def compare(base, cur, threshold=3.0):
 
     bs = base.get("metrics", {}).get("binary_size", {})
     cs = cur.get("metrics", {}).get("binary_size", {})
-    bmap = {r.get("artifact"): r.get("lark_cost_kib") for r in bs.get("rows", [])}
+    bmap = {r.get("artifact"): r.get("regolith_cost_kib") for r in bs.get("rows", [])}
     for r in cs.get("rows", []):
         art = r.get("artifact")
         reason = "" if _trusted(cs.get("trust")) and _trusted(bs.get("trust")) else "size not trusted in one run"
         # Binary size is deterministic, so no range test applies and any
         # movement past the threshold is real.
         verdict, pct, why = _classify(
-            bmap.get(art), r.get("lark_cost_kib"), None, None, False, threshold, reason)
+            bmap.get(art), r.get("regolith_cost_kib"), None, None, False, threshold, reason)
         rep.deltas.append(Delta(
             family="binary_size", name=f"{art} binary", unit="KiB",
-            before=bmap.get(art), after=r.get("lark_cost_kib"),
+            before=bmap.get(art), after=r.get("regolith_cost_kib"),
             verdict=verdict, pct=pct, reason=why or reason, higher_is_better=False))
 
     br = base.get("metrics", {}).get("rss", {})

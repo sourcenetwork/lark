@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use lark_kv::Db;
+use regolith::Db;
 
 /// A materialised database state: every live key with its value, in
 /// ascending key order.
@@ -482,7 +482,7 @@ pub enum Recovery {
     /// The database opened and holds a valid prefix of the history.
     Recovered(PrefixReport),
     /// The database refused to open and said why. This is a legitimate
-    /// outcome for a torn tail: lark reports corruption and keeps the
+    /// outcome for a torn tail: regolith reports corruption and keeps the
     /// damaged file rather than guessing. What is never legitimate is
     /// opening and serving a torn state.
     RefusedToOpen(String),
@@ -511,7 +511,7 @@ impl Recovery {
 /// the exact divergence.
 pub fn recover_and_validate(
     db_dir: &std::path::Path,
-    opts: lark_kv::Options,
+    opts: regolith::Options,
     history: &History,
 ) -> Recovery {
     match Db::open(db_dir, opts) {

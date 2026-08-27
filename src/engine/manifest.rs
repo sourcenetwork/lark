@@ -373,9 +373,23 @@ impl VersionSet {
                 trim.set_len(replay.valid_len as u64)?;
                 trim.sync_all()?;
             }
-            let file = env.open_write(&manifest_path, WriteMode::Append)?;
-            manifest_bytes = replay.valid_len as u64;
-            (replay.version, BufferedWriter::new(file))
+            // A file too short to carry a stamp is one a crash caught
+            // during creation, and the guard above has already cleared
+            // it of hiding live tables. The append path never writes a
+            // stamp, so it is written here instead: without it the next
+            // open would find a stamp-less record stream and refuse.
+            if data.len() < MANIFEST_STAMP_LEN {
+                let mut file = env.open_write(&manifest_path, WriteMode::Truncate)?;
+                file.write_all(&Self::encode_stamp())?;
+                file.sync_all()?;
+                crate::env::sync_parent_dir(&**env, &manifest_path)?;
+                manifest_bytes = MANIFEST_STAMP_LEN as u64;
+                (replay.version, BufferedWriter::new(file))
+            } else {
+                let file = env.open_write(&manifest_path, WriteMode::Append)?;
+                manifest_bytes = replay.valid_len as u64;
+                (replay.version, BufferedWriter::new(file))
+            }
         } else {
             let version = Version::new();
             let mut file = env.open_write(&manifest_path, WriteMode::Truncate)?;
@@ -569,7 +583,7 @@ impl VersionSet {
     }
 
     /// Encode the stamp a manifest begins with.
-    fn encode_stamp() -> [u8; MANIFEST_STAMP_LEN] {
+    pub(crate) fn encode_stamp() -> [u8; MANIFEST_STAMP_LEN] {
         let mut out = [0u8; MANIFEST_STAMP_LEN];
         out[0..7].copy_from_slice(&MANIFEST_MAGIC);
         out[7] = MANIFEST_FORMAT_V1;
@@ -578,14 +592,24 @@ impl VersionSet {
         out
     }
 
-    /// Length of the stamp at the head of `data`, or `None` when the
-    /// manifest predates the stamp and begins directly with a record.
+    /// Length of the stamp at the head of `data`.
+    ///
+    /// The stamp is mandatory: it is written when the manifest is
+    /// created, before any record, so a file too short to hold one is a
+    /// crash during creation rather than the loss of an acknowledged
+    /// edit. Nothing is consumed from it, so replay ends short of the
+    /// file length and the open guard still weighs the tables on disk
+    /// rather than treating the replay as clean. A file long enough to
+    /// carry a stamp but not carrying one is refused.
     fn stamp_len(data: &[u8]) -> io::Result<usize> {
-        if data.len() < MANIFEST_STAMP_LEN || data[0..7] != MANIFEST_MAGIC {
-            // A manifest written before the stamp existed. It is read as
-            // it was written, and the next compaction rewrites it with a
-            // stamp, so a database migrates by being used.
+        if data.len() < MANIFEST_STAMP_LEN {
             return Ok(0);
+        }
+        if data[0..7] != MANIFEST_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MANIFEST does not begin with the REGOMAN stamp",
+            ));
         }
         let format = data[7];
         let stored = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
@@ -599,7 +623,7 @@ impl VersionSet {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "MANIFEST format {format} was written by a newer lark than this build, \
+                    "MANIFEST format {format} was written by a newer regolith than this build, \
                      which understands up to {MANIFEST_FORMAT_V1}"
                 ),
             ));
@@ -791,9 +815,7 @@ impl VersionSet {
             offset += 4;
 
             let computed_checksum = checksum::manifest_record(len as u32, record_data);
-            if stored_checksum != computed_checksum
-                && stored_checksum != checksum::legacy_payload_u32(record_data)
-            {
+            if stored_checksum != computed_checksum {
                 tracing::warn!("Manifest checksum mismatch, stopping replay");
                 break;
             }
@@ -922,28 +944,6 @@ mod tests {
         let len = record.len() as u32;
         let baseline = checksum::manifest_record(len, &record);
         assert_ne!(baseline, checksum::manifest_record(len + 1, &record));
-    }
-
-    #[test]
-    fn replay_manifest_accepts_legacy_payload_only_checksum() {
-        let dir = TempDir::new().unwrap();
-        let mut record = Vec::new();
-        ManifestRecord::SetLastSeq(7).encode(&mut record);
-        let len = record.len() as u32;
-        let mut data = Vec::new();
-        data.extend_from_slice(&len.to_le_bytes());
-        data.extend_from_slice(&record);
-        data.extend_from_slice(&checksum::legacy_payload_u32(&record).to_le_bytes());
-
-        let replay = VersionSet::replay_manifest(
-            &crate::env::std_env(),
-            &data,
-            dir.path(),
-            MetadataPolicy::Pinned,
-        )
-        .unwrap();
-        assert_eq!(replay.version.last_seq, 7);
-        assert_eq!(replay.valid_len, data.len());
     }
 
     #[test]
@@ -1364,35 +1364,6 @@ mod tests {
         assert_eq!(reopened.current().next_file_id, EDITS);
     }
 
-    /// A manifest written before the stamp existed still opens, and is
-    /// rewritten with a stamp once it is compacted.
-    #[test]
-    fn an_unstamped_manifest_opens_and_gains_a_stamp_when_rewritten() {
-        let dir = TempDir::new().unwrap();
-        let sst_dir = dir.path().join("sst");
-        std::fs::create_dir_all(&sst_dir).unwrap();
-        let path = dir.path().join("MANIFEST");
-
-        // A manifest in the pre-stamp shape: records, no header.
-        let records = [ManifestRecord::SetLastSeq(42)];
-        std::fs::write(&path, VersionSet::encode_records(&records)).unwrap();
-
-        let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
-        assert_eq!(vs.current().last_seq, 42, "an unstamped manifest must open");
-
-        vs.compact_manifest().unwrap();
-        let data = std::fs::read(&path).unwrap();
-        assert_eq!(&data[0..7], b"REGOMAN", "a rewrite must stamp the file");
-        assert_eq!(
-            VersionSet::stamp_len(&data).unwrap(),
-            MANIFEST_STAMP_LEN,
-            "the written stamp must validate"
-        );
-        drop(vs);
-        let reopened = VersionSet::open(dir.path(), &sst_dir).unwrap();
-        assert_eq!(reopened.current().last_seq, 42);
-    }
-
     #[test]
     fn a_manifest_from_a_newer_format_is_refused() {
         let mut stamp = VersionSet::encode_stamp();
@@ -1401,7 +1372,7 @@ mod tests {
         stamp[8..12].copy_from_slice(&checksum.to_le_bytes());
 
         let err = VersionSet::stamp_len(&stamp).expect_err("a newer format must not be parsed");
-        assert!(err.to_string().contains("newer lark"), "{err}");
+        assert!(err.to_string().contains("newer regolith"), "{err}");
     }
 
     #[test]

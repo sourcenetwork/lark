@@ -5,7 +5,7 @@
 //! commit path, `write_with_durability`, and the column-family
 //! lifecycle calls.
 
-use lark_kv::{
+use regolith::{
     Db, DbWithTtl, DurabilityMode, Error, OptimisticTransactionDb, Options, WriteBatch,
     WriteOptions,
 };
@@ -30,7 +30,7 @@ fn a_read_only_handle_refuses_no_work_writes_on_every_remaining_surface() {
     let cf = ro.default_cf();
 
     let mut bad = Vec::new();
-    let mut check = |what: &str, got: lark_kv::Result<()>| {
+    let mut check = |what: &str, got: regolith::Result<()>| {
         if !matches!(got, Err(Error::ReadOnly)) {
             bad.push(format!("{what}: expected Error::ReadOnly, got {got:?}"));
         }
@@ -78,7 +78,7 @@ fn a_closed_handle_refuses_no_work_writes_on_every_remaining_surface() {
     db.close().expect("close");
 
     let mut bad = Vec::new();
-    let mut check = |what: &str, got: lark_kv::Result<()>| {
+    let mut check = |what: &str, got: regolith::Result<()>| {
         if !matches!(got, Err(Error::Closed)) {
             bad.push(format!("{what}: expected Error::Closed, got {got:?}"));
         }

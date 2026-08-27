@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
-use lark_kv::{Db, DurabilityMode, Options};
+use regolith::{Db, DurabilityMode, Options};
 use tempfile::TempDir;
 
 const KEYS: u32 = 64;

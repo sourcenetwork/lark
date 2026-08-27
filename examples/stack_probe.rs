@@ -1,4 +1,4 @@
-//! Runs one lark workload on a thread with a caller-chosen stack size.
+//! Runs one regolith workload on a thread with a caller-chosen stack size.
 //!
 //! A stack overflow aborts the process, so the exit status is the
 //! verdict: exit 0 means the workload fits, 134 means it does not.
@@ -18,7 +18,7 @@
 //! 1 MiB. A control that passes everywhere means the detector is not
 //! working and no other row on the sweep means anything.
 
-use lark_kv::{Db, Options, WriteBatch};
+use regolith::{Db, Options, WriteBatch};
 
 fn opts() -> Options {
     Options {

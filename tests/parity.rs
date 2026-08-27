@@ -4,7 +4,7 @@
 //! storage engines are expected to satisfy. The scenarios are
 //! the valuable part - they encode 15+ years of bugs-found-the-
 //! hard-way from LSM implementations. Cross-engine validation
-//! (running the same scenario against both lark and another
+//! (running the same scenario against both regolith and another
 //! engine) can be added as a follow-up.
 
 // Native-only. wasm-pack builds every test target for wasm32, and these use
@@ -12,7 +12,7 @@
 // suite lives in tests/wasm_opfs*.rs.
 #![cfg(not(target_arch = "wasm32"))]
 
-use lark_kv::{CompactionStyle, CompressionType, Db, FifoCompactionOptions, Options, WriteBatch};
+use regolith::{CompactionStyle, CompressionType, Db, FifoCompactionOptions, Options, WriteBatch};
 use tempfile::TempDir;
 
 mod common;
@@ -236,10 +236,10 @@ fn compact_range_merges_l0_to_l1() {
     for i in 0..500 {
         db.put(format!("k{i:04}").as_bytes(), b"v").unwrap();
     }
-    let l0_before = db.get_int_property("lark.num-files-at-level0").unwrap();
+    let l0_before = db.get_int_property("regolith.num-files-at-level0").unwrap();
     assert!(l0_before > 0);
     db.compact_range(None, None).unwrap();
-    let l0_after = db.get_int_property("lark.num-files-at-level0").unwrap();
+    let l0_after = db.get_int_property("regolith.num-files-at-level0").unwrap();
     assert_eq!(l0_after, 0, "compact_range should drain L0");
     // Data still readable.
     for i in 0..500 {
@@ -261,7 +261,9 @@ fn compaction_drops_shadowed_deletions() {
         db.delete(format!("k{i:02}").as_bytes()).unwrap();
     }
     db.compact_range(None, None).unwrap();
-    let total = db.get_int_property("lark.total-sst-files-size").unwrap();
+    let total = db
+        .get_int_property("regolith.total-sst-files-size")
+        .unwrap();
     // All keys deleted + compacted → the remaining SSTs should
     // be tiny (just tombstones or empty).
     assert!(
@@ -289,7 +291,8 @@ fn compression_none_produces_larger_files_than_lz4() {
             db.put(format!("k{i:04}").as_bytes(), &payload).unwrap();
         }
         db.compact_range(None, None).unwrap();
-        db.get_int_property("lark.total-sst-files-size").unwrap()
+        db.get_int_property("regolith.total-sst-files-size")
+            .unwrap()
     };
 
     let size_none = write(&dir_none, CompressionType::None);
@@ -320,7 +323,9 @@ fn fifo_drops_oldest_file_when_over_cap() {
     }
     std::thread::sleep(std::time::Duration::from_millis(200));
     db.compact_range(None, None).unwrap();
-    let total = db.get_int_property("lark.total-sst-files-size").unwrap();
+    let total = db
+        .get_int_property("regolith.total-sst-files-size")
+        .unwrap();
     assert!(
         total <= 64 * 1024,
         "FIFO cap 32KB should keep total bounded, got {total}"

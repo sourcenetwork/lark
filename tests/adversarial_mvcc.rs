@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
-use lark_kv::{Db, Options, WriteBatch, WriteOptions};
+use regolith::{Db, Options, WriteBatch, WriteOptions};
 use tempfile::TempDir;
 
 const BATCH_WIDTH: usize = 16;

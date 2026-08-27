@@ -323,7 +323,7 @@ jobs:
         continue-on-error: true
       - name: Run ${{ matrix.family }}
         env:
-          LARK_BENCH_OUT: ${{ github.workspace }}/bench-${{ matrix.family }}.jsonl
+          REGOLITH_BENCH_OUT: ${{ github.workspace }}/bench-${{ matrix.family }}.jsonl
         run: cargo bench --bench ${{ matrix.family }}
       - uses: actions/upload-artifact@v4
         with:
@@ -331,15 +331,6 @@ jobs:
           path: bench-${{ matrix.family }}.jsonl
           if-no-files-found: error
           retention-days: 7
-
-  # Assemble every family into one run document, file it alongside every
-  # earlier run, and publish the dashboard that reads the whole set.
-  #
-  # The run documents are the artifact, not a rendered page. A page
-  # regenerated per run shows one run and loses the comparison the
-  # moment it is replaced; keeping the documents is what lets the
-  # dashboard plot a metric across every run ever recorded.
-
 
   # Assemble every family into one run document, file it alongside every
   # earlier run, and publish the dashboard that reads the whole set.
@@ -368,8 +359,8 @@ jobs:
         run: |
           set -euo pipefail
           cat bench-artifacts/*.jsonl > bench-out.jsonl
-          LARK_BENCH_OUT="$PWD/bench-out.jsonl" \
-            cargo run --release --bench collect -- \
+          REGOLITH_BENCH_OUT="$PWD/bench-out.jsonl" \
+            cargo bench --bench collect -- \
               --out "run-${GITHUB_SHA::12}.json" \
               --commit "${GITHUB_SHA}" --label main
       - name: Fetch the runs already published
@@ -387,6 +378,11 @@ jobs:
           git --work-tree=site checkout origin/gh-pages -- runs 2>/dev/null || true
       - name: File this run
         run: python3 tools/perf-site/publish.py "run-${GITHUB_SHA::12}.json" site
+      # Refuse to publish a dashboard that would drop a family it
+      # collected. A blank section is not an error to the browser, so
+      # without this the job stays green and the site goes quiet.
+      - name: Check the page renders every collected family
+        run: node tools/perf-site/render_check.mjs site
       - name: Publish
         uses: peaceiris/actions-gh-pages@v4
         with:

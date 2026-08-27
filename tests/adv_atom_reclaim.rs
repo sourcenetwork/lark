@@ -33,7 +33,7 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lark_kv::{Db, Options};
+use regolith::{Db, Options};
 use tempfile::TempDir;
 
 /// Descriptors this process still holds inside `root`, split into
@@ -208,7 +208,7 @@ fn a_second_publication_from_the_same_thread_releases_the_pinned_inodes() {
     let (_, first) = open_fds_under(dir.path());
 
     let mut counts = vec![first.len()];
-    let drain_rounds: usize = std::env::var("LARK_DRAIN_ROUNDS")
+    let drain_rounds: usize = std::env::var("REGOLITH_DRAIN_ROUNDS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(6);
@@ -233,7 +233,7 @@ fn a_second_publication_from_the_same_thread_releases_the_pinned_inodes() {
 /// spawned thread and joining it releases the descriptors that the same
 /// lifecycle on the main thread does not, then the holder is a retired
 /// `ReadView` sitting in the publishing thread's kovan batch, not any
-/// structure lark still owns.
+/// structure regolith still owns.
 fn descriptors_survive_the_db_but_not_the_publishing_thread() {
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().to_path_buf();

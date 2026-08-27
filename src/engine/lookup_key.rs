@@ -217,7 +217,7 @@ mod tests {
     use crate::engine::internal_key::encode_internal_key;
     use proptest::prelude::*;
 
-    fn legacy(cf_id: u32, user_key: &[u8], seq: u64) -> Vec<u8> {
+    fn reference_encoding(cf_id: u32, user_key: &[u8], seq: u64) -> Vec<u8> {
         encode_internal_key(&prefix_key(cf_id, user_key), seq, VALUE_TYPE_DELETION)
     }
 
@@ -274,18 +274,21 @@ mod tests {
     fn empty_user_key_round_trips() {
         let lk = LookupKey::new(4, b"", u64::MAX);
         assert_eq!(lk.prefixed_user_key(), 4u32.to_be_bytes());
-        assert_eq!(lk.internal(), legacy(4, b"", u64::MAX).as_slice());
+        assert_eq!(
+            lk.internal(),
+            reference_encoding(4, b"", u64::MAX).as_slice()
+        );
     }
 
     proptest! {
         #[test]
-        fn matches_legacy_encoding(
+        fn matches_reference_encoding(
             cf_id in any::<u32>(),
             key in proptest::collection::vec(any::<u8>(), 0..4096),
             seq in any::<u64>(),
         ) {
             let lk = LookupKey::new(cf_id, &key, seq);
-            let expected_internal = legacy(cf_id, &key, seq);
+            let expected_internal = reference_encoding(cf_id, &key, seq);
             let expected_prefixed = prefix_key(cf_id, &key);
             prop_assert_eq!(lk.internal(), expected_internal.as_slice());
             prop_assert_eq!(lk.prefixed_user_key(), expected_prefixed.as_slice());

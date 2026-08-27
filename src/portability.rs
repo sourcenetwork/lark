@@ -1,6 +1,6 @@
 //! The atomic types the engine uses, and the portability tier map.
 //!
-//! Every atomic in lark's production paths comes from here rather than
+//! Every atomic in regolith's production paths comes from here rather than
 //! from `core::sync::atomic` directly. `portable-atomic` emits the
 //! native instruction on any target that has one and substitutes an
 //! implementation where the hardware does not, so a server build is
@@ -13,7 +13,7 @@
 //! * **`AtomicU64` does not exist on 32-bit bare metal.** `thumbv7em`
 //!   and `riscv32imac` have no 64-bit atomic instruction, so
 //!   `core::sync::atomic::AtomicU64` is simply absent on those
-//!   targets. lark has six production `AtomicU64` sites and two of
+//!   targets. regolith has six production `AtomicU64` sites and two of
 //!   them, `latest_seq` and `visible_seq`, are the MVCC core.
 //!   `portable-atomic`'s `fallback` feature supplies the type there.
 //! * **`thumbv6m` has no compare-and-swap at all.** Not slow: absent.
@@ -37,7 +37,7 @@
 //! without the `atomics` target feature a wasm module has exactly one
 //! thread, and a read-modify-write lowers to a plain load, an
 //! arithmetic op, and a store, with no lock prefix and no fence. That
-//! is also why converting lark's remaining locks to lock-free
+//! is also why converting regolith's remaining locks to lock-free
 //! structures would be a pessimisation there rather than a win:
 //! nothing contends, so every extra atomic read-modify-write a
 //! lock-free algorithm performs is pure overhead.
@@ -65,9 +65,9 @@
 //! | `lru` | already `#![no_std]`, hashbrown-backed | none |
 //! | `rustix` | already `cfg(unix)`-gated | none |
 //! | `tracing` | `no_std` via `default-features = false` | low |
-//! | `lz4_flex` | `no_std` covers the block format, which is all lark uses | low: `default-features = false` |
+//! | `lz4_flex` | `no_std` covers the block format, which is all regolith uses | low: `default-features = false` |
 //! | `thiserror` 1.0 | no `no_std` support | medium: bump to 2.x |
-//! | `snap` | no `no_std` path at all; lark uses only `snap::raw` | medium: upstream a feature, vendor `raw.rs`, or drop Snappy on `no_std` |
+//! | `snap` | no `no_std` path at all; regolith uses only `snap::raw` | medium: upstream a feature, vendor `raw.rs`, or drop Snappy on `no_std` |
 //! | `kovan-mvcc` | pulls `parking_lot`, which is `std`-only | medium: the transactional layer is not part of a tier-B build and can be feature-gated off |
 //! | **locks** | **[`crate::sync`] is `std::sync`-backed** | **medium, see below** |
 //!

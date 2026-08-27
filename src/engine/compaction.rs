@@ -255,7 +255,7 @@ where
             ));
         }
     }
-    env.spawn(&format!("lark-compaction-{index}"), Box::new(body))
+    env.spawn(&format!("regolith-compaction-{index}"), Box::new(body))
 }
 
 #[cfg(test)]
@@ -479,7 +479,7 @@ pub(crate) enum CompactionOutcome {
 /// whether any work was done.
 ///
 /// Shared by the background worker loop and by the engine's foreground
-/// pass ([`crate::engine::LarkEngine::run_one_compaction_pass`]) so the
+/// pass ([`crate::engine::RegolithEngine::run_one_compaction_pass`]) so the
 /// two can never diverge on what "one job" means. Callers hold either
 /// side of the engine-wide compaction lock and pass the engine-wide
 /// `in_progress` set.
@@ -724,7 +724,7 @@ fn pick_and_run_level_compaction(
     Ok(CompactionOutcome::Idle)
 }
 
-/// FIFO picker: every flush lands a new L0 file, and lark never
+/// FIFO picker: every flush lands a new L0 file, and regolith never
 /// merges in this style. After each pass, if the total bytes held
 /// across L0 exceed `max_table_files_size`, we unlink the oldest
 /// file (smallest `file_id`) and emit a `RemoveFile` edit. We stop
@@ -1305,7 +1305,7 @@ fn gc_old_versions(entries: Vec<(Vec<u8>, Vec<u8>)>, pin_seq: u64) -> Vec<(Vec<u
 ///
 /// Deletion internal keys are passed through without consulting the
 /// filter - the filter's contract is about the user's own values,
-/// not about tombstones lark writes itself.
+/// not about tombstones regolith writes itself.
 fn apply_compaction_filter(
     entries: Vec<(Vec<u8>, Vec<u8>)>,
     filter: &dyn crate::options::CompactionFilter,

@@ -1,9 +1,9 @@
 //! Assemble one schema v1 run file from every metric family the benches wrote.
 //!
 //! Usage:
-//!   cargo run --release --bench collect -- --out <run.json> --commit <sha> --label <label>
+//!   cargo bench --bench collect -- --out <run.json> --commit <sha> --label <label>
 //!
-//! Families are read from `$LARK_BENCH_OUT` (JSON Lines) when it is set, and
+//! Families are read from `$REGOLITH_BENCH_OUT` (JSON Lines) when it is set, and
 //! from `./bench-out/*.json` otherwise. Criterion's own `estimates.json` files
 //! are folded in as supporting per-iteration timings.
 //!
@@ -127,14 +127,14 @@ struct Args {
 
 const USAGE: &str = "collect: assemble one schema v1 run file from every bench family.
 
-  cargo run --release --bench collect -- --out <run.json> --commit <sha> --label <label>
+  cargo bench --bench collect -- --out <run.json> --commit <sha> --label <label>
 
-Families are read from $LARK_BENCH_OUT (JSON Lines) when set, else ./bench-out/*.json.";
+Families are read from $REGOLITH_BENCH_OUT (JSON Lines) when set, else ./bench-out/*.json.";
 
 /// `None` means this invocation is not ours: `cargo bench` drives every bench
 /// target with criterion's flags, and collect has nothing to do then.
 fn parse_args() -> Option<Args> {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let argv = common::args();
     let mut out: Option<PathBuf> = None;
     let mut commit: Option<String> = None;
     let mut label: Option<String> = None;
@@ -172,7 +172,7 @@ fn parse_args() -> Option<Args> {
             foreign.join(" ")
         );
         eprintln!(
-            "  cargo run --release --bench collect -- --out <run.json> --commit <sha> --label \
+            "  cargo bench --bench collect -- --out <run.json> --commit <sha> --label \
              <label>"
         );
         return None;
@@ -280,14 +280,21 @@ fn rss(bag: &mut Bag) -> Json {
         entries.push(s);
     }
 
+    let mut memory = bag.take_one(MEMORY);
+    if let Some(m) = &memory {
+        require_obj(m, "memory");
+    }
+
     let mut family = Json::obj(vec![("unit", Json::s("MiB"))]);
     if let Some(w) = workload {
         family.set("workload", Json::Str(w));
     }
-    family.set(
-        "trust",
-        Json::s(if entries.is_empty() { "absent" } else { trust }),
-    );
+    // Either contributor is a measurement. `soak` is not in the bench
+    // matrix, so deriving this from the soaks alone reported `absent`
+    // over a memory bench that had run, which is a gap rendered where
+    // there is data.
+    let measured = !entries.is_empty() || memory.is_some();
+    family.set("trust", Json::s(if measured { trust } else { "absent" }));
     family.set(
         "trust_note",
         Json::s(
@@ -297,10 +304,6 @@ fn rss(bag: &mut Bag) -> Json {
     );
     family.set("soaks", Json::Arr(entries));
 
-    let mut memory = bag.take_one(MEMORY);
-    if let Some(m) = &memory {
-        require_obj(m, "memory");
-    }
     for part in RSS_PARTS {
         match memory.as_mut().and_then(|m| m.remove(part)) {
             None => family.set(part, absent(&[])),

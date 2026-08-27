@@ -23,11 +23,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use lark_kv::{Db, DurabilityMode, Options, WriteBatch, WriteOptions};
+use regolith::{Db, DurabilityMode, Options, WriteBatch, WriteOptions};
 use tempfile::TempDir;
 
-const CHILD_MODE: &str = "LARK_ADV_CRASH_MODE";
-const CHILD_DIR: &str = "LARK_ADV_CRASH_DIR";
+const CHILD_MODE: &str = "REGOLITH_ADV_CRASH_MODE";
+const CHILD_DIR: &str = "REGOLITH_ADV_CRASH_DIR";
 const CHILD_ENTRY: &str = "zzz_child_entry_point";
 const WRITERS: usize = 8;
 const BATCH_OPS: usize = 4;

@@ -13,7 +13,7 @@
 //! worst outcome - a failed write would read back as a missing key and
 //! the transaction would commit over it.
 //!
-//! So a failure is recorded in [`LarkStorage::failure`] and the
+//! So a failure is recorded in [`RegolithStorage::failure`] and the
 //! transaction layer checks it at commit, turning a silent loss into a
 //! refused commit. The first failure is kept rather than the last: it is
 //! the one that explains the rest.
@@ -26,7 +26,7 @@ use kovan_mvcc::{LockInfo, Storage, Value, WriteInfo, WriteKind};
 use super::layout;
 use crate::WriteBatchOp;
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
-use crate::engine::{DurabilityMode, LarkEngine};
+use crate::engine::{DurabilityMode, RegolithEngine};
 
 /// Ceiling on the keys one `delete_range` may cover.
 ///
@@ -44,11 +44,11 @@ pub(crate) const MAX_RANGE_DELETE_KEYS: usize = 1 << 20;
 // walks `next` links, and a link belonging to an already-retired node is
 // frozen, so nothing writes it again and reclamation does not protect a
 // pointer read out of it. That difference is a use-after-free under
-// concurrent get and remove, reproducible with no lark code involved.
+// concurrent get and remove, reproducible with no regolith code involved.
 type LockTable = kovan_map::HopscotchMap<Vec<u8>, LockInfo>;
 
-pub(crate) struct LarkStorage {
-    engine: Arc<LarkEngine>,
+pub(crate) struct RegolithStorage {
+    engine: Arc<RegolithEngine>,
     locks: LockTable,
     durability: DurabilityMode,
     /// The first I/O failure seen through an infallible trait method.
@@ -88,8 +88,8 @@ fn with_key<R>(compose: impl FnOnce(&mut Vec<u8>), f: impl FnOnce(&[u8]) -> R) -
     })
 }
 
-impl LarkStorage {
-    pub(crate) fn new(engine: Arc<LarkEngine>, durability: DurabilityMode) -> Self {
+impl RegolithStorage {
+    pub(crate) fn new(engine: Arc<RegolithEngine>, durability: DurabilityMode) -> Self {
         Self {
             engine,
             // Sized small: a lock table holds only in-flight transactions,
@@ -149,7 +149,7 @@ impl LarkStorage {
     }
 }
 
-impl Storage for LarkStorage {
+impl Storage for RegolithStorage {
     fn get_lock(&self, key: &[u8]) -> Option<LockInfo> {
         self.locks.get(key)
     }
@@ -244,7 +244,7 @@ impl Storage for LarkStorage {
     }
 }
 
-impl LarkStorage {
+impl RegolithStorage {
     /// The user-keyspace write that mirrors a commit record.
     ///
     /// kovan-mvcc keeps its versions under `D | key | start_ts` and its
@@ -361,7 +361,7 @@ impl LarkStorage {
     /// Walk write records for one key, newest first.
     fn walk_writes(
         &self,
-        iter: &mut crate::engine::iterator::LarkIterator,
+        iter: &mut crate::engine::iterator::RegolithIterator,
         prefix: &[u8],
         skip_rollbacks: bool,
     ) -> Option<(u64, WriteInfo)> {
@@ -414,14 +414,14 @@ mod tests {
     use kovan_mvcc::LockType;
     use tempfile::TempDir;
 
-    fn storage() -> (TempDir, Arc<LarkStorage>) {
+    fn storage() -> (TempDir, Arc<RegolithStorage>) {
         let dir = TempDir::new().unwrap();
         let db = crate::Db::open(dir.path(), crate::Options::default()).unwrap();
         let engine = db.engine_arc();
         std::mem::forget(db);
         (
             dir,
-            Arc::new(LarkStorage::new(engine, DurabilityMode::Eventual)),
+            Arc::new(RegolithStorage::new(engine, DurabilityMode::Eventual)),
         )
     }
 
@@ -560,7 +560,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         {
             let db = crate::Db::open(dir.path(), crate::Options::default()).unwrap();
-            let s = LarkStorage::new(db.engine_arc(), DurabilityMode::Immediate);
+            let s = RegolithStorage::new(db.engine_arc(), DurabilityMode::Immediate);
             s.put_data(b"tk", 9, Arc::new(b"v".to_vec()));
             s.put_write(
                 b"tk",
@@ -573,7 +573,7 @@ mod tests {
             db.close().unwrap();
         }
         let db = crate::Db::open(dir.path(), crate::Options::default()).unwrap();
-        let s = LarkStorage::new(db.engine_arc(), DurabilityMode::Immediate);
+        let s = RegolithStorage::new(db.engine_arc(), DurabilityMode::Immediate);
         assert_eq!(s.get_latest_write(b"tk", 99).map(|(ts, _)| ts), Some(10));
         assert_eq!(s.get_data(b"tk", 9).as_deref(), Some(&b"v".to_vec()));
         // Locks are deliberately not durable.

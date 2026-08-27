@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
-use lark_kv::{BackupEngine, Db, Options, WriteBatch};
+use regolith::{BackupEngine, Db, Options, WriteBatch};
 use tempfile::TempDir;
 
 /// `DbSlice` is `Eq + Hash`; equal bytes must hash equally no matter
@@ -48,7 +48,7 @@ fn dbslice_hash_and_eq_agree_across_every_owner() {
         clippy::mutable_key_type,
         reason = "DbSlice hashes only its immutable bytes"
     )]
-    let mut set: HashSet<lark_kv::DbSlice> = HashSet::new();
+    let mut set: HashSet<regolith::DbSlice> = HashSet::new();
     assert!(set.insert(arena_slice));
     assert!(
         !set.insert(block_slice),

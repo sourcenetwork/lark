@@ -18,7 +18,7 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lark_kv::{Db, Options, WriteBatch};
+use regolith::{Db, Options, WriteBatch};
 use tempfile::TempDir;
 
 fn env(name: &str, default: u64) -> u64 {
@@ -32,8 +32,8 @@ fn env(name: &str, default: u64) -> u64 {
 /// `multi_get` and `iter`, while rotation and compaction churn.
 #[test]
 fn a_writer_always_reads_back_at_least_its_own_write() {
-    let threads = env("LARK_RYW_THREADS", 12) as usize;
-    let ops = env("LARK_RYW_OPS", 4000);
+    let threads = env("REGOLITH_RYW_THREADS", 12) as usize;
+    let ops = env("REGOLITH_RYW_OPS", 4000);
 
     let dir = TempDir::new().expect("tempdir");
     let db = Arc::new(
@@ -120,7 +120,7 @@ fn a_writer_always_reads_back_at_least_its_own_write() {
 /// check; a stalled run is the failure.
 #[test]
 fn every_publisher_of_the_read_view_running_at_once_stays_live() {
-    let secs = env("LARK_LIVE_SECS", 8);
+    let secs = env("REGOLITH_LIVE_SECS", 8);
     let dir = TempDir::new().expect("tempdir");
     let db = Arc::new(
         Db::open(

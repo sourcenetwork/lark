@@ -248,9 +248,7 @@ impl WalReplayIter {
 
             let stored_checksum = u32::from_le_bytes(checksum_bytes);
             let computed_checksum = checksum::wal_record(len as u32, record_type, &self.payload);
-            if stored_checksum != computed_checksum
-                && stored_checksum != checksum::legacy_payload_u32(&self.payload)
-            {
+            if stored_checksum != computed_checksum {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("WAL checksum mismatch in {}", self.path.display()),

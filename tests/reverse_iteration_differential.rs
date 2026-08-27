@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use lark_kv::{Db, Options};
+use regolith::{Db, Options};
 use tempfile::TempDir;
 
 /// Deterministic 64-bit stream; no dependency, no wall clock.

@@ -17,9 +17,9 @@
 //!
 //! # Physical naming
 //!
-//! OPFS directories are flat for lark's purposes, so a logical path is
+//! OPFS directories are flat for regolith's purposes, so a logical path is
 //! escaped into one filename: `%` becomes `%25`, then `/` becomes `%2F`
-//! and `\` becomes `%5C`. Every mirror file carries the `.lark-file-`
+//! and `\` becomes `%5C`. Every mirror file carries the `.regolith-file-`
 //! prefix so a mirror database and a slot pool can share one directory.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -31,7 +31,7 @@ use wasm_bindgen::JsValue;
 
 use super::js;
 
-const FILE_PREFIX: &str = ".lark-file-";
+const FILE_PREFIX: &str = ".regolith-file-";
 
 /// Escape a logical path into a single OPFS entry name.
 fn encode_name(path: &Path) -> String {
@@ -426,7 +426,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn a_foreign_entry_is_not_decoded() {
-        assert_eq!(decode_name(".lark-sah-0000"), None);
+        assert_eq!(decode_name(".regolith-sah-0000"), None);
         assert_eq!(decode_name("something-else"), None);
     }
 }

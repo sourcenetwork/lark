@@ -13,7 +13,7 @@
 //! explore a handful of spawn/join orders while proving nothing.
 //!
 //! So these models do not call kovan. They transcribe, in loom
-//! atomics, the protocol lark builds *on top of* `Atom`: the
+//! atomics, the protocol regolith builds *on top of* `Atom`: the
 //! compare-exchange retry loop, the four mutation closures the engine
 //! passes it, and the load ordering the read path depends on. Each
 //! model names the source lines it transcribes. The transcription is
@@ -32,8 +32,8 @@
 //!   view is published in one step is structural in both, not a
 //!   property either one tests.
 //!
-//! What is left is genuinely lark's, and every model below would fail
-//! if lark got it wrong. Each ships with a negative control that
+//! What is left is genuinely regolith's, and every model below would fail
+//! if regolith got it wrong. Each ships with a negative control that
 //! mutates one decision and asserts loom reports the violation, so a
 //! model that stopped exploring cannot pass silently. Every model also
 //! asserts a floor on the number of interleavings loom explored.
@@ -137,7 +137,7 @@ impl View {
 }
 
 /// Seal the active memtable and hand writers a fresh one, in one
-/// publication. Transcribes `LarkEngine::rotate_memtable`
+/// publication. Transcribes `RegolithEngine::rotate_memtable`
 /// (src/engine/mod.rs:1805).
 fn rotate(view: View, fresh: u8) -> View {
     let mut next = view;
@@ -164,7 +164,7 @@ fn rotate_prepending(view: View, fresh: u8) -> View {
 }
 
 /// Drop the oldest frozen memtable. Transcribes
-/// `LarkEngine::retire_oldest_frozen` (src/engine/mod.rs:1315),
+/// `RegolithEngine::retire_oldest_frozen` (src/engine/mod.rs:1315),
 /// including its `frozen.get(1..).unwrap_or_default()` behaviour on an
 /// empty list.
 fn retire_oldest(view: View) -> View {
@@ -190,7 +190,7 @@ fn publish_version(view: View, flushed_id: u8, gc_floor: u8) -> View {
     next
 }
 
-/// The published cell. Transcribes `Atom<ReadView>` as lark uses it:
+/// The published cell. Transcribes `Atom<ReadView>` as regolith uses it:
 /// an acquire load, and an `AcqRel`/`Acquire` compare-exchange retry
 /// loop that rebuilds on whatever won (kovan `src/atom.rs:557`).
 struct Cell {

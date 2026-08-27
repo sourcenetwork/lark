@@ -3,5 +3,5 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    lark_kv::fuzzing::open_sst(data);
+    regolith::fuzzing::open_sst(data);
 });

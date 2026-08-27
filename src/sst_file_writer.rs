@@ -1,6 +1,6 @@
 //! Offline SSTable builder and bulk-ingest options.
 //!
-//! [`SstFileWriter`] lets a caller construct a valid lark SSTable on disk
+//! [`SstFileWriter`] lets a caller construct a valid regolith SSTable on disk
 //! without going through a [`crate::Db`], and
 //! [`crate::Db::ingest_external_files`] bulk-loads those files into a
 //! running database. All entries in a single ingest file are assigned

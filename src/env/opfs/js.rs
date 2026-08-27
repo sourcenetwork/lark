@@ -1,4 +1,4 @@
-//! The nine OPFS calls lark needs, reached through `js_sys::Reflect`.
+//! The nine OPFS calls regolith needs, reached through `js_sys::Reflect`.
 //!
 //! Bindings are hand-rolled rather than taken from `web-sys` for the same
 //! reason defradb's OPFS backend does it: `FileSystemSyncAccessHandle` is
@@ -105,7 +105,7 @@ pub(super) async fn remove_entry(dir: &JsValue, name: &str) -> Result<(), JsValu
 }
 
 /// File entries directly under `dir`, as `(name, FileSystemFileHandle)`.
-/// Subdirectories are skipped: lark's OPFS layout is flat.
+/// Subdirectories are skipped: regolith's OPFS layout is flat.
 pub(super) async fn list_files(dir: &JsValue) -> Result<Vec<(String, JsValue)>, JsValue> {
     let values = method(dir, "values")?;
     let iterator = values.call0(dir)?;

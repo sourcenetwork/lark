@@ -20,7 +20,7 @@
 //!
 //! [`MergingIter`] holds one [`LevelIter`] per source. In forward mode it
 //! picks the smallest internal key across all valid sources; in reverse
-//! mode it picks the largest. The top-level [`LarkIterator`] then:
+//! mode it picks the largest. The top-level [`RegolithIterator`] then:
 //!
 //! - Drops entries with `seq > snapshot_seq` (not visible at the captured
 //!   snapshot).
@@ -37,7 +37,7 @@
 //! In **reverse** mode, entries within a user-key group are visited
 //! oldest-seq first (because internal keys are `!seq`-sorted). We must
 //! scan the *entire* group before we know the latest visible version, so
-//! [`LarkIterator::materialize_prev_visible`] accumulates the most recent
+//! [`RegolithIterator::materialize_prev_visible`] accumulates the most recent
 //! visible entry seen and emits it once the group ends.
 //!
 //! # Direction changes
@@ -45,8 +45,8 @@
 //! Calling `next()` while in reverse mode (or vice versa) flips the
 //! direction. To avoid yielding the already-emitted user key again, the
 //! iterator re-seeks every level to the position just past the current
-//! user key in the new direction - see [`LarkIterator::flip_to_forward`]
-//! and [`LarkIterator::flip_to_reverse`].
+//! user key in the new direction - see [`RegolithIterator::flip_to_forward`]
+//! and [`RegolithIterator::flip_to_reverse`].
 //!
 //! # Safety against concurrent compaction
 //!
@@ -75,7 +75,7 @@ use crate::DbSlice;
 use crate::options::MergeOperator;
 use crate::options::PrefixExtractor;
 
-/// Scan direction for [`LarkIterator`].
+/// Scan direction for [`RegolithIterator`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Direction {
     Forward,
@@ -785,7 +785,7 @@ impl LevelConcatIter {
 
 /// Merges multiple `LevelIter`s into a single stream of internal-key /
 /// value pairs in ascending internal-key order. Picks the winning source
-/// on every step via linear scan - for the small number of levels lark
+/// on every step via linear scan - for the small number of levels regolith
 /// produces (≤ 30 in worst case) this beats a heap's overhead.
 struct MergingIter {
     levels: Vec<LevelIter>,
@@ -911,7 +911,7 @@ impl MergingIter {
 /// snapshot sequence. Wraps [`MergingIter`] and adds user-key
 /// deduplication, snapshot visibility filtering, tombstone suppression,
 /// and bidirectional iteration.
-pub(crate) struct LarkIterator {
+pub(crate) struct RegolithIterator {
     inner: MergingIter,
     snapshot_seq: u64,
     /// Current scan direction. `next()` / `prev()` honor this; calling
@@ -957,13 +957,13 @@ pub(crate) struct LarkIterator {
     /// constructing an iterator from a closed engine. Terminal errors
     /// are reported by `status` and are not cleared by later seeks.
     terminal_error: bool,
-    /// Exclusive upper bound set by [`LarkIterator::seek_prefix`]. When
+    /// Exclusive upper bound set by [`RegolithIterator::seek_prefix`]. When
     /// `Some`, forward iteration stops as soon as the next visible key
     /// is `>= upper_bound`, confining the scan to the originally seeked
     /// prefix. Cleared by any other seek.
     upper_bound: Option<Vec<u8>>,
     /// Prefix extractor captured at construction. Used by
-    /// [`LarkIterator::seek_prefix`] to derive the bloom probe for
+    /// [`RegolithIterator::seek_prefix`] to derive the bloom probe for
     /// the caller's query prefix. If the extractor cannot produce a
     /// prefix from the query itself, the iterator falls back to a
     /// plain upper-bound scan without bloom skipping.
@@ -1006,7 +1006,7 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-impl LarkIterator {
+impl RegolithIterator {
     /// Build an iterator over `(active_memtable, frozen_memtables, version)`
     /// at the given snapshot sequence. SSTable readers come directly from
     /// the pinned `Version`, which holds `Arc<LiveSst>`s whose file

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use lark_kv::{Db, Options};
+use regolith::{Db, Options};
 use tempfile::TempDir;
 
 fn open(dir: &TempDir) -> Arc<Db> {

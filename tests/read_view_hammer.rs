@@ -12,8 +12,8 @@
 //!
 //! Bounded by operation counts, not by wall time, so it is not a soak.
 //!
-//! Scale is `LARK_HAMMER_VERSIONS` (default 120) and
-//! `LARK_HAMMER_COMPACTIONS` (default 24). The defaults are the
+//! Scale is `REGOLITH_HAMMER_VERSIONS` (default 120) and
+//! `REGOLITH_HAMMER_COMPACTIONS` (default 24). The defaults are the
 //! smallest shape that still has every publisher running at once; the
 //! soak shape is 900 and 400, which is hours of CPU and tens of GB of
 //! scratch space, not a gate.
@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
-use lark_kv::{Db, Options, WriteBatch};
+use regolith::{Db, Options, WriteBatch};
 use tempfile::TempDir;
 
 const WRITERS: usize = 6;
@@ -74,10 +74,10 @@ fn overwritten_keys_never_vanish_and_never_travel_backwards() {
     // Gate-shaped by default, crankable for a soak. Every publisher is
     // already running at this size; more versions buy a wider window
     // for a rare interleaving, not a different shape. The full soak is
-    // `LARK_HAMMER_VERSIONS=900 LARK_HAMMER_COMPACTIONS=400`, which
+    // `REGOLITH_HAMMER_VERSIONS=900 REGOLITH_HAMMER_COMPACTIONS=400`, which
     // costs hours of CPU and tens of GB of scratch and is not a gate.
-    let versions = env("LARK_HAMMER_VERSIONS", 120) as u64;
-    let compaction_passes = env("LARK_HAMMER_COMPACTIONS", 24) as u32;
+    let versions = env("REGOLITH_HAMMER_VERSIONS", 120) as u64;
+    let compaction_passes = env("REGOLITH_HAMMER_COMPACTIONS", 24) as u32;
     let dir = TempDir::new().expect("tempdir");
     let db = open(&dir);
 

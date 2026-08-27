@@ -15,7 +15,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use lark_kv::{
+use regolith::{
     IsolationLevel, OptimisticTransactionDb, Transaction, TransactionDb, TransactionError,
 };
 

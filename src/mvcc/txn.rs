@@ -49,19 +49,19 @@ use std::sync::Arc;
 
 use kovan_mvcc::{IsolationLevel as MvccIsolation, KovanMVCC, MvccError};
 
-use super::storage::LarkStorage;
-use crate::engine::{DurabilityMode, LarkEngine};
+use super::storage::RegolithStorage;
+use crate::engine::{DurabilityMode, RegolithEngine};
 use crate::transaction::{IsolationLevel, TransactionError, TxResult};
 
 /// Transactions over one database, executed by kovan-mvcc.
 pub(crate) struct MvccTransactions {
     mvcc: KovanMVCC,
-    storage: Arc<LarkStorage>,
+    storage: Arc<RegolithStorage>,
 }
 
 impl MvccTransactions {
-    pub(crate) fn new(engine: Arc<LarkEngine>, durability: DurabilityMode) -> Self {
-        let storage = Arc::new(LarkStorage::new(engine, durability));
+    pub(crate) fn new(engine: Arc<RegolithEngine>, durability: DurabilityMode) -> Self {
+        let storage = Arc::new(RegolithStorage::new(engine, durability));
         Self {
             mvcc: KovanMVCC::with_storage(storage.clone() as Arc<dyn kovan_mvcc::Storage>),
             storage,
@@ -89,7 +89,7 @@ fn map_isolation(level: IsolationLevel) -> MvccIsolation {
 /// One in-flight transaction.
 pub(crate) struct MvccTxn<'db> {
     inner: kovan_mvcc::Txn,
-    storage: &'db Arc<LarkStorage>,
+    storage: &'db Arc<RegolithStorage>,
     /// Point writes not yet handed to kovan-mvcc. `Some` is a put,
     /// `None` a delete. Ordered so a multi-key failure always reports
     /// the same key. Flushed by [`MvccTxn::commit`].

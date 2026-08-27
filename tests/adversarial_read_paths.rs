@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use lark_kv::{Db, MergeOperator, Options, WriteBatch};
+use regolith::{Db, MergeOperator, Options, WriteBatch};
 use tempfile::TempDir;
 
 /// Append-only merge: the final value is the base followed by every
@@ -354,7 +354,7 @@ fn every_read_surface_agrees_with_a_partitioned_index_and_a_tiny_cache() {
 #[test]
 fn every_read_surface_agrees_under_the_embedded_arena_profile() {
     let opts = Options {
-        arena_profile: lark_kv::ArenaProfile::EMBEDDED,
+        arena_profile: regolith::ArenaProfile::EMBEDDED,
         write_buffer_size: 4 * 1024,
         ..churny()
     };

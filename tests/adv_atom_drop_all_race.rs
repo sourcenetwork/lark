@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
-use lark_kv::{Db, Options};
+use regolith::{Db, Options};
 use tempfile::TempDir;
 
 const KEYS: usize = 64;
@@ -37,7 +37,7 @@ fn well_formed(v: &[u8]) -> bool {
 
 #[test]
 fn readers_never_observe_a_freed_view_across_drop_all() {
-    let rounds: u64 = std::env::var("LARK_DROPALL_ROUNDS")
+    let rounds: u64 = std::env::var("REGOLITH_DROPALL_ROUNDS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(400);

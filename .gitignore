@@ -24,7 +24,7 @@ crates/ffi/defra.h
 # Local planning docs: the repo rule in CLAUDE.md forbids a docs/ tree in-tree
 /docs/
 
-# Bench output: a bench run without LARK_BENCH_OUT writes families here
+# Bench output: a bench run without REGOLITH_BENCH_OUT writes families here
 /bench-out/
 
 # Environment
@@ -36,3 +36,7 @@ crates/ffi/defra.h
 fuzz/target/
 fuzz/corpus/
 fuzz/artifacts/
+
+# Python bytecode caches, produced by running the perf-report scripts.
+__pycache__/
+*.pyc

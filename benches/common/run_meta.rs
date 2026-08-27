@@ -41,7 +41,7 @@ impl Guard {
 /// clean.
 pub fn loadguard(out: &Path) -> Guard {
     let load = loadavg();
-    let script = match std::env::var_os("LARK_LOADGUARD") {
+    let script = match std::env::var_os("REGOLITH_LOADGUARD") {
         Some(p) if !p.is_empty() => PathBuf::from(p),
         // `just gains` writes into <gains dir>/runs/<file>, and loadguard.py
         // sits at the top of that directory.
@@ -55,7 +55,7 @@ pub fn loadguard(out: &Path) -> Guard {
             passed: false,
             load,
             note: format!(
-                "loadguard.py not found at {} (set LARK_LOADGUARD to point at it). Not run, so \
+                "loadguard.py not found at {} (set REGOLITH_LOADGUARD to point at it). Not run, so \
                  the host is not certified quiet: throughput is marked contaminated rather than \
                  presumed clean.",
                 script.display()
@@ -123,8 +123,8 @@ pub fn host() -> Json {
         .and_then(|v| v.split_whitespace().next()?.parse::<f64>().ok())
         .map(|kib| Json::Num((kib / 1_048_576.0).round()))
         .unwrap_or(Json::Null);
-    let store = std::env::var("LARK_BENCH_STORE").unwrap_or_else(|_| {
-        "unrecorded (set LARK_BENCH_STORE to name the filesystem the benches ran on)".into()
+    let store = std::env::var("REGOLITH_BENCH_STORE").unwrap_or_else(|_| {
+        "unrecorded (set REGOLITH_BENCH_STORE to name the filesystem the benches ran on)".into()
     });
     Json::obj(vec![
         ("cpu", cpu),
@@ -147,10 +147,10 @@ fn proc_field(path: &str, field: &str) -> Option<String> {
 }
 
 /// Plan constants, not measurements: the success criteria in
-/// docs/plans/lark-production.md, carried so a renderer can draw the target
+/// docs/plans/regolith-production.md, carried so a renderer can draw the target
 /// side of a comparison when only one run has been collected.
 const PLAN_TARGETS: &str = r#"{
-  "note": "From docs/plans/lark-production.md success criteria. NOT measurements.",
+  "note": "From docs/plans/regolith-production.md success criteria. NOT measurements.",
   "rss_point": {
     "Empty DB, 8 MiB cache budget": 12.0,
     "RSS at 4 GiB data, 192 MiB budget": 250.0,

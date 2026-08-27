@@ -57,7 +57,7 @@ pub(crate) enum DurabilityMode {
     Eventual,
 }
 
-/// Outcome of [`LarkEngine::commit_with_conflict_check`].
+/// Outcome of [`RegolithEngine::commit_with_conflict_check`].
 /// `Conflict` indicates that another writer changed one of the
 /// tracked keys after the sequence the transaction observed it at;
 /// the caller typically surfaces this as a retry-able error.
@@ -169,7 +169,7 @@ fn set_multi_get_result(
     entry.resolved = true;
 }
 
-/// Configuration for the Lark engine.
+/// Configuration for the Regolith engine.
 #[derive(Clone)]
 pub(crate) struct EngineOptions {
     pub(crate) write_buffer_size: usize,
@@ -327,7 +327,7 @@ const CLOSE_STATE_CLOSING: u8 = 1;
 const CLOSE_STATE_CLOSED: u8 = 2;
 
 /// The core LSM-tree engine.
-pub(crate) struct LarkEngine {
+pub(crate) struct RegolithEngine {
     /// The published read view: the active memtable, the frozen
     /// memtables and the version every read resolves against. Loading
     /// it is the whole of a read's source acquisition - one shared lock
@@ -419,7 +419,7 @@ pub(crate) struct LarkEngine {
     /// How a stalled writer makes room. See [`StallPolicy`].
     stall_policy: StallPolicy,
     /// File ids currently being compacted, shared with every background
-    /// worker and with [`LarkEngine::run_one_compaction_pass`]. One set
+    /// worker and with [`RegolithEngine::run_one_compaction_pass`]. One set
     /// for the whole engine is what stops a foreground pass and a
     /// worker from picking overlapping inputs.
     compaction_in_progress: Arc<Mutex<HashSet<u64>>>,
@@ -446,7 +446,7 @@ pub(crate) enum StallPolicy {
     CompactInline,
 }
 
-impl LarkEngine {
+impl RegolithEngine {
     /// Open or create the database at the given path.
     pub(crate) fn open(db_dir: &Path, mut options: EngineOptions) -> std::io::Result<Arc<Self>> {
         options.read_only = false;
@@ -935,7 +935,7 @@ impl LarkEngine {
     /// Construct a streaming iterator over the latest published read
     /// horizon. The view is loaded before the horizon is sampled, for
     /// the reason spelled out on [`Self::get_latest`].
-    pub(crate) fn new_iter_latest(&self) -> iterator::LarkIterator {
+    pub(crate) fn new_iter_latest(&self) -> iterator::RegolithIterator {
         let closed = self.is_closed();
         let view = self.view.load();
         let snapshot_seq = self.visible_seq.visible();
@@ -947,7 +947,7 @@ impl LarkEngine {
     /// the version; no filesystem access happens here - file handles
     /// are already open in the pinned `Arc<LiveSst>`s carried by the
     /// version.
-    pub(crate) fn new_iter_at(&self, snapshot_seq: u64) -> iterator::LarkIterator {
+    pub(crate) fn new_iter_at(&self, snapshot_seq: u64) -> iterator::RegolithIterator {
         let closed = self.is_closed();
         let view = self.view.load();
         self.iter_in_view(&view, snapshot_seq, closed)
@@ -958,8 +958,8 @@ impl LarkEngine {
         view: &ReadView,
         snapshot_seq: u64,
         closed: bool,
-    ) -> iterator::LarkIterator {
-        let mut iter = iterator::LarkIterator::new(
+    ) -> iterator::RegolithIterator {
+        let mut iter = iterator::RegolithIterator::new(
             Arc::clone(&view.active),
             view.frozen.clone(),
             Arc::clone(&view.version),
@@ -1047,7 +1047,7 @@ impl LarkEngine {
         Ok(self.get_slice(&lk)?.map(DbSlice::into_vec))
     }
 
-    /// [`LarkEngine::get`] without copying the value. The returned
+    /// [`RegolithEngine::get`] without copying the value. The returned
     /// [`DbSlice`] borrows the block or heap buffer the value already
     /// lives in and keeps that owner alive.
     /// The sequence a "read the latest" caller must use, sampled with
@@ -1067,7 +1067,7 @@ impl LarkEngine {
     ///
     /// A caller reading at a *pinned* snapshot does not need this: the
     /// registration is what holds the versions, so the order does not
-    /// matter there. See [`LarkEngine::get_at`].
+    /// matter there. See [`RegolithEngine::get_at`].
     /// Newest visible value for `key`, without copying it.
     pub(crate) fn get_slice_latest(
         &self,
@@ -1102,7 +1102,7 @@ impl LarkEngine {
 
     /// Length of the live value for `lk`, or `None` when there is none.
     ///
-    /// Reads the same sources [`LarkEngine::get_slice`] does and pays
+    /// Reads the same sources [`RegolithEngine::get_slice`] does and pays
     /// the same block reads, but never takes a reference on the block
     /// or buffer the value lives in.
     pub(crate) fn get_size(&self, lk: &LookupKey) -> std::io::Result<Option<usize>> {
@@ -1745,7 +1745,7 @@ impl LarkEngine {
 
     /// Snapshot the current write-stall inputs: L0 file count,
     /// in-memory memtable count (active + frozen), and total bytes
-    /// across all L0 files (lark's approximation of pending
+    /// across all L0 files (regolith's approximation of pending
     /// compaction bytes).
     fn stall_snapshot(&self) -> (usize, usize, u64) {
         let view = self.view.load();
@@ -2950,7 +2950,7 @@ impl LarkEngine {
 
     /// Number of SSTable files at a specific level. Returns 0 for
     /// out-of-range levels rather than panicking, so
-    /// `lark.num-files-at-level<N>` for unknown levels reads
+    /// `regolith.num-files-at-level<N>` for unknown levels reads
     /// cleanly as `Some(0)`.
     pub(crate) fn num_files_at_level(&self, level: usize) -> u64 {
         let version = self.published_version();
@@ -2997,7 +2997,7 @@ impl LarkEngine {
     /// allocator: the sum of their arena chunk sizes plus the heap their
     /// range tombstones own.
     ///
-    /// [`LarkEngine::active_memtable_size`] is the payload figure that
+    /// [`RegolithEngine::active_memtable_size`] is the payload figure that
     /// `write_buffer_size` bounds; this is what the process is really
     /// holding, so the gap between them is the arena's rounding waste.
     pub(crate) fn memtables_reserved_size(&self) -> u64 {
@@ -3037,13 +3037,13 @@ impl LarkEngine {
     }
 
     /// Total bytes currently held by the block cache across all
-    /// shards. Used by the `lark.block-cache-usage` property.
+    /// shards. Used by the `regolith.block-cache-usage` property.
     pub(crate) fn block_cache_usage(&self) -> usize {
         self.cache.usage()
     }
 
     /// Block cache capacity in bytes (the sum of every shard's
-    /// budget). Used by the `lark.block-cache-capacity`
+    /// budget). Used by the `regolith.block-cache-capacity`
     /// property.
     pub(crate) fn block_cache_capacity(&self) -> usize {
         self.cache.capacity()
@@ -3053,7 +3053,7 @@ impl LarkEngine {
     /// block cache budget: pinned indexes, pinned filter regions, any
     /// metadata block the cache refused, and range tombstones.
     ///
-    /// This is the honest counterpart to `lark.block-cache-usage`:
+    /// This is the honest counterpart to `regolith.block-cache-usage`:
     /// together they account for every byte of SSTable metadata the
     /// engine is holding. With
     /// [`Options::cache_index_and_filter_blocks`] off this number grows
@@ -3079,7 +3079,7 @@ impl LarkEngine {
     }
 
     /// Borrow the current version so a caller can walk every
-    /// SSTable's metadata - used by `lark.sstables` formatter.
+    /// SSTable's metadata - used by `regolith.sstables` formatter.
     pub(crate) fn current_version(&self) -> Arc<manifest::Version> {
         self.published_version()
     }
@@ -3427,7 +3427,7 @@ fn compute_target_level(
 }
 
 /// A consistent snapshot of on-disk state captured by
-/// [`LarkEngine::checkpoint_capture`]. Holds the engine's compaction
+/// [`RegolithEngine::checkpoint_capture`]. Holds the engine's compaction
 /// lock for its entire lifetime, so no background or foreground
 /// compaction can unlink files referenced by `version` while the
 /// snapshot is alive. Callers MUST drop this snapshot as soon as
@@ -3558,8 +3558,9 @@ fn wal_file_id(path: &Path) -> Option<u64> {
 fn should_replay_wal(path: &Path, min_wal_id: u64) -> bool {
     match wal_file_id(path) {
         Some(id) => id >= min_wal_id,
-        // Legacy or temporary WAL names predate the reset marker. Once a
-        // reset has committed, they must not be allowed to resurrect data.
+        // A temporary WAL name carries no id to compare against the
+        // reset marker. Once a reset has committed, such a file must not
+        // be allowed to resurrect data.
         None => min_wal_id == 0,
     }
 }

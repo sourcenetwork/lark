@@ -8,9 +8,9 @@
 //! ```
 //!
 //! A `prefix_bloom_len` of `0` means the file was written without a
-//! prefix extractor (or the extractor yielded no prefixes). Files that
-//! predate prefix blooms wrote the same `0` marker, so the format is
-//! backward compatible.
+//! prefix extractor (or the extractor yielded no prefixes). The marker
+//! is written unconditionally, so the region decodes the same way either
+//! way.
 //!
 //! The two filters travel together because the footer describes them as
 //! one region: one region, one decode, one cache entry, one charge.

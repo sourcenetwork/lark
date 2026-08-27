@@ -1,6 +1,6 @@
 //! The default [`Env`]: `std::fs`, `std::thread`, `std::time`.
 //!
-//! Every call here is the same call lark made before the [`Env`]
+//! Every call here is the same call regolith made before the [`Env`]
 //! trait existed, in the same order, returning the same error kinds.
 //! This is the environment [`crate::Options::default`] installs, so a
 //! native user sees no behavior change at all.
@@ -36,7 +36,7 @@ const SUPPORTS_DIR_SYNC: bool = cfg!(unix) && !cfg!(target_family = "wasm");
 /// fails rather than after.
 const SUPPORTS_THREADS: bool = !cfg!(all(target_family = "wasm", not(target_feature = "atomics")));
 
-/// The host platform as lark has always used it.
+/// The host platform as regolith has always used it.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StdEnv;
 
@@ -509,7 +509,7 @@ mod tests {
         let flag = Arc::clone(&done);
         let handle = env
             .spawn(
-                "lark-env-test",
+                "regolith-env-test",
                 Box::new(move || flag.store(true, Ordering::Release)),
             )
             .unwrap();

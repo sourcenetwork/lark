@@ -1,4 +1,4 @@
-//! Property-based tests for lark's core invariants.
+//! Property-based tests for regolith's core invariants.
 //!
 //! Every test in this file uses `proptest` to generate randomized
 //! inputs and verify that the database satisfies its contract
@@ -20,8 +20,8 @@
 
 use std::collections::BTreeMap;
 
-use lark_kv::WriteBatch;
 use proptest::prelude::*;
+use regolith::WriteBatch;
 use tempfile::TempDir;
 
 mod common;
@@ -199,7 +199,7 @@ proptest! {
     }
 
     /// A `WriteBatch` is atomic: either every write in the batch
-    /// is visible, or none of them are. (Since lark doesn't have
+    /// is visible, or none of them are. (Since regolith doesn't have
     /// partial-batch failure modes today, the "none" case only
     /// happens on I/O error, which proptest can't trigger. So this
     /// test verifies the "all" case under concurrent reads.)
@@ -324,7 +324,7 @@ proptest! {
     }
 
     /// Range scans return exactly the BTreeMap slice for the given
-    /// bounds. Verifies lark's `scan(start, end)` honours the
+    /// bounds. Verifies regolith's `scan(start, end)` honours the
     /// `[start, end)` half-open convention.
     #[test]
     fn range_scan_matches_btree_slice(

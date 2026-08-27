@@ -25,7 +25,7 @@
 
 #![cfg(loom)]
 
-use lark_kv::loom_exports::{handoff, skiplist, slice, version};
+use regolith::loom_exports::{handoff, skiplist, slice, version};
 
 #[test]
 fn insert_publishes_a_whole_node_to_a_concurrent_reader() {

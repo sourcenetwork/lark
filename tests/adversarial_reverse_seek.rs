@@ -19,7 +19,7 @@
 //! Both reproduce byte for byte at the base commit `d1ec2e7`, so this is
 //! a pre-existing defect in code this PR rewrote, not one it introduced.
 
-use lark_kv::{Db, Options};
+use regolith::{Db, Options};
 use tempfile::TempDir;
 
 fn probe(label: &str, opts: Options, compact: bool) {

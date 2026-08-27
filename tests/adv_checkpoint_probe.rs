@@ -1,7 +1,7 @@
 //! Regression gate: a checkpoint taken while a writer is running must
 //! not miss data that was acknowledged before the writer ever started.
 //!
-//! `LarkEngine::checkpoint_capture` used to flush the *active* memtable
+//! `RegolithEngine::checkpoint_capture` used to flush the *active* memtable
 //! when it was non-empty and never look at the frozen list. A concurrent
 //! `rotate_memtable` leaves a window where the active memtable is fresh
 //! and empty while the sealed one is still being flushed; a checkpoint
@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use lark_kv::{Db, Options, WriteBatch};
+use regolith::{Db, Options, WriteBatch};
 use tempfile::TempDir;
 
 fn tiny() -> Options {

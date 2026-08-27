@@ -13,10 +13,10 @@
 //! # Usage
 //!
 //! ```no_run
-//! use lark_kv::{Db, Options, PerfContext, PerfLevel};
+//! use regolith::{Db, Options, PerfContext, PerfLevel};
 //!
-//! # fn main() -> lark_kv::Result<()> {
-//! let db = Db::open("/tmp/lark_perf", Options::default())?;
+//! # fn main() -> regolith::Result<()> {
+//! let db = Db::open("/tmp/regolith_perf", Options::default())?;
 //!
 //! PerfContext::set_level(PerfLevel::EnableTime);
 //! PerfContext::reset();

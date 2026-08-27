@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use lark_kv::{Db, DurabilityMode, Options, WriteBatch};
+use regolith::{Db, DurabilityMode, Options, WriteBatch};
 
 use super::journal::{Journal, journal_path_for, root_filter_for};
 use super::prefix::{History, OpValue};
@@ -44,7 +44,7 @@ use super::shim;
 /// replays byte for byte; override with `ChildSpec::seed`.
 pub const DEFAULT_SEED: u64 = 0x1A12_5EED_C0FF_EE01;
 
-pub const CHILD_ENV: &str = "LARK_CRASH_CHILD";
+pub const CHILD_ENV: &str = "REGOLITH_CRASH_CHILD";
 /// Name of the `#[test]` function the parent re-executes.
 ///
 /// An ordinary test, not an ignored one. [`child_entrypoint`] returns
@@ -297,21 +297,30 @@ impl ChildSpec {
     fn to_env(&self) -> Vec<(String, String)> {
         vec![
             (CHILD_ENV.into(), self.phase.as_str().into()),
-            ("LARK_CRASH_DB".into(), self.db_path.display().to_string()),
-            ("LARK_CRASH_SEED".into(), self.seed.to_string()),
-            ("LARK_CRASH_OPS".into(), self.ops.to_string()),
-            ("LARK_CRASH_BATCH".into(), self.batch_size.to_string()),
-            ("LARK_CRASH_VLEN".into(), self.value_len.to_string()),
-            ("LARK_CRASH_DEL".into(), self.delete_every.to_string()),
             (
-                "LARK_CRASH_DUR".into(),
+                "REGOLITH_CRASH_DB".into(),
+                self.db_path.display().to_string(),
+            ),
+            ("REGOLITH_CRASH_SEED".into(), self.seed.to_string()),
+            ("REGOLITH_CRASH_OPS".into(), self.ops.to_string()),
+            ("REGOLITH_CRASH_BATCH".into(), self.batch_size.to_string()),
+            ("REGOLITH_CRASH_VLEN".into(), self.value_len.to_string()),
+            ("REGOLITH_CRASH_DEL".into(), self.delete_every.to_string()),
+            (
+                "REGOLITH_CRASH_DUR".into(),
                 match self.durability {
                     DurabilityMode::Immediate => "immediate".into(),
                     DurabilityMode::Eventual => "eventual".into(),
                 },
             ),
-            ("LARK_CRASH_WBS".into(), self.write_buffer_size.to_string()),
-            ("LARK_CRASH_ACK".into(), self.ack_path.display().to_string()),
+            (
+                "REGOLITH_CRASH_WBS".into(),
+                self.write_buffer_size.to_string(),
+            ),
+            (
+                "REGOLITH_CRASH_ACK".into(),
+                self.ack_path.display().to_string(),
+            ),
         ]
     }
 
@@ -325,21 +334,21 @@ impl ChildSpec {
         };
         Some(ChildSpec {
             phase,
-            db_path: PathBuf::from(std::env::var("LARK_CRASH_DB").ok()?),
-            seed: std::env::var("LARK_CRASH_SEED")
+            db_path: PathBuf::from(std::env::var("REGOLITH_CRASH_DB").ok()?),
+            seed: std::env::var("REGOLITH_CRASH_SEED")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1),
-            ops: num("LARK_CRASH_OPS", 100),
-            batch_size: num("LARK_CRASH_BATCH", 1),
-            value_len: num("LARK_CRASH_VLEN", 64),
-            delete_every: num("LARK_CRASH_DEL", 0),
-            durability: match std::env::var("LARK_CRASH_DUR").as_deref() {
+            ops: num("REGOLITH_CRASH_OPS", 100),
+            batch_size: num("REGOLITH_CRASH_BATCH", 1),
+            value_len: num("REGOLITH_CRASH_VLEN", 64),
+            delete_every: num("REGOLITH_CRASH_DEL", 0),
+            durability: match std::env::var("REGOLITH_CRASH_DUR").as_deref() {
                 Ok("immediate") => DurabilityMode::Immediate,
                 _ => DurabilityMode::Eventual,
             },
-            write_buffer_size: num("LARK_CRASH_WBS", 1 << 20),
-            ack_path: PathBuf::from(std::env::var("LARK_CRASH_ACK").unwrap_or_default()),
+            write_buffer_size: num("REGOLITH_CRASH_WBS", 1 << 20),
+            ack_path: PathBuf::from(std::env::var("REGOLITH_CRASH_ACK").unwrap_or_default()),
         })
     }
 }
@@ -505,15 +514,15 @@ impl CrashRun {
         for (k, v) in spec.to_env() {
             cmd.env(k, v);
         }
-        cmd.env("LARK_CRASH_STARTED", &started_path);
+        cmd.env("REGOLITH_CRASH_STARTED", &started_path);
         // A stale trigger inherited from the parent environment would kill
         // a child that was meant to run to completion.
         for k in [
-            "LARK_FAULT_DIE_KIND",
-            "LARK_FAULT_DIE_PATH",
-            "LARK_FAULT_DIE_NTH",
-            "LARK_FAULT_DIE_WHEN",
-            "LARK_FAULT_JOURNAL",
+            "REGOLITH_FAULT_DIE_KIND",
+            "REGOLITH_FAULT_DIE_PATH",
+            "REGOLITH_FAULT_DIE_NTH",
+            "REGOLITH_FAULT_DIE_WHEN",
+            "REGOLITH_FAULT_JOURNAL",
         ] {
             cmd.env_remove(k);
         }
@@ -522,9 +531,9 @@ impl CrashRun {
         if needs_shim {
             let lib = shim::require();
             cmd.env("LD_PRELOAD", shim::preload_value(&lib));
-            cmd.env("LARK_FAULT_ROOT", root_filter_for(&db));
+            cmd.env("REGOLITH_FAULT_ROOT", root_filter_for(&db));
             if self.record_io {
-                cmd.env("LARK_FAULT_JOURNAL", &journal);
+                cmd.env("REGOLITH_FAULT_JOURNAL", &journal);
             }
         }
         if let Trigger::Syscall {
@@ -534,11 +543,11 @@ impl CrashRun {
             before,
         } = &self.trigger
         {
-            cmd.env("LARK_FAULT_DIE_KIND", kind.as_str())
-                .env("LARK_FAULT_DIE_PATH", path_contains)
-                .env("LARK_FAULT_DIE_NTH", nth.to_string())
+            cmd.env("REGOLITH_FAULT_DIE_KIND", kind.as_str())
+                .env("REGOLITH_FAULT_DIE_PATH", path_contains)
+                .env("REGOLITH_FAULT_DIE_NTH", nth.to_string())
                 .env(
-                    "LARK_FAULT_DIE_WHEN",
+                    "REGOLITH_FAULT_DIE_WHEN",
                     if *before { "before" } else { "after" },
                 );
         }
@@ -723,7 +732,7 @@ pub fn child_entrypoint(dispatch: fn(&ChildSpec)) {
         Some(s) => s,
         None => return,
     };
-    if let Ok(marker) = std::env::var("LARK_CRASH_STARTED") {
+    if let Ok(marker) = std::env::var("REGOLITH_CRASH_STARTED") {
         std::fs::write(&marker, spec.phase.as_str())
             .unwrap_or_else(|e| panic!("child: writing start marker {marker}: {e}"));
     }

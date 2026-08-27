@@ -17,7 +17,7 @@ use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use lark_kv::{Db, Error};
+use regolith::{Db, Error};
 use tempfile::TempDir;
 
 mod common;

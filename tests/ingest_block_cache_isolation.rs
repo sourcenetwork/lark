@@ -21,7 +21,7 @@
 
 use std::path::{Path, PathBuf};
 
-use lark_kv::{Db, DurabilityMode, IngestOptions, Options, SstFileWriter};
+use regolith::{Db, DurabilityMode, IngestOptions, Options, SstFileWriter};
 use tempfile::TempDir;
 
 const PER_FILE: u32 = 2000;

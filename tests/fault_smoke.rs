@@ -30,7 +30,7 @@ use common::fault::{
     self, ChildSpec, CrashRun, CutPoint, History, OpValue, Phase, PowerLossOptions, TearMode,
     Trigger,
 };
-use lark_kv::{Db, DurabilityMode, Options};
+use regolith::{Db, DurabilityMode, Options};
 use tempfile::TempDir;
 
 /// Child process entry point. Returns immediately unless this process was
@@ -53,15 +53,15 @@ fn reopen(dir: &Path) -> Db {
 }
 
 /// Proves the `LD_PRELOAD` interposer compiles here and actually observes
-/// lark's I/O: it must record writes to the WAL, writes to an SSTable, and
+/// regolith's I/O: it must record writes to the WAL, writes to an SSTable, and
 /// at least one `fsync`.
 ///
 /// Catches: a shim that loads but interposes nothing (wrong symbol names,
-/// a `rustix` raw-syscall path that bypasses glibc, or a future lark
+/// a `rustix` raw-syscall path that bypasses glibc, or a future regolith
 /// change to `mmap` writes). Without this, every power-loss test would
 /// reconstruct from an empty journal and pass vacuously.
 #[test]
-fn the_shim_records_larks_real_file_io() {
+fn the_shim_records_regoliths_real_file_io() {
     assert!(
         fault::shim::available(),
         "fault shim did not build: {:?}",
@@ -254,7 +254,7 @@ fn eventual_durability_recovers_to_a_valid_prefix() {
 /// The invariant asserted is the one that holds in every durability mode:
 /// the engine either recovers a valid prefix, or it refuses to open and
 /// says why. What it must never do is open and serve a state that is
-/// neither. lark today takes the second branch on a garbage WAL tail.
+/// neither. regolith today takes the second branch on a garbage WAL tail.
 ///
 /// Catches: a WAL reader that trusts a length prefix before verifying the
 /// checksum, and any recovery that applies a record whose bytes are wrong.
@@ -507,7 +507,7 @@ fn the_locators_find_the_wal_manifest_and_sstable() {
 ///
 /// Observed on this engine, and recorded here so it is not mistaken for a
 /// harness fault: with the tail dropped, every acknowledged batch is
-/// recovered. With the tail zeroed, lark reports a WAL checksum mismatch
+/// recovered. With the tail zeroed, regolith reports a WAL checksum mismatch
 /// and refuses to open at all, so the assertion below allows a loud
 /// refusal but never a torn state.
 ///

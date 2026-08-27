@@ -6,7 +6,7 @@
 //! into one run file and told apart by the `options` each entry carries.
 //!
 //! Usage:
-//!   cargo run --release --bench soak -- <seconds> <write_buffer_mib> <cache_mib> <shard_bits> <tag>
+//!   cargo bench --bench soak -- <seconds> <write_buffer_mib> <cache_mib> <shard_bits> <tag>
 //! Defaults: 360 64 64 6 default
 
 mod common;
@@ -14,7 +14,7 @@ mod common;
 use std::hint::black_box;
 use std::time::Instant;
 
-use lark_kv::{Options, Snapshot};
+use regolith::{Options, Snapshot};
 
 const KEYSPACE: u64 = 400_000;
 const VALUE_BYTES: usize = 4096;
@@ -39,13 +39,13 @@ hold-and-release over a 400k keyspace with 4 KiB values.";
 const RSS_AVAILABLE: bool = cfg!(target_os = "linux");
 
 fn main() {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let argv = common::args();
     if argv.iter().any(|a| a.starts_with('-')) {
         eprintln!(
             "soak: skipped. It is a custom long-running harness, not a criterion bench, so `cargo bench` does not drive it."
         );
         eprintln!(
-            "  cargo run --release --bench soak -- <seconds> <write_buffer_mib> <cache_mib> <shard_bits> <tag>"
+            "  cargo bench --bench soak -- <seconds> <write_buffer_mib> <cache_mib> <shard_bits> <tag>"
         );
         return;
     }
@@ -218,7 +218,7 @@ fn main() {
             samples.len()
         );
     }
-    println!("  family 'soak' written (LARK_BENCH_OUT, else bench-out/soak.json)");
+    println!("  family 'soak' written (REGOLITH_BENCH_OUT, else bench-out/soak.json)");
 }
 
 fn samples_json(samples: &[(f64, f64, u64)]) -> String {

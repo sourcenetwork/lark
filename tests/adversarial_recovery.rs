@@ -9,7 +9,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
-use lark_kv::{Db, Options, WriteOptions};
+use regolith::{Db, Options, WriteOptions};
 use tempfile::TempDir;
 
 fn opts() -> Options {

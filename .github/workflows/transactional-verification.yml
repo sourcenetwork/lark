@@ -56,7 +56,7 @@ jobs:
           unzip -q -o /tmp/elle-cli.zip -d /tmp/elle-cli
           find /tmp/elle-cli -name '*.jar' -exec cp {} harness/elle/elle-cli.jar \;
           test -s harness/elle/elle-cli.jar
-      - name: Every isolation level lark claims
+      - name: Every isolation level regolith claims
         run: just elle-matrix
 
   # The performance artifact: one self-contained HTML page per commit on

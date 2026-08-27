@@ -10,7 +10,7 @@
 use std::fs;
 use std::path::Path;
 
-use lark_kv::{BackupEngine, Db, IngestOptions, Options, SstFileWriter};
+use regolith::{BackupEngine, Db, IngestOptions, Options, SstFileWriter};
 use tempfile::TempDir;
 
 const N: usize = 4000;

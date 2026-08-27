@@ -7,11 +7,11 @@
 //! on a given device is a separate, measured question.
 #![cfg(not(target_arch = "wasm32"))]
 
-use lark_kv::env::{
+use regolith::env::{
     Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, StdEnv, WriteFile,
     WriteMode,
 };
-use lark_kv::{Db, Options, WriteBatch, WriteOptions};
+use regolith::{Db, Options, WriteBatch, WriteOptions};
 use std::io;
 use std::path::Path;
 use std::sync::Arc;

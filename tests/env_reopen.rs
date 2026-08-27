@@ -16,8 +16,8 @@
 
 use std::sync::Arc;
 
-use lark_kv::env::{Env, WriteMode};
-use lark_kv::{Db, MemEnv, Options, WriteBatch};
+use regolith::env::{Env, WriteMode};
+use regolith::{Db, MemEnv, Options, WriteBatch};
 
 fn opts(env: &Arc<MemEnv>) -> Options {
     Options {

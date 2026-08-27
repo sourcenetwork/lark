@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use lark_kv::{DurabilityMode, Options};
+use regolith::{DurabilityMode, Options};
 
 use crate::cli::{Config, Fault, WorkerRole};
 use crate::faults::{tear_wal_write, truncate_wal_tail, WalMark};
@@ -326,10 +326,10 @@ fn prepare_dir(dir: &Path) -> Result<(), String> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(format!("inspect {}: {}", dir.display(), err)),
         Ok(mut entries) => {
-            let looks_like_lark = std::fs::metadata(dir.join("MANIFEST")).is_ok();
-            if entries.next().is_some() && !looks_like_lark {
+            let looks_like_regolith = std::fs::metadata(dir.join("MANIFEST")).is_ok();
+            if entries.next().is_some() && !looks_like_regolith {
                 return Err(format!(
-                    "{} is not empty and does not look like a lark database; \
+                    "{} is not empty and does not look like a regolith database; \
                      refusing to delete it",
                     dir.display()
                 ));

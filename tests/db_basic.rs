@@ -12,7 +12,7 @@
 // suite lives in tests/wasm_opfs*.rs.
 #![cfg(not(target_arch = "wasm32"))]
 
-use lark_kv::{Db, Options, Range, WriteBatch};
+use regolith::{Db, Options, Range, WriteBatch};
 use tempfile::TempDir;
 
 mod common;
@@ -467,7 +467,7 @@ fn write_batch_range_delete_hides_every_key_in_range() {
 }
 
 /// The sequence API is what lets an upper layer order its own versions against
-/// lark's without holding a lock across a commit: the horizon publishes inside
+/// regolith's without holding a lock across a commit: the horizon publishes inside
 /// the write, and a snapshot captures it atomically.
 #[test]
 fn sequences_order_snapshots_against_commits() {

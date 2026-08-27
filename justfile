@@ -117,7 +117,7 @@ test-slow:
 # Rebuild the LD_PRELOAD fault shim from scratch by dropping its cache.
 
 fault-shim-clean:
-    rm -rf target/tmp/lark-fault
+    rm -rf target/tmp/regolith-fault
 
 # The `#[ignore]`d exhaustive corruption sweeps: every byte offset and
 # every single-bit flip of a WAL, an SSTable and a MANIFEST. 14,265
@@ -141,11 +141,11 @@ mvcc-slow:
 
 set shell := ["bash", "-uc"]
 
-gains_dir := justfile_directory() / "../larkgains"
+gains_dir := justfile_directory() / "../regolithgains"
 
 label     := env_var_or_default("LABEL", "wip")
 
-py        := env_var_or_default("LARKGAINS_PY", "python3")
+py        := env_var_or_default("REGOLITHGAINS_PY", "python3")
 
 # NOTE: the commit sha is resolved INSIDE the recipe, never as a top-level
 # `sha := `git ...`` assignment. just evaluates those eagerly at parse time, so a
@@ -190,7 +190,7 @@ bench-one name: loadguard
 # RSS soak. Default 360s; pass seconds and an Options variant tag.
 
 soak secs="360" wb="64" cache="64" shard_bits="6" tag="default": loadguard
-    cargo run --release --bench soak -- {{secs}} {{wb}} {{cache}} {{shard_bits}} {{tag}}
+    cargo bench --bench soak -- {{secs}} {{wb}} {{cache}} {{shard_bits}} {{tag}}
 
 # The two soak variants compared. Deterministic: no loadguard needed.
 
@@ -201,7 +201,7 @@ soak-pair:
 # Binary size, native and both wasm targets, against the budget.
 
 size:
-    cargo run --release --bench size
+    cargo bench --bench size
 
 # The memory table in the README: every profile, on both hosts, one
 # workload. The wasm column is the reproducible one because linear
@@ -227,19 +227,19 @@ wasm-budget puts="20000":
 # Point memory probes.
 
 mem:
-    cargo run --release --bench memory
+    cargo bench --bench memory
 
 # The MVCC regression probes. Must stay at zero violations.
 
 ycsb workload="a" records="1000000" ops="1000000": loadguard
-    cargo run --release -p lark-ycsb -- \
+    cargo run --release -p regolith-ycsb -- \
         --workload {{workload}} --records {{records}} --operations {{ops}}
 
 ycsb-all: loadguard
     for w in a b c d e f; do just ycsb $w; done
 
 stress secs="600":
-    cargo run --release -p lark-stress -- --duration {{secs}}
+    cargo run --release -p regolith-stress -- --duration {{secs}}
 
 # ---------- model checking ----------
 
@@ -282,8 +282,8 @@ loom-all: loom loom-debug
 # the overlap count is already in the thousands per instance here.
 
 chaos instances="4" rounds="2" versions="120" min_rounds="20":
-    LARK_CHAOS_INSTANCES={{instances}} LARK_CHAOS_ROUNDS={{rounds}} \
-    LARK_CHAOS_VERSIONS={{versions}} LARK_CHAOS_MIN_ROUNDS={{min_rounds}} \
+    REGOLITH_CHAOS_INSTANCES={{instances}} REGOLITH_CHAOS_ROUNDS={{rounds}} \
+    REGOLITH_CHAOS_VERSIONS={{versions}} REGOLITH_CHAOS_MIN_ROUNDS={{min_rounds}} \
         cargo test --release --test read_view_chaos_workload -- --nocapture
 
 # ---------- consistency ----------
@@ -298,22 +298,22 @@ elle model="list-append" level="snapshot-isolation" isolation="repeatable-read":
     cargo run --release --manifest-path harness/elle/Cargo.toml --bin elle-gen -- \
         --model {{model}} --isolation {{isolation}} \
         --threads 8 --txns 50 --keys 4 \
-        --out /tmp/lark-history.json --dir /tmp/lark-elle-db
+        --out /tmp/regolith-history.json --dir /tmp/regolith-elle-db
     java -jar harness/elle/elle-cli.jar --model {{model}} \
-        --consistency-models {{level}} /tmp/lark-history.json
+        --consistency-models {{level}} /tmp/regolith-history.json
 
 # The same, with the fault injection the harness supports.
 elle-fault model="list-append" level="snapshot-isolation":
     cargo run --release --manifest-path harness/elle/Cargo.toml --bin elle-gen -- \
         --model {{model}} --isolation repeatable-read --faults \
         --threads 8 --txns 50 --keys 4 \
-        --out /tmp/lark-history-fault.json --dir /tmp/lark-elle-fault-db
+        --out /tmp/regolith-history-fault.json --dir /tmp/regolith-elle-fault-db
     java -jar harness/elle/elle-cli.jar --model {{model}} \
-        --consistency-models {{level}} /tmp/lark-history-fault.json
+        --consistency-models {{level}} /tmp/regolith-history-fault.json
 
-# Every level lark claims, checked in one go.
+# Every level regolith claims, checked in one go.
 #
-# Each line prints `true` or `false`; a `false` on a level lark claims is
+# Each line prints `true` or `false`; a `false` on a level regolith claims is
 # a real failure and the recipe exits non-zero.
 elle-matrix:
     #!/usr/bin/env bash
@@ -336,7 +336,7 @@ elle-matrix:
         if [ "$v" != "true" ]; then fail=1; fi
     }
     # Optimistic transactions are snapshot isolation. That is the level
-    # lark claims, so a false here is a defect.
+    # regolith claims, so a false here is a defect.
     check optimistic-si       list-append snapshot-isolation --isolation repeatable-read --threads 8 --txns 50 --keys 4 --seed 4
     check optimistic-rw       rw-register snapshot-isolation --isolation repeatable-read --threads 8 --txns 50 --keys 4 --seed 5
     # Pessimistic transactions are checked at the level they request.
@@ -360,27 +360,27 @@ wasm records="5000" sustained="20000":
     # stop trigger with a 32 KiB memtable and no explicit compaction,
     # which is the case that wedges when nothing compacts on the
     # calling thread.
-    cargo build --release -p lark-wasm-probe --target wasm32-wasip1
+    cargo build --release -p regolith-wasm-probe --target wasm32-wasip1
     # Both shipped profiles a wasm module can open with, on the real
     # target: `embedded` runs with no block cache, `wasm` with one.
     for profile in embedded wasm; do
         echo "== profile $profile =="
         d=$(mktemp -d)
         wasmtime run --dir="$d::/data" \
-            target/wasm32-wasip1/release/lark-wasm-probe.wasm -- \
+            target/wasm32-wasip1/release/regolith-wasm-probe.wasm -- \
             --profile "$profile" --records {{records}} --sustained {{sustained}} \
             --probe-host --report-memory
         rm -rf "$d"
     done
 
-# The same lifecycle natively, to tell a lark bug apart from a wasm one.
+# The same lifecycle natively, to tell a regolith bug apart from a wasm one.
 
 wasm-native records="5000" sustained="20000":
     #!/usr/bin/env bash
     set -euo pipefail
     for profile in embedded wasm; do
         echo "== profile $profile =="
-        cargo run --release -p lark-wasm-probe -- \
+        cargo run --release -p regolith-wasm-probe -- \
             --profile "$profile" --records {{records}} --sustained {{sustained}} \
             --probe-host --report-memory
     done
@@ -406,7 +406,7 @@ wasm-browser:
     done
 
 embedded:
-    cargo run --release --bench memory -- --profile embedded
+    cargo bench --bench memory -- --profile embedded
 
 # ---------- the gains figures ----------
 
@@ -417,7 +417,7 @@ gains: loadguard
     set -euo pipefail
     sha=$(git rev-parse --short HEAD)
     cargo bench -- --baseline pre --save-baseline "$sha"
-    cargo run --release --bench collect -- \
+    cargo bench --bench collect -- \
         --out {{gains_dir}}/runs/"$sha"-{{label}}.json \
         --commit "$sha" --label {{label}}
     just gains-render

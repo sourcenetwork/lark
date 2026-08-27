@@ -30,7 +30,7 @@ pub(crate) struct SnapshotRegistry {
     /// is O(log n). `earliest_register_unix` is captured on the
     /// first `register` call at a given seq and reused by
     /// subsequent increments so the property
-    /// `lark.oldest-snapshot-time` is stable across refcount
+    /// `regolith.oldest-snapshot-time` is stable across refcount
     /// changes.
     active: Mutex<BTreeMap<u64, SlotState>>,
     /// Signalled whenever the last pin is released, so a caller
@@ -44,7 +44,7 @@ pub(crate) struct SnapshotRegistry {
 struct SlotState {
     refcount: usize,
     /// `None` on a platform with no wall clock. The
-    /// `lark.oldest-snapshot-time` property then reports the
+    /// `regolith.oldest-snapshot-time` property then reports the
     /// timestamp as absent rather than as the epoch.
     registered_at_unix: Option<u64>,
 }
@@ -177,9 +177,9 @@ impl SnapshotRegistry {
     /// snapshot was registered.
     ///
     /// `None` when no snapshot is alive, and also `None` when the
-    /// environment has no wall clock: lark reports "not known"
+    /// environment has no wall clock: regolith reports "not known"
     /// rather than inventing an epoch timestamp. Used to populate
-    /// the `lark.oldest-snapshot-time` property.
+    /// the `regolith.oldest-snapshot-time` property.
     pub(crate) fn oldest_snapshot_time_unix(&self) -> Option<u64> {
         self.active
             .lock()

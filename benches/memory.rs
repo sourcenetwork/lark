@@ -1,7 +1,7 @@
 //! Memory-footprint bench: every number here is bytes, not time.
 //!
 //! Custom harness, not criterion. Each sample runs in a fresh child process (a
-//! re-exec of this binary with `LARK_MEM_CHILD` set) because a freed allocation
+//! re-exec of this binary with `REGOLITH_MEM_CHILD` set) because a freed allocation
 //! stays mapped in the process: measuring two configurations in one process
 //! lets the first one's arena silently become the second one's floor.
 //!
@@ -16,9 +16,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use lark_kv::{Db, Options, WriteBatch};
+use regolith::{Db, Options, WriteBatch};
 
-const CHILD_ENV: &str = "LARK_MEM_CHILD";
+const CHILD_ENV: &str = "REGOLITH_MEM_CHILD";
 /// Pinned across the shard sweep so shard count is the only variable.
 const PINNED_CACHE: usize = 8 * 1024 * 1024;
 const FILL_WRITE_BUFFER: usize = 64 * 1024 * 1024;
@@ -270,7 +270,7 @@ impl Cfg {
     fn parse(args: Vec<String>) -> Cfg {
         let mut c = Cfg {
             write_mib: vec![1024, 2048, 4096],
-            max_shard_bits: lark_kv::MAX_BLOCK_CACHE_SHARD_BITS,
+            max_shard_bits: regolith::MAX_BLOCK_CACHE_SHARD_BITS,
             wal_mib: 256,
             embedded_mib: 64,
             embedded_only: false,
@@ -301,9 +301,9 @@ impl Cfg {
                 "--max-shard-bits" => {
                     c.max_shard_bits = num(&value()) as u32;
                     assert!(
-                        c.max_shard_bits <= lark_kv::MAX_BLOCK_CACHE_SHARD_BITS,
+                        c.max_shard_bits <= regolith::MAX_BLOCK_CACHE_SHARD_BITS,
                         "--max-shard-bits must be <= {}",
-                        lark_kv::MAX_BLOCK_CACHE_SHARD_BITS
+                        regolith::MAX_BLOCK_CACHE_SHARD_BITS
                     );
                 }
                 "--wal-mib" => c.wal_mib = num(&value()),
@@ -427,7 +427,7 @@ fn wal_bytes(dir: &Path) -> u64 {
 }
 
 fn parent(cfg: Cfg) {
-    println!("lark memory bench (bytes, not time)");
+    println!("regolith memory bench (bytes, not time)");
     println!(
         "memory.meta process_metrics={METRICS} source={}",
         if METRICS {

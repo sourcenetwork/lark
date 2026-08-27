@@ -22,14 +22,14 @@
 //! so "absent" and "went backwards" are both violations of the read
 //! path and never of the workload.
 //!
-//! Scale comes from `LARK_SCAN_ORDER_INSTANCES` / `LARK_SCAN_ORDER_ROUNDS`; the
+//! Scale comes from `REGOLITH_SCAN_ORDER_INSTANCES` / `REGOLITH_SCAN_ORDER_ROUNDS`; the
 //! defaults are the smallest shape that reproduced on a 36-core box.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
-use lark_kv::{ColumnFamilyHandle, Db, Options};
+use regolith::{ColumnFamilyHandle, Db, Options};
 use tempfile::TempDir;
 
 #[derive(Clone, Copy, Debug)]
@@ -263,11 +263,11 @@ fn drive(surface: Surface) {
     // horizon, and that window is per read, so the number of reads is
     // what matters rather than the number of databases: these defaults
     // still drive over a million of them.
-    let instances = env("LARK_SCAN_ORDER_INSTANCES", 4);
-    let rounds = env("LARK_SCAN_ORDER_ROUNDS", 2);
-    let keys = env("LARK_SCAN_ORDER_KEYS", 16);
-    let versions = env("LARK_SCAN_ORDER_VERSIONS", 500) as u64;
-    let min_rounds = env("LARK_SCAN_ORDER_MIN_ROUNDS", 40);
+    let instances = env("REGOLITH_SCAN_ORDER_INSTANCES", 4);
+    let rounds = env("REGOLITH_SCAN_ORDER_ROUNDS", 2);
+    let keys = env("REGOLITH_SCAN_ORDER_KEYS", 16);
+    let versions = env("REGOLITH_SCAN_ORDER_VERSIONS", 500) as u64;
+    let min_rounds = env("REGOLITH_SCAN_ORDER_MIN_ROUNDS", 40);
 
     let mut reads = 0u64;
     let mut all = Vec::new();

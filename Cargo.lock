@@ -501,69 +501,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lark-bench"
-version = "0.1.0"
-dependencies = [
- "clap",
- "lark-kv",
- "rand",
- "tempfile",
-]
-
-[[package]]
-name = "lark-kv"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "js-sys",
- "kovan",
- "kovan-channel",
- "kovan-map",
- "kovan-mvcc",
- "kovan-queue",
- "loom",
- "lz4_flex",
- "portable-atomic",
- "proptest",
- "rustix",
- "snap",
- "tempfile",
- "thiserror",
- "tracing",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-bindgen-test",
- "xxhash-rust",
-]
-
-[[package]]
-name = "lark-stress"
-version = "0.1.0"
-dependencies = [
- "clap",
- "lark-kv",
- "rand",
- "tempfile",
-]
-
-[[package]]
-name = "lark-wasm-probe"
-version = "0.1.0"
-dependencies = [
- "lark-kv",
-]
-
-[[package]]
-name = "lark-ycsb"
-version = "0.1.0"
-dependencies = [
- "clap",
- "lark-kv",
- "rand",
- "tempfile",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -911,6 +848,69 @@ name = "regex-syntax"
 version = "0.8.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
+
+[[package]]
+name = "regolith"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "js-sys",
+ "kovan",
+ "kovan-channel",
+ "kovan-map",
+ "kovan-mvcc",
+ "kovan-queue",
+ "loom",
+ "lz4_flex",
+ "portable-atomic",
+ "proptest",
+ "rustix",
+ "snap",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "regolith-bench"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "rand",
+ "regolith",
+ "tempfile",
+]
+
+[[package]]
+name = "regolith-stress"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "rand",
+ "regolith",
+ "tempfile",
+]
+
+[[package]]
+name = "regolith-wasm-probe"
+version = "0.1.0"
+dependencies = [
+ "regolith",
+]
+
+[[package]]
+name = "regolith-ycsb"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "rand",
+ "regolith",
+ "tempfile",
+]
 
 [[package]]
 name = "rustix"

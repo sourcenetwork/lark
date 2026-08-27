@@ -1,0 +1,13 @@
+[package]
+name = "regolith-wasm-probe"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+publish = false
+
+# No dependencies beyond regolith on purpose. The probe is built for
+# wasm32-wasip1 and checked on the 1.82 MSRV toolchain, so anything it
+# pulls in would have to satisfy both. Argument parsing is hand-rolled
+# for the same reason.
+[dependencies]
+regolith = { path = "../.." }

@@ -2,7 +2,7 @@
 
 //! The main-thread half of the OPFS contract.
 //!
-//! Browsers refuse `createSyncAccessHandle` outside a Worker. lark must
+//! Browsers refuse `createSyncAccessHandle` outside a Worker. regolith must
 //! say so plainly at mount rather than hanging, blocking, or opening a
 //! database whose writes cannot land, so those are the assertions here.
 //!
@@ -18,9 +18,9 @@
 //! cargo invocation, which builds every test target in the package, and
 //! the rest of `tests/` is native-only.
 
-use lark_kv::env::Env;
-use lark_kv::env::opfs::{OpfsEnv, OpfsError, OpfsMode, OpfsOptions};
-use lark_kv::{Db, Options};
+use regolith::env::Env;
+use regolith::env::opfs::{OpfsEnv, OpfsError, OpfsMode, OpfsOptions};
+use regolith::{Db, Options};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_browser);
@@ -31,7 +31,7 @@ async fn demanding_sync_access_handles_off_a_worker_fails_at_mount() {
         force_mode: Some(OpfsMode::Sah),
         ..OpfsOptions::default()
     };
-    let error = OpfsEnv::mount("lark-test-main-forced", options)
+    let error = OpfsEnv::mount("regolith-test-main-forced", options)
         .await
         .expect_err("sync access handles must not be available on the main thread");
 
@@ -47,7 +47,7 @@ async fn demanding_sync_access_handles_off_a_worker_fails_at_mount() {
 
 #[wasm_bindgen_test]
 async fn the_probe_falls_back_to_mirror_on_the_main_thread() {
-    let env = OpfsEnv::mount("lark-test-main-probe", OpfsOptions::default())
+    let env = OpfsEnv::mount("regolith-test-main-probe", OpfsOptions::default())
         .await
         .expect("mount");
     assert_eq!(env.mode(), OpfsMode::Mirror);
@@ -64,7 +64,7 @@ async fn the_probe_falls_back_to_mirror_on_the_main_thread() {
 
 #[wasm_bindgen_test]
 async fn a_database_opened_on_the_main_thread_round_trips_through_persist() {
-    let name = "lark-test-main-lifecycle";
+    let name = "regolith-test-main-lifecycle";
     {
         let env = OpfsEnv::mount(name, OpfsOptions::default())
             .await
@@ -96,7 +96,7 @@ async fn a_database_opened_on_the_main_thread_round_trips_through_persist() {
 
 #[wasm_bindgen_test]
 async fn a_database_larger_than_the_mirror_bound_is_refused_at_mount() {
-    let name = "lark-test-main-residency";
+    let name = "regolith-test-main-residency";
     {
         let env = OpfsEnv::mount(name, OpfsOptions::default())
             .await
@@ -137,7 +137,7 @@ async fn mirror_mode_refuses_immediate_durability() {
     // Accepting `DurabilityMode::Immediate` there would report a
     // guarantee the backend cannot keep, so `Options::validate`
     // refuses it at open rather than silently downgrading it.
-    let env = OpfsEnv::mount("lark-test-main-durability", OpfsOptions::default())
+    let env = OpfsEnv::mount("regolith-test-main-durability", OpfsOptions::default())
         .await
         .expect("mount falls back to mirror mode on the main thread");
     assert_eq!(env.mode(), OpfsMode::Mirror);
@@ -148,11 +148,11 @@ async fn mirror_mode_refuses_immediate_durability() {
 
     let options = Options {
         env: std::sync::Arc::new(env.clone()),
-        durability: lark_kv::DurabilityMode::Immediate,
+        durability: regolith::DurabilityMode::Immediate,
         max_background_compactions: 0,
         ..Options::default()
     };
-    let error = Db::open("/lark-test-main-durability", options)
+    let error = Db::open("/regolith-test-main-durability", options)
         .err()
         .expect("Immediate durability must be refused on a non-durable env");
     let text = error.to_string();

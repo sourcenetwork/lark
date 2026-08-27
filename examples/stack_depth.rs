@@ -1,4 +1,4 @@
-//! Measure how much stack each lark code path actually consumes.
+//! Measure how much stack each regolith code path actually consumes.
 //!
 //! This matters because an embedded stack is commonly 4 to 8 KiB in
 //! total. A frame that is too fat there is a hard crash on a guard
@@ -36,7 +36,7 @@
 //! # Running it
 //!
 //! ```sh
-//! cargo run --release --example stack_depth -- /tmp/lark-stack
+//! cargo run --release --example stack_depth -- /tmp/regolith-stack
 //! ```
 //!
 //! Release matters: an unoptimized build has far larger frames and
@@ -44,7 +44,7 @@
 
 use std::path::{Path, PathBuf};
 
-use lark_kv::{Db, Options};
+use regolith::{Db, Options};
 
 /// Byte written into every painted stack slot. Not zero, because
 /// zeroed stack is common and would collide with genuine writes.
@@ -85,12 +85,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A dedicated thread, so the painted window is known-clean rather
     // than sharing whatever the runtime already left on the main stack.
     let handle = std::thread::Builder::new()
-        .name("lark-stack-probe".to_string())
+        .name("regolith-stack-probe".to_string())
         .stack_size(MEASURE_THREAD_STACK)
         .spawn(move || run_probes(&db_dir))?;
     let results = handle.join().map_err(|_| "measuring thread panicked")??;
 
-    println!("lark stack depth, {} profile", profile_name());
+    println!("regolith stack depth, {} profile", profile_name());
     println!(
         "  method     paint 0x{PATTERN:02X}, {PAINT_LEVELS} x {PAINT_CHUNK} B window, gap-cancelled diff"
     );
@@ -208,7 +208,7 @@ fn build_fixture(db_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
 fn level_shape(db: &Db) -> String {
     let mut parts = Vec::new();
     for level in 0..7 {
-        let name = format!("lark.num-files-at-level{level}");
+        let name = format!("regolith.num-files-at-level{level}");
         if let Some(n) = db.get_int_property(&name)
             && n > 0
         {
@@ -305,7 +305,7 @@ fn run_probes(db_dir: &Path) -> Result<Vec<Probe>, String> {
 }
 
 /// A workload with a stack cost that is known by construction, used to
-/// calibrate the harness rather than to learn anything about lark.
+/// calibrate the harness rather than to learn anything about regolith.
 #[inline(never)]
 fn consume_64k() {
     let buf = [0u8; CALIBRATION_BYTES];

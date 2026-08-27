@@ -1,0 +1,12 @@
+[package]
+name = "regolith-bench"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+publish = false
+
+[dependencies]
+regolith = { path = "../.." }
+clap = { version = "4", features = ["derive"] }
+rand = "0.9"
+tempfile = "3.8"

@@ -7,7 +7,7 @@
 //! the abstraction instead of through it.
 //!
 //! `MemEnv` also cannot start a thread, cannot hard-link, and cannot
-//! fsync a directory, so these tests double as the check that lark
+//! fsync a directory, so these tests double as the check that regolith
 //! degrades around a missing capability instead of claiming one.
 
 // Native-only. wasm-pack builds every test target for wasm32, and these use
@@ -15,7 +15,7 @@
 // suite lives in tests/wasm_opfs*.rs.
 #![cfg(not(target_arch = "wasm32"))]
 
-use lark_kv::{Db, Env, MemEnv, Options, WriteBatch};
+use regolith::{Db, Env, MemEnv, Options, WriteBatch};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -175,7 +175,7 @@ fn a_checkpoint_copies_bytes_when_the_environment_has_no_hard_links() {
     }
     db.flush().unwrap();
 
-    lark_kv::Checkpoint::new(&db)
+    regolith::Checkpoint::new(&db)
         .unwrap()
         .create("/checkpoint")
         .expect("checkpoint must fall back to copying without hard links");
@@ -194,7 +194,7 @@ fn a_checkpoint_copies_bytes_when_the_environment_has_no_hard_links() {
 fn a_ttl_database_is_refused_when_the_environment_has_no_wall_clock() {
     let env = MemEnv::new();
     env.set_clocks(Some(0), None);
-    let err = lark_kv::DbWithTtl::open(Path::new("/ttl"), mem_options(&env), 60)
+    let err = regolith::DbWithTtl::open(Path::new("/ttl"), mem_options(&env), 60)
         .expect_err("a TTL database needs a wall clock");
     assert!(
         err.to_string().contains("wall clock"),
@@ -211,7 +211,7 @@ fn a_backup_is_refused_when_the_environment_has_no_wall_clock() {
     db.flush().unwrap();
 
     let mut backups =
-        lark_kv::BackupEngine::open_with_env("/backups", Arc::new(env.clone())).unwrap();
+        regolith::BackupEngine::open_with_env("/backups", Arc::new(env.clone())).unwrap();
     let err = backups
         .create_backup(&db)
         .expect_err("a backup records when it was taken");

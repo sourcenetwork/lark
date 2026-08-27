@@ -1,8 +1,8 @@
 # Development Principles
 
-## 0. What Lark Is
+## 0. What Regolith Is
 
-**lark** (crate: `lark-kv`, v0.1.0) is a pure Rust, embedded LSM-tree key-value store built from scratch. The architecture follows the LevelDB design (memtable → WAL → leveled SSTables → background compaction); the public API is shaped to slot into common embedded-KV abstraction layers so consuming applications can swap lark in alongside other backends through the same trait.
+**regolith** (crate: `regolith`, v0.1.0) is a pure Rust, embedded LSM-tree key-value store built from scratch. The architecture follows the LevelDB design (memtable → WAL → leveled SSTables → background compaction); the public API is shaped to slot into common embedded-KV abstraction layers so consuming applications can swap regolith in alongside other backends through the same trait.
 
 Early-stage. The public API (`Db`, `Snapshot`, `WriteBatch`, `Options`) is small and stable-shaped, but breakage is allowed pre-1.0.
 
@@ -48,11 +48,11 @@ No `ROADMAP.md`, `DEVELOPMENT.md`, `docs/` directories, or planning documents.
 Workspace layout:
 
 ```text
-src/                    # Publishable lark-kv library crate
+src/                    # Publishable regolith library crate
 tests/                  # Public-API integration, corruption, concurrency, and property tests
-tools/lark-bench/       # Pure-Rust benchmark CLI
-tools/lark-stress/      # Pure-Rust stress CLI
-tools/lark-ycsb/        # Pure-Rust YCSB-style workload CLI
+tools/regolith-bench/       # Pure-Rust benchmark CLI
+tools/regolith-stress/      # Pure-Rust stress CLI
+tools/regolith-ycsb/        # Pure-Rust YCSB-style workload CLI
 fuzz/                   # cargo-fuzz harnesses, outside the normal workspace
 ```
 
@@ -77,7 +77,7 @@ src/
 ├── transaction.rs      # Optimistic and pessimistic transaction wrappers
 ├── ttl.rs              # TTL database wrapper
 └── engine/
-    ├── mod.rs          # LarkEngine orchestration, read/write paths, recovery
+    ├── mod.rs          # RegolithEngine orchestration, read/write paths, recovery
     ├── block.rs        # Data blocks: prefix compression, restart points, varint
     ├── block_cache.rs  # Sharded LRU cache for decompressed SSTable blocks
     ├── bloom.rs        # Bloom filter (double-hashed xxh3)
@@ -145,9 +145,9 @@ touching a cohesive area with tests, and keep new modules small.
 ## 8. Git Worktree Workflow
 
 ```bash
-git worktree add ../lark-foo -b feat/foo    # Work on feature foo
-git worktree add ../lark-bar -b feat/bar    # Work on feature bar
-git worktree remove ../lark-foo             # Clean up
+git worktree add ../regolith-foo -b feat/foo    # Work on feature foo
+git worktree add ../regolith-bar -b feat/bar    # Work on feature bar
+git worktree remove ../regolith-foo             # Clean up
 ```
 
 Each worktree is isolated, no branch-switching overhead.

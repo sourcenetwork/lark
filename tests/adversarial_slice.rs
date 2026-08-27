@@ -1,4 +1,4 @@
-//! Adversarial probes on [`lark_kv::DbSlice`]'s pinning contract and on
+//! Adversarial probes on [`regolith::DbSlice`]'s pinning contract and on
 //! the arena memtable's edge shapes.
 //!
 //! Every test here tries to make a borrowed view outlive what owns it,
@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
-use lark_kv::{ArenaProfile, Db, DbSlice, Options, WriteBatch};
+use regolith::{ArenaProfile, Db, DbSlice, Options, WriteBatch};
 use tempfile::TempDir;
 
 fn embedded_opts() -> Options {
@@ -52,8 +52,8 @@ fn a_memtable_slice_outlives_the_database_that_produced_it() {
         // out again, so a violation of the pinning contract would have
         // handed one of these slices' chunks to a later memtable.
         let parked = db
-            .get_int_property("lark.arena-pool-bytes")
-            .expect("lark.arena-pool-bytes is a known property");
+            .get_int_property("regolith.arena-pool-bytes")
+            .expect("regolith.arena-pool-bytes is a known property");
         assert!(
             parked > 0,
             "no chunks were recycled, so this probe proves nothing"

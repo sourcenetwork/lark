@@ -1,10 +1,10 @@
 # Elle consistency harness
 
-Drives concurrent transactions against lark, records a Jepsen-format
+Drives concurrent transactions against regolith, records a Jepsen-format
 history, and hands it to [Elle](https://github.com/jepsen-io/elle) for a
 transactional-safety verdict.
 
-This crate lives outside the `lark-kv` workspace, exactly like `fuzz/`.
+This crate lives outside the `regolith` workspace, exactly like `fuzz/`.
 It declares its own `[workspace]` table, so `cargo check --workspace` at
 the repository root never builds it and the MSRV job is unaffected.
 
@@ -26,7 +26,7 @@ git clone https://github.com/ligurio/elle-cli
 cd elle-cli
 lein deps
 lein uberjar
-cp target/elle-cli-*-standalone.jar /path/to/lark/harness/elle/elle-cli.jar
+cp target/elle-cli-*-standalone.jar /path/to/regolith/harness/elle/elle-cli.jar
 ```
 
 Or take the prebuilt jar from a release, which needs no Clojure
@@ -99,20 +99,20 @@ directly rather than only through a dependency cycle.
 ## Isolation levels
 
 `--isolation read-committed|repeatable-read|serializable` selects the
-level to exercise. lark today exposes snapshot isolation only, through
+level to exercise. regolith today exposes snapshot isolation only, through
 two transaction flavors, so not every level is reachable:
 
 | Requested | Runs against | Reachable today? |
 | --- | --- | --- |
 | `read-committed` | `TransactionDb` (pessimistic locks) | Yes, as a sound over-approximation. Snapshot isolation is strictly stronger than read-committed, so every anomaly the checker reports at `--consistency-models read-committed` is a genuine violation. |
-| `repeatable-read` | `OptimisticTransactionDb` | No. Snapshot isolation is incomparable with repeatable-read: it permits write skew (`G2-item`), which repeatable-read forbids. A `G2-item` verdict here is legal behavior, not a lark bug. |
+| `repeatable-read` | `OptimisticTransactionDb` | No. Snapshot isolation is incomparable with repeatable-read: it permits write skew (`G2-item`), which repeatable-read forbids. A `G2-item` verdict here is legal behavior, not a regolith bug. |
 | `serializable` | `OptimisticTransactionDb` | No. Snapshot isolation is strictly weaker than serializable, for the same reason. |
 
 The two unreachable levels still run, so the flag is exercisable and
 will keep working once the engine grows the levels, but the generator
 prints an unmissable warning naming the gap. To get a verdict that means
-something about lark today, check the optimistic history against the
-level lark actually claims:
+something about regolith today, check the optimistic history against the
+level regolith actually claims:
 
 ```sh
 java -jar elle-cli.jar --model list-append \
@@ -158,7 +158,7 @@ the authority; the built-in check is a witness, not a substitute.
 
 ## Status on this tree
 
-Measured on the full stack with `just elle-matrix`. Every level lark
+Measured on the full stack with `just elle-matrix`. Every level regolith
 claims is green:
 
 | Workload | Engine | Checked against | Verdict |
@@ -178,7 +178,7 @@ pass.
 
 ### What a green matrix does and does not say
 
-lark provides **snapshot isolation**, not serializability. Checking an
+regolith provides **snapshot isolation**, not serializability. Checking an
 SI history against `strict-serializable` returns `false`, and that is
 correct rather than a defect: SI permits write skew (G2 anti-dependency
 cycles) by definition. That check is kept as the matrix's calibration -

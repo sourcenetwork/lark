@@ -1,11 +1,11 @@
-//! Binary-size bench: what linking lark costs, in bytes.
+//! Binary-size bench: what linking regolith costs, in bytes.
 //!
 //! Custom harness, not criterion. Two helper crates are generated into a
 //! scratch directory and built at run time on the same release profile: a
 //! baseline that only argues and prints, and the same program plus a database
-//! it writes to, reads from, and iterates. lark's contribution is the
+//! it writes to, reads from, and iterates. regolith's contribution is the
 //! difference, so the std and runtime cost every Rust binary pays is
-//! subtracted out rather than attributed to lark.
+//! subtracted out rather than attributed to regolith.
 //!
 //! The figure covers the surface the probe touches, and no more: fat LTO plus
 //! a stripped binary drops everything else, so the surface is reported next to
@@ -51,18 +51,18 @@ const CARGO_TOML: &str = "[package]\n\
                           panic = \"abort\"\n";
 
 /// Not `fn main() {}`: a truly empty main links neither `fmt` nor stdout, and
-/// the difference would then charge lark for std machinery every real program
+/// the difference would then charge regolith for std machinery every real program
 /// already carries. The baseline argues and prints so both sides start from a
 /// program that has done some work.
 const BASELINE_MAIN: &str = "fn main() { println!(\"{}\", std::env::args().count()); }\n";
 
 /// Held to the surface a typical embedded dependent uses. Fat LTO plus strip
 /// means only what this touches survives the link, so widening it raises the
-/// number: it is the cost of this surface, not of every API lark exposes.
-const LINKED_MAIN: &str = r#"use lark_kv::{Db, Options};
+/// number: it is the cost of this surface, not of every API regolith exposes.
+const LINKED_MAIN: &str = r#"use regolith::{Db, Options};
 
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "lark-size-probe".into());
+    let path = std::env::args().nth(1).unwrap_or_else(|| "regolith-size-probe".into());
     if let Ok(db) = Db::open(&path, Options::default()) {
         let _ = db.put(b"k", b"v");
         let _ = db.get(b"k");
@@ -318,14 +318,14 @@ fn optimize_pair(target_dir: &Path, out_dir: &Path) -> Result<(u64, u64), String
 fn emit_family(name: &str, result: &Result<(u64, u64), String>) -> String {
     let kv = match result {
         Ok((baseline, linked)) => {
-            let lark = linked.saturating_sub(*baseline);
+            let regolith = linked.saturating_sub(*baseline);
             vec![
                 ("name", name.to_string()),
                 ("available", "true".to_string()),
                 ("baseline_bytes", baseline.to_string()),
                 ("linked_bytes", linked.to_string()),
-                ("lark_bytes", lark.to_string()),
-                ("lark_kib", format!("{:.1}", lark as f64 / 1024.0)),
+                ("regolith_bytes", regolith.to_string()),
+                ("regolith_kib", format!("{:.1}", regolith as f64 / 1024.0)),
                 ("reason", "null".to_string()),
             ]
         }
@@ -334,8 +334,8 @@ fn emit_family(name: &str, result: &Result<(u64, u64), String>) -> String {
             ("available", "false".to_string()),
             ("baseline_bytes", "null".to_string()),
             ("linked_bytes", "null".to_string()),
-            ("lark_bytes", "null".to_string()),
-            ("lark_kib", "null".to_string()),
+            ("regolith_bytes", "null".to_string()),
+            ("regolith_kib", "null".to_string()),
             ("reason", flatten(reason)),
         ],
     };
@@ -344,13 +344,13 @@ fn emit_family(name: &str, result: &Result<(u64, u64), String>) -> String {
 
 fn main() {
     let cfg = Cfg::parse(std::env::args().skip(1).collect());
-    let lark_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let regolith_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = common::TempDb::new("size");
     let root = scratch.path().to_path_buf();
 
     let dep = format!(
-        "lark-kv = {{ path = \"{}\" }}",
-        lark_dir.display().to_string().replace('\\', "\\\\")
+        "regolith = {{ path = \"{}\" }}",
+        regolith_dir.display().to_string().replace('\\', "\\\\")
     );
     let baseline_manifest = write_crate(&root, "baseline", "", BASELINE_MAIN);
     let linked_manifest = write_crate(&root, "linked", &dep, LINKED_MAIN);
@@ -360,7 +360,7 @@ fn main() {
         .unwrap_or_else(|| root.join("target"));
 
     let host = host_triple();
-    println!("lark binary-size bench (bytes, not time)");
+    println!("regolith binary-size bench (bytes, not time)");
     println!("size.meta host={host} profile={PROFILE} surface={SURFACE}");
     println!(
         "size.meta scratch={} target_dir={}",

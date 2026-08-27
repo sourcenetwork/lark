@@ -18,7 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use lark_kv::{Db, Options, WriteBatch};
+use regolith::{Db, Options, WriteBatch};
 
 const N_KEYS: u64 = 200_000;
 const VALUE_LEN: usize = 200;

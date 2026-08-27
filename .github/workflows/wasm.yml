@@ -52,13 +52,13 @@ jobs:
       # job's summary were first measured against 47.0.3.
       - uses: bytecodealliance/actions/wasmtime/setup@v1
       - name: Build the probe for wasm32-wasip1
-        run: cargo build --release -p lark-wasm-probe --target wasm32-wasip1
+        run: cargo build --release -p regolith-wasm-probe --target wasm32-wasip1
       - name: Full lifecycle under wasmtime
         run: |
           set -euo pipefail
           d=$(mktemp -d)
           wasmtime run --dir="$d::/data" \
-            target/wasm32-wasip1/release/lark-wasm-probe.wasm -- \
+            target/wasm32-wasip1/release/regolith-wasm-probe.wasm -- \
             --profile embedded --records 5000 --sustained 20000 \
             --probe-host --report-memory | tee wasip1-probe.txt
           rm -rf "$d"

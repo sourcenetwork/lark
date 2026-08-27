@@ -4,7 +4,7 @@
 //! existing probes do not cover: snapshots that are *held* across
 //! thousands of commits rather than taken and dropped, every read surface
 //! cross-checked against every other on the same snapshot, and borrowed
-//! [`lark_kv::DbSlice`] views carried through `drop_all`, which is the one
+//! [`regolith::DbSlice`] views carried through `drop_all`, which is the one
 //! engine operation that discards every memtable and resets the read
 //! horizon underneath a live reader.
 
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
-use lark_kv::{ArenaProfile, Db, DbSlice, Options, WriteBatch};
+use regolith::{ArenaProfile, Db, DbSlice, Options, WriteBatch};
 use tempfile::TempDir;
 
 const BATCH_WIDTH: usize = 24;
@@ -295,7 +295,7 @@ fn slices_survive_drop_all_and_the_reuse_that_follows_it() {
 /// `d1ec2e7`, so the defect is pre-existing rather than introduced here.
 #[test]
 fn a_second_ingest_must_not_be_served_the_first_sources_cached_blocks() {
-    use lark_kv::{IngestOptions, SstFileWriter};
+    use regolith::{IngestOptions, SstFileWriter};
 
     let dir = TempDir::new().unwrap();
     let staging = TempDir::new().unwrap();

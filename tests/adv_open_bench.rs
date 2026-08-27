@@ -53,11 +53,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use lark_kv::env::{
+use regolith::env::{
     Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, StdEnv, WriteFile,
     WriteMode,
 };
-use lark_kv::{Db, Options};
+use regolith::{Db, Options};
 use tempfile::TempDir;
 
 /// SSTables to flush, one per batch. Small enough to keep the fixture

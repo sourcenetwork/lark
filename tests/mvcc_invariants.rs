@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use lark_kv::{Db, Snapshot, WriteBatch};
+use regolith::{Db, Snapshot, WriteBatch};
 use tempfile::TempDir;
 
 mod common;
@@ -205,7 +205,7 @@ fn batch_atomicity_at_full_scale() {
 /// runs, and left
 /// [`a_user_thread_compact_range_never_makes_a_read_travel_backwards`]
 /// green on 0 of 60 instances twice, over 2.2 billion reads each. The
-/// order is kept on the argument written on `LarkEngine::get_latest`,
+/// order is kept on the argument written on `RegolithEngine::get_latest`,
 /// not on a red test, and no test here is known to catch its
 /// inversion.
 #[test]
@@ -262,7 +262,7 @@ fn monotonic_reads_at_full_scale() {
 /// them, and one thread calling `Db::compact_range`, no reader may see
 /// a key move backwards in version or read back as absent.
 ///
-/// The defect was in the read path: `LarkEngine::get` took the active
+/// The defect was in the read path: `RegolithEngine::get` took the active
 /// memtable, the frozen memtable list and the version under three
 /// separate lock acquisitions, and sampled the read horizon before any
 /// of them, so a compaction that no snapshot pinned was free to drop
@@ -648,7 +648,7 @@ fn a_snapshot_pins_every_version_its_reads_need() {
         snapshots.push((generation, snap, view));
     }
     assert_eq!(
-        db.get_int_property("lark.num-snapshots"),
+        db.get_int_property("regolith.num-snapshots"),
         Some(3),
         "the engine did not register all three snapshot pins",
     );
@@ -691,7 +691,7 @@ fn a_snapshot_pins_every_version_its_reads_need() {
     let middle = snapshots.pop().unwrap();
     drop(newest);
     drop(middle);
-    assert_eq!(db.get_int_property("lark.num-snapshots"), Some(1));
+    assert_eq!(db.get_int_property("regolith.num-snapshots"), Some(1));
     db.compact_range(None, None).unwrap();
 
     let (generation, snap, view) = snapshots.pop().unwrap();
@@ -703,7 +703,7 @@ fn a_snapshot_pins_every_version_its_reads_need() {
     );
 
     drop(snap);
-    assert_eq!(db.get_int_property("lark.num-snapshots"), Some(0));
+    assert_eq!(db.get_int_property("regolith.num-snapshots"), Some(0));
     db.compact_range(None, None).unwrap();
     for i in 0..keys {
         assert_eq!(

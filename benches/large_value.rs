@@ -5,7 +5,7 @@
 //! exactly that length, so the standard sweep runs right up to the limit
 //! without reconfiguring anything. The 1 GiB case has to raise the limit, and
 //! costs multiples of the value in resident memory, so it is gated behind
-//! `LARK_BENCH_HUGE=1` and skipped by default.
+//! `REGOLITH_BENCH_HUGE=1` and skipped by default.
 //!
 //! `VmHWM` is a process high-water mark that never decreases, so the peak
 //! reported for one size includes every earlier size. Sizes therefore run in
@@ -68,7 +68,7 @@ fn secs(started: Instant) -> f64 {
     s
 }
 
-fn run_size(mib: usize, reps: usize, opts: lark_kv::Options) -> SizeResult {
+fn run_size(mib: usize, reps: usize, opts: regolith::Options) -> SizeResult {
     let (_tmp, db) = common::open(&format!("large-value-{mib}mib"), opts);
     let mut rng = common::Rng::new(0x1A26_0000 ^ mib as u64);
     let value = common::rand_value(&mut rng, mib * MIB);
@@ -131,7 +131,7 @@ fn report(result: &mut SizeResult) -> String {
 }
 
 fn huge_requested() -> bool {
-    std::env::var("LARK_BENCH_HUGE")
+    std::env::var("REGOLITH_BENCH_HUGE")
         .map(|v| v == "1")
         .unwrap_or(false)
 }
@@ -148,15 +148,17 @@ fn main() {
     }
 
     let gib_case = if huge_requested() {
-        println!("LARK_BENCH_HUGE=1: running the {HUGE_MIB} MiB case with max_value_size raised");
-        let opts = lark_kv::Options {
+        println!(
+            "REGOLITH_BENCH_HUGE=1: running the {HUGE_MIB} MiB case with max_value_size raised"
+        );
+        let opts = regolith::Options {
             max_value_size: HUGE_MIB * MIB,
             ..common::default_opts()
         };
         let mut result = run_size(HUGE_MIB, 1, opts);
         report(&mut result)
     } else {
-        println!("{HUGE_MIB} MiB case skipped: set LARK_BENCH_HUGE=1 to run it");
+        println!("{HUGE_MIB} MiB case skipped: set REGOLITH_BENCH_HUGE=1 to run it");
         "null".to_string()
     };
 
@@ -166,7 +168,7 @@ fn main() {
             "{{\"quick\":{quick},\"process_metrics_available\":{PROCESS_METRICS},\
              \"compression\":\"{:?}\",\"default_max_value_mib\":{},\
              \"sizes\":[{}],\"gib_case\":{gib_case},\
-             \"gib_note\":\"the {HUGE_MIB} MiB case raises max_value_size and runs only with LARK_BENCH_HUGE=1\"}}",
+             \"gib_note\":\"the {HUGE_MIB} MiB case raises max_value_size and runs only with REGOLITH_BENCH_HUGE=1\"}}",
             common::default_opts().compression,
             common::default_opts().max_value_size / MIB,
             sizes.join(",")

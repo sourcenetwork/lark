@@ -1,22 +1,26 @@
 [workspace]
 members = [
     ".",
-    "tools/lark-bench",
-    "tools/lark-stress",
-    "tools/lark-wasm-probe",
-    "tools/lark-ycsb",
+    "tools/regolith-bench",
+    "tools/regolith-stress",
+    "tools/regolith-wasm-probe",
+    "tools/regolith-ycsb",
 ]
 resolver = "2"
 
 [package]
-name = "lark-kv"
+name = "regolith"
 version = "0.1.0"
 edition = "2024"
+authors = [
+    "Ivan Vercenco <ivan@source.network>",
+    "Theo Bulut <theo@source.network>"
+]
 rust-version = "1.90"
 license = "Apache-2.0 OR MIT"
 description = "ACID, performance oriented, embedded key-value database engine for edge systems"
-repository = "https://github.com/sourcenetwork/lark"
-homepage = "https://github.com/sourcenetwork/lark"
+repository = "https://github.com/sourcenetwork/regolith"
+homepage = "https://github.com/sourcenetwork/regolith"
 readme = "README.md"
 keywords = ["database", "key-value", "lsm-tree", "storage", "embedded"]
 categories = ["database-implementations"]
@@ -92,7 +96,7 @@ wasm-bindgen-test = "0.3"
 # dev-dependency of the package before any example or test target,
 # whether or not that target uses it, so leaving either unconditional
 # makes `cargo build --example --target wasm32-*` fail before it
-# reaches any lark code. The property tests and the benchmarks they
+# reaches any regolith code. The property tests and the benchmarks they
 # back live in `tests/` and `benches/` and only ever run on the host.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

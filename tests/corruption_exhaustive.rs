@@ -38,7 +38,7 @@ use std::fs;
 use std::panic;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use lark_kv::Db;
+use regolith::Db;
 use tempfile::TempDir;
 
 mod common;

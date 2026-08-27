@@ -59,7 +59,7 @@ pub(crate) fn user_key_of(internal_key: &[u8]) -> &[u8] {
 
 /// Compare two internal keys correctly: user-key portion first
 /// (standard lexicographic byte comparison), then the `!seq ||
-/// vt` trailer on tie. This is the lark equivalent of LevelDB's
+/// vt` trailer on tie. This is the regolith equivalent of LevelDB's
 /// `InternalKeyComparator` - raw byte comparison of the encoded
 /// form is NOT correct when user keys have different lengths.
 pub(crate) fn compare_internal_keys(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
@@ -218,7 +218,7 @@ mod tests {
     /// `decode_internal_key`, which indexes the trailer directly and
     /// panicked with a subtract overflow. `Db::open` is a reachable
     /// entry point, through `load_cf_registry` -> `collect_range` ->
-    /// `LarkIterator::seek`, so the shape is now rejected where the
+    /// `RegolithIterator::seek`, so the shape is now rejected where the
     /// block is parsed.
     #[test]
     fn short_key_from_a_tampered_sstable_is_rejected_as_corruption() {

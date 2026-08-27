@@ -5,7 +5,7 @@
 //! open in. The invariant under test throughout is that a writer never
 //! blocks on a signal that nobody will send: it either does the
 //! compaction work on its own thread or returns
-//! [`lark_kv::Error::Busy`].
+//! [`regolith::Error::Busy`].
 
 // Native-only. wasm-pack builds every test target for wasm32, and these use
 // threads, the filesystem or proptest, none of which exist there. The browser
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use lark_kv::{
+use regolith::{
     CompactionJobInfo, Db, Error, EventListener, FlushJobInfo, Options, WriteBatch, WriteOptions,
 };
 
@@ -92,7 +92,7 @@ fn zero_workers_do_not_wedge_at_the_stop_trigger() {
         );
     }
 
-    let l0: u64 = db.get_int_property("lark.num-files-at-level0").unwrap();
+    let l0: u64 = db.get_int_property("regolith.num-files-at-level0").unwrap();
     assert!(
         l0 < 8,
         "L0 grew to {l0} files, at or past the stop trigger: inline compaction is not keeping up"
@@ -231,14 +231,14 @@ fn a_full_memtable_becomes_an_l0_file_with_no_worker() {
     )
     .unwrap();
 
-    assert_eq!(db.get_int_property("lark.num-files-at-level0"), Some(0));
+    assert_eq!(db.get_int_property("regolith.num-files-at-level0"), Some(0));
 
     for i in 0..400usize {
         db.put(format!("key{i:06}").as_bytes(), &value(i)).unwrap();
     }
 
     assert!(
-        db.get_int_property("lark.num-files-at-level0").unwrap() > 0,
+        db.get_int_property("regolith.num-files-at-level0").unwrap() > 0,
         "the memtable filled but no L0 file was written"
     );
 }
@@ -257,13 +257,13 @@ fn explicit_flush_writes_an_l0_file_and_is_idempotent() {
 
     db.put(b"a", b"1").unwrap();
     db.flush().unwrap();
-    let after_first = db.get_int_property("lark.num-files-at-level0").unwrap();
+    let after_first = db.get_int_property("regolith.num-files-at-level0").unwrap();
     assert_eq!(after_first, 1);
 
     // Nothing left in the memtable, so a second flush writes nothing.
     db.flush().unwrap();
     assert_eq!(
-        db.get_int_property("lark.num-files-at-level0").unwrap(),
+        db.get_int_property("regolith.num-files-at-level0").unwrap(),
         after_first
     );
 

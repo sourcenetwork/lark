@@ -4,8 +4,8 @@
 
 use std::collections::HashSet;
 
-use lark_kv::{Db, DbSlice, MergeOperator, Options, WriteBatch};
 use proptest::prelude::*;
+use regolith::{Db, DbSlice, MergeOperator, Options, WriteBatch};
 use tempfile::TempDir;
 
 mod common;

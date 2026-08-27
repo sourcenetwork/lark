@@ -201,7 +201,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lark-kv"
+name = "regolith"
 version = "0.1.0"
 dependencies = [
  "crossbeam-skiplist",
@@ -216,10 +216,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "lark-kv-fuzz"
+name = "regolith-fuzz"
 version = "0.0.0"
 dependencies = [
- "lark-kv",
+ "regolith",
  "libfuzzer-sys",
  "tempfile",
 ]

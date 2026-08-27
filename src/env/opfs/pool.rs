@@ -1,7 +1,7 @@
 //! The Rust-side bookkeeping for a slot pool.
 //!
 //! [`super::sah`] owns the on-disk slot format and the JS handles; this
-//! module owns the map from lark's logical paths to slot indices, the
+//! module owns the map from regolith's logical paths to slot indices, the
 //! free list, and the virtual directory set. Every operation here is
 //! synchronous, which is the whole point: `Db::open` lists directories and
 //! the write path creates files, both from code that cannot `await`.

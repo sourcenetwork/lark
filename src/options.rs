@@ -245,7 +245,7 @@ impl PrefixExtractor for FixedLengthPrefix {
 
 /// Compaction strategy used by the background compaction thread.
 ///
-/// Lark currently ships two styles. More can be added in follow-up
+/// Regolith currently ships two styles. More can be added in follow-up
 /// work (universal / size-tiered is the obvious next one) without
 /// breaking callers, since the field is consumed by name.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -257,7 +257,7 @@ pub enum CompactionStyle {
     /// write amplification. This is the default.
     #[default]
     Level,
-    /// FIFO: lark never merges files. Once the total size of all
+    /// FIFO: regolith never merges files. Once the total size of all
     /// SSTables exceeds [`FifoCompactionOptions::max_table_files_size`],
     /// the oldest SSTable is unlinked. Best fit for time-series and
     /// append-only log workloads where the oldest data is also the
@@ -395,7 +395,7 @@ pub enum CompressionType {
 
 pub use crate::engine::arena::ArenaProfile;
 
-/// Configuration options for a lark database.
+/// Configuration options for a regolith database.
 #[derive(Clone)]
 pub struct Options {
     /// Write buffer (memtable) size before flush. Must be greater
@@ -484,7 +484,7 @@ pub struct Options {
     pub merge_operator: Option<Arc<dyn MergeOperator>>,
     /// Opt-in flag accepted for parity with storage engines that
     /// require an explicit switch to get atomic multi-CF flushes.
-    /// Lark's column-family implementation is key-prefix based:
+    /// Regolith's column-family implementation is key-prefix based:
     /// every CF shares one memtable, one WAL, one manifest, and
     /// one flush path, so a multi-CF [`crate::WriteBatch`] is
     /// **always** atomic across CFs regardless of this flag's
@@ -547,7 +547,7 @@ pub struct Options {
     /// [`Options::hard_pending_compaction_bytes_limit`] instead,
     /// which both apply to every style.
     pub level0_stop_writes_trigger: usize,
-    /// Start slowing writes when total bytes in L0 (lark's
+    /// Start slowing writes when total bytes in L0 (regolith's
     /// approximation of "pending compaction bytes") reach this
     /// limit. `0` disables this trigger. If both pending-byte
     /// triggers are enabled, this must be <=
@@ -641,7 +641,7 @@ pub struct Options {
     /// where a flat file's whole index and every file's filter region
     /// live.
     ///
-    /// `Db::get_int_property("lark.pinned-metadata-bytes")` reports
+    /// `Db::get_int_property("regolith.pinned-metadata-bytes")` reports
     /// what the open files are holding outside the cache budget either
     /// way.
     ///
@@ -667,9 +667,9 @@ pub struct Options {
     /// clock, and its threads.
     ///
     /// Defaults to [`crate::env::StdEnv`], which is `std::fs` +
-    /// `std::time` + `std::thread` and behaves exactly as lark did
+    /// `std::time` + `std::thread` and behaves exactly as regolith did
     /// before this field existed. Replace it to run on a filesystem
-    /// lark does not know about, or on [`crate::env::MemEnv`] to keep
+    /// regolith does not know about, or on [`crate::env::MemEnv`] to keep
     /// a database entirely in memory.
     ///
     /// What the environment can actually do is reported by
@@ -912,12 +912,12 @@ impl Options {
     ///
     /// # Not a promise about your workload
     ///
-    /// These values bound what lark reserves. They do not bound what
+    /// These values bound what regolith reserves. They do not bound what
     /// your keys and values cost, nor what the allocator does with
     /// fragmentation. Measure on the target.
     ///
     /// ```
-    /// use lark_kv::{Db, Options};
+    /// use regolith::{Db, Options};
     ///
     /// let dir = tempfile::TempDir::new()?;
     /// let db = Db::open(dir.path(), Options::embedded())?;
@@ -1039,7 +1039,7 @@ impl Options {
     ///
     /// # Not a promise about your workload
     ///
-    /// These values bound what lark reserves. They do not bound what
+    /// These values bound what regolith reserves. They do not bound what
     /// your keys and values cost, nor what the allocator does with
     /// fragmentation. Measure in the target runtime.
     ///
@@ -1066,7 +1066,7 @@ impl Options {
     /// exercised by the normal test suite:
     ///
     /// ```
-    /// use lark_kv::{Db, Options};
+    /// use regolith::{Db, Options};
     ///
     /// let dir = tempfile::TempDir::new()?;
     /// let db = Db::open(dir.path(), Options::wasm())?;

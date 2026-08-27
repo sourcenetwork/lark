@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
-use lark_kv::{Db, Options};
+use regolith::{Db, Options};
 use tempfile::TempDir;
 
 const KEYS: usize = 6_000;
@@ -89,8 +89,8 @@ fn assert_cache_is_far_too_small(dir: &TempDir, partitioned: bool, cache_bytes: 
     )
     .unwrap();
     let metadata = pinned
-        .get_int_property("lark.pinned-metadata-bytes")
-        .expect("lark.pinned-metadata-bytes is a known property");
+        .get_int_property("regolith.pinned-metadata-bytes")
+        .expect("regolith.pinned-metadata-bytes is a known property");
     pinned.close().unwrap();
     assert!(
         metadata > (cache_bytes as u64) * 4,

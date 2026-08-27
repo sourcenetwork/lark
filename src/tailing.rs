@@ -46,20 +46,20 @@ use std::sync::Arc;
 
 use crate::Result;
 use crate::column_family::{ColumnFamilyHandle, DEFAULT_CF_ID, cf_upper_bound, prefix_key};
-use crate::engine::LarkEngine;
-use crate::engine::iterator::LarkIterator;
+use crate::engine::RegolithEngine;
+use crate::engine::iterator::RegolithIterator;
 use crate::slice::DbSlice;
 use crate::statistics::{Histogram, Statistics, Ticker, TimeScope};
 
 /// Forward-only tailing iterator. See the module docs.
 ///
 /// Created via [`crate::Db::iter_tailing`] or
-/// [`crate::Db::iter_tailing_cf`]. Owns an `Arc<LarkEngine>` so it
+/// [`crate::Db::iter_tailing_cf`]. Owns an `Arc<RegolithEngine>` so it
 /// can be moved between threads and outlives the originating `Db`
 /// handle.
 pub struct TailingIter {
-    engine: Arc<LarkEngine>,
-    inner: LarkIterator,
+    engine: Arc<RegolithEngine>,
+    inner: RegolithIterator,
     /// User key (with the CF prefix still attached - we match on
     /// the internal representation) of the most recently emitted
     /// entry. Used by [`Self::refresh`] to position the rebuilt
@@ -82,7 +82,7 @@ pub struct TailingIter {
 }
 
 impl TailingIter {
-    pub(crate) fn new(engine: Arc<LarkEngine>, cf_id: u32) -> Self {
+    pub(crate) fn new(engine: Arc<RegolithEngine>, cf_id: u32) -> Self {
         let inner = engine.new_iter_at(u64::MAX);
         let stats = engine.statistics_arc();
         Self {
@@ -96,7 +96,7 @@ impl TailingIter {
         }
     }
 
-    pub(crate) fn empty(engine: Arc<LarkEngine>) -> Self {
+    pub(crate) fn empty(engine: Arc<RegolithEngine>) -> Self {
         let mut iter = Self::new(engine, DEFAULT_CF_ID);
         iter.valid_cf = false;
         iter
@@ -202,7 +202,7 @@ impl TailingIter {
         // of the CF so we pick up everything in the new view.
         match self.last_returned.clone() {
             Some(k) => {
-                // `LarkIterator::seek` interprets its argument as
+                // `RegolithIterator::seek` interprets its argument as
                 // a user key and lands on the newest visible
                 // version, so a literal seek(k) returns k itself
                 // (or the next user key if k was tombstoned).
@@ -289,16 +289,16 @@ impl TailingIter {
 
 /// Helper called from `Db::iter_tailing` - defaults to the default
 /// column family so the common case doesn't need to pass a handle.
-pub(crate) fn new_default(engine: Arc<LarkEngine>) -> TailingIter {
+pub(crate) fn new_default(engine: Arc<RegolithEngine>) -> TailingIter {
     TailingIter::new(engine, DEFAULT_CF_ID)
 }
 
 /// Helper called from `Db::iter_tailing_cf`.
-pub(crate) fn new_for_cf(engine: Arc<LarkEngine>, cf: &ColumnFamilyHandle) -> TailingIter {
+pub(crate) fn new_for_cf(engine: Arc<RegolithEngine>, cf: &ColumnFamilyHandle) -> TailingIter {
     TailingIter::new(engine, cf.id())
 }
 
 /// Helper called when a stale CF handle is used with `Db::iter_tailing_cf`.
-pub(crate) fn new_empty(engine: Arc<LarkEngine>) -> TailingIter {
+pub(crate) fn new_empty(engine: Arc<RegolithEngine>) -> TailingIter {
     TailingIter::empty(engine)
 }

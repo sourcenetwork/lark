@@ -60,5 +60,6 @@ default-filter = """
         or test(/^engine::block_cache::adversarial::/)
         or test(=rate_limiter::tests::ten_mb_through_one_mbps_takes_at_least_nine_seconds)
         or test(=every_publisher_of_the_read_view_running_at_once_stays_live)
+        or test(=every_bit_flip_in_the_manifest_stops_replay_without_inventing_data)
     )
 """

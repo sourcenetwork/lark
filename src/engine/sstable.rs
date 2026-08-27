@@ -22,27 +22,14 @@
 //! footer's size is discoverable before anything else is parsed.
 //!
 //! ```text
-//! MAGIC_V1 (version byte 0x01) flat index,        64-byte footer, no metadata checksum
-//! MAGIC_V2 (version byte 0x02) partitioned index, 64-byte footer, no metadata checksum
-//! MAGIC_V3 (version byte 0x03) flat index,        72-byte footer, metadata checksummed
-//! MAGIC_V4 (version byte 0x04) partitioned index, 72-byte footer, metadata checksummed
 //! MAGIC_V5 (version byte 0x05) flat index,        72-byte footer, metadata checksummed
 //! MAGIC_V6 (version byte 0x06) partitioned index, 72-byte footer, metadata checksummed
-//!
-//! The first four carry the `LARKSST` identifier and the last two carry
-//! `REGOSST`. Only the `REGOSST` pair is written; the others are read so
-//! that a database written by an earlier build opens, and migrates as
-//! compaction rewrites its tables.
 //! ```
 //!
-//! lark writes V3 or V4 and reads all four. A table written by an older
-//! lark keeps opening and keeps serving; it simply carries no metadata
-//! checksum, so bit rot in its footer, index, bloom or range-tombstone
-//! block is not detected there. Rewriting such a table (any compaction
-//! that touches it) upgrades it to the checksummed form. There is no
-//! migration step and no downgrade path: a V3/V4 table is rejected by an
-//! older lark with "invalid SSTable magic number", which is the correct
-//! loud failure.
+//! Both carry the `REGOSST` identifier. These are the formats regolith
+//! has written since its first release, and the only ones it reads: a
+//! file whose trailing magic is anything else is refused with "invalid
+//! SSTable magic number", which is the correct loud failure.
 //!
 //! # What a checksum covers
 //!
@@ -91,48 +78,21 @@ use crate::DbSlice;
 use crate::env::{BufferedWriter, Env, ReadFile, WriteMode};
 use crate::options::{CompressionType, PrefixExtractor};
 
-/// SSTable magic number: "LARKSST\x01" - flat-index format with the
-/// 64-byte footer and no metadata checksums. Legacy: read, never written.
-const MAGIC_V1: u64 = 0x4C41524B_53535401;
-
-/// SSTable magic number: "LARKSST\x02" - partitioned-index format with
-/// the 64-byte footer and no metadata checksums. The footer's
-/// `index_offset/index_size` point to a compact top-level index whose
-/// entries each reference a leaf sub-block on disk. Legacy: read, never
-/// written.
-const MAGIC_V2: u64 = 0x4C41524B_53535402;
-
-/// SSTable magic number: "LARKSST\x03" - flat index, 72-byte footer,
-/// metadata regions checksummed. Written by lark today.
-const MAGIC_V3: u64 = 0x4C41524B_53535403;
-
-/// SSTable magic number: "LARKSST\x04" - partitioned index, 72-byte
-/// footer, metadata regions checksummed. Legacy: read, never written.
-const MAGIC_V4: u64 = 0x4C41524B_53535404;
-
 /// SSTable magic number: "REGOSST\x05" - flat index, 72-byte footer,
-/// metadata regions checksummed. Written by lark today.
-///
-/// Same layout as [`MAGIC_V3`] under the current identifier. A table is
-/// migrated by being rewritten, which compaction does in the ordinary
-/// course of running, so a database moves to the new magic without a
-/// conversion step and without a version in which it cannot be opened.
+/// metadata regions checksummed. Written by regolith today.
 const MAGIC_V5: u64 = 0x5245474F_53535405;
 
 /// SSTable magic number: "REGOSST\x06" - partitioned index, 72-byte
-/// footer, metadata regions checksummed. Written by lark today.
+/// footer, metadata regions checksummed. Written by regolith today.
 const MAGIC_V6: u64 = 0x5245474F_53535406;
 
-/// Footer size for [`MAGIC_V1`] and [`MAGIC_V2`].
-const FOOTER_SIZE_V1: usize = 64;
+/// Footer size: seven 8-byte fields, an 8-byte metadata checksum, then
+/// the magic.
+const FOOTER_SIZE: usize = 72;
 
-/// Footer size for [`MAGIC_V3`] and [`MAGIC_V4`]: the V1 fields plus an
-/// 8-byte metadata checksum ahead of the magic.
-const FOOTER_SIZE_V2: usize = 72;
-
-/// Bytes a checksummed metadata region carries after its payload. The
-/// trailer is counted inside the region size the footer records, so a
-/// legacy reader's bounds arithmetic needs no special case.
+/// Bytes a metadata region carries after its payload. The trailer is
+/// counted inside the region size the footer records, so bounds
+/// arithmetic reads the same number either way.
 const META_CHECKSUM_LEN: usize = 4;
 
 const COMPRESSION_NONE: u8 = 0x00;
@@ -177,39 +137,25 @@ struct Footer {
 }
 
 impl Footer {
-    /// Whether a table carrying `magic` checksums its metadata regions.
-    fn magic_is_checksummed(magic: u64) -> bool {
-        matches!(magic, MAGIC_V3 | MAGIC_V4 | MAGIC_V5 | MAGIC_V6)
-    }
-
     /// Whether `magic` names the partitioned index layout, where the
     /// footer's index handle points at a top-level index of leaves.
     fn magic_is_partitioned(magic: u64) -> bool {
-        matches!(magic, MAGIC_V2 | MAGIC_V4 | MAGIC_V6)
+        matches!(magic, MAGIC_V6)
     }
 
     /// Footer byte length implied by `magic`, or an error naming the
-    /// magic when it is not one lark writes or reads.
+    /// magic when it is not one regolith writes or reads.
     fn size_for_magic(magic: u64) -> io::Result<usize> {
         match magic {
-            MAGIC_V1 | MAGIC_V2 => Ok(FOOTER_SIZE_V1),
-            MAGIC_V3 | MAGIC_V4 | MAGIC_V5 | MAGIC_V6 => Ok(FOOTER_SIZE_V2),
+            MAGIC_V5 | MAGIC_V6 => Ok(FOOTER_SIZE),
             other => Err(invalid_data(format!(
                 "invalid SSTable magic number: {other:#018x}"
             ))),
         }
     }
 
-    fn checksummed(&self) -> bool {
-        Self::magic_is_checksummed(self.magic)
-    }
-
     fn size(&self) -> usize {
-        if self.checksummed() {
-            FOOTER_SIZE_V2
-        } else {
-            FOOTER_SIZE_V1
-        }
+        FOOTER_SIZE
     }
 
     /// Encode into the layout `self.magic` selects.
@@ -222,23 +168,19 @@ impl Footer {
         buf[32..40].copy_from_slice(&self.index_offset.to_le_bytes());
         buf[40..48].copy_from_slice(&self.index_size.to_le_bytes());
         buf[48..56].copy_from_slice(&self.num_entries.to_le_bytes());
-        if self.checksummed() {
-            let sum = checksum::sst_footer(&buf[0..56], self.magic).to_le_bytes();
-            buf[56..64].copy_from_slice(&sum);
-            buf[64..72].copy_from_slice(&self.magic.to_le_bytes());
-        } else {
-            buf[56..64].copy_from_slice(&self.magic.to_le_bytes());
-        }
+        let sum = checksum::sst_footer(&buf[0..56], self.magic).to_le_bytes();
+        buf[56..64].copy_from_slice(&sum);
+        buf[64..72].copy_from_slice(&self.magic.to_le_bytes());
         buf
     }
 
     /// Decode a footer whose length is exactly what its magic implies.
     ///
     /// The magic is validated first, so a table from a format version
-    /// lark does not implement is reported as a magic error rather than
+    /// regolith does not implement is reported as a magic error rather than
     /// as a checksum error.
     fn decode(buf: &[u8]) -> io::Result<Self> {
-        if buf.len() < FOOTER_SIZE_V1 {
+        if buf.len() < FOOTER_SIZE {
             return Err(invalid_data("SSTable footer is truncated"));
         }
         let magic = u64::from_le_bytes(buf[buf.len() - 8..].try_into().unwrap());
@@ -249,11 +191,9 @@ impl Footer {
                 buf.len()
             )));
         }
-        if Self::magic_is_checksummed(magic) {
-            let stored = u64::from_le_bytes(buf[56..64].try_into().unwrap());
-            if stored != checksum::sst_footer(&buf[0..56], magic) {
-                return Err(invalid_data("SSTable footer checksum mismatch"));
-            }
+        let stored = u64::from_le_bytes(buf[56..64].try_into().unwrap());
+        if stored != checksum::sst_footer(&buf[0..56], magic) {
+            return Err(invalid_data("SSTable footer checksum mismatch"));
         }
         Ok(Self {
             range_tombstone_offset: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
@@ -269,8 +209,7 @@ impl Footer {
 }
 
 /// Read the trailing footer of an SSTable. The magic is the file's last
-/// 8 bytes, so the footer's length is known before it is parsed and a
-/// legacy table needs no separate code path.
+/// 8 bytes, so the footer's length is known before it is parsed.
 fn read_footer(file: &dyn ReadFile, file_size: u64) -> io::Result<Footer> {
     if file_size < 8 {
         return Err(invalid_data(
@@ -620,14 +559,11 @@ fn read_bytes(
 }
 
 /// Check every region the footer points at against `data_end`, the first
-/// byte past the region area (the file size less the footer). A
-/// checksummed region also has to be long enough to hold its trailer.
+/// byte past the region area (the file size less the footer). Every
+/// region is checksummed, so each also has to be long enough to hold its
+/// trailer.
 fn validate_footer_regions(footer: &Footer, data_end: u64) -> io::Result<()> {
-    let trailer = if footer.checksummed() {
-        META_CHECKSUM_LEN as u64
-    } else {
-        0
-    };
+    let trailer = META_CHECKSUM_LEN as u64;
     if footer.bloom_size < 8 + trailer {
         return Err(invalid_data("bloom region too short"));
     }
@@ -902,9 +838,8 @@ impl SsTableWriter {
         //
         // A `prefix_bloom_len` of 0 means "no prefix bloom" - the file
         // was built without a prefix extractor (or there were zero
-        // extractable prefixes). The reader keeps backward compatibility
-        // with pre-prefix SSTables via the same 0 marker written
-        // unconditionally.
+        // extractable prefixes). The marker is written unconditionally,
+        // so the reader needs no separate case for it.
         let prefix_bloom_data = match self.prefix_bloom_builder.take() {
             Some(builder) => encode_bloom_block(&builder.build()),
             None => Vec::new(),
@@ -1115,15 +1050,11 @@ pub(crate) struct SsTableReader {
     index_fallback: OnceLock<Arc<IndexBlock>>,
     filter_fallback: OnceLock<Arc<FilterBlock>>,
     range_tombstones: RangeTombstoneSet,
-    /// `true` when the file was written with `MAGIC_V2` (partitioned
+    /// `true` when the file was written with `MAGIC_V6` (partitioned
     /// index). `self.index` then holds only the compact top-level
     /// entries; each entry's `handle` points to a leaf sub-block read
     /// via [`SsTableReader::read_index_leaf`].
     partitioned: bool,
-    /// Whether this file's metadata regions carry checksum trailers.
-    /// False for a legacy V1/V2 table, whose regions have no trailer to
-    /// strip and no checksum to verify.
-    meta_checksummed: bool,
     /// Number of index leaves actually read from disk, i.e. block-cache
     /// misses. Cached leaf hits do not count.
     #[cfg(test)]
@@ -1202,7 +1133,6 @@ impl SsTableReader {
         let footer = read_footer(&*file, file_size)?;
         let data_end = file_size - footer.size() as u64;
         validate_footer_regions(&footer, data_end)?;
-        let meta_checksummed = footer.checksummed();
 
         let filter_handle = BlockHandle {
             offset: footer.bloom_offset,
@@ -1218,7 +1148,7 @@ impl SsTableReader {
         let filter_block = FilterBlock::decode(verify_meta_region(
             &filter_region,
             checksum::META_KIND_BLOOM,
-            meta_checksummed,
+            true,
             "bloom region",
         )?)?;
         let filter = match policy {
@@ -1243,7 +1173,7 @@ impl SsTableReader {
         let index_payload_len = verify_meta_region(
             &index_region,
             checksum::META_KIND_INDEX,
-            meta_checksummed,
+            true,
             "index block",
         )?
         .len();
@@ -1263,7 +1193,7 @@ impl SsTableReader {
             decode_range_tombstone_block(verify_meta_region(
                 &rt_region,
                 checksum::META_KIND_RANGE_TOMBSTONE,
-                meta_checksummed,
+                true,
                 "range tombstone block",
             )?)?
         };
@@ -1287,7 +1217,6 @@ impl SsTableReader {
             filter_fallback: OnceLock::new(),
             range_tombstones: RangeTombstoneSet::from_vec(range_tombstones),
             partitioned,
-            meta_checksummed,
             #[cfg(test)]
             index_leaf_reads: AtomicUsize::new(0),
         })
@@ -1298,7 +1227,7 @@ impl SsTableReader {
     /// and its range tombstones.
     ///
     /// Summed across a version's files this is the engine's
-    /// `lark.pinned-metadata-bytes` property, which is what makes the
+    /// `regolith.pinned-metadata-bytes` property, which is what makes the
     /// residency this reader is responsible for observable instead of
     /// merely asserted.
     pub(crate) fn pinned_metadata_bytes(&self) -> usize {
@@ -1369,9 +1298,8 @@ impl SsTableReader {
     ///
     /// Both halves matter: `data_end` keeps a region from running into
     /// the footer, and the trailer is what makes a corrupt index, filter
-    /// or leaf fail its read instead of surfacing as a wrong answer. A
-    /// legacy table carries no trailer and is passed through untouched.
-    /// The payload is truncated in place, so verifying costs no copy.
+    /// or leaf fail its read instead of surfacing as a wrong answer. The
+    /// payload is truncated in place, so verifying costs no copy.
     fn read_metadata_region(
         &self,
         handle: BlockHandle,
@@ -1380,7 +1308,7 @@ impl SsTableReader {
     ) -> io::Result<Vec<u8>> {
         let mut region =
             { read_file_region(&*self.file, handle.offset, handle.size, self.data_end, name)? };
-        let payload_len = verify_meta_region(&region, kind, self.meta_checksummed, name)?.len();
+        let payload_len = verify_meta_region(&region, kind, true, name)?.len();
         region.truncate(payload_len);
         Ok(region)
     }
@@ -1948,9 +1876,7 @@ impl SsTableReader {
         let compressed_data = &block_data[1..checksum_offset];
 
         let computed_checksum = checksum::sst_block(compression_type, compressed_data);
-        if stored_checksum != computed_checksum
-            && stored_checksum != checksum::legacy_payload_u32(compressed_data)
-        {
+        if stored_checksum != computed_checksum {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "block checksum mismatch",
@@ -2041,7 +1967,7 @@ pub(crate) fn table_carries_data(env: &dyn Env, path: &Path) -> io::Result<bool>
     let payload_len = verify_meta_region(
         &index_region,
         checksum::META_KIND_INDEX,
-        footer.checksummed(),
+        true,
         "index block",
     )?
     .len();
@@ -2062,7 +1988,6 @@ pub(crate) fn remove_sst_in(env: &dyn Env, path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::lookup_key::with_key_scratch;
 
     /// Point lookup with the per-read key encoder and scratch buffer
     /// the engine threads down, so the assertions below stay about the
@@ -2364,88 +2289,8 @@ mod tests {
     // ── Footer encode/decode ────────────────────────────────────
 
     #[test]
-    fn footer_round_trip_v1() {
-        let f = Footer {
-            range_tombstone_offset: 10,
-            range_tombstone_size: 20,
-            bloom_offset: 30,
-            bloom_size: 40,
-            index_offset: 70,
-            index_size: 80,
-            num_entries: 100,
-            magic: MAGIC_V1,
-        };
-        let buf = f.encode();
-        let got = Footer::decode(&buf).unwrap();
-        assert_eq!(got.range_tombstone_offset, 10);
-        assert_eq!(got.range_tombstone_size, 20);
-        assert_eq!(got.bloom_offset, 30);
-        assert_eq!(got.bloom_size, 40);
-        assert_eq!(got.index_offset, 70);
-        assert_eq!(got.index_size, 80);
-        assert_eq!(got.num_entries, 100);
-        assert_eq!(got.magic, MAGIC_V1);
-    }
-
-    #[test]
-    fn footer_round_trip_v2() {
-        let f = Footer {
-            range_tombstone_offset: 0,
-            range_tombstone_size: 0,
-            bloom_offset: 1,
-            bloom_size: 2,
-            index_offset: 3,
-            index_size: 4,
-            num_entries: 5,
-            magic: MAGIC_V2,
-        };
-        let got = Footer::decode(&f.encode()).unwrap();
-        assert_eq!(got.magic, MAGIC_V2);
-    }
-
-    #[test]
-    fn footer_round_trip_v3() {
-        let f = Footer {
-            range_tombstone_offset: 10,
-            range_tombstone_size: 20,
-            bloom_offset: 30,
-            bloom_size: 40,
-            index_offset: 70,
-            index_size: 80,
-            num_entries: 100,
-            magic: MAGIC_V3,
-        };
-        let buf = f.encode();
-        assert_eq!(buf.len(), FOOTER_SIZE_V2);
-        let got = Footer::decode(&buf).unwrap();
-        assert_eq!(got.range_tombstone_offset, 10);
-        assert_eq!(got.num_entries, 100);
-        assert_eq!(got.magic, MAGIC_V3);
-        assert!(got.checksummed());
-        assert!(!Footer::magic_is_partitioned(got.magic));
-    }
-
-    #[test]
-    fn footer_round_trip_v4() {
-        let f = Footer {
-            range_tombstone_offset: 0,
-            range_tombstone_size: 0,
-            bloom_offset: 1,
-            bloom_size: 2,
-            index_offset: 3,
-            index_size: 4,
-            num_entries: 5,
-            magic: MAGIC_V4,
-        };
-        let got = Footer::decode(&f.encode()).unwrap();
-        assert_eq!(got.magic, MAGIC_V4);
-        assert!(got.checksummed());
-        assert!(Footer::magic_is_partitioned(got.magic));
-    }
-
-    #[test]
     fn footer_decode_rejects_bad_magic() {
-        let mut buf = [0u8; FOOTER_SIZE_V1];
+        let mut buf = [0u8; FOOTER_SIZE];
         // Leave magic at zero - any unknown value should be rejected.
         buf[56..64].copy_from_slice(&0xDEAD_BEEF_u64.to_le_bytes());
         let err = Footer::decode(&buf).expect_err("should reject");
@@ -2463,7 +2308,7 @@ mod tests {
             index_offset: 19,
             index_size: 23,
             num_entries: 29,
-            magic: MAGIC_V3,
+            magic: MAGIC_V5,
         };
         let clean = f.encode();
         for byte in 0..clean.len() {
@@ -2476,23 +2321,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn a_legacy_footer_carries_no_checksum_and_still_decodes() {
-        let f = Footer {
-            range_tombstone_offset: 1,
-            range_tombstone_size: 0,
-            bloom_offset: 2,
-            bloom_size: 3,
-            index_offset: 4,
-            index_size: 5,
-            num_entries: 6,
-            magic: MAGIC_V1,
-        };
-        let buf = f.encode();
-        assert_eq!(buf.len(), FOOTER_SIZE_V1);
-        assert!(!Footer::decode(&buf).unwrap().checksummed());
     }
 
     #[test]
@@ -2513,182 +2341,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn verify_meta_region_passes_a_legacy_region_through_untouched() {
-        let region = b"no trailer here";
-        let got = verify_meta_region(region, checksum::META_KIND_INDEX, false, "index block")
-            .expect("a legacy region is never verified");
-        assert_eq!(got, region);
-    }
-
-    /// Write a table in the pre-checksum layout: no trailer on any
-    /// metadata region and a 64-byte footer carrying [`MAGIC_V1`] or
-    /// [`MAGIC_V2`]. This is the writer lark had before the metadata
-    /// checksums landed, kept here so the compatibility contract in the
-    /// module docs is tested rather than merely claimed.
-    fn write_legacy_table(
-        path: &Path,
-        entries: &[(Vec<u8>, Vec<u8>)],
-        partitioned: bool,
-    ) -> io::Result<()> {
-        let mut out: Vec<u8> = Vec::new();
-        let mut index_entries: Vec<(Vec<u8>, BlockHandle)> = Vec::new();
-        let mut bloom_builder = BloomFilterBuilder::new(10);
-
-        // One data block per two entries, so a partitioned layout has
-        // several index entries to spread over leaves.
-        for pair in entries.chunks(2) {
-            let mut block = BlockBuilder::new(RESTART_INTERVAL);
-            for (internal_key, value) in pair {
-                block.add(internal_key, value);
-                bloom_builder.add_key(user_key_of(internal_key));
-            }
-            let raw = block.finish();
-            let offset = out.len() as u64;
-            out.push(COMPRESSION_NONE);
-            out.extend_from_slice(&raw);
-            out.extend_from_slice(&checksum::sst_block(COMPRESSION_NONE, &raw).to_le_bytes());
-            let last_key = pair.last().expect("non-empty chunk").0.clone();
-            index_entries.push((
-                last_key,
-                BlockHandle {
-                    offset,
-                    size: out.len() as u64 - offset,
-                },
-            ));
-        }
-
-        let range_tombstone_offset = out.len() as u64;
-        let bloom_offset = out.len() as u64;
-        let user_bloom = encode_bloom_block(&bloom_builder.build());
-        out.extend_from_slice(&0u64.to_le_bytes());
-        out.extend_from_slice(&user_bloom);
-        let bloom_size = out.len() as u64 - bloom_offset;
-
-        let (index_offset, index_size, magic) = if partitioned {
-            let mut top_level: Vec<(Vec<u8>, BlockHandle)> = Vec::new();
-            for chunk in index_entries.chunks(2) {
-                let leaf = encode_index_block(chunk);
-                let leaf_offset = out.len() as u64;
-                out.extend_from_slice(&leaf);
-                top_level.push((
-                    chunk.last().expect("non-empty chunk").0.clone(),
-                    BlockHandle {
-                        offset: leaf_offset,
-                        size: leaf.len() as u64,
-                    },
-                ));
-            }
-            let top = encode_index_block(&top_level);
-            let top_offset = out.len() as u64;
-            out.extend_from_slice(&top);
-            (top_offset, top.len() as u64, MAGIC_V2)
-        } else {
-            let index = encode_index_block(&index_entries);
-            let index_offset = out.len() as u64;
-            out.extend_from_slice(&index);
-            (index_offset, index.len() as u64, MAGIC_V1)
-        };
-
-        let footer = Footer {
-            range_tombstone_offset,
-            range_tombstone_size: 0,
-            bloom_offset,
-            bloom_size,
-            index_offset,
-            index_size,
-            num_entries: entries.len() as u64,
-            magic,
-        };
-        let encoded = footer.encode();
-        assert_eq!(encoded.len(), FOOTER_SIZE_V1);
-        out.extend_from_slice(&encoded);
-        fs::write(path, out)
-    }
-
-    fn legacy_entries() -> Vec<(Vec<u8>, Vec<u8>)> {
-        (0..40)
-            .map(|i| {
-                (
-                    ik(format!("key_{i:04}").as_bytes(), 1),
-                    format!("value_{i}").into_bytes(),
-                )
-            })
-            .collect()
-    }
-
-    fn assert_legacy_table_reads(path: &Path, partitioned: bool) {
-        let on_disk = fs::read(path).unwrap();
-        assert_eq!(
-            on_disk[on_disk.len() - 8],
-            if partitioned { 2 } else { 1 },
-            "the fixture must carry a legacy format version byte"
-        );
-
-        let reader = SsTableReader::open(path, 7).unwrap();
-        assert_eq!(reader.partitioned, partitioned);
-        assert!(
-            !reader.meta_checksummed,
-            "a legacy table has no metadata checksums to verify"
-        );
-
-        let cache = BlockCache::new(1024 * 1024);
-        for i in 0..40 {
-            let key = format!("key_{i:04}");
-            assert_eq!(
-                with_key_scratch(|buf| {
-                    reader.get(
-                        &LookupKey::from_prefixed(key.as_bytes(), u64::MAX),
-                        buf,
-                        &cache,
-                    )
-                })
-                .unwrap()
-                .map_value(|v| v.to_vec()),
-                LookupResult::Found {
-                    seq: 1,
-                    value: format!("value_{i}").into_bytes(),
-                },
-                "legacy table lost {key}"
-            );
-        }
-        assert_eq!(
-            with_key_scratch(|buf| {
-                reader.get(
-                    &LookupKey::from_prefixed(b"key_9999", u64::MAX),
-                    buf,
-                    &cache,
-                )
-            })
-            .unwrap()
-            .map_value(|v| v.to_vec()),
-            LookupResult::NotInTable
-        );
-        let scanned = reader.iter_internal(&cache).unwrap();
-        assert_eq!(scanned.len(), 40);
-    }
-
-    /// A table written before the metadata checksums landed must keep
-    /// opening and keep serving every key. A format change that cannot
-    /// read yesterday's files is a data-loss bug of its own.
-    #[test]
-    fn open_accepts_a_legacy_v1_footer() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("legacy-v1.sst");
-        write_legacy_table(&path, &legacy_entries(), false).unwrap();
-        assert_legacy_table_reads(&path, false);
-    }
-
-    /// The same for the legacy partitioned layout, whose index leaves
-    /// also carry no checksum trailer.
-    #[test]
-    fn open_accepts_a_legacy_v2_footer() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("legacy-v2.sst");
-        write_legacy_table(&path, &legacy_entries(), true).unwrap();
-        assert_legacy_table_reads(&path, true);
-    }
-
     /// The writer emits the checksummed form, and the reader agrees with
     /// the module docs about which magic means what.
     #[test]
@@ -2706,8 +2358,13 @@ mod tests {
                 256,
             )
             .unwrap();
-            for (internal_key, value) in legacy_entries() {
-                writer.add(&internal_key, &value).unwrap();
+            for i in 0..64u32 {
+                let key = super::super::internal_key::encode_internal_key(
+                    format!("k{i:04}").as_bytes(),
+                    1,
+                    VALUE_TYPE_VALUE,
+                );
+                writer.add(&key, format!("v{i}").as_bytes()).unwrap();
             }
             writer.finish().unwrap().unwrap();
 
@@ -2716,7 +2373,7 @@ mod tests {
             assert_eq!(
                 magic,
                 if partitioned { MAGIC_V6 } else { MAGIC_V5 },
-                "a fresh table must carry the REGOSST magic, not a legacy one"
+                "a fresh table must carry the REGOSST magic"
             );
             assert_eq!(
                 &magic.to_be_bytes()[..7],
@@ -2724,7 +2381,6 @@ mod tests {
                 "the identifier itself must read as REGOSST"
             );
             let reader = SsTableReader::open(&path, 1).unwrap();
-            assert!(reader.meta_checksummed);
             assert_eq!(reader.partitioned, partitioned);
             assert!(table_carries_data(&*crate::env::std_env(), &path).unwrap());
         }
@@ -2750,7 +2406,7 @@ mod tests {
         writer.finish().unwrap().unwrap();
 
         let clean = fs::read(&path).unwrap();
-        let f = &clean[clean.len() - FOOTER_SIZE_V2..];
+        let f = &clean[clean.len() - FOOTER_SIZE..];
         let word = |i: usize| u64::from_le_bytes(f[i * 8..i * 8 + 8].try_into().unwrap());
         let range_tombstones = word(0)..word(0) + word(1);
         // Everything between the end of the bloom region and the
@@ -2805,7 +2461,7 @@ mod tests {
     fn open_rejects_file_with_bogus_magic() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("bogus.sst");
-        fs::write(&path, vec![0u8; FOOTER_SIZE_V1]).unwrap();
+        fs::write(&path, vec![0u8; FOOTER_SIZE]).unwrap();
         let kind = match SsTableReader::open(&path, 1) {
             Err(e) => e.kind(),
             Ok(_) => panic!("expected InvalidData"),
@@ -2825,7 +2481,7 @@ mod tests {
             index_offset: 8,
             index_size: 4,
             num_entries: 0,
-            magic: MAGIC_V1,
+            magic: MAGIC_V5,
         };
         fs::write(&path, footer.encode()).unwrap();
 
@@ -2861,7 +2517,6 @@ mod tests {
             filter_fallback: OnceLock::new(),
             range_tombstones: RangeTombstoneSet::default(),
             partitioned: false,
-            meta_checksummed: false,
             index_leaf_reads: AtomicUsize::new(0),
         };
         let cache = BlockCache::new(1024);
@@ -3533,7 +3188,7 @@ mod tests {
         // num_entries/magic. Shrink index_size so decode sees trailing
         // bytes; the region stays inside the file.
         let mut bytes = fs::read(&path).unwrap();
-        let footer_at = bytes.len() - FOOTER_SIZE_V1;
+        let footer_at = bytes.len() - FOOTER_SIZE;
         let index_size =
             u64::from_le_bytes(bytes[footer_at + 40..footer_at + 48].try_into().unwrap());
         bytes[footer_at + 40..footer_at + 48].copy_from_slice(&(index_size - 1).to_le_bytes());

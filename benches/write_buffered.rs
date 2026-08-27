@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use lark_kv::{Options, WriteOptions};
+use regolith::{Options, WriteOptions};
 
 const THREAD_COUNTS: [usize; 4] = [1, 2, 4, 8];
 const VALUE_BYTES: usize = 100;
@@ -197,12 +197,12 @@ fn main() {
     let reps = if smoke {
         2
     } else {
-        env_u64("LARK_BENCH_REPS", 9).max(7)
+        env_u64("REGOLITH_BENCH_REPS", 9).max(7)
     } as usize;
     let rep_ms = if smoke {
         60
     } else {
-        env_u64("LARK_BENCH_REP_MS", 500)
+        env_u64("REGOLITH_BENCH_REP_MS", 500)
     };
     let dur = Duration::from_millis(rep_ms);
 
