@@ -638,9 +638,15 @@ fn a_power_cut_during_a_manifest_append_keeps_every_acknowledged_write() {
     let db = tmp.path().join("db");
     let spec =
         ChildSpec::new(Phase::DuringManifestWrite, &db).durability(DurabilityMode::Immediate);
+    // The first write to a MANIFEST is its 12-byte REGOMAN stamp, not a
+    // record, so a `VersionEdit` append is one write later than its
+    // ordinal. Triggering on write 2 lands on the stamp's successor
+    // before anything is appended, and the cut then has no unsynced
+    // record to discard. Matches `MANIFEST_STAMP_LEN`.
+    const MANIFEST_STAMP_WRITES: u64 = 1;
     let (out, report) = crash_and_cut(
         spec,
-        Trigger::manifest_write(2),
+        Trigger::manifest_write(MANIFEST_STAMP_WRITES + 2),
         CutPoint::End,
         TearMode::Truncate,
     );
@@ -856,7 +862,13 @@ fn a_write_batch_is_all_or_nothing_at_every_cut_point() {
     for (i, (cut, tear)) in cuts.into_iter().enumerate() {
         let db = tmp.path().join(format!("db_{i}"));
         let spec = ChildSpec::new(Phase::MidWriteBatch, &db);
-        let (out, report) = crash_and_cut(spec, Trigger::wal_write(11), cut, tear);
+        // The trigger counts WAL write syscalls, and group commit means
+        // a syscall is not a record: one vectored write carries a whole
+        // group, so this phase produces a handful of writes rather than
+        // one per operation. Read off the journal, not derived from an
+        // operation count; a number past the end never fires and the
+        // probe silently proves nothing.
+        let (out, report) = crash_and_cut(spec, Trigger::wal_write(3), cut, tear);
         assert!(
             report.discarded_anything(),
             "{cut:?}/{tear:?}: the in-flight batch was not disturbed at all\n{}",

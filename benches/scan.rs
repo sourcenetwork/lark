@@ -14,7 +14,7 @@ use std::cell::Cell;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use lark_kv::{Db, Options, WriteBatch, WriteOptions};
 
 const VALUE_LEN: usize = 1024;

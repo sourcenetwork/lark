@@ -224,7 +224,8 @@ fn main() {
             s.median,
             s.lo,
             s.hi,
-            s.spread.map_or_else(|| "n/a".to_string(), |v| format!("{v:.2}")),
+            s.spread
+                .map_or_else(|| "n/a".to_string(), |v| format!("{v:.2}")),
             s.stability,
             cpu,
         );

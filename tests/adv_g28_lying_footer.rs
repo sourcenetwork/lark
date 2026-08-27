@@ -86,10 +86,18 @@ fn modern_table(entries: usize) -> Vec<u8> {
 #[test]
 fn a_modern_table_that_lies_about_its_entry_count_is_still_refused() {
     let mut bytes = modern_table(50);
-    assert_eq!(
-        &bytes[bytes.len() - 8..],
-        &[0x03, 0x54, 0x53, 0x53, 0x4b, 0x52, 0x41, 0x4c],
-        "this probe needs a V3 table",
+    // Any checksummed footer will do: V3 and V4 are LARKSST, V5 and V6
+    // the stamped REGOSST ones. They share a 72-byte layout, so the
+    // offsets below hold for all of them. What the probe needs is a
+    // footer the reader *can* verify, so that refusing the lie is the
+    // checksum doing its job and not the version byte.
+    let magic = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().expect("8"));
+    assert!(
+        matches!(
+            magic,
+            0x4C41524B_53535403 | 0x4C41524B_53535404 | 0x5245474F_53535405 | 0x5245474F_53535406
+        ),
+        "this probe needs a checksummed table, got {magic:#018x}",
     );
     lie_about_the_contents(&mut bytes, 72);
 

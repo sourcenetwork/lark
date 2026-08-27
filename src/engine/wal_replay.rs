@@ -80,8 +80,19 @@ impl WalReplayIter {
             n => super::wal::validate_wal_stamp(&head[..n])?,
         };
         let consumed = stamped.unwrap_or(0) as u64;
-        // Nothing but a stamp-less empty log can leave records unread
-        // here, so an unstamped file yields no entries at all.
+        // A file with no valid stamp yields no entries at all. When it
+        // still held bytes, that is a discard and has to be reported
+        // as one: `reject_tail_discard_before_live_wal` is what decides
+        // whether dropping this whole log is the end of the history or
+        // a hole in the middle of it.
+        let tail = match stamped {
+            Some(_) => None,
+            None if file_len > 0 => Some(TailVerdict {
+                offset: 0,
+                discarded_bytes: file_len,
+            }),
+            None => None,
+        };
         let file_len = if stamped.is_some() {
             file_len
         } else {
@@ -95,7 +106,7 @@ impl WalReplayIter {
             consumed,
             payload: Vec::new(),
             pending: VecDeque::new(),
-            tail: None,
+            tail,
         })
     }
 

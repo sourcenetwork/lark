@@ -122,7 +122,10 @@ fn reopen(db: &Path, n: usize) -> Result<Vec<usize>, String> {
 /// rather than imported, so a change to the engine's own framing helper
 /// cannot quietly move this test's oracle along with it.
 fn boundaries(bytes: &[u8]) -> Vec<usize> {
-    let mut out = vec![0usize];
+    /// Matches `WAL_STAMP_LEN` in `src/engine/wal.rs`. Records begin
+    /// after the format stamp, not at byte zero.
+    const STAMP: usize = 12;
+    let mut out = vec![STAMP];
     loop {
         let pos = *out.last().expect("seeded");
         if pos + 5 > bytes.len() {
@@ -153,7 +156,14 @@ fn a_cut_at_every_offset_of_the_wal_keeps_exactly_the_whole_records_before_it() 
     let db = root.path().join("db");
     for cut in 0..=full.len() {
         plant(&files, &wal, &full[..cut], &db);
-        let whole = bounds.iter().filter(|b| **b <= cut).count() - 1;
+        // `saturating_sub`: a cut inside the stamp leaves no boundary at
+        // or below it, and zero whole records is the right answer there
+        // rather than an underflow.
+        let whole = bounds
+            .iter()
+            .filter(|b| **b <= cut)
+            .count()
+            .saturating_sub(1);
         let found = reopen(&db, 12)
             .unwrap_or_else(|e| panic!("a cut at {cut} must be a torn tail, not an error: {e}"));
         let expected: Vec<usize> = (0..whole).collect();

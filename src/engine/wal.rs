@@ -779,12 +779,25 @@ pub(super) fn validate_wal_stamp(bytes: &[u8]) -> io::Result<Option<usize>> {
         return Ok(None);
     }
     if bytes[0..4] != WAL_MAGIC {
-        if bytes.iter().all(|b| *b == 0) {
-            return Ok(None);
-        }
-        return Err(invalid_wal(
-            "not a lark WAL: the file does not begin with the REGO stamp",
-        ));
+        // No stamp means no record in this file was ever acknowledged.
+        // The stamp is written when the log is created, before any
+        // record, so a write that returned `Ok` from this file had a
+        // durable stamp behind it. Damage here is therefore a crash
+        // during creation, not the loss of an acknowledged write, and
+        // the file is discardable whatever the damage looks like:
+        // zeros from an unwritten extent, or garbage from a torn one.
+        //
+        // Refusing instead would turn a recoverable state into an
+        // unopenable database, which is the opposite of the durability
+        // rule: recovery must reach a valid prefix of the write
+        // history, and "everything before this log" is one.
+        //
+        // The discard is not silent. The caller records it and
+        // `reject_tail_discard_before_live_wal` refuses the open if a
+        // *later* log still yielded records, because then the missing
+        // bytes would be a hole in the middle of the history rather
+        // than its end.
+        return Ok(None);
     }
     let format = u16::from_le_bytes([bytes[4], bytes[5]]);
     let reserved = u16::from_le_bytes([bytes[6], bytes[7]]);
@@ -1560,11 +1573,47 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
+    /// Bytes that are not a stamped log yield no records rather than an
+    /// error, and the difference matters.
+    ///
+    /// An `fsync` that makes a record durable flushes everything written
+    /// before it, and the stamp is written when the log is created. So a
+    /// log holding an acknowledged write has a durable stamp behind it,
+    /// and damage to the stamp proves nothing in the file was ever
+    /// acknowledged. Refusing would turn that into an unopenable
+    /// database; discarding reaches "everything before this log", which
+    /// is a valid prefix of the write history.
+    ///
+    /// The discard is not silent, and it is not unconditional: the
+    /// caller reports it and `reject_tail_discard_before_live_wal`
+    /// refuses the open when a later log still yielded records, because
+    /// then the missing bytes are a hole rather than the end. That case
+    /// is covered by `a_torn_tail_in_an_earlier_wal_file_is_not_the_end_of_the_log`.
     #[test]
-    fn a_file_that_is_not_a_lark_log_is_refused() {
-        let bytes = b"this is not a write-ahead log at all";
-        let err = validate_wal_stamp(bytes).expect_err("foreign bytes must not replay");
-        assert!(err.to_string().contains("REGO"), "{err}");
+    fn a_file_that_is_not_a_stamped_log_yields_no_records() {
+        for bytes in [
+            &b"this is not a write-ahead log at all"[..],
+            &[0xFFu8; 64][..],
+            &[0x00u8; 64][..],
+        ] {
+            assert_eq!(
+                validate_wal_stamp(bytes).expect("an unstamped log is discardable, not an error"),
+                None,
+                "unstamped bytes must report no stamp so the caller can record the discard",
+            );
+        }
+    }
+
+    /// A stamp that parses but is damaged is still refused. The
+    /// checksum and the version field are the parts a later build
+    /// relies on to know what framing it is holding, so a wrong value
+    /// there is not a crash artifact and must not be guessed at.
+    #[test]
+    fn a_damaged_but_present_stamp_is_still_refused() {
+        let mut stamp = encode_wal_stamp();
+        stamp[8] ^= 0xFF;
+        let err = validate_wal_stamp(&stamp).expect_err("a corrupt checksum must not pass");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -2012,6 +2061,10 @@ mod tests {
         data.extend_from_slice(&[0xAA, 0xBB]);
 
         let mut f = File::create(&path).unwrap();
+        // The stamp first: without it the file is an unstamped log and
+        // replay reports no records, which would let these probes pass
+        // on the wrong reason instead of on the malformed record.
+        f.write_all(&encode_wal_stamp()).unwrap();
         append_raw_record(&mut f, RECORD_BATCH, &data, None);
         f.sync_all().unwrap();
 
@@ -2031,6 +2084,10 @@ mod tests {
         data.push(0xFF);
 
         let mut f = File::create(&path).unwrap();
+        // The stamp first: without it the file is an unstamped log and
+        // replay reports no records, which would let these probes pass
+        // on the wrong reason instead of on the malformed record.
+        f.write_all(&encode_wal_stamp()).unwrap();
         append_raw_record(&mut f, RECORD_BATCH, &data, None);
         f.sync_all().unwrap();
 

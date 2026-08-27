@@ -116,7 +116,12 @@ impl Attempts {
     fn json(&self) -> String {
         format!(
             "{{\"commits\":{},\"conflicts\":{},\"busy\":{},\"io_errors\":{},\"other_errors\":{},\"abandoned\":{}}}",
-            self.commits, self.conflicts, self.busy, self.io_errors, self.other_errors, self.abandoned
+            self.commits,
+            self.conflicts,
+            self.busy,
+            self.io_errors,
+            self.other_errors,
+            self.abandoned
         )
     }
 }

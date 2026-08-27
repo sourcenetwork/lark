@@ -98,9 +98,13 @@ struct Regions {
 fn regions(bytes: &[u8]) -> Regions {
     let n = bytes.len();
     let magic = u64::from_le_bytes(bytes[n - 8..].try_into().expect("8"));
+    // v1 and v2 are the unchecksummed LARKSST footers, v3 and v4 the
+    // checksummed ones, v5 and v6 the stamped REGOSST flat and
+    // partitioned ones. v3 onward share a 72-byte layout, so the field
+    // offsets below hold for all of them.
     let footer_size = match magic & 0xff {
         0x01 | 0x02 => 64usize,
-        0x03 | 0x04 => 72,
+        0x03 | 0x04 | 0x05 | 0x06 => 72,
         v => panic!("unknown format version {v:#04x} (magic {magic:#018x})"),
     };
     let f = n - footer_size;

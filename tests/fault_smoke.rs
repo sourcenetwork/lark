@@ -109,8 +109,15 @@ fn the_shim_records_larks_real_file_io() {
 fn a_kill_point_lands_on_the_requested_syscall() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("db");
+    // This probe checks that the harness dies *where it was asked to*,
+    // so it names the write rather than inheriting the phase default:
+    // a default that moves would otherwise look like the harness
+    // missing its mark.
+    const NTH_MANIFEST_WRITE: u64 = 2;
     let spec = ChildSpec::new(Phase::DuringManifestWrite, &db);
-    let out = CrashRun::new(spec).run();
+    let out = CrashRun::new(spec)
+        .trigger(Trigger::manifest_write(NTH_MANIFEST_WRITE))
+        .run();
 
     out.assert_killed();
     assert_eq!(out.signal, Some(9), "expected SIGKILL");
@@ -127,8 +134,8 @@ fn a_kill_point_lands_on_the_requested_syscall() {
     );
     assert_eq!(
         out.journal.writes_to("MANIFEST").len(),
-        2,
-        "expected to die on the 2nd MANIFEST write\n{}",
+        NTH_MANIFEST_WRITE as usize,
+        "expected to die on MANIFEST write {NTH_MANIFEST_WRITE}\n{}",
         out.journal,
     );
 }

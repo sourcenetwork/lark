@@ -242,7 +242,7 @@ fn overwrite(path: &Path, offset: usize, patch: &[u8]) {
 /// Record boundaries in a WAL, derived from the on-disk framing.
 fn frames(bytes: &[u8]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
-    let mut pos = 0usize;
+    let mut pos = STAMP;
     while pos + 5 <= bytes.len() {
         let len = u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
             as usize;
@@ -255,6 +255,10 @@ fn frames(bytes: &[u8]) -> Vec<(usize, usize)> {
     }
     out
 }
+
+/// Matches `WAL_STAMP_LEN` in `src/engine/wal.rs`. Records begin after
+/// the format stamp, not at byte zero.
+const STAMP: usize = 12;
 
 // --- the attacks -------------------------------------------------------
 
@@ -546,11 +550,11 @@ fn plant_split(fx: &Fixture, db: &Path, split_at: usize, cut_first_to: Option<us
         None => &bytes[..split_at],
     };
     fs::write(dir.join(format!("wal_{id:06}.log")), head).expect("write first wal");
-    fs::write(
-        dir.join(format!("wal_{:06}.log", id + 1)),
-        &bytes[split_at..],
-    )
-    .expect("write second wal");
+    // The tail is a fresh file, so it needs its own stamp: the split
+    // point is inside the record stream, past the original one.
+    let mut tail = bytes[..STAMP].to_vec();
+    tail.extend_from_slice(&bytes[split_at..]);
+    fs::write(dir.join(format!("wal_{:06}.log", id + 1)), &tail).expect("write second wal");
 }
 
 /// A torn record at the end of a WAL file that is **not** the last WAL

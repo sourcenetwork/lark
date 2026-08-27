@@ -1965,11 +1965,17 @@ impl SsTableReader {
 /// Whether `path` is a complete SSTable that carries data: at least one
 /// point entry or one range tombstone.
 ///
-/// Only the footer is read, so probing a whole table directory costs one
-/// small read per file rather than one index and bloom load per file. An
-/// `Err` means the file is not a readable SSTable at all, which the
-/// caller must not read as "holds nothing": a file whose footer will not
-/// parse cannot be proved empty.
+/// The footer is read first, so probing a whole table directory usually
+/// costs one small read per file rather than an index and bloom load per
+/// file. An `Err` means the file is not a readable SSTable at all, which
+/// the caller must not read as "holds nothing": a file whose footer will
+/// not parse cannot be proved empty.
+///
+/// A footer that claims nothing is not taken at its word. A V1 or V2
+/// footer carries no checksum, so two zeroed `u64`s make a table holding
+/// real data claim to hold none, and the open guard that trusts it then
+/// discards the table as a crash artifact. When the claim is "empty",
+/// the index block is decoded and has to agree.
 pub(crate) fn table_carries_data(path: &Path) -> io::Result<bool> {
     let mut file = File::open(path)?;
     let file_size = file.metadata()?.len();
@@ -1990,7 +1996,25 @@ pub(crate) fn table_carries_data(path: &Path) -> io::Result<bool> {
     file.read_exact(&mut footer_buf)?;
     let footer = Footer::decode(&footer_buf)?;
     validate_footer_regions(&footer, data_end)?;
-    Ok(footer.num_entries > 0 || footer.range_tombstone_size > 0)
+    if footer.num_entries > 0 || footer.range_tombstone_size > 0 {
+        return Ok(true);
+    }
+    let mut index_region = read_file_region(
+        &mut file,
+        footer.index_offset,
+        footer.index_size,
+        data_end,
+        "index block",
+    )?;
+    let payload_len = verify_meta_region(
+        &index_region,
+        checksum::META_KIND_INDEX,
+        footer.checksummed(),
+        "index block",
+    )?
+    .len();
+    index_region.truncate(payload_len);
+    Ok(!IndexBlock::decode(index_region)?.is_empty())
 }
 
 /// Format an SSTable filename from a numeric ID.

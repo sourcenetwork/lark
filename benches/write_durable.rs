@@ -196,7 +196,9 @@ fn main() {
 
     let root = storage_root();
     println!("durable writes (sync=true), {reps} reps x {rep_ms} ms, value {VALUE_BYTES} B");
-    println!("  storage root: {root} (an fsync on a tmpfs is nearly free; set TMPDIR to the device you care about)");
+    println!(
+        "  storage root: {root} (an fsync on a tmpfs is nearly free; set TMPDIR to the device you care about)"
+    );
     let mut summaries = Vec::with_capacity(THREAD_COUNTS.len());
     for threads in THREAD_COUNTS {
         let measured: Vec<Rep> = (0..reps).map(|_| run_rep(threads, dur)).collect();
@@ -212,7 +214,8 @@ fn main() {
             s.median,
             s.lo,
             s.hi,
-            s.spread.map_or_else(|| "n/a".to_string(), |v| format!("{v:.2}")),
+            s.spread
+                .map_or_else(|| "n/a".to_string(), |v| format!("{v:.2}")),
             s.stability,
             cpu,
         );
@@ -226,7 +229,9 @@ fn main() {
     } else {
         "stable"
     };
-    println!("  stability: {overall} (spread within this run; on the baseline host separate sessions still disagreed 2-3x)");
+    println!(
+        "  stability: {overall} (spread within this run; on the baseline host separate sessions still disagreed 2-3x)"
+    );
 
     if smoke {
         println!("  smoke run (--test): metrics not emitted");
