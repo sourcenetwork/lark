@@ -387,17 +387,6 @@ fn compaction_loop(
     in_progress: Arc<crate::sync::Mutex<HashSet<u64>>>,
 ) {
     loop {
-        // Hand back this thread's share of the block cache's deferred
-        // reclamation before parking. A thread that has taken a
-        // reclamation guard and then idles pins every batch holding a
-        // node born before its last published epoch, so a worker that
-        // read one block and then slept would hold the cache's evicted
-        // entries for as long as it stayed asleep - which, between
-        // compactions, is most of the time. Measured on the block-cache
-        // overhead probe, skipping this left live heap at 1.79x the byte
-        // budget against 1.04x with it.
-        kovan::flush();
-
         // Wait for a trigger, or fall through on the periodic poll.
         // The gate is reopened before the pass runs, so a notification
         // that lands mid-pass queues a token instead of being swallowed.

@@ -516,7 +516,6 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "js-sys",
- "kovan",
  "kovan-channel",
  "kovan-map",
  "kovan-mvcc",

@@ -63,27 +63,6 @@ const MIN_MAP_BUCKETS: usize = 64;
 /// on demand instead.
 const MAX_MAP_BUCKETS: usize = 64 * 1024;
 
-/// Map removals a shard performs before draining the calling thread's
-/// retired map nodes.
-///
-/// The map hands a removed node to a deferred reclaimer, so between the
-/// eviction and the reclaim the node and the [`ClockEntry`] allocation
-/// its `Weak` pins stay resident. Left to its own cadence that set grows
-/// with churn rather than with the working set: the small-block overhead
-/// probe measured live heap at 3.8x the byte budget after 40,000 inserts
-/// through a 2 MiB cache, and the multiple rose with the churn count.
-/// Draining on a fixed eviction count turns it into a constant, roughly
-/// this many entries' bookkeeping per shard.
-///
-/// 64 rather than 1: a saturated cache evicts on every insert, and a
-/// drain advances the global epoch and walks the thread's slots, so
-/// paying it per insert would put epoch work on the write path for no
-/// further bound. An isolated churn probe measured live heap flat at
-/// 164 bytes per live entry across 10k, 40k and 160k removals at this
-/// setting, against 4.5 KiB, 17 KiB and 68 KiB per live entry with no
-/// drain at all.
-const EVICTIONS_PER_RECLAIM: u32 = 64;
-
 /// Bytes one cached entry costs the cache.
 /// What a cache slot holds.
 ///
@@ -190,9 +169,6 @@ struct ClockRing {
     /// field rather than an atomic because every mutation happens under
     /// the ring mutex anyway.
     used: usize,
-    /// Evictions since this shard last drained its thread's retired
-    /// nodes. See [`EVICTIONS_PER_RECLAIM`].
-    evictions_since_reclaim: u32,
 }
 
 impl ClockRing {
@@ -202,7 +178,6 @@ impl ClockRing {
             free: Vec::new(),
             hand: 0,
             used: 0,
-            evictions_since_reclaim: 0,
         }
     }
 
@@ -214,25 +189,6 @@ impl ClockRing {
         }
         self.slots.push(None);
         self.slots.len() - 1
-    }
-
-    /// Account one map removal, draining the calling thread's retired
-    /// nodes once [`EVICTIONS_PER_RECLAIM`] have accumulated.
-    ///
-    /// Every removal goes through here, not just the hand's: a
-    /// compaction's `evict_file` sweep and the replace path retire nodes
-    /// exactly as an eviction does, and a counter that missed them would
-    /// leave the bound in place only for the workload that happens to
-    /// evict.
-    fn record_removal(&mut self) {
-        self.evictions_since_reclaim += 1;
-        if self.evictions_since_reclaim >= EVICTIONS_PER_RECLAIM {
-            self.evictions_since_reclaim = 0;
-            // On the removing thread, which is the thread that retired
-            // the nodes: `flush` drains the caller's own batch and
-            // nobody else's.
-            kovan::flush();
-        }
     }
 
     /// Release `slot` and the bytes the entry it held charged.
@@ -254,7 +210,6 @@ impl ClockRing {
         self.free = Vec::new();
         self.hand = 0;
         self.used = 0;
-        self.evictions_since_reclaim = 0;
     }
 }
 
@@ -331,9 +286,14 @@ impl CacheShard {
         let Some(map) = self.map.get() else {
             return;
         };
-        if let Some(entry) = map.remove(key).as_ref().and_then(Weak::upgrade) {
+        // `force_remove`, not `remove`: an insert racing a remove can
+        // transiently leave more than one node for a key, and a plain
+        // remove unlinks only the first, which makes an older version
+        // visible again. For a cache that means a reader is handed the
+        // block that used to be at this key, and the shard's byte
+        // accounting no longer matches what the map holds.
+        if let Some(entry) = map.force_remove(key).as_ref().and_then(Weak::upgrade) {
             ring.release(entry.slot as usize, entry.charge);
-            ring.record_removal();
         }
     }
 
@@ -367,9 +327,8 @@ impl CacheShard {
             ring.free.push(hand);
             ring.used = ring.used.saturating_sub(entry.charge);
             if let Some(map) = self.map.get() {
-                map.remove(&entry.key);
+                map.force_remove(&entry.key);
             }
-            ring.record_removal();
             return true;
         }
         false
@@ -457,21 +416,16 @@ impl CacheShard {
                 continue;
             }
             let (key, charge) = (entry.key, entry.charge);
-            map.remove(&key);
+            map.force_remove(&key);
             ring.release(slot, charge);
-            ring.record_removal();
         }
     }
 
     fn clear(&self, ring: &mut ClockRing) {
-        let held = self.map.get().map(|map| {
+        if let Some(map) = self.map.get() {
             map.clear();
-            map.len()
-        });
-        ring.reset();
-        if held.is_some() {
-            kovan::flush();
         }
+        ring.reset();
     }
 }
 
@@ -557,26 +511,20 @@ impl CacheShard {
 ///   ring mutex the moment the hand takes the slot.
 ///
 /// Together those put live heap above the budget at saturation by a
-/// fixed margin. Both costs are per entry rather than per byte, so the
-/// margin is set by the block size: measured 1.25x with 1 KiB blocks and
-/// 1.54x with 256-byte blocks, which are a quarter and a sixteenth of
-/// the default `block_size`, so a default-configured cache sits well
-/// inside the tighter of the two.
-/// The margin is a constant, not a leak, and
-/// `tests/adv_block_cache_overhead.rs` proves it on every run by
-/// tripling the churn through the same budget and requiring resident
-/// memory not to move: 40,000 and 120,000 inserts through a 2 MiB cache
-/// measure within 0.4% of each other.
+/// margin that is NOT bounded today, and this is a known open defect
+/// rather than a documented cost. Measured on the small-block probe:
+/// 3.8x the byte budget after 40,000 inserts through a 2 MiB cache, and
+/// 9.3x after 120,000. It grows with churn, not with the working set,
+/// so a long-running database keeps climbing.
 ///
-/// The margin is only constant because both halves are drained. A map
-/// node that nothing drains grows without bound in churn rather than in
-/// working set: the same probe measured 3.8x the budget after 40,000
-/// inserts and rising. Two things keep it flat, and both are load-
-/// bearing. [`EVICTIONS_PER_RECLAIM`] drains the removing thread. And
-/// the compaction worker drains itself before it parks, because a
-/// thread that has taken a reclamation guard and then idles pins every
-/// batch holding a node born before its last published epoch - which,
-/// for a worker between compactions, is nearly all of them.
+/// The cause is that the map's retired nodes are not reclaimed in this
+/// process without an explicit `kovan::flush()`, and calling that from
+/// a live thread while readers hold guards corrupts memory: the block
+/// cache's own adversarial test aborted with SIGSEGV and with a
+/// misaligned pointer dereference inside the map's own traversal.
+/// `force_remove` rather than `remove` closes a separate hazard, a
+/// stale version of a key becoming visible again, but it does not
+/// change retention at all: both measure the same bytes.
 ///
 /// The map's reclamation guard is taken and dropped inside each map
 /// call, so no guard is ever held across a lock acquisition or a wait,
