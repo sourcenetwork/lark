@@ -39,20 +39,26 @@
 //! assert_eq!(snap.get(b"key1").unwrap(), Some(b"val1".to_vec()));
 //! ```
 
-#![forbid(unsafe_code)]
+// `unsafe` is confined to the modules that need raw pointers to hand
+// out zero-copy views of bytes the engine already owns. Every other
+// module inherits the crate-level deny.
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 mod backup;
 mod checkpoint;
 mod column_family;
 mod engine;
+pub mod env;
 mod error;
 mod event_listener;
 mod iter;
+mod mvcc;
 mod options;
-mod os_hint;
 mod perf_context;
+mod portability;
 mod rate_limiter;
+mod slice;
 mod sst_file_writer;
 mod statistics;
 mod tailing;
@@ -62,6 +68,9 @@ mod ttl;
 pub use backup::{BackupEngine, BackupId, BackupInfo};
 pub use checkpoint::Checkpoint;
 pub use column_family::{ColumnFamilyHandle, DEFAULT_CF_NAME};
+#[cfg(target_os = "wasi")]
+pub use env::WasiEnv;
+pub use env::{Capabilities, Env, MemEnv, StdEnv};
 pub use error::Error;
 pub use event_listener::{
     BackgroundErrorReason, CompactionJobInfo, EventListener, ExternalFileIngestionInfo,
@@ -70,20 +79,38 @@ pub use event_listener::{
 };
 pub use iter::Iter;
 pub use options::{
-    CompactionDecision, CompactionFilter, CompactionStyle, CompressionType, DurabilityMode,
-    FifoCompactionOptions, FixedLengthPrefix, MergeOperator, Options, PrefixExtractor,
-    UniversalCompactionOptions, WriteOptions, DEFAULT_MAX_KEY_SIZE, DEFAULT_MAX_VALUE_SIZE,
-    MAX_BLOCK_CACHE_SHARD_BITS, MAX_BLOOM_BITS_PER_KEY,
+    ArenaProfile, CompactionDecision, CompactionFilter, CompactionStyle, CompressionType,
+    DEFAULT_MAX_BACKGROUND_COMPACTIONS, DEFAULT_MAX_KEY_SIZE, DEFAULT_MAX_VALUE_SIZE,
+    DurabilityMode, FifoCompactionOptions, FixedLengthPrefix, MAX_BLOCK_CACHE_SHARD_BITS,
+    MAX_BLOOM_BITS_PER_KEY, MergeOperator, Options, PrefixExtractor, UniversalCompactionOptions,
+    WriteOptions,
 };
 pub use perf_context::{PerfContext, PerfContextSnapshot, PerfLevel};
 pub use rate_limiter::{Priority, RateLimiter, TokenBucketRateLimiter};
+pub use slice::DbSlice;
 pub use sst_file_writer::{IngestOptions, SstFileMeta, SstFileWriter};
 pub use statistics::{Histogram, HistogramSnapshot, Statistics, Ticker};
 pub use tailing::TailingIter;
 pub use transaction::{
-    OptimisticTransactionDb, Transaction, TransactionDb, TransactionError, TxResult,
+    IsolationLevel, OptimisticTransactionDb, Transaction, TransactionDb, TransactionError, TxResult,
 };
-pub use ttl::{strip_timestamp, DbWithTtl, TtlCompactionFilter};
+pub use ttl::{DbWithTtl, TtlCompactionFilter, strip_timestamp};
+
+#[cfg(loom)]
+#[doc(hidden)]
+pub mod loom_exports {
+    //! Model-checking entry points, published only in a `--cfg loom`
+    //! build.
+    //!
+    //! `tests/loom_memtable.rs` is an integration test and so sees only
+    //! the public API, while everything the models drive - the arena,
+    //! the skip list, the memtable, the read horizon - is crate-private.
+    //! The models therefore live inside the crate, next to the code they
+    //! check, and this module is the seam that lets the test target call
+    //! them. It does not exist in an ordinary build.
+
+    pub use crate::engine::loom_model::{handoff, skiplist, slice, version};
+}
 
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
@@ -101,7 +128,7 @@ pub mod fuzzing {
 
     /// Decode arbitrary bytes as an SSTable data block.
     pub fn decode_block(data: &[u8]) {
-        let _ = crate::engine::block::Block::decode(data.to_vec());
+        let _ = crate::engine::block::Block::decode_data_block(data.to_vec());
     }
 
     /// Decode arbitrary bytes as an SSTable range-tombstone block.
@@ -112,7 +139,14 @@ pub mod fuzzing {
     /// Replay arbitrary bytes as a WAL file.
     pub fn replay_wal(data: &[u8]) {
         with_temp_file("wal", "log", data, |path| {
-            let _ = crate::engine::wal::Wal::replay(path);
+            let Ok(mut iter) = crate::engine::wal_replay::WalReplayIter::open(
+                &*crate::env::std_env(),
+                path,
+                crate::engine::wal_replay::WalPosition::Newest,
+            ) else {
+                return;
+            };
+            while matches!(iter.next_entry(), Ok(Some(_))) {}
         });
     }
 
@@ -157,8 +191,9 @@ pub mod fuzzing {
 }
 
 use column_family::{
-    cf_lower_bound, cf_upper_bound, meta, prefix_key, CfRegistry, DEFAULT_CF_ID, META_CF_ID,
+    CfRegistry, DEFAULT_CF_ID, META_CF_ID, cf_lower_bound, cf_upper_bound, meta, prefix_key,
 };
+use engine::lookup_key::LookupKey;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -190,11 +225,20 @@ fn invalid_cf_id_io_error(cf_id: u32) -> std::io::Error {
 }
 
 fn map_point_read_error(err: std::io::Error, prefixed_key: &[u8]) -> Error {
+    let user_key = prefixed_key.get(4..).unwrap_or(prefixed_key);
+    map_point_read_error_for(err, user_key)
+}
+
+/// [`map_point_read_error`] for a caller that already holds the user
+/// key. Stripping the column-family prefix a second time would eat
+/// four bytes of the key itself and report a truncated one, so the
+/// strip lives in exactly one place and both entries share the
+/// decision below.
+fn map_point_read_error_for(err: std::io::Error, user_key: &[u8]) -> Error {
     if err.kind() == std::io::ErrorKind::InvalidData
         && err.to_string().starts_with("merge operator ")
     {
-        let user_key = prefixed_key.get(4..).unwrap_or(prefixed_key).to_vec();
-        Error::MergeFailed(user_key)
+        Error::MergeFailed(user_key.to_vec())
     } else {
         Error::from(err)
     }
@@ -242,7 +286,7 @@ fn prefixed_cf_id(prefixed_key: &[u8]) -> std::io::Result<u32> {
 }
 
 /// Minimal snapshot of the currently-configured options, returned
-/// by `Db::get_property("lark.options")`. Deliberately small —
+/// by `Db::get_property("lark.options")`. Deliberately small -
 /// lark doesn't retain the full `Options` past `Db::open`, and
 /// the Debug impl of this struct is the property's string value.
 #[derive(Debug)]
@@ -292,7 +336,7 @@ impl<'a> Range<'a> {
 /// raw entries (including every version and every tombstone) for
 /// user keys in the queried range; `size` is the sum of
 /// `internal_key.len() + value.len()` over those entries. Both
-/// values are exact with respect to the current active memtable —
+/// values are exact with respect to the current active memtable -
 /// this method walks the skip list.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MemTableStats {
@@ -333,6 +377,10 @@ impl Db {
     /// call [`Db::create_column_family`] for additional CFs; those
     /// calls persist into the database and survive reopen. Invalid
     /// option combinations fail before any filesystem work starts.
+    ///
+    /// Returns [`Error::Io`] with [`std::io::ErrorKind::Unsupported`]
+    /// when the platform cannot start the background compaction
+    /// thread, as a single-threaded target does.
     pub fn open<P: AsRef<Path>>(path: P, opts: Options) -> Result<Self> {
         opts.validate()?;
         let read_only = opts.read_only;
@@ -377,45 +425,40 @@ impl Db {
     /// fresh database. Called once from [`Db::open`].
     fn load_cf_registry(&self) -> Result<()> {
         // Scan every `name:*` entry in the meta CF to rebuild the
-        // name→id map. The default CF is not persisted to disk —
+        // name→id map. The default CF is not persisted to disk -
         // it's always injected into the in-memory registry with a
         // hardcoded id so an empty database stays byte-free on
         // disk. User-created CFs are the only thing that produces
         // on-disk metadata writes.
         let mut entries: Vec<(String, u32)> = Vec::new();
-        let seq = self.engine.snapshot_seq();
         let pairs = collect_range(
-            &self.engine,
+            self.engine.new_iter_latest(),
             Some(&meta::name_scan_prefix()),
             Some(&meta::name_scan_upper()),
-            seq,
         )?;
         for (key, value) in pairs {
-            if value.len() != 4 {
+            // A meta value that is not a 4-byte id is not one of ours.
+            let Ok(id_bytes) = <[u8; 4]>::try_from(value.as_slice()) else {
                 continue;
-            }
+            };
             let Some(name) = meta::name_from_key(&key) else {
                 continue;
             };
-            let id = u32::from_be_bytes(value.as_slice().try_into().unwrap());
-            entries.push((name.to_string(), id));
+            entries.push((name.to_string(), u32::from_be_bytes(id_bytes)));
         }
 
         // Recover `next_id`. Absent on a fresh database.
         let next_id_raw = self
             .engine
-            .get(&meta::next_id_key(), self.engine.snapshot_seq())
+            .get_latest(&meta::next_id_key())
             .map_err(Error::from)?;
-        let next_id = match next_id_raw {
-            Some(bytes) if bytes.len() == 4 => {
-                u32::from_be_bytes(bytes.as_slice().try_into().unwrap())
-            }
-            _ => DEFAULT_CF_ID + 1,
-        };
+        let next_id = next_id_raw
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes.as_slice()).ok())
+            .map_or(DEFAULT_CF_ID + 1, u32::from_be_bytes);
 
         // Inject the default CF into the in-memory registry so
         // `Db::default_cf()` always succeeds. It's never persisted
-        // to the meta CF — any re-open computes the same id.
+        // to the meta CF - any re-open computes the same id.
         entries.push((DEFAULT_CF_NAME.to_string(), DEFAULT_CF_ID));
         self.cfs.load(entries, next_id);
         Ok(())
@@ -423,30 +466,106 @@ impl Db {
 
     /// Get the value for a key from the default column family.
     /// Returns `None` if the key doesn't exist.
+    ///
+    /// This is [`Db::get_slice`] followed by [`DbSlice::into_vec`].
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.get_raw(&prefix_key(DEFAULT_CF_ID, key))
+        Ok(self.get_slice(key)?.map(DbSlice::into_vec))
     }
 
-    /// Engine-direct point read that bypasses CF prefixing. Used
-    /// by the CF metadata loader and by other modules (e.g. the
-    /// `_cf` wrappers above) that have already prefixed the key.
-    fn get_raw(&self, prefixed_key: &[u8]) -> Result<Option<Vec<u8>>> {
+    /// Read a value from the default column family without copying it.
+    ///
+    /// The returned [`DbSlice`] borrows bytes the database already owns
+    /// and holds a reference count on their owner, so nothing is copied
+    /// on the way out. Holding one pins that owner: see [`DbSlice`].
+    ///
+    /// `Option<DbSlice>` does not compare against `Option<Vec<u8>>`
+    /// (`core`'s `PartialEq` for `Option` is homogeneous), so this
+    /// method is additive and [`Db::get`] keeps its signature.
+    pub fn get_slice(&self, key: &[u8]) -> Result<Option<DbSlice>> {
+        self.lookup_slice_latest(DEFAULT_CF_ID, key)
+    }
+
+    /// [`Db::get_slice`] scoped to a column family.
+    pub fn get_slice_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<Option<DbSlice>> {
+        self.validate_cf_handle(cf)?;
+        self.lookup_slice_latest(cf.id(), key)
+    }
+
+    /// Whether a live value exists for `key` in the default column
+    /// family.
+    ///
+    /// Reads the same sources [`Db::get`] does and pays the same block
+    /// reads: a bloom filter is probabilistic, so ruling a key *in*
+    /// still requires consulting the data block. What it skips is the
+    /// copy, so no value bytes are ever materialized and nothing is
+    /// pinned after it returns. On a bloom-negative lookup `has` and
+    /// `get` cost the same and neither touches a block.
+    ///
+    /// When a [`MergeOperator`] is configured this method does
+    /// materialize: the operator decides inside `full_merge` whether a
+    /// value exists at all, so there is no way to answer without
+    /// collapsing the chain.
+    pub fn has(&self, key: &[u8]) -> Result<bool> {
+        Ok(self.get_size(key)?.is_some())
+    }
+
+    /// [`Db::has`] scoped to a column family.
+    pub fn has_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<bool> {
+        Ok(self.get_size_cf(cf, key)?.is_some())
+    }
+
+    /// Length in bytes of the live value for `key` in the default
+    /// column family, or `None` when there is none.
+    ///
+    /// Same sources and same block reads as [`Db::get`], without the
+    /// copy. See [`Db::has`] for what that does and does not save, and
+    /// for the [`MergeOperator`] caveat.
+    pub fn get_size(&self, key: &[u8]) -> Result<Option<usize>> {
+        self.lookup_size_latest(DEFAULT_CF_ID, key)
+    }
+
+    /// [`Db::get_size`] scoped to a column family.
+    pub fn get_size_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<Option<usize>> {
+        self.validate_cf_handle(cf)?;
+        self.lookup_size_latest(cf.id(), key)
+    }
+
+    /// [`Db::lookup_slice`] for a read of the newest visible value.
+    ///
+    /// The engine samples the read horizon against the view it walks,
+    /// which a caller cannot do for it: building a `LookupKey` here
+    /// would fix the sequence before the engine loads its view, and a
+    /// compaction in between can drop the newest version at or below
+    /// it, so the read reports the key absent or an older value.
+    fn lookup_slice_latest(&self, cf_id: u32, key: &[u8]) -> Result<Option<DbSlice>> {
         let stats = self.stats();
         let _scope = statistics::TimeScope::new(stats, Histogram::DbGet);
         if let Some(s) = stats {
             s.add(Ticker::KeysRead, 1);
         }
         perf_context::record_get_call();
-        let seq = self.engine.snapshot_seq();
         let result = self
             .engine
-            .get(prefixed_key, seq)
-            .map_err(|err| map_point_read_error(err, prefixed_key));
+            .get_slice_latest(cf_id, key)
+            .map_err(|err| map_point_read_error_for(err, key));
         if let (Some(s), Ok(Some(v))) = (stats, &result) {
             s.add(Ticker::BytesRead, v.len() as u64);
             s.record(Histogram::BytesPerRead, v.len() as u64);
         }
         result
+    }
+
+    /// The length-only twin of [`Db::lookup_slice_latest`].
+    fn lookup_size_latest(&self, cf_id: u32, key: &[u8]) -> Result<Option<usize>> {
+        let stats = self.stats();
+        let _scope = statistics::TimeScope::new(stats, Histogram::DbGet);
+        if let Some(s) = stats {
+            s.add(Ticker::KeysRead, 1);
+        }
+        perf_context::record_get_call();
+        self.engine
+            .get_size_latest(cf_id, key)
+            .map_err(|err| map_point_read_error_for(err, key))
     }
 
     /// Helper that exposes a borrowed reference to the engine's
@@ -462,14 +581,13 @@ impl Db {
     /// order and duplicates); each entry is `None` if the key does
     /// not exist or is tombstoned.
     ///
-    /// All keys in a single call see the **same** consistent view —
+    /// All keys in a single call see the **same** consistent view -
     /// a concurrent writer cannot make two keys disagree about
     /// visibility.
     pub fn multi_get(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
         let owned: Vec<Vec<u8>> = keys.iter().map(|k| prefix_key(DEFAULT_CF_ID, k)).collect();
         let refs: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
-        let seq = self.engine.snapshot_seq();
-        self.engine.multi_get(&refs, seq).map_err(Error::from)
+        self.engine.multi_get_latest(&refs).map_err(Error::from)
     }
 
     /// Set a key-value pair in the default column family using
@@ -503,6 +621,7 @@ impl Db {
                 disable_wal,
             )
             .map_err(Error::from)
+            .map(|_| ())
     }
 
     /// Delete a key from the default column family using the
@@ -525,6 +644,7 @@ impl Db {
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
             .apply_grouped_batch(batch, Vec::new(), Vec::new(), dm, disable_wal)
+            .map(|_| ())
             .map_err(Error::from)
     }
 
@@ -556,6 +676,7 @@ impl Db {
                 dm,
                 disable_wal,
             )
+            .map(|_| ())
             .map_err(Error::from)
     }
 
@@ -563,7 +684,7 @@ impl Db {
     /// family.
     ///
     /// Range deletes are cheap regardless of how many keys the range
-    /// covers — internally they are stored as a single range-tombstone
+    /// covers - internally they are stored as a single range-tombstone
     /// record rather than as one point tombstone per key. The delete
     /// is durable under the same rules as [`Db::put`] / [`Db::delete`]
     /// and is atomic with respect to concurrent readers.
@@ -575,12 +696,15 @@ impl Db {
 
     /// Delete every key in `[start, end)` in the default column
     /// family with an explicit [`WriteOptions`] override.
+    ///
+    /// An empty range is still a write: a read-only or closed handle
+    /// rejects it with [`Error::ReadOnly`] or [`Error::Closed`] rather
+    /// than returning `Ok`.
     pub fn delete_range_opt(&self, opts: &WriteOptions, start: &[u8], end: &[u8]) -> Result<()> {
-        self.ensure_open()?;
+        self.ensure_writable()?;
         if start >= end {
             return Ok(());
         }
-        self.ensure_writable()?;
         self.validate_key_size(start)?;
         self.validate_key_size(end)?;
         self.wait_for_write_capacity(opts)?;
@@ -599,6 +723,7 @@ impl Db {
                 dm,
                 disable_wal,
             )
+            .map(|_| ())
             .map_err(Error::from)
     }
 
@@ -610,12 +735,51 @@ impl Db {
 
     /// Apply a batch of writes atomically with an explicit
     /// [`WriteOptions`] override.
+    ///
+    /// Apply a batch and return the sequence it committed at.
+    ///
+    /// The returned sequence is the engine's visibility horizon once the batch
+    /// is durable and applied: a [`Snapshot`] taken afterwards reports at least
+    /// this value from [`Snapshot::sequence`], and one taken before reports
+    /// less. An upper layer can therefore order its own versions against lark's
+    /// without holding a lock across the write, because the horizon publishes
+    /// atomically inside this call.
+    ///
+    /// An empty batch commits nothing and returns the current horizon.
+    pub fn write_sequenced(&self, batch: WriteBatch) -> Result<u64> {
+        self.write_sequenced_opt(&WriteOptions::default(), batch)
+    }
+
+    /// [`Db::write_sequenced`] with explicit [`WriteOptions`].
+    pub fn write_sequenced_opt(&self, opts: &WriteOptions, batch: WriteBatch) -> Result<u64> {
+        self.write_opt_inner(opts, batch)
+    }
+
+    /// The newest sequence visible to a snapshot taken now.
+    ///
+    /// Monotonic and never decreasing for an open database.
+    pub fn latest_sequence(&self) -> u64 {
+        self.engine.snapshot_seq()
+    }
+
+    /// Apply a batch of writes atomically with explicit [`WriteOptions`].
+    ///
+    /// Use [`Db::write_sequenced_opt`] instead when the caller needs the
+    /// sequence the batch committed at.
     pub fn write_opt(&self, opts: &WriteOptions, batch: WriteBatch) -> Result<()> {
-        self.ensure_open()?;
-        if batch.is_empty() {
-            return Ok(());
-        }
+        self.write_opt_inner(opts, batch).map(|_| ())
+    }
+
+    fn write_opt_inner(&self, opts: &WriteOptions, batch: WriteBatch) -> Result<u64> {
+        // Checked before the empty-batch shortcut: an empty batch is
+        // still a write, so a read-only or closed handle rejects it
+        // rather than reporting a horizon it could not have advanced.
         self.ensure_writable()?;
+        if batch.is_empty() {
+            // Nothing committed: report the current horizon, which is what a
+            // snapshot taken now would read at.
+            return Ok(self.engine.snapshot_seq());
+        }
         self.validate_batch_cf_liveness(&batch)?;
         self.validate_batch_sizes(&batch)?;
         self.wait_for_write_capacity(opts)?;
@@ -661,7 +825,7 @@ impl Db {
 
     /// Apply a batch of writes atomically with an explicit
     /// [`DurabilityMode`] override. Retained for backwards
-    /// compatibility — prefer [`Db::write_opt`] for new code.
+    /// compatibility - prefer [`Db::write_opt`] for new code.
     pub fn write_with_durability(
         &self,
         batch: WriteBatch,
@@ -831,8 +995,7 @@ impl Db {
     /// Dropping the returned `Snapshot` releases the pin and may
     /// allow subsequent compactions to reclaim space.
     pub fn snapshot(&self) -> Snapshot {
-        let seq = self.engine.snapshot_seq();
-        self.engine.register_snapshot(seq);
+        let seq = self.engine.register_snapshot_at_horizon();
         Snapshot {
             engine: Arc::clone(&self.engine),
             cfs: Arc::clone(&self.cfs),
@@ -860,8 +1023,12 @@ impl Db {
             Some(e) => prefix_key(DEFAULT_CF_ID, e),
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
-        let seq = self.engine.snapshot_seq();
-        let raw = collect_range(&self.engine, Some(&lo), Some(&hi), seq)?;
+        // `new_iter_latest` loads the published view and *then* samples the
+        // horizon. Sampling first and building the iterator after leaves a
+        // window where a compaction no snapshot pins can drop the newest
+        // version at or below the sampled sequence, after which the scan
+        // finds only versions it must filter out and a key reads absent.
+        let raw = collect_range(self.engine.new_iter_latest(), Some(&lo), Some(&hi))?;
         strip_cf_prefix_entries(raw)
     }
 
@@ -887,15 +1054,14 @@ impl Db {
             Some(e) => prefix_key(DEFAULT_CF_ID, e),
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
-        let seq = self.engine.snapshot_seq();
-        collect_page(&self.engine, &lo, &hi, seq, limit).and_then(strip_cf_prefix_page)
+        collect_page(self.engine.new_iter_latest(), &lo, &hi, limit).and_then(strip_cf_prefix_page)
     }
 
     /// Create a streaming iterator over the default column family.
     ///
-    /// The iterator captures a consistent view at the moment it is created
-    /// — later writes are invisible to this iterator, and concurrent
-    /// background compaction cannot invalidate it. Keys returned from
+    /// The iterator captures a consistent view at the moment it is
+    /// created: later writes are invisible to this iterator, and
+    /// concurrent background compaction cannot invalidate it. Keys from
     /// the iterator have the CF prefix stripped and appear exactly as
     /// the caller supplied them on put.
     ///
@@ -908,11 +1074,10 @@ impl Db {
     }
 
     /// Create a raw streaming iterator over the entire engine
-    /// keyspace, including the reserved metadata CF. Internal —
+    /// keyspace, including the reserved metadata CF. Internal -
     /// used by [`Db::iter_cf`] via `CfIter`.
     fn raw_iter(&self) -> Iter<'_> {
-        let seq = self.engine.snapshot_seq();
-        Iter::from_internal(self.engine.new_iter(seq)).with_stats(self.engine.statistics_arc())
+        Iter::from_internal(self.engine.new_iter_latest()).with_stats(self.engine.statistics_arc())
     }
 
     /// Delete all data in the database.
@@ -954,6 +1119,52 @@ impl Db {
             .map_err(Error::from)
     }
 
+    /// Rotate the active memtable and write it to a level-0 SSTable,
+    /// on this thread, before returning.
+    ///
+    /// A no-op when the active memtable holds no entries and no range
+    /// tombstones. This is the same flush a full memtable triggers on
+    /// the write path, made explicit so a caller can decide when to
+    /// pay for it. Memtable flushes are written by the calling thread
+    /// in every mode, so this behaves identically with and without
+    /// background compaction workers.
+    ///
+    /// Flushing does not compact: the new file lands in L0 and stays
+    /// there until a compaction job merges it. See [`Db::compact_step`]
+    /// and [`Db::compact_range`].
+    pub fn flush(&self) -> Result<()> {
+        self.ensure_writable()?;
+        self.engine.flush_active_memtable().map_err(Error::from)
+    }
+
+    /// Perform at most one pending compaction job on this thread.
+    ///
+    /// Returns `Ok(true)` when a job ran. Callers running with
+    /// [`Options::max_background_compactions`] set to `0` use this to
+    /// keep the level structure healthy outside the write path; a
+    /// writer that would otherwise stall already performs the same job
+    /// itself, so this is an optimization of write latency rather than
+    /// a requirement for correctness.
+    ///
+    /// `Ok(false)` means this call did no work, for either of two
+    /// reasons: nothing was over its compaction trigger, or another
+    /// thread currently holds the files that would be compacted. A
+    /// loop of the form `while db.compact_step()? {}` therefore
+    /// terminates, and terminates having compacted everything this
+    /// thread could reach. Every compaction style lark offers reduces
+    /// the file count it merges, so the loop cannot be fed forever by
+    /// its own output.
+    ///
+    /// Safe to call with background workers running: the job is picked
+    /// under the same engine-wide compaction lock and the same
+    /// in-progress file set the workers use, so the two can never pick
+    /// overlapping inputs.
+    pub fn compact_step(&self) -> Result<bool> {
+        self.ensure_writable()?;
+        let outcome = self.engine.run_one_compaction_pass().map_err(Error::from)?;
+        Ok(outcome == engine::compaction::CompactionOutcome::DidWork)
+    }
+
     /// Return the string value of a named property, or `None` if
     /// `name` isn't recognized. See the module-level docs for the
     /// full list of supported properties; the most useful ones
@@ -967,11 +1178,25 @@ impl Db {
             "lark.options" => Some(format!("{:#?}", self.options_snapshot())),
             _ => {
                 // Integer properties surfaced through the string
-                // API too — every int property's string form is
+                // API too - every int property's string form is
                 // just its decimal number.
                 self.get_int_property(name).map(|v| v.to_string())
             }
         }
+    }
+
+    /// What the environment this database was opened on can
+    /// actually do.
+    ///
+    /// Read this when a durability or isolation guarantee matters.
+    /// lark keeps working on a host without directory fsync, without
+    /// hard links, or without cross-process locking, but the
+    /// guarantee is narrower there, and this is where it says so
+    /// instead of the database quietly claiming more than it
+    /// provides. On the default [`crate::env::StdEnv`] every flag is
+    /// `true` on Linux, macOS, and Windows.
+    pub fn capabilities(&self) -> env::Capabilities {
+        self.engine.capabilities()
     }
 
     /// Return the integer value of a named property, or `None` if
@@ -984,6 +1209,8 @@ impl Db {
         match name {
             "lark.total-sst-files-size" => Some(self.engine.total_sst_size()),
             "lark.cur-size-active-mem-table" => Some(self.engine.active_memtable_size()),
+            "lark.memtable-reserved-bytes" => Some(self.engine.memtables_reserved_size()),
+            "lark.arena-pool-bytes" => Some(self.engine.arena_pool_size()),
             "lark.cur-size-all-mem-tables" => {
                 Some(self.engine.active_memtable_size() + self.engine.frozen_memtables_size())
             }
@@ -1013,9 +1240,10 @@ impl Db {
             "lark.oldest-snapshot-time" => self.engine.oldest_snapshot_time_unix(),
             "lark.block-cache-usage" => Some(self.engine.block_cache_usage() as u64),
             "lark.block-cache-capacity" => Some(self.engine.block_cache_capacity() as u64),
+            "lark.pinned-metadata-bytes" => Some(self.engine.pinned_metadata_bytes() as u64),
             // Background errors are surfaced through the
-            // `EventListener::on_background_error` callback today
-            // — no dedicated counter yet. Report `0` so any
+            // `EventListener::on_background_error` callback today,
+            // with no dedicated counter yet. Report `0` so any
             // monitoring layer consuming this property gets a
             // stable numeric value instead of `None`.
             "lark.background-errors" => Some(0),
@@ -1034,7 +1262,7 @@ impl Db {
             out.push('\n');
             out.push_str(&stats.dump());
         } else {
-            out.push_str("\n(no Statistics object configured — see Options::statistics)\n");
+            out.push_str("\n(no Statistics object configured - see Options::statistics)\n");
         }
         out
     }
@@ -1096,7 +1324,7 @@ impl Db {
     /// bounded by one data-block worth of bytes per range
     /// boundary (partially-covered blocks at `start` and `end` are
     /// included whole). Active-memtable contents are **not**
-    /// included — call [`Db::get_approximate_memtable_stats`] for
+    /// included - call [`Db::get_approximate_memtable_stats`] for
     /// those.
     pub fn get_approximate_sizes(&self, ranges: &[Range<'_>]) -> Vec<u64> {
         ranges
@@ -1165,7 +1393,7 @@ impl Db {
     /// [`IngestOptions`] for the snapshot-consistency and placement
     /// rules.
     ///
-    /// The source files are left untouched on disk — the engine
+    /// The source files are left untouched on disk - the engine
     /// re-emits each file into the database's own SSTable directory
     /// so it can rewrite entry sequence numbers. Callers may delete
     /// the source files or re-ingest them at any time.
@@ -1212,7 +1440,7 @@ impl Db {
     // ── column families ─────────────────────────────────────────────────
 
     /// Return a handle to the default column family. Always
-    /// present — [`Db::open`] creates it if the database didn't
+    /// present - [`Db::open`] creates it if the database didn't
     /// already contain one.
     pub fn default_cf(&self) -> ColumnFamilyHandle {
         ColumnFamilyHandle {
@@ -1252,7 +1480,11 @@ impl Db {
             return Ok(existing);
         }
         self.validate_prefixed_key_size(&meta::name_key(name))?;
-        let (handle, next_id) = self.cfs.allocate(name);
+        let Some((handle, next_id)) = self.cfs.allocate(name) else {
+            return Err(Error::invalid_argument(
+                "the column-family id space is exhausted",
+            ));
+        };
         let mut batch = BTreeMap::new();
         batch.insert(
             meta::name_key(name),
@@ -1261,6 +1493,7 @@ impl Db {
         batch.insert(meta::next_id_key(), Some(next_id.to_be_bytes().to_vec()));
         self.engine
             .apply_grouped_batch(batch, Vec::new(), Vec::new(), self.durability, false)
+            .map(|_| ())
             .map_err(Error::from)?;
         Ok(handle)
     }
@@ -1296,6 +1529,7 @@ impl Db {
         let range_deletes = vec![(lo, hi)];
         self.engine
             .apply_grouped_batch(point_ops, range_deletes, Vec::new(), self.durability, false)
+            .map(|_| ())
             .map_err(Error::from)?;
         self.cfs.remove(cf.name());
         Ok(())
@@ -1304,8 +1538,7 @@ impl Db {
     /// Read `key` from column family `cf`. Same semantics as
     /// [`Db::get`] but scoped to the CF's keyspace.
     pub fn get_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.validate_cf_handle(cf)?;
-        self.get_raw(&prefix_key(cf.id(), key))
+        Ok(self.get_slice_cf(cf, key)?.map(DbSlice::into_vec))
     }
 
     /// Batched point lookup across a single CF.
@@ -1317,8 +1550,7 @@ impl Db {
         self.validate_cf_handle(cf)?;
         let owned: Vec<Vec<u8>> = keys.iter().map(|k| prefix_key(cf.id(), k)).collect();
         let refs: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
-        let seq = self.engine.snapshot_seq();
-        self.engine.multi_get(&refs, seq).map_err(Error::from)
+        self.engine.multi_get_latest(&refs).map_err(Error::from)
     }
 
     /// Write `key → value` in column family `cf`.
@@ -1330,6 +1562,7 @@ impl Db {
         batch.insert(prefix_key(cf.id(), key), Some(value.to_vec()));
         self.engine
             .apply_grouped_batch(batch, Vec::new(), Vec::new(), self.durability, false)
+            .map(|_| ())
             .map_err(Error::from)
     }
 
@@ -1342,16 +1575,20 @@ impl Db {
         batch.insert(prefix_key(cf.id(), key), None);
         self.engine
             .apply_grouped_batch(batch, Vec::new(), Vec::new(), self.durability, false)
+            .map(|_| ())
             .map_err(Error::from)
     }
 
     /// Delete every key in `[start, end)` in column family `cf`.
+    ///
+    /// An empty range is still a write: a read-only or closed handle
+    /// rejects it with [`Error::ReadOnly`] or [`Error::Closed`] rather
+    /// than returning `Ok`.
     pub fn delete_range_cf(&self, cf: &ColumnFamilyHandle, start: &[u8], end: &[u8]) -> Result<()> {
-        self.ensure_open()?;
+        self.ensure_writable()?;
         if start >= end {
             return Ok(());
         }
-        self.ensure_writable()?;
         self.validate_cf_handle(cf)?;
         self.validate_key_size(start)?;
         self.validate_key_size(end)?;
@@ -1363,6 +1600,7 @@ impl Db {
                 self.durability,
                 false,
             )
+            .map(|_| ())
             .map_err(Error::from)
     }
 
@@ -1380,12 +1618,13 @@ impl Db {
                 self.durability,
                 false,
             )
+            .map(|_| ())
             .map_err(Error::from)
     }
 
     /// Scan a key range inside column family `cf`.
     ///
-    /// Returned keys have the CF prefix stripped — they appear
+    /// Returned keys have the CF prefix stripped - they appear
     /// exactly as the caller supplied them on put. This convenience
     /// method materializes the entire range into memory. Prefer
     /// [`Db::iter_cf`] for streaming scans or [`Db::scan_page_cf`]
@@ -1405,8 +1644,12 @@ impl Db {
             Some(e) => prefix_key(cf.id(), e),
             None => cf_upper_bound(cf.id()),
         };
-        let seq = self.engine.snapshot_seq();
-        let raw = collect_range(&self.engine, Some(&lo), Some(&hi), seq)?;
+        // `new_iter_latest` loads the published view and *then* samples the
+        // horizon. Sampling first and building the iterator after leaves a
+        // window where a compaction no snapshot pins can drop the newest
+        // version at or below the sampled sequence, after which the scan
+        // finds only versions it must filter out and a key reads absent.
+        let raw = collect_range(self.engine.new_iter_latest(), Some(&lo), Some(&hi))?;
         strip_cf_prefix_entries(raw)
     }
 
@@ -1431,8 +1674,7 @@ impl Db {
             Some(e) => prefix_key(cf.id(), e),
             None => cf_upper_bound(cf.id()),
         };
-        let seq = self.engine.snapshot_seq();
-        collect_page(&self.engine, &lo, &hi, seq, limit).and_then(strip_cf_prefix_page)
+        collect_page(self.engine.new_iter_latest(), &lo, &hi, limit).and_then(strip_cf_prefix_page)
     }
 
     /// Streaming iterator bounded to column family `cf`. The
@@ -1449,7 +1691,7 @@ impl Db {
     /// Create a forward-only [`TailingIter`] over the default
     /// column family. Unlike [`Db::iter`], a tailing iterator
     /// sees writes that arrive after it was created and does not
-    /// pin the database at a point in time — see [`TailingIter`]
+    /// pin the database at a point in time - see [`TailingIter`]
     /// for the ordering rules.
     pub fn iter_tailing(&self) -> TailingIter {
         tailing::new_default(Arc::clone(&self.engine))
@@ -1470,7 +1712,7 @@ impl Db {
         &self.engine
     }
 
-    /// Clone the engine `Arc` — used by transaction facade types
+    /// Clone the engine `Arc` - used by transaction facade types
     /// that need to carry an engine reference around independent
     /// of the owning `Db`'s lifetime. Internal-only.
     pub(crate) fn engine_arc(&self) -> Arc<LarkEngine> {
@@ -1529,23 +1771,7 @@ impl<'a> CfIter<'a> {
         if !self.valid_cf {
             return;
         }
-        // `seek_for_prev(upper_bound - 1)` is the trick: seek to
-        // the largest key strictly less than `upper_bound`.
-        let mut probe = self.upper_bound.clone();
-        // Decrement by one — upper_bound is built by incrementing
-        // the CF id, so it's never all zeros; subtracting one byte
-        // gives a valid probe. Simpler: seek_for_prev(upper_bound)
-        // which lands on the last key < upper_bound.
-        if let Some(last) = probe.last_mut() {
-            if *last > 0 {
-                *last -= 1;
-                // Append 0xff bytes to get a probe strictly less
-                // than upper_bound but larger than every key in
-                // the CF.
-                probe.extend_from_slice(&[0xff; 8]);
-            }
-        }
-        self.inner.seek_for_prev(&probe);
+        self.inner.seek_to_last_before(&self.upper_bound);
     }
 
     /// Position the cursor at the first key `>= target` in the CF.
@@ -1627,6 +1853,15 @@ impl<'a> CfIter<'a> {
         self.inner.value()
     }
 
+    /// Current value as a [`DbSlice`], which outlives the cursor
+    /// moving on. See [`Iter::value_slice`].
+    pub fn value_slice(&self) -> Option<DbSlice> {
+        if !self.valid() {
+            return None;
+        }
+        self.inner.value_slice()
+    }
+
     /// Propagate any I/O error from the underlying iterator.
     pub fn status(&self) -> Result<()> {
         self.inner.status()
@@ -1644,7 +1879,7 @@ pub struct OwnedSnapshotIter {
 
 impl OwnedSnapshotIter {
     fn new(snapshot: Snapshot) -> Self {
-        let inner = Iter::<'static>::from_internal(snapshot.engine.new_iter(snapshot.seq))
+        let inner = Iter::<'static>::from_internal(snapshot.engine.new_iter_at(snapshot.seq))
             .with_stats(snapshot.engine.statistics_arc());
         Self {
             inner: CfIter::new(inner, DEFAULT_CF_ID),
@@ -1702,6 +1937,12 @@ impl OwnedSnapshotIter {
         self.inner.value()
     }
 
+    /// Current value as a [`DbSlice`], which outlives the cursor
+    /// moving on. See [`Iter::value_slice`].
+    pub fn value_slice(&self) -> Option<DbSlice> {
+        self.inner.value_slice()
+    }
+
     /// Propagate any I/O error from the underlying iterator.
     pub fn status(&self) -> Result<()> {
         self.inner.status()
@@ -1756,19 +1997,77 @@ impl Snapshot {
         self.cfs.is_live_handle(cf)
     }
 
+    /// The engine sequence this snapshot reads at.
+    ///
+    /// Every write with a sequence at or below this value is visible here, and
+    /// every later write is not. Pairs with [`Db::write_sequenced`], which
+    /// returns the sequence a batch committed at, so an upper layer can order
+    /// its own versions against lark's without serializing commits behind a
+    /// lock of its own: the horizon publishes atomically inside the write, and
+    /// a snapshot captures it atomically here.
+    pub fn sequence(&self) -> u64 {
+        self.seq
+    }
+
     /// Get the value for a key at this snapshot (default CF).
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let prefixed = prefix_key(DEFAULT_CF_ID, key);
+        Ok(self.get_slice(key)?.map(DbSlice::into_vec))
+    }
+
+    /// Read a value at this snapshot without copying it. See
+    /// [`Db::get_slice`] and [`DbSlice`].
+    pub fn get_slice(&self, key: &[u8]) -> Result<Option<DbSlice>> {
+        self.lookup_slice(&LookupKey::new(DEFAULT_CF_ID, key, self.seq))
+    }
+
+    /// [`Snapshot::get_slice`] scoped to a column family.
+    pub fn get_slice_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<Option<DbSlice>> {
+        self.validate_cf_handle(cf)?;
+        self.lookup_slice(&LookupKey::new(cf.id(), key, self.seq))
+    }
+
+    fn lookup_slice(&self, lk: &LookupKey) -> Result<Option<DbSlice>> {
         self.engine
-            .get(&prefixed, self.seq)
-            .map_err(|err| map_point_read_error(err, &prefixed))
+            .get_slice(lk)
+            .map_err(|err| map_point_read_error(err, lk.prefixed_user_key()))
+    }
+
+    /// Whether a live value exists for `key` at this snapshot. See
+    /// [`Db::has`] for what this does and does not avoid.
+    pub fn has(&self, key: &[u8]) -> Result<bool> {
+        Ok(self.get_size(key)?.is_some())
+    }
+
+    /// [`Snapshot::has`] scoped to a column family.
+    pub fn has_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<bool> {
+        Ok(self.get_size_cf(cf, key)?.is_some())
+    }
+
+    /// Length in bytes of the live value for `key` at this snapshot,
+    /// or `None` when there is none. See [`Db::get_size`].
+    pub fn get_size(&self, key: &[u8]) -> Result<Option<usize>> {
+        self.lookup_size(&LookupKey::new(DEFAULT_CF_ID, key, self.seq))
+    }
+
+    /// [`Snapshot::get_size`] scoped to a column family.
+    pub fn get_size_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<Option<usize>> {
+        self.validate_cf_handle(cf)?;
+        self.lookup_size(&LookupKey::new(cf.id(), key, self.seq))
+    }
+
+    fn lookup_size(&self, lk: &LookupKey) -> Result<Option<usize>> {
+        self.engine
+            .get_size(lk)
+            .map_err(|err| map_point_read_error(err, lk.prefixed_user_key()))
     }
 
     /// Batched point lookup anchored at this snapshot (default CF).
     pub fn multi_get(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
         let owned: Vec<Vec<u8>> = keys.iter().map(|k| prefix_key(DEFAULT_CF_ID, k)).collect();
         let refs: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
-        self.engine.multi_get(&refs, self.seq).map_err(Error::from)
+        self.engine
+            .multi_get_at(&refs, self.seq)
+            .map_err(Error::from)
     }
 
     /// Scan a key range at this snapshot (default CF).
@@ -1790,7 +2089,7 @@ impl Snapshot {
             Some(e) => prefix_key(DEFAULT_CF_ID, e),
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
-        let raw = collect_range(&self.engine, Some(&lo), Some(&hi), self.seq)?;
+        let raw = collect_range(self.engine.new_iter_at(self.seq), Some(&lo), Some(&hi))?;
         strip_cf_prefix_entries(raw)
     }
 
@@ -1813,14 +2112,15 @@ impl Snapshot {
             Some(e) => prefix_key(DEFAULT_CF_ID, e),
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
-        collect_page(&self.engine, &lo, &hi, self.seq, limit).and_then(strip_cf_prefix_page)
+        collect_page(self.engine.new_iter_at(self.seq), &lo, &hi, limit)
+            .and_then(strip_cf_prefix_page)
     }
 
     /// Create a streaming iterator anchored at this snapshot
     /// (default CF). Keys returned have the CF prefix stripped.
     pub fn iter(&self) -> CfIter<'_> {
         CfIter::new(
-            Iter::from_internal(self.engine.new_iter(self.seq))
+            Iter::from_internal(self.engine.new_iter_at(self.seq))
                 .with_stats(self.engine.statistics_arc()),
             DEFAULT_CF_ID,
         )
@@ -1843,11 +2143,7 @@ impl Snapshot {
 
     /// CF-scoped get at this snapshot.
     pub fn get_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.validate_cf_handle(cf)?;
-        let prefixed = prefix_key(cf.id(), key);
-        self.engine
-            .get(&prefixed, self.seq)
-            .map_err(|err| map_point_read_error(err, &prefixed))
+        Ok(self.get_slice_cf(cf, key)?.map(DbSlice::into_vec))
     }
 
     /// CF-scoped multi_get at this snapshot.
@@ -1859,7 +2155,9 @@ impl Snapshot {
         self.validate_cf_handle(cf)?;
         let owned: Vec<Vec<u8>> = keys.iter().map(|k| prefix_key(cf.id(), k)).collect();
         let refs: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
-        self.engine.multi_get(&refs, self.seq).map_err(Error::from)
+        self.engine
+            .multi_get_at(&refs, self.seq)
+            .map_err(Error::from)
     }
 
     /// CF-scoped scan at this snapshot.
@@ -1884,7 +2182,7 @@ impl Snapshot {
             Some(e) => prefix_key(cf.id(), e),
             None => cf_upper_bound(cf.id()),
         };
-        let raw = collect_range(&self.engine, Some(&lo), Some(&hi), self.seq)?;
+        let raw = collect_range(self.engine.new_iter_at(self.seq), Some(&lo), Some(&hi))?;
         strip_cf_prefix_entries(raw)
     }
 
@@ -1910,12 +2208,13 @@ impl Snapshot {
             Some(e) => prefix_key(cf.id(), e),
             None => cf_upper_bound(cf.id()),
         };
-        collect_page(&self.engine, &lo, &hi, self.seq, limit).and_then(strip_cf_prefix_page)
+        collect_page(self.engine.new_iter_at(self.seq), &lo, &hi, limit)
+            .and_then(strip_cf_prefix_page)
     }
 
     /// CF-scoped streaming iterator at this snapshot.
     pub fn iter_cf<'a>(&'a self, cf: &ColumnFamilyHandle) -> CfIter<'a> {
-        let inner = Iter::from_internal(self.engine.new_iter(self.seq))
+        let inner = Iter::from_internal(self.engine.new_iter_at(self.seq))
             .with_stats(self.engine.statistics_arc());
         if self.is_live_cf_handle(cf) {
             CfIter::new(inner, cf.id())
@@ -1929,12 +2228,10 @@ impl Snapshot {
 /// iterator. This is the engine of `Db::scan` / `Snapshot::scan`; the
 /// dedicated method exists so both callers share one merge implementation.
 fn collect_range(
-    engine: &LarkEngine,
+    mut iter: crate::engine::iterator::LarkIterator,
     start: Option<&[u8]>,
     end: Option<&[u8]>,
-    snapshot_seq: u64,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let mut iter = engine.new_iter(snapshot_seq);
     match start {
         Some(s) => iter.seek(s),
         None => iter.seek_to_first(),
@@ -1946,10 +2243,10 @@ fn collect_range(
         let (Some(k), Some(v)) = (iter.key(), iter.value()) else {
             break;
         };
-        if let Some(e) = end {
-            if k >= e {
-                break;
-            }
+        if let Some(e) = end
+            && k >= e
+        {
+            break;
         }
         out.push((k.to_vec(), v.to_vec()));
         iter.next();
@@ -1959,10 +2256,9 @@ fn collect_range(
 }
 
 fn collect_page(
-    engine: &LarkEngine,
+    mut iter: crate::engine::iterator::LarkIterator,
     start: &[u8],
     end: &[u8],
-    snapshot_seq: u64,
     limit: usize,
 ) -> Result<ScanPage> {
     if limit == 0 {
@@ -1971,7 +2267,6 @@ fn collect_page(
         ));
     }
 
-    let mut iter = engine.new_iter(snapshot_seq);
     iter.seek(start);
     iter.status().map_err(Error::from)?;
 
@@ -2479,9 +2774,17 @@ mod tests {
         batch.put(b"b", b"2");
         db.write(batch).unwrap();
 
+        // Records begin after the file stamp; the type byte is the fifth
+        // byte of the first record.
+        let stamp = crate::engine::wal::WAL_STAMP_LEN;
         let wal = std::fs::read(first_wal_path(&dir)).unwrap();
-        assert!(wal.len() >= 5);
-        assert_eq!(wal[4], 0x05, "multi-op WriteBatch must use RECORD_BATCH");
+        assert!(wal.len() >= stamp + 5);
+        assert_eq!(&wal[0..4], b"REGO", "the log must carry its stamp");
+        assert_eq!(
+            wal[stamp + 4],
+            0x05,
+            "multi-op WriteBatch must use RECORD_BATCH"
+        );
     }
 
     #[test]
@@ -2644,7 +2947,7 @@ mod tests {
         stale_wal
             .append_put(&prefix_key(DEFAULT_CF_ID, b"resurrect"), b"bad", 99)
             .unwrap();
-        stale_wal.sync().unwrap();
+        stale_wal.sync_data().unwrap();
 
         let db = Db::open(dir.path(), Options::default()).unwrap();
         assert_eq!(db.get(b"flushed").unwrap(), None);
@@ -2692,7 +2995,7 @@ mod tests {
             db.put(b"b", b"2").unwrap();
             db.delete(b"a").unwrap();
             db.put(b"c", b"3").unwrap();
-            // Drop without close() — simulates a crash; the WAL must be replayed.
+            // Drop without close() - simulates a crash; the WAL must be replayed.
         }
 
         let db = Db::open(dir.path(), Options::default()).unwrap();
@@ -3054,7 +3357,7 @@ mod tests {
         db.put(b"k", b"v2").unwrap();
         db.put(b"k", b"v3").unwrap();
         let snap = db.snapshot();
-        // `snap` now pins seq=3 — the snapshot sees v3.
+        // `snap` now pins seq=3 - the snapshot sees v3.
 
         for v in 4..10 {
             db.put(b"k", format!("v{}", v).as_bytes()).unwrap();
@@ -3125,7 +3428,7 @@ mod tests {
     #[test]
     fn test_gc_preserves_tombstone_hiding_older_entries() {
         // A tombstone newer than any live snapshot still needs to
-        // survive compaction — it's the newest version and reads
+        // survive compaction - it's the newest version and reads
         // must resolve to "deleted".
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
@@ -3139,7 +3442,7 @@ mod tests {
 
         assert_eq!(db.get(b"k").unwrap(), None);
 
-        // The newest surviving version is a tombstone — look for it
+        // The newest surviving version is a tombstone - look for it
         // on disk.
         let versions = all_versions_of(&db, b"k");
         assert!(!versions.is_empty());
@@ -3259,7 +3562,7 @@ mod tests {
 
     #[test]
     fn test_compact_range_drains_l0() {
-        // After a full compact_range, nothing should remain at L0 —
+        // After a full compact_range, nothing should remain at L0 -
         // every file must have been pushed down to L1+.
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
@@ -3342,7 +3645,7 @@ mod tests {
     fn test_compact_range_reclaims_space_after_overwrite() {
         // Write N keys, overwrite them, force flush, then compact_range.
         // The number of distinct entries after compaction should be N
-        // (one per user key) — the old overwritten versions got merged
+        // (one per user key) - the old overwritten versions got merged
         // away by deduplication during compaction.
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
@@ -3415,7 +3718,7 @@ mod tests {
     #[test]
     fn test_compact_range_tombstones_are_preserved() {
         // Tombstones must survive compaction until the bottommost level
-        // drops them — for now compaction preserves all versions, so a
+        // drops them - for now compaction preserves all versions, so a
         // deleted key is still absent to reads.
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
@@ -4100,7 +4403,7 @@ mod tests {
         let (db, _dir) = open_tmp();
         db.put(b"k", b"old").unwrap();
         db.delete_range(b"a", b"z").unwrap();
-        // A put after the range delete must win — it has a higher seq.
+        // A put after the range delete must win - it has a higher seq.
         db.put(b"k", b"new").unwrap();
         assert_eq!(db.get(b"k").unwrap(), Some(b"new".to_vec()));
     }
@@ -4234,7 +4537,7 @@ mod tests {
                 db.put(&[c], &[c]).unwrap();
             }
             db.delete_range(b"b", b"d").unwrap();
-            // Drop without close — only the WAL has the range delete.
+            // Drop without close - only the WAL has the range delete.
         }
         let db = Db::open(dir.path(), Options::default()).unwrap();
         assert_eq!(db.get(b"a").unwrap(), Some(b"a".to_vec()));
@@ -4624,7 +4927,7 @@ mod tests {
             db.put(&[c], &[c]).unwrap();
         }
         db.delete_range(b"b", b"e").unwrap();
-        // Before compaction, the range-delete is honored — no snapshot
+        // Before compaction, the range-delete is honored - no snapshot
         // pinning, so the read path sees the memtable RT directly.
         for c in b'b'..=b'd' {
             assert_eq!(db.get(&[c]).unwrap(), None);
@@ -4850,7 +5153,7 @@ mod tests {
     fn test_write_options_sync_override_persists_across_reopen() {
         // With Eventual default, a sync write should still land on
         // disk such that a reopen recovers it. (Eventual alone
-        // already survives a clean close — this test's real content
+        // already survives a clean close - this test's real content
         // is that the sync flag doesn't break the normal code path.)
         let dir = TempDir::new().unwrap();
         let opts = Options {
@@ -4861,7 +5164,7 @@ mod tests {
             let db = Db::open(dir.path(), opts.clone()).unwrap();
             db.put_opt(&WriteOptions::sync(), b"critical", b"payload")
                 .unwrap();
-            // Deliberately skip close() — sync must have forced the
+            // Deliberately skip close() - sync must have forced the
             // WAL to durable storage already.
         }
         let db = Db::open(dir.path(), opts).unwrap();
@@ -4879,7 +5182,7 @@ mod tests {
             let db = Db::open(dir.path(), opts.clone()).unwrap();
             db.put_opt(&WriteOptions::disable_wal(), b"ephemeral", b"ghost")
                 .unwrap();
-            // No close() — simulate a crash. The memtable holds the
+            // No close() - simulate a crash. The memtable holds the
             // write but nothing on disk does.
         }
         let db = Db::open(dir.path(), opts).unwrap();
@@ -4889,7 +5192,7 @@ mod tests {
     #[test]
     fn test_write_options_disable_wal_visible_within_session() {
         // Within the same process, a disable_wal write is visible
-        // to subsequent reads via the memtable — only a crash
+        // to subsequent reads via the memtable - only a crash
         // erases it.
         let (db, _dir) = open_tmp();
         db.put_opt(&WriteOptions::disable_wal(), b"k", b"v")
@@ -4971,9 +5274,9 @@ mod tests {
     }
 
     #[test]
-    fn test_write_options_low_pri_and_no_slowdown_are_no_ops() {
-        // Accepted but currently ignored. Reserved for future
-        // write-stall / priority-queue plumbing.
+    fn test_write_options_low_pri_and_no_slowdown_pass_through_when_not_stalling() {
+        // `low_pri` is accepted and ignored. `no_slowdown` only bites
+        // while the engine is stalling, and an idle engine is not.
         let (db, _dir) = open_tmp();
         let opts = WriteOptions {
             low_pri: true,
@@ -5106,7 +5409,7 @@ mod tests {
     fn test_merge_without_base_defaults_to_none() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
-        // No put — counter starts at 0 (base=None).
+        // No put - counter starts at 0 (base=None).
         db.merge(b"counter", &encode_i64(7)).unwrap();
         db.merge(b"counter", &encode_i64(5)).unwrap();
         assert_eq!(db.get(b"counter").unwrap(), Some(encode_i64(12)));
@@ -5278,7 +5581,7 @@ mod tests {
             db.put(b"counter", &encode_i64(0)).unwrap();
             db.merge(b"counter", &encode_i64(7)).unwrap();
             db.merge(b"counter", &encode_i64(3)).unwrap();
-            // No close — memtable flush didn't happen; WAL must
+            // No close - memtable flush didn't happen; WAL must
             // survive the chain.
         }
         let db = Db::open(dir.path(), counter_opts()).unwrap();
@@ -5526,9 +5829,10 @@ mod tests {
         writer.put_cf(&stale, b"k", b"ghost").unwrap();
         writer.finish().unwrap();
 
-        assert!(db
-            .ingest_external_files(&[path], IngestOptions::default())
-            .is_err());
+        assert!(
+            db.ingest_external_files(&[path], IngestOptions::default())
+                .is_err()
+        );
         let live = db.create_column_family("tmp").unwrap();
         assert_eq!(db.get_cf(&live, b"k").unwrap(), None);
     }
@@ -5614,7 +5918,7 @@ mod tests {
             batch.put_cf(&cf, b"b", b"2");
             batch.put(b"default_k", b"default_v");
             db.write(batch).unwrap();
-            // No close — simulate a crash. WAL must survive.
+            // No close - simulate a crash. WAL must survive.
         }
         let db = Db::open(dir.path(), Options::default()).unwrap();
         let cf = db.column_family("txn").expect("CF must survive");
@@ -5800,7 +6104,7 @@ mod tests {
         // approximate size against the on-disk file size. The
         // accuracy contract is "within a factor of 2".
         //
-        // Use a high-entropy payload so LZ4 can't crush it — a
+        // Use a high-entropy payload so LZ4 can't crush it - a
         // zero-filled payload compresses to near-nothing and would
         // undercut the accuracy window we're checking.
         let dir = TempDir::new().unwrap();
@@ -5819,7 +6123,7 @@ mod tests {
         assert!(sizes[0] > 0, "whole-range size must be > 0 after flush");
         // Raw on-disk footprint of the point data: 100 entries,
         // each ≈ 256-byte value + ~20-byte key/overhead + a bit
-        // of block framing, so ~28–30k. The approximation
+        // of block framing, so ~28-30k. The approximation
         // includes whole covered blocks, so a 2x window covers
         // it comfortably.
         let approx = sizes[0];
@@ -5856,7 +6160,7 @@ mod tests {
     fn test_approximate_sizes_cf_scoped() {
         let (db, _dir) = open_tmp();
         let cf = db.create_column_family("scoped").unwrap();
-        // Put into default CF but not into `scoped` — the
+        // Put into default CF but not into `scoped` - the
         // scoped CF's whole-range size must be 0.
         for i in 0..20 {
             db.put(format!("k{i}").as_bytes(), b"v").unwrap();
@@ -5864,7 +6168,7 @@ mod tests {
         let default_sizes = db.get_approximate_sizes(&[Range::new(b"a", b"z")]);
         let cf_sizes = db.get_approximate_sizes_cf(&cf, &[Range::new(b"a", b"z")]);
         // Memtable contents aren't in approximate_sizes, but they
-        // aren't on disk either — the default-CF whole-range
+        // aren't on disk either - the default-CF whole-range
         // matches the scoped-CF whole-range (both 0) unless a
         // flush happened. With default write_buffer_size, 20 small
         // writes don't trigger a flush.
@@ -5898,7 +6202,7 @@ mod tests {
             batch.put_cf(&cf_b, b"k2", b"b2");
             batch.put(b"default_k", b"default_v");
             db.write(batch).unwrap();
-            // Drop without close — simulate a crash. WAL is the
+            // Drop without close - simulate a crash. WAL is the
             // source of truth; recovery must restore every key.
         }
         let db = Db::open(dir.path(), Options::default()).unwrap();
@@ -5981,7 +6285,7 @@ mod tests {
 
     #[test]
     fn test_atomic_flush_option_accepted() {
-        // The flag is a no-op for API parity — both values must
+        // The flag is a no-op for API parity - both values must
         // open cleanly and produce the same atomic behavior.
         let dir = TempDir::new().unwrap();
         let opts = Options {
@@ -6297,7 +6601,7 @@ mod tests {
         // and contaminate the counters), every point lookup
         // that reaches a data block fires either a hit or a
         // miss on the block cache. We don't assert the strict
-        // `adds == misses` invariant here — LRU eviction plus
+        // `adds == misses` invariant here - LRU eviction plus
         // any lingering background work can perturb that
         // equality on fast machines. The weaker "both hits and
         // misses see traffic" is the observable contract.
@@ -6323,7 +6627,7 @@ mod tests {
         let adds = stats.get_ticker(Ticker::BlockCacheAdd);
         assert!(misses > 0, "expected at least one block cache miss");
         assert!(hits > 0, "expected at least one block cache hit");
-        // `adds` tracks inserts after a miss — it can never
+        // `adds` tracks inserts after a miss - it can never
         // exceed `misses`.
         assert!(adds <= misses, "adds={adds} misses={misses}");
     }
@@ -6831,7 +7135,7 @@ mod tests {
             }
             db.compact_range(None, None).unwrap();
         }
-        // Reopen — the V2 SSTables must still be readable.
+        // Reopen - the V2 SSTables must still be readable.
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..200 {
             let k = format!("k{i:04}");
@@ -6870,7 +7174,7 @@ mod tests {
                 let k = format!("k{i:04}");
                 db.put(k.as_bytes(), b"v2").unwrap();
             }
-            // Don't compact — leave V1 files at lower levels and
+            // Don't compact - leave V1 files at lower levels and
             // V2 files in L0/L1.
         }
         let opts = Options {
@@ -7113,7 +7417,7 @@ mod tests {
 
     #[test]
     fn test_universal_compaction_never_creates_l1_files() {
-        // Every Universal merge output should stay at L0 — the
+        // Every Universal merge output should stay at L0 - the
         // level-size push-down rule must not fire for this style.
         let opts = Options {
             write_buffer_size: 4 * 1024,
@@ -7221,7 +7525,7 @@ mod tests {
 
     #[test]
     fn test_fifo_compaction_keeps_at_least_one_file() {
-        // A single oversized file must not be deleted — FIFO
+        // A single oversized file must not be deleted - FIFO
         // refuses to drop the last surviving SST because that
         // would wipe the database.
         let opts = Options {
@@ -7278,7 +7582,7 @@ mod tests {
     #[test]
     fn test_tailing_iter_sees_writes_after_creation() {
         // Initial writes, then a tailing iterator, then more
-        // writes — the tailing iterator must surface the later
+        // writes - the tailing iterator must surface the later
         // writes once it advances past the initial set.
         let (db, _dir) = open_tmp();
         for i in 0..5 {
@@ -7342,7 +7646,7 @@ mod tests {
         }
         assert_eq!(seen, 16);
 
-        // Force a flush and a compaction — the existing tail
+        // Force a flush and a compaction - the existing tail
         // iter is no longer pinned to anything visible, but a
         // refresh + new writes should still work.
         db.compact_range(None, None).unwrap();

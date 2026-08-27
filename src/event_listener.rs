@@ -10,7 +10,7 @@
 //! # Dispatch
 //!
 //! Events are dispatched **synchronously** on the thread that
-//! triggered them — flush events on the write thread, compaction
+//! triggered them - flush events on the write thread, compaction
 //! events on the compaction thread, ingest events on the ingest
 //! caller's thread. Listeners **MUST NOT block** or re-enter the
 //! database. The contract is "do a cheap thing or spawn a task."
@@ -28,7 +28,7 @@
 //!   subset should filter in the callback.
 //! - `on_wal_full` is declared so listener implementations can
 //!   target a common shape across storage backends, but lark
-//!   itself never fires it — the WAL is rotated alongside every
+//!   itself never fires it - the WAL is rotated alongside every
 //!   memtable, so there's no separate "WAL-full" condition.
 
 use std::path::PathBuf;
@@ -66,6 +66,8 @@ pub struct FlushJobInfo {
     pub largest_key: Vec<u8>,
     /// Wall-clock duration of the flush, from memtable rotation
     /// through manifest apply.
+    /// Zero on a platform whose [`crate::env::Env`] has no
+    /// monotonic clock, where nothing was measured.
     pub duration: Duration,
 }
 
@@ -88,7 +90,9 @@ pub struct CompactionJobInfo {
     /// [`EventListener::on_compaction_completed`]; empty on
     /// [`EventListener::on_compaction_begin`].
     pub output_files: Vec<u64>,
-    /// Wall-clock duration of the compaction. Zero on begin.
+    /// Wall-clock duration of the compaction. Zero on begin, and
+    /// zero on a platform whose [`crate::env::Env`] has no monotonic
+    /// clock, where nothing was measured.
     pub duration: Duration,
 }
 
@@ -216,7 +220,7 @@ pub trait EventListener: Send + Sync + 'static {
     }
 
     /// Called when a background flush / compaction / manifest /
-    /// WAL operation returns an error. The engine keeps running —
+    /// WAL operation returns an error. The engine keeps running -
     /// the listener is for observability, not error handling.
     fn on_background_error(&self, reason: BackgroundErrorReason, err: &Error) {
         let _ = (reason, err);
@@ -245,8 +249,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Listener that counts every callback it receives. Used to
     /// verify that `dispatch` reaches every registered listener

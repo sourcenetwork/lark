@@ -1,13 +1,13 @@
 //! Per-operation performance counters captured in thread-local
 //! state.
 //!
-//! [`Statistics`](crate::Statistics) is a database-global sink —
+//! [`Statistics`](crate::Statistics) is a database-global sink -
 //! every thread bumps the same atomic counters and the caller
 //! reads an aggregate view. That's the right shape for metrics
 //! export, but it can't answer "what did *this one* `Db::get`
 //! call spend its time on?". [`PerfContext`] is the
 //! complementary tool: a thread-local bundle of counters that
-//! the caller resets, runs an operation, and snapshots — the
+//! the caller resets, runs an operation, and snapshots - the
 //! per-op breakdown falls out.
 //!
 //! # Usage
@@ -48,7 +48,6 @@
 //! writes naturally attribute work to the originating thread.
 
 use std::cell::RefCell;
-use std::time::Instant;
 
 /// Granularity of `PerfContext` measurement. Higher levels
 /// produce more detail at the cost of more work per
@@ -96,7 +95,7 @@ pub struct PerfContextSnapshot {
     /// Number of block cache lookups performed on this thread.
     /// Incremented at both `EnableCount` and `EnableTime`.
     pub block_cache_lookup_count: u64,
-    /// Block cache lookups that hit — i.e. the block was
+    /// Block cache lookups that hit - i.e. the block was
     /// already decompressed and resident.
     pub block_cache_hit_count: u64,
     /// Number of bloom filter checks performed on this thread.
@@ -240,7 +239,8 @@ pub(crate) fn record_bloom_check(useful: bool) {
 /// `Drop` does nothing.
 #[must_use]
 pub(crate) struct PerfTimer {
-    start: Option<Instant>,
+    /// Start reading in nanoseconds from the platform clock.
+    start: Option<u64>,
     which: PerfTimerField,
 }
 
@@ -258,8 +258,11 @@ pub(crate) enum PerfTimerField {
 impl PerfTimer {
     #[inline]
     pub(crate) fn new(which: PerfTimerField) -> Self {
+        // `None` covers both "not timing" and "this platform has no
+        // monotonic clock". Either way the scope records nothing
+        // rather than a fabricated zero.
         let start = if is_timed() {
-            Some(Instant::now())
+            crate::env::platform_nanos()
         } else {
             None
         };
@@ -273,7 +276,10 @@ impl Drop for PerfTimer {
         let Some(start) = self.start else {
             return;
         };
-        let nanos = start.elapsed().as_nanos() as u64;
+        let Some(now) = crate::env::platform_nanos() else {
+            return;
+        };
+        let nanos = now.saturating_sub(start);
         PERF_STATE.with(|cell| {
             let mut s = cell.borrow_mut();
             match self.which {

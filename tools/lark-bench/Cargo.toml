@@ -1,11 +1,12 @@
 [package]
 name = "lark-bench"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.90"
 publish = false
 
 [dependencies]
 lark-kv = { path = "../.." }
-clap = { version = ">=4.5, <4.6", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
 rand = "0.9"
 tempfile = "3.8"

@@ -2,10 +2,15 @@
 //!
 //! Each test exercises a specific behavior that production
 //! storage engines are expected to satisfy. The scenarios are
-//! the valuable part — they encode 15+ years of bugs-found-the-
+//! the valuable part - they encode 15+ years of bugs-found-the-
 //! hard-way from LSM implementations. Cross-engine validation
 //! (running the same scenario against both lark and another
 //! engine) can be added as a follow-up.
+
+// Native-only. wasm-pack builds every test target for wasm32, and these use
+// threads, the filesystem or proptest, none of which exist there. The browser
+// suite lives in tests/wasm_opfs*.rs.
+#![cfg(not(target_arch = "wasm32"))]
 
 use lark_kv::{CompactionStyle, CompressionType, Db, FifoCompactionOptions, Options, WriteBatch};
 use tempfile::TempDir;

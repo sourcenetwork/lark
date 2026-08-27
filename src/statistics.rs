@@ -21,12 +21,11 @@
 //! The initial histogram implementation tracks `count`, `sum`,
 //! `min`, and `max` only. `HistogramSnapshot::average` gives you
 //! `sum / count`. Percentiles / buckets are intentionally out of
-//! scope for v1 — adding an HDR-style bucket array is a follow-up
+//! scope for v1 - adding an HDR-style bucket array is a follow-up
 //! that drops in behind the existing API without breaking
 //! callers.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use crate::portability::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
@@ -62,10 +61,10 @@ pub enum Ticker {
     /// Block cache insertions (one per miss that actually
     /// populated the cache).
     BlockCacheAdd = 9,
-    /// Bloom-filter "useful" hits — the filter correctly
+    /// Bloom-filter "useful" hits - the filter correctly
     /// answered "not present" and spared a block read.
     BloomFilterUseful = 10,
-    /// Bloom-filter "full positive" hits — the filter said
+    /// Bloom-filter "full positive" hits - the filter said
     /// "maybe", and the key was actually present in the block.
     BloomFilterFullPositive = 11,
     /// Bytes read by compaction (sum of input file sizes).
@@ -87,20 +86,25 @@ pub enum Ticker {
     /// Number of `Iter::next` calls that produced a key.
     IterNextCount = 20,
     /// Microseconds the engine spent stalling a writer. Not
-    /// populated yet — reserved for the write-stall plumbing.
+    /// populated yet - reserved for the write-stall plumbing.
     WriteStallMicros = 21,
     /// Number of snapshots registered via `Db::snapshot`.
     SnapshotsRegistered = 22,
     /// Number of snapshots released (dropped or explicitly
     /// released).
     SnapshotsReleased = 23,
+    /// Number of incomplete trailing WAL records discarded during
+    /// recovery. A non-zero value means a crash left a partly written
+    /// record behind and the bytes from it to end-of-file were dropped;
+    /// the discard is also logged with the file and the offset.
+    WalTailDiscarded = 24,
 }
 
-const NUM_TICKERS: usize = 24;
+const NUM_TICKERS: usize = 25;
 
 /// Every defined ticker, in discriminant order. Used by
 /// [`Statistics::dump`] to iterate all slots. Keep this in sync
-/// with the [`Ticker`] enum — adding a variant without
+/// with the [`Ticker`] enum - adding a variant without
 /// appending here will silently drop it from the dump output.
 const ALL_TICKERS: &[Ticker] = &[
     Ticker::BytesWritten,
@@ -127,6 +131,7 @@ const ALL_TICKERS: &[Ticker] = &[
     Ticker::WriteStallMicros,
     Ticker::SnapshotsRegistered,
     Ticker::SnapshotsReleased,
+    Ticker::WalTailDiscarded,
 ];
 
 impl Ticker {
@@ -157,6 +162,7 @@ impl Ticker {
             Ticker::WriteStallMicros => "lark.write_stall_micros",
             Ticker::SnapshotsRegistered => "lark.snapshots_registered",
             Ticker::SnapshotsReleased => "lark.snapshots_released",
+            Ticker::WalTailDiscarded => "lark.wal_tail_discarded",
         }
     }
 }
@@ -330,7 +336,7 @@ impl Statistics {
 
     /// Read the current value of a ticker. Guaranteed to be
     /// consistent with the corresponding `fetch_add` via
-    /// `Ordering::Relaxed` — callers that need stronger
+    /// `Ordering::Relaxed` - callers that need stronger
     /// ordering should wrap their own fences.
     pub fn get_ticker(&self, ticker: Ticker) -> u64 {
         self.tickers[ticker as usize].load(Ordering::Relaxed)
@@ -379,7 +385,7 @@ impl Statistics {
         out
     }
 
-    /// Add `amount` to `ticker`. `Ordering::Relaxed` — callers
+    /// Add `amount` to `ticker`. `Ordering::Relaxed` - callers
     /// that need stronger ordering should provide their own.
     pub(crate) fn add(&self, ticker: Ticker, amount: u64) {
         self.tickers[ticker as usize].fetch_add(amount, Ordering::Relaxed);
@@ -394,9 +400,13 @@ impl Statistics {
 /// Convenience RAII helper: creates a timer on construction and
 /// records the elapsed wall-clock microseconds into `hist` on
 /// `Drop`. If the statistics handle is `None` the helper is
-/// optimized out — both construction and drop are no-ops.
+/// optimized out - both construction and drop are no-ops.
 pub(crate) struct TimeScope<'a> {
-    start: Option<Instant>,
+    /// Start reading in microseconds. `None` when no statistics
+    /// handle is installed, and also `None` on a platform with no
+    /// monotonic clock: the histogram then takes no sample at all
+    /// rather than a zero that reads like a measurement.
+    start: Option<u64>,
     stats: Option<&'a Statistics>,
     hist: Histogram,
 }
@@ -404,7 +414,7 @@ pub(crate) struct TimeScope<'a> {
 impl<'a> TimeScope<'a> {
     pub(crate) fn new(stats: Option<&'a Statistics>, hist: Histogram) -> Self {
         Self {
-            start: stats.as_ref().map(|_| Instant::now()),
+            start: stats.and_then(|_| crate::env::platform_micros()),
             stats,
             hist,
         }
@@ -413,9 +423,10 @@ impl<'a> TimeScope<'a> {
 
 impl Drop for TimeScope<'_> {
     fn drop(&mut self) {
-        if let (Some(start), Some(stats)) = (self.start, self.stats) {
-            let micros = start.elapsed().as_micros() as u64;
-            stats.record(self.hist, micros);
+        if let (Some(start), Some(stats), Some(now)) =
+            (self.start, self.stats, crate::env::platform_micros())
+        {
+            stats.record(self.hist, now.saturating_sub(start));
         }
     }
 }
@@ -492,7 +503,7 @@ mod tests {
     #[test]
     fn time_scope_disabled_is_noop() {
         let _t = TimeScope::new(None, Histogram::DbGet);
-        // Nothing to assert — the test is that Drop runs without
+        // Nothing to assert - the test is that Drop runs without
         // panicking when the stats handle is absent.
     }
 }

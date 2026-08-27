@@ -1,0 +1,125 @@
+//! Broadcast wake-up for stalled writers.
+
+use std::time::Duration;
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+
+#[cfg(not(target_arch = "wasm32"))]
+use kovan_channel::signal::Signal;
+#[cfg(not(target_arch = "wasm32"))]
+use kovan_queue::array_queue::ArrayQueue;
+
+/// How many stalled writers can hold a registration at once.
+#[cfg(not(target_arch = "wasm32"))]
+const STALL_WAITER_SLOTS: usize = 256;
+
+/// Bounded broadcast wake-up for writers parked on a stop-writes stall.
+///
+/// Writers register a signal and park with a deadline; the compaction
+/// worker drains every registration after each pass. The ring is bounded,
+/// and a writer that finds it full parks without registering, which stays
+/// live because the deadline alone already bounds every wait.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct StallSignal {
+    waiters: ArrayQueue<Arc<Signal>>,
+}
+
+/// On wasm32 there is nothing to park: the platform has no threads, so
+/// compaction runs on the calling thread and a stalled writer has no
+/// worker to wait for. Waiting would deadlock rather than delay, so the
+/// wait returns immediately and the caller re-checks its thresholds.
+#[cfg(target_arch = "wasm32")]
+pub(crate) struct StallSignal;
+
+#[cfg(target_arch = "wasm32")]
+impl StallSignal {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    /// Returns at once: the work this would wait for happens inline.
+    pub(crate) fn wait(&self, _timeout: Duration) {}
+
+    /// No registrations exist to wake.
+    pub(crate) fn notify_all(&self) {}
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl StallSignal {
+    pub(crate) fn new() -> Self {
+        Self {
+            waiters: ArrayQueue::new(STALL_WAITER_SLOTS),
+        }
+    }
+
+    /// Park the calling writer for at most `timeout`.
+    pub(crate) fn wait(&self, timeout: Duration) {
+        let signal = Arc::new(Signal::new());
+        let _ = self.waiters.push(Arc::clone(&signal));
+        signal.wait_deadline(Instant::now() + timeout);
+        // Mark our own registration stale so a later `notify_all` does not
+        // spend a wake-up on a signal nobody is waiting on any more.
+        signal.notify();
+    }
+
+    /// Wake every registered writer so it can re-check its thresholds.
+    pub(crate) fn notify_all(&self) {
+        while let Some(waiter) = self.waiters.pop() {
+            if !waiter.is_notified() {
+                waiter.notify();
+            }
+        }
+    }
+}
+
+impl Default for StallSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use std::thread;
+
+    #[test]
+    fn stall_signal_wakes_a_registered_waiter() {
+        let signal = Arc::new(StallSignal::new());
+        let waiter = Arc::clone(&signal);
+        let handle = thread::spawn(move || {
+            waiter.wait(Duration::from_secs(5));
+        });
+        // Drain-and-notify until the waiter has registered and exited; the
+        // deadline in `wait` bounds this even if the notify races ahead.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.is_finished() && Instant::now() < deadline {
+            signal.notify_all();
+            thread::yield_now();
+        }
+        handle.join().expect("waiter thread panicked");
+    }
+
+    #[test]
+    fn stall_signal_wait_returns_on_its_deadline_without_a_notify() {
+        let signal = StallSignal::new();
+        let start = Instant::now();
+        signal.wait(Duration::from_millis(20));
+        assert!(start.elapsed() >= Duration::from_millis(15));
+    }
+
+    #[test]
+    fn stall_signal_survives_more_waiters_than_slots() {
+        let signal = StallSignal::new();
+        for _ in 0..(STALL_WAITER_SLOTS * 2) {
+            let _ = signal.waiters.push(Arc::new(Signal::new()));
+        }
+        signal.notify_all();
+        // Every surviving registration was drained, so the ring is
+        // available again for the next round of stalled writers.
+        assert!(signal.waiters.pop().is_none());
+    }
+}

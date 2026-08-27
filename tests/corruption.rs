@@ -5,8 +5,13 @@
 //! Each test writes data, closes the DB, mangles an on-disk file
 //! with raw `std::fs` ops, then re-opens and asserts that the
 //! engine either (a) surfaces a diagnostic error or (b) recovers
-//! gracefully with the expected partial data — never silent loss
+//! gracefully with the expected partial data - never silent loss
 //! of earlier, uncorrupted data.
+
+// Native-only. wasm-pack builds every test target for wasm32, and these use
+// threads, the filesystem or proptest, none of which exist there. The browser
+// suite lives in tests/wasm_opfs*.rs.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::fs::{self, OpenOptions};
 use std::io;
@@ -83,7 +88,7 @@ fn torn_wal_tail_checksum_flip_fails_open_and_keeps_wal() {
     let wal = first_wal(dir.path());
     let wal_count = count_wal_files(dir.path());
     let size = fs::metadata(&wal).unwrap().len() as usize;
-    // Flip the last byte of the file — always part of the trailing
+    // Flip the last byte of the file - always part of the trailing
     // record's 4-byte checksum.
     flip_byte(&wal, size - 1);
 
@@ -93,27 +98,45 @@ fn torn_wal_tail_checksum_flip_fails_open_and_keeps_wal() {
 }
 
 #[test]
-fn wal_truncated_at_arbitrary_offset_fails_open_and_keeps_wal() {
-    // Robustness check: truncate the WAL at every byte offset from
-    // one past the first record up to the end. The engine must fail
-    // closed and keep the WAL rather than silently prefix-replay.
-    let dir = TempDir::new().unwrap();
-    {
-        let db = open(&dir);
-        db.put(b"a", b"1").unwrap();
-        db.put(b"b", b"2").unwrap();
-    }
-    let wal = first_wal(dir.path());
-    let wal_count = count_wal_files(dir.path());
-    let full = fs::read(&wal).unwrap();
+fn wal_truncated_at_arbitrary_offset_replays_the_whole_records_before_the_cut() {
+    // Truncation is what a crash leaves behind: the records before the
+    // cut are byte-for-byte what the process wrote, and only the one the
+    // cut lands in is incomplete. Every cut below lands inside the second
+    // record, so the first must always come back and the second never
+    // may. Failing the open here instead would throw away a write that
+    // was acknowledged and fsynced.
     for trim in [1u64, 3, 5, 9, 11, 15, 20] {
-        if (full.len() as u64) <= trim {
-            continue;
+        let dir = TempDir::new().unwrap();
+        {
+            let db = open(&dir);
+            db.put(b"a", b"1").unwrap();
+            db.put(b"b", b"2").unwrap();
         }
-        fs::write(&wal, &full).unwrap();
-        truncate(&wal, full.len() as u64 - trim);
-        assert_open_fails_with_kind(&dir, io::ErrorKind::UnexpectedEof);
-        assert!(wal.exists());
+        let wal = first_wal(dir.path());
+        let wal_count = count_wal_files(dir.path());
+        let full = fs::read(&wal).unwrap();
+        // `[stamp: 12][len: u32 LE][type: u8][payload][crc: u32 LE]`,
+        // so this is where the first record ends. The length is read
+        // after the stamp, not at byte zero: reading it at zero takes
+        // four bytes of the REGO stamp as a length and lands the cut
+        // somewhere arbitrary. Matches `WAL_STAMP_LEN` in
+        // `src/engine/wal.rs`.
+        const STAMP: u64 = 12;
+        let len =
+            u32::from_le_bytes(full[STAMP as usize..STAMP as usize + 4].try_into().unwrap()) as u64;
+        let first_end = STAMP + 9 + len;
+        let cut = full.len() as u64 - trim;
+        assert!(
+            cut > first_end && cut < full.len() as u64,
+            "a cut of {trim} must land inside the second record",
+        );
+
+        truncate(&wal, cut);
+        let db = Db::open(dir.path(), Default::default())
+            .unwrap_or_else(|e| panic!("cut at {cut}: {e}"));
+        assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()), "cut at {cut}");
+        assert_eq!(db.get(b"b").unwrap(), None, "cut at {cut}");
+        db.close().unwrap();
         assert_eq!(count_wal_files(dir.path()), wal_count);
     }
 }
@@ -141,7 +164,7 @@ fn wal_checksum_flip_in_final_record_fails_open() {
 
 #[test]
 fn manifest_deleted_prevents_reopen_of_nonempty_db() {
-    // corruption_test.cc::MissingDescriptor — once a DB has written
+    // corruption_test.cc::MissingDescriptor - once a DB has written
     // SSTables, deleting the manifest drops the pointer to them.
     // Opening without a manifest yields a fresh-looking DB (the
     // manifest is re-created empty), so the pre-existing files are
@@ -170,7 +193,7 @@ fn manifest_deleted_prevents_reopen_of_nonempty_db() {
 
 #[test]
 fn corrupted_manifest_record_stops_replay_but_opens() {
-    // corruption_test.cc::CorruptedDescriptor — a mid-file bad
+    // corruption_test.cc::CorruptedDescriptor - a mid-file bad
     // checksum in the manifest halts replay at the corruption but
     // leaves the pre-corruption state intact.
     let dir = TempDir::new().unwrap();
@@ -181,7 +204,7 @@ fn corrupted_manifest_record_stops_replay_but_opens() {
         db.put(b"k2", b"v2").unwrap();
         force_compaction(&db);
     }
-    // Flip a byte deep in the manifest — lands inside the second
+    // Flip a byte deep in the manifest - lands inside the second
     // record's payload or checksum, which the replay loop treats
     // as "stop here".
     let manifest = dir.path().join("MANIFEST");
@@ -200,7 +223,7 @@ fn corrupted_manifest_record_stops_replay_but_opens() {
 
 #[test]
 fn truncated_sst_file_to_below_footer_reports_error_on_open() {
-    // corruption_test.cc::CorruptedBlock — an SSTable smaller than
+    // corruption_test.cc::CorruptedBlock - an SSTable smaller than
     // its 64-byte footer cannot be opened. The engine must
     // surface the error rather than silently drop the file.
     let dir = TempDir::new().unwrap();
@@ -226,7 +249,7 @@ fn truncated_sst_file_to_below_footer_reports_error_on_open() {
 
 #[test]
 fn sst_footer_magic_byte_flip_detected_on_open() {
-    // corruption_test.cc::CorruptedBlock — the last 8 bytes of the
+    // corruption_test.cc::CorruptedBlock - the last 8 bytes of the
     // footer carry the magic number; flipping one byte must make
     // the engine refuse to trust the file.
     let dir = TempDir::new().unwrap();
@@ -244,7 +267,7 @@ fn sst_footer_magic_byte_flip_detected_on_open() {
     // Open attempt: we accept either Err OR Ok that errors on read.
     if let Ok(db) = Db::open(dir.path(), Default::default()) {
         // If open tolerates the file, the first read of a key
-        // inside that file must either error or return None —
+        // inside that file must either error or return None -
         // crucially, it must not panic.
         let _ = db.get(b"k_00");
     }

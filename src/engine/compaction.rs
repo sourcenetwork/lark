@@ -1,21 +1,35 @@
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
+use std::sync::Arc;
+// The periodic worker poll is the only user of these, and the worker
+// itself does not exist on a target without threads.
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{Duration, Instant};
+
+#[cfg(not(target_arch = "wasm32"))]
+use kovan_channel::RecvDeadline;
+#[cfg(not(target_arch = "wasm32"))]
+use kovan_channel::unbounded::Receiver;
+use kovan_channel::unbounded::Sender;
+
+// Through the portability shim so a target without 64-bit atomics still
+// builds; see `src/portability.rs`.
+use crate::portability::{AtomicBool, Ordering};
 
 use super::block_cache::BlockCache;
 use super::internal_key::{compare_internal_keys, decode_internal_key, user_key_of};
-use super::manifest::{VersionEdit, VersionSet, MAX_LEVELS};
+use super::manifest::{MAX_LEVELS, VersionEdit};
 use super::range_tombstone::{
-    exclusive_successor, sort_dedup_tombstones, RangeTombstone, RangeTombstoneSet,
+    RangeTombstone, RangeTombstoneSet, exclusive_successor, sort_dedup_tombstones,
 };
+use super::read_view::VersionStore;
 use super::snapshot_registry::SnapshotRegistry;
 use super::sstable::{
-    remove_sst, sst_filename, LiveSst, SsTableInternalIter, SsTableMeta, SsTableReader,
-    SsTableWriter,
+    LiveSst, MetadataPolicy, SsTableInternalIter, SsTableMeta, SsTableReader, SsTableWriter,
+    remove_sst_in, sst_filename,
 };
+use crate::env::{Env, JoinHandle};
 
 /// Default compaction trigger: flush L0 → L1 when L0 has this many SSTables.
 pub(crate) const L0_COMPACTION_TRIGGER: usize = 4;
@@ -29,19 +43,34 @@ pub(crate) const DEFAULT_LEVEL_BASE_BYTES: u64 = 256 * 1024 * 1024;
 /// Default target SSTable file size (64 MB).
 pub(crate) const DEFAULT_TARGET_FILE_SIZE: u64 = 64 * 1024 * 1024;
 
+/// How long a worker sleeps between periodic checks when no wake-up
+/// arrives. The backstop that keeps compaction live if a coalesced
+/// notification is ever dropped.
+#[cfg(not(target_arch = "wasm32"))]
+const WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Manages background compaction on one or more dedicated OS threads.
 pub(crate) struct CompactionScheduler {
     shutdown: Arc<AtomicBool>,
-    trigger: Arc<(Mutex<bool>, Condvar)>,
-    handles: Vec<thread::JoinHandle<()>>,
+    /// Wake-up channel. One token wakes one idle worker.
+    trigger: Sender<()>,
+    /// Coalescing gate: at most one unconsumed token is ever in flight,
+    /// so a flush storm cannot queue thousands of wake-ups for work a
+    /// single pass already covers.
+    pending: Arc<AtomicBool>,
+    /// Joined through the env, so a target that cannot spawn threads
+    /// runs compaction in the foreground instead of failing to build.
+    handles: Vec<Box<dyn JoinHandle>>,
 }
 
 impl CompactionScheduler {
     /// Construct a scheduler with no background workers.
     pub(crate) fn disabled() -> Self {
+        let (trigger, _rx) = kovan_channel::unbounded();
         Self {
             shutdown: Arc::new(AtomicBool::new(true)),
-            trigger: Arc::new((Mutex::new(false), Condvar::new())),
+            trigger,
+            pending: Arc::new(AtomicBool::new(false)),
             handles: Vec::new(),
         }
     }
@@ -56,41 +85,88 @@ impl CompactionScheduler {
     ///
     /// `snapshot_registry` lets each compaction pass query the current
     /// pin seq so it can drop versions that no live snapshot needs.
+    ///
+    /// `in_progress` is the engine-wide set of file ids currently being
+    /// compacted. The engine owns it and shares it with the foreground
+    /// inline compaction path, so a worker and a foreground pass can
+    /// never pick overlapping inputs.
+    ///
+    /// `max_background_compactions == 0` starts no worker at all and
+    /// returns a scheduler equivalent to [`CompactionScheduler::disabled`];
+    /// compaction then runs on whichever thread asks for it. That is the
+    /// only mode a single-threaded host such as `wasm32-wasip1` can open
+    /// in, because `std::thread::spawn` reports
+    /// [`std::io::ErrorKind::Unsupported`] there.
+    ///
+    /// Returns the spawn error if a worker thread cannot be created,
+    /// after shutting down and joining any worker already started, so
+    /// a failed open leaves no detached thread behind.
+    // Every parameter is a distinct shared handle the workers need;
+    // `compaction_loop` below carries the same fan-out for the same
+    // reason.
+    #[allow(clippy::too_many_arguments)]
+    // On wasm32 the spawn half below is compiled out, which leaves the
+    // shared handles the workers would have taken unread.
+    #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
     pub(crate) fn start(
         compaction_lock: Arc<parking_lot::RwLock<()>>,
         snapshot_registry: Arc<SnapshotRegistry>,
-        versions: Arc<parking_lot::Mutex<VersionSet>>,
+        versions: Arc<VersionStore>,
         sst_dir: Arc<Path>,
         cache: Arc<BlockCache>,
         opts: CompactionOptions,
         stall_signal: Arc<crate::engine::StallSignal>,
-    ) -> Self {
+        in_progress: Arc<parking_lot::Mutex<HashSet<u64>>>,
+    ) -> std::io::Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
-        let trigger = Arc::new((Mutex::new(false), Condvar::new()));
-        let in_progress: Arc<parking_lot::Mutex<HashSet<u64>>> =
-            Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        let (trigger, receiver) = kovan_channel::unbounded::<()>();
+        let pending = Arc::new(AtomicBool::new(false));
 
-        let worker_count = opts.max_background_compactions.max(1);
-        let mut handles = Vec::with_capacity(worker_count);
+        // Zero means no background worker: compaction runs on the
+        // calling thread, which is what a target without threads needs.
+        let worker_count = opts.max_background_compactions;
+        if worker_count == 0 {
+            return Ok(Self::disabled());
+        }
 
-        for i in 0..worker_count {
-            let shutdown_clone = Arc::clone(&shutdown);
-            let trigger_clone = Arc::clone(&trigger);
-            let lock_clone = Arc::clone(&compaction_lock);
-            let registry_clone = Arc::clone(&snapshot_registry);
-            let versions_clone = Arc::clone(&versions);
-            let sst_dir_clone = Arc::clone(&sst_dir);
-            let cache_clone = Arc::clone(&cache);
-            let opts_clone = opts.clone();
-            let stall_clone = Arc::clone(&stall_signal);
-            let in_progress_clone = Arc::clone(&in_progress);
+        // wasm32 has no threads at all, so `Env::spawn` reports
+        // `Unsupported` for every worker. Report it up front and leave
+        // the whole worker loop out of the build rather than carrying
+        // machinery the target can never reach.
+        #[cfg(target_arch = "wasm32")]
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "failed to spawn compaction thread 0: this target has no threads; set \
+             Options::max_background_compactions = 0 to run compaction on the calling thread",
+        ));
 
-            let handle = thread::Builder::new()
-                .name(format!("lark-compaction-{i}"))
-                .spawn(move || {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut scheduler = Self {
+                shutdown: Arc::clone(&shutdown),
+                trigger,
+                pending: Arc::clone(&pending),
+                handles: Vec::with_capacity(worker_count),
+            };
+
+            for i in 0..worker_count {
+                let shutdown_clone = Arc::clone(&shutdown);
+                let receiver_clone = receiver.clone();
+                let pending_clone = Arc::clone(&pending);
+                let lock_clone = Arc::clone(&compaction_lock);
+                let registry_clone = Arc::clone(&snapshot_registry);
+                let versions_clone = Arc::clone(&versions);
+                let sst_dir_clone = Arc::clone(&sst_dir);
+                let cache_clone = Arc::clone(&cache);
+                let opts_clone = opts.clone();
+                let stall_clone = Arc::clone(&stall_signal);
+                let in_progress_clone = Arc::clone(&in_progress);
+
+                let spawned = spawn_worker(&*opts.env, i, move || {
                     compaction_loop(
                         shutdown_clone,
-                        trigger_clone,
+                        receiver_clone,
+                        pending_clone,
                         lock_clone,
                         registry_clone,
                         versions_clone,
@@ -100,32 +176,57 @@ impl CompactionScheduler {
                         stall_clone,
                         in_progress_clone,
                     );
-                })
-                .expect("failed to spawn compaction thread");
-            handles.push(handle);
-        }
+                });
 
-        Self {
-            shutdown,
-            trigger,
-            handles,
+                match spawned {
+                    Ok(handle) => scheduler.handles.push(handle),
+                    Err(e) => {
+                        // Dropping `scheduler` on the way out signals
+                        // shutdown and joins the workers already started,
+                        // which is the same path `shutdown` takes.
+                        return Err(std::io::Error::new(
+                            e.kind(),
+                            format!(
+                                "failed to spawn compaction thread {i}: {e}; set \
+                             Options::max_background_compactions = 0 to run compaction \
+                             on the calling thread"
+                            ),
+                        ));
+                    }
+                }
+            }
+
+            Ok(scheduler)
         }
     }
 
-    /// Notify the compaction thread that work may be available.
+    /// Notify the compaction workers that work may be available.
+    ///
+    /// Coalesced: a notification arriving while one is still unconsumed
+    /// is dropped, because the worker that picks the outstanding token up
+    /// re-checks the whole version before it decides there is nothing to
+    /// do. Send is non-blocking, so this never stalls a flush.
     pub(crate) fn notify(&self) {
-        let (lock, cvar) = &*self.trigger;
-        let mut triggered = lock.lock().unwrap();
-        *triggered = true;
-        cvar.notify_one();
+        if !self.pending.swap(true, Ordering::AcqRel) {
+            self.trigger.send(());
+        }
     }
 
     /// Shut down all compaction threads.
+    ///
+    /// Wakes every worker, not just one: `join` below waits for all of
+    /// them, so a `notify_one` here would leave the rest sleeping until
+    /// their condvar timeout and make close latency scale with
+    /// `max_background_compactions`.
     pub(crate) fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Release);
-        self.notify();
+        // One token per worker, bypassing the coalescing gate, so every
+        // thread wakes now instead of waiting out its periodic poll.
+        for _ in 0..self.handles.len() {
+            self.trigger.send(());
+        }
         for handle in self.handles.drain(..) {
-            let _ = handle.join();
+            handle.join();
         }
     }
 }
@@ -133,6 +234,60 @@ impl CompactionScheduler {
 impl Drop for CompactionScheduler {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// Spawn one named compaction worker.
+///
+/// Split out of [`CompactionScheduler::start`] so tests can force the
+/// spawn failure that a single-threaded target produces natively.
+#[cfg(not(target_arch = "wasm32"))]
+fn spawn_worker<F>(env: &dyn Env, index: usize, body: F) -> std::io::Result<Box<dyn JoinHandle>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    #[cfg(test)]
+    {
+        if SPAWN_FAILURE_AFTER.with(|limit| limit.get().is_some_and(|after| index >= after)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "test seam: compaction worker spawn disabled",
+            ));
+        }
+    }
+    env.spawn(&format!("lark-compaction-{index}"), Box::new(body))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: index of the first compaction worker whose spawn
+    /// reports `Unsupported`, mirroring what a single-threaded target
+    /// does natively. `None` disables the seam. Thread-local because
+    /// `start` runs entirely on its caller's thread, so a parallel
+    /// test never observes another test's setting.
+    static SPAWN_FAILURE_AFTER: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only guard that makes compaction-worker spawning fail on the
+/// current thread for the guard's lifetime.
+#[cfg(test)]
+pub(crate) struct SpawnFailureGuard;
+
+#[cfg(test)]
+impl SpawnFailureGuard {
+    /// Let the first `after` workers spawn and fail every one past
+    /// them until the guard is dropped.
+    pub(crate) fn allowing(after: usize) -> Self {
+        SPAWN_FAILURE_AFTER.with(|limit| limit.set(Some(after)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for SpawnFailureGuard {
+    fn drop(&mut self) {
+        SPAWN_FAILURE_AFTER.with(|limit| limit.set(None));
     }
 }
 
@@ -159,9 +314,23 @@ pub(crate) struct CompactionOptions {
     pub(crate) max_background_compactions: usize,
     pub(crate) partitioned_index: bool,
     pub(crate) metadata_block_size: usize,
+    pub(crate) cache_index_and_filter_blocks: bool,
+    /// The host platform. Compaction reads, writes, and unlinks
+    /// SSTables through it, and starts its workers on it.
+    pub(crate) env: Arc<dyn Env>,
 }
 
 impl CompactionOptions {
+    /// How readers opened by compaction should hold their index and
+    /// filter blocks. Mirrors `EngineOptions::metadata_policy`.
+    pub(crate) fn metadata_policy(&self) -> MetadataPolicy {
+        if self.cache_index_and_filter_blocks {
+            MetadataPolicy::Cached
+        } else {
+            MetadataPolicy::Pinned
+        }
+    }
+
     /// Resolve the codec used when writing an output SSTable destined
     /// for `level`. Mirrors `EngineOptions::compression_for_level`.
     pub(crate) fn compression_for_level(&self, level: usize) -> crate::options::CompressionType {
@@ -196,17 +365,21 @@ impl Default for CompactionOptions {
             max_background_compactions: 1,
             partitioned_index: false,
             metadata_block_size: 4096,
+            cache_index_and_filter_blocks: false,
+            env: crate::env::std_env(),
         }
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
 fn compaction_loop(
     shutdown: Arc<AtomicBool>,
-    trigger: Arc<(Mutex<bool>, Condvar)>,
+    trigger: Receiver<()>,
+    pending: Arc<AtomicBool>,
     compaction_lock: Arc<parking_lot::RwLock<()>>,
     snapshot_registry: Arc<SnapshotRegistry>,
-    versions: Arc<parking_lot::Mutex<VersionSet>>,
+    versions: Arc<VersionStore>,
     sst_dir: Arc<Path>,
     cache: Arc<BlockCache>,
     opts: CompactionOptions,
@@ -214,15 +387,13 @@ fn compaction_loop(
     in_progress: Arc<parking_lot::Mutex<HashSet<u64>>>,
 ) {
     loop {
-        // Wait for trigger or periodic check
-        {
-            let (lock, cvar) = &*trigger;
-            let mut triggered = lock.lock().unwrap();
-            if !*triggered {
-                let _ = cvar.wait_timeout(triggered, std::time::Duration::from_secs(1));
-                triggered = lock.lock().unwrap();
-            }
-            *triggered = false;
+        // Wait for a trigger, or fall through on the periodic poll.
+        // The gate is reopened before the pass runs, so a notification
+        // that lands mid-pass queues a token instead of being swallowed.
+        match trigger.recv_deadline(Instant::now() + WORKER_POLL_INTERVAL) {
+            RecvDeadline::Msg(()) => pending.store(false, Ordering::Release),
+            RecvDeadline::Timeout => {}
+            RecvDeadline::Disconnected => break,
         }
 
         if shutdown.load(Ordering::Acquire) {
@@ -249,12 +420,12 @@ fn compaction_loop(
                     pin_seq,
                     &in_progress,
                 ) {
-                    Ok(did_work) => did_work,
+                    Ok(outcome) => outcome == CompactionOutcome::DidWork,
                     Err(e) => {
                         tracing::error!(error = %e, "Compaction failed");
                         // Surface the failure to any registered
                         // listeners so metrics pipelines and
-                        // debuggers notice it — the scheduler
+                        // debuggers notice it - the scheduler
                         // itself keeps running.
                         if !opts.listeners.is_empty() {
                             let err =
@@ -283,34 +454,74 @@ fn compaction_loop(
     }
 }
 
-fn pick_and_run_compaction(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+/// What one call to [`pick_and_run_compaction`] achieved.
+///
+/// The distinction between [`CompactionOutcome::Idle`] and
+/// [`CompactionOutcome::Contended`] is load-bearing, not cosmetic. A
+/// writer stalling with no background worker performs the compaction
+/// itself; if it treated "another thread already holds these inputs"
+/// as "there is nothing to compact", it would fail the write with
+/// [`crate::Error::Busy`] the moment a second thread was mid-pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactionOutcome {
+    /// A compaction job ran to completion.
+    DidWork,
+    /// No level was over its trigger. Nothing to do.
+    Idle,
+    /// Work is pending, but another thread holds the input files. The
+    /// caller should wait for that thread rather than conclude the
+    /// engine is idle.
+    Contended,
+}
+
+/// Pick the highest-priority pending compaction job for the configured
+/// style and run it to completion on the calling thread. Returns
+/// whether any work was done.
+///
+/// Shared by the background worker loop and by the engine's foreground
+/// pass ([`crate::engine::LarkEngine::run_one_compaction_pass`]) so the
+/// two can never diverge on what "one job" means. Callers hold either
+/// side of the engine-wide compaction lock and pass the engine-wide
+/// `in_progress` set.
+pub(crate) fn pick_and_run_compaction(
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
     pin_seq: u64,
     in_progress: &parking_lot::Mutex<HashSet<u64>>,
-) -> std::io::Result<bool> {
+) -> std::io::Result<CompactionOutcome> {
     match opts.compaction_style {
         crate::options::CompactionStyle::Level => {
             pick_and_run_level_compaction(versions, sst_dir, cache, opts, pin_seq, in_progress)
         }
         crate::options::CompactionStyle::Fifo => {
-            // Skip if any file is already being compacted — with a
+            // Skip if any file is already being compacted - with a
             // single L0 pool there's nothing safe to pick in parallel.
             if !in_progress.lock().is_empty() {
-                return Ok(false);
+                return Ok(CompactionOutcome::Contended);
             }
-            run_fifo_pass(versions, sst_dir, opts)
+            Ok(outcome(run_fifo_pass(versions, sst_dir, opts)?))
         }
         crate::options::CompactionStyle::Universal => {
             // Same: universal merges all L0 files, so parallel picks
             // would conflict. Skip until the in-progress set clears.
             if !in_progress.lock().is_empty() {
-                return Ok(false);
+                return Ok(CompactionOutcome::Contended);
             }
-            pick_and_run_universal(versions, sst_dir, cache, opts, pin_seq)
+            Ok(outcome(pick_and_run_universal(
+                versions, sst_dir, cache, opts, pin_seq,
+            )?))
         }
+    }
+}
+
+/// Map a picker that has no notion of contention onto an outcome.
+fn outcome(did_work: bool) -> CompactionOutcome {
+    if did_work {
+        CompactionOutcome::DidWork
+    } else {
+        CompactionOutcome::Idle
     }
 }
 
@@ -324,7 +535,7 @@ fn pick_and_run_compaction(
 /// background compaction loop re-invokes it until there's nothing
 /// left to do.
 fn pick_and_run_universal(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
@@ -349,7 +560,7 @@ fn pick_and_run_universal(
     let mut by_age: Vec<Arc<LiveSst>> = l0_files;
     by_age.sort_by_key(|f| std::cmp::Reverse(f.meta.file_id));
 
-    // Rule 1 — size ratio merge. Accumulate newest files into a
+    // Rule 1 - size ratio merge. Accumulate newest files into a
     // candidate group; keep adding until the group's total size
     // grows past `size_ratio` percent of the next file's size, at
     // which point the next file is too much larger to be worth
@@ -371,7 +582,7 @@ fn pick_and_run_universal(
         }
         // Does adding this file keep the "size-tier" invariant?
         // The rule: the running total must be within
-        // `size_ratio` percent of the new candidate — i.e. the
+        // `size_ratio` percent of the new candidate - i.e. the
         // candidate should not dwarf the accumulator.
         let candidate_size = file.meta.file_size as u128;
         if group_size * (100 + ratio) / 100 >= candidate_size {
@@ -389,7 +600,7 @@ fn pick_and_run_universal(
             .map(|_| true);
     }
 
-    // Rule 2 — size amplification. Compute the ratio of "all
+    // Rule 2 - size amplification. Compute the ratio of "all
     // files except the oldest" to "the oldest file". When it
     // exceeds the configured percent, fold everything into one
     // run so the database stops accumulating redundancy.
@@ -417,15 +628,27 @@ fn pick_and_run_universal(
 /// files are removed from the version; the new file gets a fresh
 /// id (so it sorts as the newest L0 file under the picker's
 /// age-by-file_id ordering).
+///
+/// The output is deliberately **one** file regardless of
+/// [`CompactionOptions::target_file_size`]. Under this style each L0
+/// file is one sorted run and the picker's size-ratio rule reasons
+/// about runs, so splitting a merge across several files re-creates
+/// the very group that was just merged: the picker re-selects it, the
+/// writer re-splits it, and the pass never terminates while burning a
+/// full merge each time. Emitting one run makes every merge reduce the
+/// L0 file count by at least one, which is what bounds the loop in
+/// [`crate::Db::compact_step`] and in the inline stall path.
 fn perform_universal_merge(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
     inputs: Vec<Arc<LiveSst>>,
     pin_seq: u64,
 ) -> std::io::Result<()> {
-    // Universal merges are L0 → L0. The shared
+    let mut run_opts = opts.clone();
+    run_opts.target_file_size = u64::MAX;
+    // Universal merges are L0 -> L0. The shared
     // `perform_compaction_to` helper handles the merge-and-write
     // path; we just tell it to target L0 and pass no overlap
     // files (there is no "next level" to drag in).
@@ -433,7 +656,7 @@ fn perform_universal_merge(
         versions,
         sst_dir,
         cache,
-        opts,
+        &run_opts,
         0,
         0,
         inputs,
@@ -446,7 +669,7 @@ fn perform_universal_merge(
 /// `compact_range` path so callers can trigger a deterministic
 /// drop of over-cap files.
 pub(crate) fn run_fifo_pass(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     opts: &CompactionOptions,
 ) -> std::io::Result<bool> {
@@ -459,7 +682,7 @@ pub(crate) fn run_fifo_pass(
 /// caller asking for a manual compaction gets full deduplication
 /// across every live file regardless of the picker's ratio rules.
 pub(crate) fn run_universal_full_compaction(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
@@ -476,13 +699,13 @@ pub(crate) fn run_universal_full_compaction(
 }
 
 fn pick_and_run_level_compaction(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
     pin_seq: u64,
     in_progress: &parking_lot::Mutex<HashSet<u64>>,
-) -> std::io::Result<bool> {
+) -> std::io::Result<CompactionOutcome> {
     let version = versions.lock().current();
 
     // Check L0 first
@@ -498,18 +721,18 @@ fn pick_and_run_level_compaction(
         }
     }
 
-    Ok(false)
+    Ok(CompactionOutcome::Idle)
 }
 
 /// FIFO picker: every flush lands a new L0 file, and lark never
 /// merges in this style. After each pass, if the total bytes held
 /// across L0 exceed `max_table_files_size`, we unlink the oldest
 /// file (smallest `file_id`) and emit a `RemoveFile` edit. We stop
-/// when the cap is satisfied or only one file remains — a single
+/// when the cap is satisfied or only one file remains - a single
 /// oversized file is not worth deleting because that would lose
 /// data with no successor on disk.
 fn pick_and_run_fifo(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     opts: &CompactionOptions,
 ) -> std::io::Result<bool> {
@@ -531,7 +754,7 @@ fn pick_and_run_fifo(
         return Ok(false);
     }
 
-    // Sort by file_id ascending — smaller id was allocated earlier,
+    // Sort by file_id ascending - smaller id was allocated earlier,
     // so it is the oldest file by construction.
     let mut by_age: Vec<Arc<crate::engine::sstable::LiveSst>> = l0_files;
     by_age.sort_by_key(|f| f.meta.file_id);
@@ -540,7 +763,7 @@ fn pick_and_run_fifo(
     let mut edits: Vec<VersionEdit> = Vec::new();
     let mut removed_paths: Vec<std::path::PathBuf> = Vec::new();
     for file in &by_age {
-        // Always keep at least one file alive — dropping the only
+        // Always keep at least one file alive - dropping the only
         // remaining file would delete every byte of user data the
         // database currently holds.
         if by_age.len() - edits.len() <= 1 {
@@ -567,9 +790,9 @@ fn pick_and_run_fifo(
     // versions (held by long-running snapshots / iterators) keep
     // file descriptors open, so the kernel preserves the inode
     // until those readers drop. A failure here doesn't corrupt the
-    // database — the manifest already reflects the removal.
+    // database - the manifest already reflects the removal.
     for path in &removed_paths {
-        let _ = std::fs::remove_file(path);
+        let _ = opts.env.remove_file(path);
     }
 
     if let Some(s) = &opts.statistics {
@@ -592,15 +815,15 @@ fn level_target_size(level: usize, opts: &CompactionOptions) -> u64 {
 
 /// Compact all L0 SSTables into L1.
 fn compact_l0(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
     pin_seq: u64,
     in_progress: &parking_lot::Mutex<HashSet<u64>>,
-) -> std::io::Result<bool> {
+) -> std::io::Result<CompactionOutcome> {
     // If any L0 file is already being compacted by another worker,
-    // skip — L0 files may overlap so concurrent picks would produce
+    // skip - L0 files may overlap so concurrent picks would produce
     // conflicting output sets.
     {
         let ip = in_progress.lock();
@@ -609,7 +832,7 @@ fn compact_l0(
             .iter()
             .any(|f| ip.contains(&f.meta.file_id))
         {
-            return Ok(false);
+            return Ok(CompactionOutcome::Contended);
         }
     }
     compact_level(versions, sst_dir, cache, opts, 0, pin_seq, in_progress)
@@ -619,24 +842,24 @@ fn compact_l0(
 /// heuristic (all L0 files, or the first file of L1+). Used by the
 /// background scheduler.
 fn compact_level(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
     level: usize,
     pin_seq: u64,
     in_progress: &parking_lot::Mutex<HashSet<u64>>,
-) -> std::io::Result<bool> {
+) -> std::io::Result<CompactionOutcome> {
     let target_level = level + 1;
     if target_level >= MAX_LEVELS {
-        return Ok(false);
+        return Ok(CompactionOutcome::Idle);
     }
 
     let version = versions.lock().current();
 
     let input_files: Vec<Arc<LiveSst>> = version.levels[level].clone();
     if input_files.is_empty() {
-        return Ok(false);
+        return Ok(CompactionOutcome::Idle);
     }
 
     // For L0, all files may overlap. For other levels, pick the first
@@ -655,7 +878,7 @@ fn compact_level(
         drop(ip);
         let picked = match candidate {
             Some(f) => vec![f],
-            None => return Ok(false),
+            None => return Ok(CompactionOutcome::Contended),
         };
         let (min_key, max_key) = key_range(&picked);
         // Also skip if any overlap file is already in-progress.
@@ -663,7 +886,7 @@ fn compact_level(
         {
             let ip = in_progress.lock();
             if overlapping.iter().any(|f| ip.contains(&f.meta.file_id)) {
-                return Ok(false);
+                return Ok(CompactionOutcome::Contended);
             }
         }
         (picked, overlapping)
@@ -704,7 +927,7 @@ fn compact_level(
     }
 
     result?;
-    Ok(true)
+    Ok(CompactionOutcome::DidWork)
 }
 
 /// Run a manual `compact_range` pass synchronously: for every level from
@@ -715,7 +938,7 @@ fn compact_level(
 /// Callers must hold the engine-wide compaction lock so the background
 /// scheduler can't pick an overlapping input set concurrently.
 pub(crate) fn run_compact_range(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
@@ -733,7 +956,7 @@ pub(crate) fn run_compact_range(
 
             // At L0 files overlap each other, so picking any file that
             // intersects the range drags in every other L0 file it
-            // overlaps — simplest correct move: take every L0 file
+            // overlaps - simplest correct move: take every L0 file
             // that intersects the range in one shot.
             //
             // At L1+ files are non-overlapping, so we can pick them
@@ -796,7 +1019,7 @@ pub(crate) fn run_compact_range(
 /// newest version of each user key is retained.
 #[allow(clippy::too_many_arguments)]
 fn perform_compaction(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
@@ -827,7 +1050,7 @@ fn perform_compaction(
 /// `input_level`.
 #[allow(clippy::too_many_arguments)]
 fn perform_compaction_to(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
@@ -837,7 +1060,7 @@ fn perform_compaction_to(
     overlap_files: Vec<Arc<LiveSst>>,
     pin_seq: u64,
 ) -> std::io::Result<()> {
-    let compaction_start = std::time::Instant::now();
+    let compaction_start = opts.env.now_micros();
 
     // Snapshot input file ids up-front so the on_compaction_begin
     // callback has them even if the job errors out later.
@@ -873,18 +1096,18 @@ fn perform_compaction_to(
     // the point-entry RT shadow pass so a filter that drops a range
     // tombstone doesn't leave orphaned point entries already wiped
     // out by that same RT. Only runs when no snapshot is pinned.
-    if pin_seq == u64::MAX {
-        if let Some(filter) = opts.compaction_filter.as_ref() {
-            merged_range_tombstones.retain(|rt| {
-                !matches!(
-                    filter.filter_range_delete(target_level, &rt.start, &rt.end),
-                    crate::options::CompactionDecision::Remove
-                )
-            });
-        }
+    if pin_seq == u64::MAX
+        && let Some(filter) = opts.compaction_filter.as_ref()
+    {
+        merged_range_tombstones.retain(|rt| {
+            !matches!(
+                filter.filter_range_delete(target_level, &rt.start, &rt.end),
+                crate::options::CompactionDecision::Remove
+            )
+        });
     }
 
-    // Dedup merged range tombstones by (start, end, seq) — a single
+    // Dedup merged range tombstones by (start, end, seq) - a single
     // logical RT may appear in multiple input files after previous
     // compactions carried it forward.
     let merged_range_tombstones = RangeTombstoneSet::from_vec(merged_range_tombstones);
@@ -923,19 +1146,19 @@ fn perform_compaction_to(
     if opts.evict_compaction_data_from_page_cache {
         for file in input_files.iter().chain(overlap_files.iter()) {
             let path = sst_dir.join(sst_filename(file.meta.file_id));
-            crate::os_hint::drop_page_cache_by_path(&path);
+            opts.env.drop_page_cache(&path);
         }
     }
 
     // Atomically apply the remove / add edits. `SetNextFileId` is not
-    // needed here — each output file already advanced it when it was
+    // needed here - each output file already advanced it when it was
     // allocated above.
     versions.lock().apply(&edits)?;
 
     // Unlink the old SSTable paths. Their file descriptors stay alive
     // through any `Arc<LiveSst>` still held by older versions or by
     // iterators, so the data remains readable until those Arcs drop.
-    delete_old_files(sst_dir, &input_files, &overlap_files, cache);
+    delete_old_files(&*opts.env, sst_dir, &input_files, &overlap_files, cache);
 
     // Publish compaction statistics. Bytes-in is the sum of
     // every input file's on-disk size; bytes-out is the sum of
@@ -952,10 +1175,9 @@ fn perform_compaction_to(
         s.add(crate::statistics::Ticker::CompactionCount, 1);
         s.add(crate::statistics::Ticker::CompactionBytesRead, bytes_in);
         s.add(crate::statistics::Ticker::CompactionBytesWritten, bytes_out);
-        s.record(
-            crate::statistics::Histogram::CompactionTime,
-            compaction_start.elapsed().as_micros() as u64,
-        );
+        if let Some(micros) = crate::env::elapsed_micros(&*opts.env, compaction_start) {
+            s.record(crate::statistics::Histogram::CompactionTime, micros);
+        }
     }
 
     // Dispatch compaction completion + per-file creation +
@@ -987,7 +1209,9 @@ fn perform_compaction_to(
             input_files_input_level: begin_inputs_l,
             input_files_output_level: begin_inputs_l1,
             output_files: output_file_infos.iter().map(|f| f.file_id).collect(),
-            duration: compaction_start.elapsed(),
+            duration: std::time::Duration::from_micros(
+                crate::env::elapsed_micros(&*opts.env, compaction_start).unwrap_or(0),
+            ),
         };
         crate::event_listener::dispatch(&opts.listeners, |l| l.on_compaction_completed(&job_info));
     }
@@ -1012,13 +1236,13 @@ fn perform_compaction_to(
 /// 1. Keep every entry with `seq > pin_seq`. These are visible to
 ///    newer snapshots or to current reads.
 /// 2. For the stretch of entries with `seq <= pin_seq`, keep only
-///    the *first* one we see — that's the largest seq not exceeding
+///    the *first* one we see - that's the largest seq not exceeding
 ///    `pin_seq`, i.e. the version the oldest live snapshot actually
 ///    reads. Drop everything strictly older than that.
 ///
 /// When `pin_seq == u64::MAX` (no live snapshot), rule (1) vacuously
 /// keeps nothing and rule (2) keeps only the newest version of each
-/// user key — the aggressive GC case. When `pin_seq` is somewhere in
+/// user key - the aggressive GC case. When `pin_seq` is somewhere in
 /// the middle, older versions still visible to some snapshot are
 /// conservatively preserved.
 ///
@@ -1035,7 +1259,7 @@ fn gc_old_versions(entries: Vec<(Vec<u8>, Vec<u8>)>, pin_seq: u64) -> Vec<(Vec<u
     // Once set to `true`, every subsequent entry for the current
     // user key that sits at or below `pin_seq` is shadowed by an
     // already-emitted terminator and can be dropped. Merge
-    // operands do *not* set this flag — they form an open chain
+    // operands do *not* set this flag - they form an open chain
     // that must be preserved until a non-merge terminator arrives.
     let mut chain_terminated = false;
 
@@ -1053,7 +1277,7 @@ fn gc_old_versions(entries: Vec<(Vec<u8>, Vec<u8>)>, pin_seq: u64) -> Vec<(Vec<u
         }
 
         // `seq <= pin_seq` and we've already reached a terminator
-        // for this user key — the entry is strictly older and
+        // for this user key - the entry is strictly older and
         // shadowed. Drop it.
         if chain_terminated {
             continue;
@@ -1071,23 +1295,23 @@ fn gc_old_versions(entries: Vec<(Vec<u8>, Vec<u8>)>, pin_seq: u64) -> Vec<(Vec<u
 /// Run the user [`crate::options::CompactionFilter`] over every
 /// `Value` entry in `entries` and apply its decision:
 ///
-/// - [`CompactionDecision::Keep`] — pass the entry through unchanged.
-/// - [`CompactionDecision::Change`] — pass through with the filter's
+/// - [`CompactionDecision::Keep`] - pass the entry through unchanged.
+/// - [`CompactionDecision::Change`] - pass through with the filter's
 ///   new value (key and seq preserved).
-/// - [`CompactionDecision::Remove`] — replace the entry with a
+/// - [`CompactionDecision::Remove`] - replace the entry with a
 ///   deletion tombstone at the same seq. The tombstone prevents an
 ///   older version of the same user key (living deeper in the LSM)
 ///   from resurfacing after the filtered value disappears.
 ///
 /// Deletion internal keys are passed through without consulting the
-/// filter — the filter's contract is about the user's own values,
+/// filter - the filter's contract is about the user's own values,
 /// not about tombstones lark writes itself.
 fn apply_compaction_filter(
     entries: Vec<(Vec<u8>, Vec<u8>)>,
     filter: &dyn crate::options::CompactionFilter,
     level: usize,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
-    use super::internal_key::{encode_internal_key, VALUE_TYPE_DELETION, VALUE_TYPE_VALUE};
+    use super::internal_key::{VALUE_TYPE_DELETION, VALUE_TYPE_VALUE, encode_internal_key};
 
     let mut out = Vec::with_capacity(entries.len());
     for (ik, value) in entries {
@@ -1122,7 +1346,7 @@ fn apply_compaction_filter(
 ///    layered on top of it, call `full_merge(base, operands)` and
 ///    replace the whole group with a single `Value` entry at the
 ///    newest merge's seq (or with the original terminator if
-///    `full_merge` fails — we conservatively keep the raw chain).
+///    `full_merge` fails - we conservatively keep the raw chain).
 ///
 /// 2. **Partial fold:** if a group is pure merges (no terminator in
 ///    the compaction's input set) and the operator's
@@ -1131,7 +1355,7 @@ fn apply_compaction_filter(
 ///    newest merge's seq.
 ///
 /// Anything the operator rejects (`None` return) is left intact so
-/// a compaction-time merge failure never loses data — the raw
+/// a compaction-time merge failure never loses data - the raw
 /// operands survive to be retried on the next compaction or
 /// materialized by a reader.
 fn collapse_merge_chains(
@@ -1139,7 +1363,7 @@ fn collapse_merge_chains(
     op: &dyn crate::options::MergeOperator,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
     use super::internal_key::{
-        encode_internal_key, VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE,
+        VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE, encode_internal_key,
     };
 
     let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(entries.len());
@@ -1190,7 +1414,7 @@ fn collapse_merge_chains(
 
         match (has_operands, &terminator) {
             (false, _) => {
-                // No merges in this group — nothing to collapse.
+                // No merges in this group - nothing to collapse.
                 out.extend(group.iter().cloned());
             }
             (true, Some((_term_seq, term_vt, term_value))) => {
@@ -1230,6 +1454,7 @@ fn collapse_merge_chains(
                 // merge to shrink the chain.
                 if everything_scanned && operands_newest_first.len() > 1 {
                     // Fold oldest→newest, carrying an accumulator.
+                    // The length check above guarantees a first item.
                     let mut iter = operands_newest_first.iter().rev();
                     let first = iter.next().unwrap();
                     let mut acc: Vec<u8> = first.1.clone();
@@ -1269,15 +1494,15 @@ fn collapse_merge_chains(
 /// Whether a file's user-key range intersects `[start, end)`. `None`
 /// bounds are treated as unbounded.
 fn file_overlaps_range(file: &Arc<LiveSst>, start: Option<&[u8]>, end: Option<&[u8]>) -> bool {
-    if let Some(s) = start {
-        if file.meta.largest_key.as_slice() < s {
-            return false;
-        }
+    if let Some(s) = start
+        && file.meta.largest_key.as_slice() < s
+    {
+        return false;
     }
-    if let Some(e) = end {
-        if file.meta.smallest_key.as_slice() >= e {
-            return false;
-        }
+    if let Some(e) = end
+        && file.meta.smallest_key.as_slice() >= e
+    {
+        return false;
     }
     true
 }
@@ -1328,7 +1553,7 @@ struct CompactionInputStream<'a> {
 
 #[allow(clippy::too_many_arguments)]
 fn stream_compaction_outputs(
-    versions: &Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &Arc<VersionStore>,
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
@@ -1444,7 +1669,7 @@ struct StreamingOutputBuilder {
 }
 
 struct StreamingCompactionWriter<'a> {
-    versions: &'a Arc<parking_lot::Mutex<VersionSet>>,
+    versions: &'a Arc<VersionStore>,
     sst_dir: &'a Path,
     opts: &'a CompactionOptions,
     target_level: usize,
@@ -1457,7 +1682,7 @@ struct StreamingCompactionWriter<'a> {
 
 impl<'a> StreamingCompactionWriter<'a> {
     fn new(
-        versions: &'a Arc<parking_lot::Mutex<VersionSet>>,
+        versions: &'a Arc<VersionStore>,
         sst_dir: &'a Path,
         opts: &'a CompactionOptions,
         target_level: usize,
@@ -1489,6 +1714,8 @@ impl<'a> StreamingCompactionWriter<'a> {
             self.finish_current()?;
         }
 
+        // `ensure_current` either installs an output or returns an
+        // error, so `current` is `Some` on this line.
         self.ensure_current()?;
         let current = self.current.as_mut().expect("current output is open");
         let user_key = user_key_of(&entries[0].0);
@@ -1523,7 +1750,8 @@ impl<'a> StreamingCompactionWriter<'a> {
         };
 
         let path = self.sst_dir.join(sst_filename(file_id));
-        let writer = SsTableWriter::new(
+        let writer = SsTableWriter::new_in(
+            &self.opts.env,
             &path,
             self.opts.block_size,
             self.opts.bloom_bits_per_key,
@@ -1566,23 +1794,28 @@ impl<'a> StreamingCompactionWriter<'a> {
         let summary = match current.writer.finish()? {
             Some(summary) => summary,
             None => {
-                let _ = std::fs::remove_file(&current.path);
+                let _ = self.opts.env.remove_file(&current.path);
                 return Ok(());
             }
         };
 
         let num_entries = summary.num_entries;
-        let file_size = std::fs::metadata(&current.path)?.len();
+        let file_size = self.opts.env.metadata(&current.path)?.len;
 
         if let Some(limiter) = &self.opts.rate_limiter {
             limiter.request(file_size, crate::rate_limiter::Priority::Low);
         }
 
         if self.opts.evict_compaction_data_from_page_cache {
-            crate::os_hint::drop_page_cache_by_path(&current.path);
+            self.opts.env.drop_page_cache(&current.path);
         }
 
-        let reader = Arc::new(SsTableReader::open(&current.path, current.file_id)?);
+        let reader = Arc::new(SsTableReader::open_with(
+            &self.opts.env,
+            &current.path,
+            current.file_id,
+            self.opts.metadata_policy(),
+        )?);
         let (smallest_key, largest_key) = match (
             current.smallest_user_key.take(),
             current.largest_user_key.take(),
@@ -1658,7 +1891,8 @@ impl<'a> StreamingCompactionWriter<'a> {
         };
 
         let path = self.sst_dir.join(sst_filename(file_id));
-        let mut writer = SsTableWriter::new(
+        let mut writer = SsTableWriter::new_in(
+            &self.opts.env,
             &path,
             self.opts.block_size,
             self.opts.bloom_bits_per_key,
@@ -1672,21 +1906,26 @@ impl<'a> StreamingCompactionWriter<'a> {
         }
 
         let Some(summary) = writer.finish()? else {
-            let _ = std::fs::remove_file(&path);
+            let _ = self.opts.env.remove_file(&path);
             return Ok(());
         };
 
-        let file_size = std::fs::metadata(&path)?.len();
+        let file_size = self.opts.env.metadata(&path)?.len;
 
         if let Some(limiter) = &self.opts.rate_limiter {
             limiter.request(file_size, crate::rate_limiter::Priority::Low);
         }
 
         if self.opts.evict_compaction_data_from_page_cache {
-            crate::os_hint::drop_page_cache_by_path(&path);
+            self.opts.env.drop_page_cache(&path);
         }
 
-        let reader = Arc::new(SsTableReader::open(&path, file_id)?);
+        let reader = Arc::new(SsTableReader::open_with(
+            &self.opts.env,
+            &path,
+            file_id,
+            self.opts.metadata_policy(),
+        )?);
         let new_file = LiveSst::new(
             SsTableMeta {
                 file_id,
@@ -1762,11 +2001,11 @@ fn group_range_tombstone_fragments(mut fragments: Vec<RangeTombstone>) -> Vec<Ve
     let mut current_end: Option<Vec<u8>> = None;
 
     for rt in fragments {
-        if let Some(end) = &current_end {
-            if rt.start.as_slice() > end.as_slice() {
-                groups.push(std::mem::take(&mut current));
-                current_end = None;
-            }
+        if let Some(end) = &current_end
+            && rt.start.as_slice() > end.as_slice()
+        {
+            groups.push(std::mem::take(&mut current));
+            current_end = None;
         }
 
         if current_end
@@ -1808,19 +2047,11 @@ fn merge_key_ranges(ranges: &[(Vec<u8>, Vec<u8>)]) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 fn min_key(a: &[u8], b: &[u8]) -> Vec<u8> {
-    if a <= b {
-        a.to_vec()
-    } else {
-        b.to_vec()
-    }
+    if a <= b { a.to_vec() } else { b.to_vec() }
 }
 
 fn max_key(a: &[u8], b: &[u8]) -> Vec<u8> {
-    if a >= b {
-        a.to_vec()
-    } else {
-        b.to_vec()
-    }
+    if a >= b { a.to_vec() } else { b.to_vec() }
 }
 
 fn key_range(files: &[Arc<LiveSst>]) -> (Vec<u8>, Vec<u8>) {
@@ -1850,6 +2081,7 @@ fn find_overlapping(files: &[Arc<LiveSst>], min_key: &[u8], max_key: &[u8]) -> V
 }
 
 fn delete_old_files(
+    env: &dyn Env,
     sst_dir: &Path,
     input_files: &[Arc<LiveSst>],
     overlap_files: &[Arc<LiveSst>],
@@ -1858,7 +2090,7 @@ fn delete_old_files(
     for file in input_files.iter().chain(overlap_files.iter()) {
         let path = sst_dir.join(sst_filename(file.meta.file_id));
         cache.evict_file(file.meta.file_id);
-        if let Err(e) = remove_sst(&path) {
+        if let Err(e) = remove_sst_in(env, &path) {
             tracing::warn!(
                 file_id = file.meta.file_id,
                 error = %e,
@@ -1874,6 +2106,63 @@ mod tests {
 
     fn rt(start: &[u8], end: &[u8], seq: u64) -> RangeTombstone {
         RangeTombstone::new(start.to_vec(), end.to_vec(), seq)
+    }
+
+    #[test]
+    fn db_open_returns_an_error_when_a_compaction_worker_cannot_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = {
+            let _guard = SpawnFailureGuard::allowing(0);
+            crate::Db::open(dir.path(), crate::Options::default()).unwrap_err()
+        };
+        match err {
+            crate::Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::Unsupported),
+            other => panic!("expected an I/O error, got {other:?}"),
+        }
+
+        // The failed open released the directory lock and left no
+        // half-built database behind.
+        let db = crate::Db::open(dir.path(), crate::Options::default()).unwrap();
+        db.put(b"k", b"v").unwrap();
+        assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+    }
+
+    #[test]
+    fn failed_start_joins_the_workers_it_already_spawned() {
+        let dir = tempfile::tempdir().unwrap();
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+
+        let versions = Arc::new(VersionStore::new(
+            super::super::manifest::VersionSet::open(dir.path(), &sst_dir).unwrap(),
+        ));
+        let opts = CompactionOptions {
+            max_background_compactions: 3,
+            ..CompactionOptions::default()
+        };
+
+        let started = {
+            let _guard = SpawnFailureGuard::allowing(2);
+            CompactionScheduler::start(
+                Arc::new(parking_lot::RwLock::new(())),
+                Arc::new(SnapshotRegistry::new()),
+                Arc::clone(&versions),
+                Arc::from(sst_dir.as_path()),
+                Arc::new(BlockCache::new(4096)),
+                opts,
+                Arc::new(crate::engine::StallSignal::new()),
+                Arc::new(parking_lot::Mutex::new(HashSet::new())),
+            )
+        };
+
+        match started {
+            Ok(_) => panic!("expected the third worker spawn to fail"),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::Unsupported),
+        }
+        // Every worker that did start has exited and been joined, so
+        // its clone of the version set is gone.
+        assert_eq!(Arc::strong_count(&versions), 1);
     }
 
     #[test]
@@ -1912,5 +2201,63 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].len(), 2);
         assert_eq!(groups[1].len(), 1);
+    }
+
+    #[test]
+    fn failed_open_preserves_data_already_written() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = crate::Db::open(dir.path(), crate::Options::default()).unwrap();
+            for i in 0..300 {
+                db.put(format!("k{i:04}").as_bytes(), format!("v{i:04}").as_bytes())
+                    .unwrap();
+            }
+        }
+
+        for _ in 0..3 {
+            let _guard = SpawnFailureGuard::allowing(0);
+            assert!(crate::Db::open(dir.path(), crate::Options::default()).is_err());
+        }
+
+        let db = crate::Db::open(dir.path(), crate::Options::default()).unwrap();
+        for i in 0..300 {
+            assert_eq!(
+                db.get(format!("k{i:04}").as_bytes()).unwrap().as_deref(),
+                Some(format!("v{i:04}").as_bytes()),
+                "key {i} lost across failed opens"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_start_with_many_workers_returns_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+        let versions = Arc::new(VersionStore::new(
+            super::super::manifest::VersionSet::open(dir.path(), &sst_dir).unwrap(),
+        ));
+        let opts = CompactionOptions {
+            max_background_compactions: 8,
+            ..CompactionOptions::default()
+        };
+        let start = std::time::Instant::now();
+        let started = {
+            let _guard = SpawnFailureGuard::allowing(7);
+            CompactionScheduler::start(
+                Arc::new(parking_lot::RwLock::new(())),
+                Arc::new(SnapshotRegistry::new()),
+                Arc::clone(&versions),
+                Arc::from(sst_dir.as_path()),
+                Arc::new(BlockCache::new(4096)),
+                opts,
+                Arc::new(crate::engine::StallSignal::new()),
+                Arc::new(parking_lot::Mutex::new(HashSet::new())),
+            )
+        };
+        let elapsed = start.elapsed();
+        assert!(started.is_err());
+        println!("failed start with 8 workers took {elapsed:?}");
+        assert_eq!(Arc::strong_count(&versions), 1);
     }
 }

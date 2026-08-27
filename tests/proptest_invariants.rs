@@ -2,7 +2,7 @@
 //!
 //! Every test in this file uses `proptest` to generate randomized
 //! inputs and verify that the database satisfies its contract
-//! across thousands of scenarios — something hand-written unit
+//! across thousands of scenarios - something hand-written unit
 //! tests can't cover.
 //!
 //! Run with:
@@ -12,6 +12,11 @@
 //! # Or with more cases:
 //! PROPTEST_CASES=1024 cargo test --test proptest_invariants
 //! ```
+
+// Native-only. wasm-pack builds every test target for wasm32, and these use
+// threads, the filesystem or proptest, none of which exist there. The browser
+// suite lives in tests/wasm_opfs*.rs.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeMap;
 
@@ -25,12 +30,12 @@ use common::open;
 
 // ── helpers ────────────────────────────────────────────────────
 
-/// Strategy that generates a key as 1–32 random bytes.
+/// Strategy that generates a key as 1-32 random bytes.
 fn key_strategy() -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(any::<u8>(), 1..=32)
 }
 
-/// Strategy that generates a value as 0–128 random bytes.
+/// Strategy that generates a value as 0-128 random bytes.
 fn value_strategy() -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(any::<u8>(), 0..=128)
 }
@@ -86,7 +91,7 @@ proptest! {
         let dir = TempDir::new().unwrap();
         let db = open(&dir);
 
-        // Phase 1 — write "before" entries.
+        // Phase 1 - write "before" entries.
         let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
         for (k, v) in &before {
             db.put(k, v).unwrap();
@@ -95,7 +100,7 @@ proptest! {
 
         let snap = db.snapshot();
 
-        // Phase 2 — write "after" entries (invisible to snap).
+        // Phase 2 - write "after" entries (invisible to snap).
         for (k, v) in &after {
             db.put(k, v).unwrap();
         }
@@ -229,7 +234,7 @@ proptest! {
 
     /// The iterator yields the same (key, value) sequence as
     /// `scan(None, None)`. This catches any divergence between the
-    /// two read paths — they share the merge layer internally, but
+    /// two read paths - they share the merge layer internally, but
     /// any caching/prefetching difference could desync them.
     #[test]
     fn iter_matches_scan(
@@ -255,7 +260,7 @@ proptest! {
     }
 
     /// Reopening a clean-closed database yields exactly the same
-    /// scan output. This is the "ReopenIdempotent" invariant —
+    /// scan output. This is the "ReopenIdempotent" invariant -
     /// nothing about serialization should be lossy.
     #[test]
     fn reopen_preserves_scan_output(
@@ -277,7 +282,7 @@ proptest! {
         prop_assert_eq!(before, after);
     }
 
-    /// Deleted keys stay deleted across reopen — tombstones cannot
+    /// Deleted keys stay deleted across reopen - tombstones cannot
     /// resurrect values from older memtables or SSTables. This is
     /// a foundational LSM invariant; any regression here is
     /// immediately obvious to users as "my delete didn't stick".

@@ -7,6 +7,11 @@
 //! tests or [`parity.rs`] are intentionally *not* re-ported here;
 //! this file is strictly additive coverage.
 
+// Native-only. wasm-pack builds every test target for wasm32, and these use
+// threads, the filesystem or proptest, none of which exist there. The browser
+// suite lives in tests/wasm_opfs*.rs.
+#![cfg(not(target_arch = "wasm32"))]
+
 use lark_kv::{Db, Options, Range, WriteBatch};
 use tempfile::TempDir;
 
@@ -18,7 +23,7 @@ use common::{fill_sequential, force_compaction, open, verify_sequential_keys};
 
 #[test]
 fn db_is_empty_after_open() {
-    // db_test.cc::Empty — a freshly opened database answers every
+    // db_test.cc::Empty - a freshly opened database answers every
     // point lookup with `None` and a full scan with an empty vec.
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
@@ -28,7 +33,7 @@ fn db_is_empty_after_open() {
 
 #[test]
 fn empty_key_round_trips() {
-    // db_test.cc::EmptyKey — the empty byte string is a valid user
+    // db_test.cc::EmptyKey - the empty byte string is a valid user
     // key. Must survive put → get → delete → reopen.
     let dir = TempDir::new().unwrap();
     {
@@ -46,7 +51,7 @@ fn empty_key_round_trips() {
 
 #[test]
 fn empty_value_is_distinct_from_missing_after_reopen() {
-    // db_test.cc::EmptyValue — an empty byte string is a valid
+    // db_test.cc::EmptyValue - an empty byte string is a valid
     // *value*, distinct from "key absent". Reopening must preserve
     // that distinction.
     let dir = TempDir::new().unwrap();
@@ -65,7 +70,7 @@ fn empty_value_is_distinct_from_missing_after_reopen() {
 
 #[test]
 fn get_from_immutable_memtable_still_visible() {
-    // db_test.cc::GetFromImmutableLayer — a value written into the
+    // db_test.cc::GetFromImmutableLayer - a value written into the
     // active memtable must remain readable *across* the rotation
     // that freezes it, until the flush actually lands it in an SST.
     let dir = TempDir::new().unwrap();
@@ -82,7 +87,7 @@ fn get_from_immutable_memtable_still_visible() {
 
 #[test]
 fn get_level0_newer_file_shadows_older() {
-    // db_test.cc::GetLevel0Ordering — L0 files can overlap, so the
+    // db_test.cc::GetLevel0Ordering - L0 files can overlap, so the
     // engine must prefer the newer file's value.
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
@@ -97,7 +102,7 @@ fn get_level0_newer_file_shadows_older() {
 
 #[test]
 fn get_picks_correct_file_across_levels() {
-    // db_test.cc::GetPicksCorrectFile — keys from many flushes sort
+    // db_test.cc::GetPicksCorrectFile - keys from many flushes sort
     // into non-overlapping L1+ files; a point lookup must pick the
     // right file for each key.
     let dir = TempDir::new().unwrap();
@@ -115,7 +120,7 @@ fn get_picks_correct_file_across_levels() {
 
 #[test]
 fn get_encounters_empty_level_between_populated_ones() {
-    // db_test.cc::GetEncountersEmptyLevel — after compaction, some
+    // db_test.cc::GetEncountersEmptyLevel - after compaction, some
     // levels may be empty. Lookups should skip over them rather
     // than short-circuit.
     let dir = TempDir::new().unwrap();
@@ -132,7 +137,7 @@ fn get_encounters_empty_level_between_populated_ones() {
 
 #[test]
 fn snapshot_hides_later_writes() {
-    // db_test.cc::SnapshotHidesLaterWrites — a snapshot taken now
+    // db_test.cc::SnapshotHidesLaterWrites - a snapshot taken now
     // must never see writes that arrive after it was taken, even
     // across flushes and compactions.
     let dir = TempDir::new().unwrap();
@@ -147,7 +152,7 @@ fn snapshot_hides_later_writes() {
 
 #[test]
 fn identical_snapshots_see_same_state() {
-    // db_test.cc::GetIdenticalSnapshots — two snapshots captured at
+    // db_test.cc::GetIdenticalSnapshots - two snapshots captured at
     // the same seq observe the same values.
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
@@ -162,7 +167,7 @@ fn identical_snapshots_see_same_state() {
 
 #[test]
 fn iter_empty_database_is_never_valid() {
-    // db_test.cc::IterEmpty — on an empty DB, seek_to_first /
+    // db_test.cc::IterEmpty - on an empty DB, seek_to_first /
     // seek_to_last produce no valid position.
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
@@ -175,7 +180,7 @@ fn iter_empty_database_is_never_valid() {
 
 #[test]
 fn iter_single_entry_is_valid_exactly_once() {
-    // db_test.cc::IterSingle — one-entry DB: seek_to_first yields
+    // db_test.cc::IterSingle - one-entry DB: seek_to_first yields
     // the entry; a subsequent `next` invalidates the iterator.
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
@@ -191,7 +196,7 @@ fn iter_single_entry_is_valid_exactly_once() {
 
 #[test]
 fn iter_small_and_large_values_mixed() {
-    // db_test.cc::IterSmallAndLargeMix — values of wildly different
+    // db_test.cc::IterSmallAndLargeMix - values of wildly different
     // sizes must round-trip through the iterator unchanged.
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
@@ -218,7 +223,7 @@ fn iter_small_and_large_values_mixed() {
 
 #[test]
 fn iter_skips_deleted_keys_after_compaction() {
-    // db_test.cc::IterWithDeleteAndCompaction — deletes must remain
+    // db_test.cc::IterWithDeleteAndCompaction - deletes must remain
     // invisible through the iterator even after compaction has
     // physically merged the tombstone with the original value.
     let dir = TempDir::new().unwrap();
@@ -241,7 +246,7 @@ fn iter_skips_deleted_keys_after_compaction() {
 
 #[test]
 fn iter_reverse_walks_backward() {
-    // db_test.cc::IterMulti (subset) — iterator supports reverse
+    // db_test.cc::IterMulti (subset) - iterator supports reverse
     // traversal from the end of the DB.
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
@@ -271,7 +276,7 @@ fn iter_reverse_walks_backward() {
 
 #[test]
 fn recover_with_empty_wal_does_not_crash() {
-    // db_test.cc::RecoverWithEmptyLog — a database that was closed
+    // db_test.cc::RecoverWithEmptyLog - a database that was closed
     // cleanly with nothing in its WAL reopens as an empty DB.
     let dir = TempDir::new().unwrap();
     drop(open(&dir));
@@ -281,7 +286,7 @@ fn recover_with_empty_wal_does_not_crash() {
 
 #[test]
 fn recover_with_large_wal_replays_every_entry() {
-    // db_test.cc::RecoverWithLargeLog — tens of thousands of ops
+    // db_test.cc::RecoverWithLargeLog - tens of thousands of ops
     // must replay correctly on reopen.
     let dir = TempDir::new().unwrap();
     {
@@ -307,7 +312,7 @@ fn recover_with_large_wal_replays_every_entry() {
 
 #[test]
 fn recover_with_multiple_memtables_preserves_all_writes() {
-    // db_test.cc::MultipleMemTables — writes spread across many
+    // db_test.cc::MultipleMemTables - writes spread across many
     // memtable rotations (with small write_buffer_size) must all
     // survive a reopen.
     let dir = TempDir::new().unwrap();
@@ -321,7 +326,7 @@ fn recover_with_multiple_memtables_preserves_all_writes() {
 
 #[test]
 fn seq_number_preserved_across_reopen() {
-    // db_test.cc::Recover (the seq-number invariant) — writes after
+    // db_test.cc::Recover (the seq-number invariant) - writes after
     // reopen must be ordered strictly after writes before close.
     let dir = TempDir::new().unwrap();
     {
@@ -341,7 +346,7 @@ fn seq_number_preserved_across_reopen() {
 
 #[test]
 fn approximate_sizes_grows_with_range_width() {
-    // db_test.cc::ApproximateSizes — wider ranges must report more
+    // db_test.cc::ApproximateSizes - wider ranges must report more
     // bytes than narrower ones.
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
@@ -361,7 +366,7 @@ fn approximate_sizes_grows_with_range_width() {
 
 #[test]
 fn write_batch_empty_len_counts() {
-    // write_batch_test.cc::Empty — new batch has zero of everything.
+    // write_batch_test.cc::Empty - new batch has zero of everything.
     let b = WriteBatch::new();
     assert_eq!(b.len(), 0);
     assert_eq!(b.merge_count(), 0);
@@ -371,7 +376,7 @@ fn write_batch_empty_len_counts() {
 
 #[test]
 fn write_batch_put_delete_delete_range_counted_separately() {
-    // write_batch_test.cc::Multiple — each op kind increments its
+    // write_batch_test.cc::Multiple - each op kind increments its
     // own counter.
     let mut b = WriteBatch::new();
     b.put(b"a", b"1");
@@ -388,7 +393,7 @@ fn write_batch_put_delete_delete_range_counted_separately() {
 
 #[test]
 fn write_batch_degenerate_range_delete_is_ignored() {
-    // write_batch_test.cc::ApproximateSize-style edge — start >= end
+    // write_batch_test.cc::ApproximateSize-style edge - start >= end
     // must silently no-op rather than record a bogus range.
     let mut b = WriteBatch::new();
     b.delete_range(b"x", b"x");
@@ -398,7 +403,7 @@ fn write_batch_degenerate_range_delete_is_ignored() {
 
 #[test]
 fn write_batch_put_delete_on_same_key_keeps_last_op() {
-    // write_batch_test.cc::Multiple (seen-last-wins variant) — the
+    // write_batch_test.cc::Multiple (seen-last-wins variant) - the
     // operation log keeps both entries, and applying the batch in
     // caller order leaves the final delete visible.
     let mut b = WriteBatch::new();
@@ -415,7 +420,7 @@ fn write_batch_put_delete_on_same_key_keeps_last_op() {
 
 #[test]
 fn write_batch_apply_is_atomic_under_reopen() {
-    // write_batch_test.cc::Multiple + RocksDB::WriteBatchAtomicity — a
+    // write_batch_test.cc::Multiple + RocksDB::WriteBatchAtomicity - a
     // batch must be *entirely* applied on reopen if any of its
     // contents are visible.
     let dir = TempDir::new().unwrap();
@@ -439,7 +444,7 @@ fn write_batch_apply_is_atomic_under_reopen() {
 
 #[test]
 fn write_batch_range_delete_hides_every_key_in_range() {
-    // write_batch_test.cc integration — DeleteRange inside a batch
+    // write_batch_test.cc integration - DeleteRange inside a batch
     // tombstones every visible key in the range atomically.
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
@@ -459,4 +464,73 @@ fn write_batch_range_delete_hides_every_key_in_range() {
     assert_eq!(db.get(b"d").unwrap(), None);
     assert_eq!(db.get(b"e").unwrap(), None);
     assert_eq!(db.get(b"z").unwrap(), Some(b"keep_after".to_vec()));
+}
+
+/// The sequence API is what lets an upper layer order its own versions against
+/// lark's without holding a lock across a commit: the horizon publishes inside
+/// the write, and a snapshot captures it atomically.
+#[test]
+fn sequences_order_snapshots_against_commits() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open(dir.path(), Options::default()).unwrap();
+
+    let before = db.latest_sequence();
+    let snap_before = db.snapshot();
+    assert_eq!(snap_before.sequence(), before);
+
+    let mut batch = WriteBatch::new();
+    batch.put(b"a", b"1");
+    batch.put(b"b", b"2");
+    let commit = db.write_sequenced(batch).unwrap();
+    assert!(commit > before, "a commit must advance the horizon");
+
+    // The snapshot taken before the commit must not see it, and must still
+    // report its own older sequence.
+    assert_eq!(snap_before.sequence(), before);
+    assert_eq!(snap_before.get(b"a").unwrap(), None);
+
+    // One taken after sees it, and reports at least the commit sequence.
+    let snap_after = db.snapshot();
+    assert!(snap_after.sequence() >= commit);
+    assert_eq!(snap_after.get(b"a").unwrap(), Some(b"1".to_vec()));
+
+    // An empty batch commits nothing and reports the current horizon.
+    let idle = db.write_sequenced(WriteBatch::new()).unwrap();
+    assert_eq!(idle, db.latest_sequence());
+}
+
+/// Concurrent writers must each learn the sequence their own batch landed at,
+/// and those sequences must be distinct: that is what removes the need for an
+/// external commit lock.
+#[test]
+fn concurrent_commits_report_distinct_sequences() {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    let db = Arc::new(Db::open(dir.path(), Options::default()).unwrap());
+    let mut handles = Vec::new();
+    for t in 0..8u32 {
+        let db = Arc::clone(&db);
+        handles.push(std::thread::spawn(move || {
+            let mut seqs = Vec::new();
+            for i in 0..50u32 {
+                let mut batch = WriteBatch::new();
+                batch.put(format!("k{t}_{i}").as_bytes(), b"v");
+                seqs.push(db.write_sequenced(batch).unwrap());
+            }
+            seqs
+        }));
+    }
+    let all: Vec<u64> = handles
+        .into_iter()
+        .flat_map(|h| h.join().unwrap())
+        .collect();
+    let unique: HashSet<u64> = all.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        all.len(),
+        "every commit must get its own sequence"
+    );
+    assert_eq!(db.latest_sequence(), *all.iter().max().unwrap());
 }

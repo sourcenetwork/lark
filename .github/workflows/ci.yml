@@ -3,10 +3,12 @@ name: CI
 on:
   push:
     branches: [main]
+  # Every branch, not just `main`. The work ships as a stack, so every
+  # PR but the bottom one targets another PR's branch; restricting the
+  # trigger to `main` meant CI never ran on any of them.
   pull_request:
-    branches: [main]
   schedule:
-    # Nightly at 07:00 UTC — drives the long-running stress/soak jobs.
+    # Nightly at 07:00 UTC - drives the long-running stress/soak jobs.
     - cron: '0 7 * * *'
   workflow_dispatch:
 
@@ -25,7 +27,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      - uses: extractions/setup-just@v2
+      - run: just test
 
   clippy:
     runs-on: ubuntu-latest
@@ -35,7 +38,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - uses: extractions/setup-just@v2
+      - run: just lint
 
   fmt:
     runs-on: ubuntu-latest
@@ -44,7 +48,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      - uses: extractions/setup-just@v2
+      - run: just fmt
 
   doc:
     runs-on: ubuntu-latest
@@ -54,15 +59,175 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --workspace --no-deps
+      - uses: extractions/setup-just@v2
+      - run: just doc
 
+  alloc-budget:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Exits non-zero the moment a hot path allocates more per
+      # operation than its budget.
+      - run: cargo bench --bench allocs
+
+  # Model-checks the arena memtable's publication protocol, the flush
+  # and compaction version handoffs, and the engine's read horizon under
+  # every interleaving loom can reach. The models live in
+  # `src/engine/loom_model/`; `--cfg loom` is what swaps the memtable's
+  # atomics for loom's instrumented ones. Cheap enough to run on every
+  # pull request: both profiles together are under four minutes.
+  #
+  # Both profiles run, and neither is redundant. Release explores the
+  # larger search on the biggest model. Debug is where the skip list's
+  # single-writer guard (invariant S2) exists at all, because it is a
+  # `debug_assert`, so the calibration that proves the guard fires on an
+  # unserialized insert only runs there.
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.82
+      - uses: dtolnay/rust-toolchain@1.90
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace
+      - uses: extractions/setup-just@v2
+      - run: just msrv
+
+  # wasm32-wasip1 is a supported target, not a target that merely
+  # compiles. This job builds the probe and runs the whole database
+  # lifecycle under wasmtime with a host preopen - open, put, get,
+  # delete, batch, scan, snapshot, iterate, compact, close, reopen,
+  # read back - and the probe exits non-zero on the first byte that
+  # does not match what it wrote. The sustained phase then writes past
+  # the L0 stop trigger with a 32 KiB memtable and no explicit
+  # compaction, which is the case that wedges when nothing compacts on
+  # the calling thread.
+  wasm-wasip1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+      # Installs the current wasmtime release. The numbers in this
+      # job's summary were first measured against 47.0.3.
+      - uses: bytecodealliance/actions/wasmtime/setup@v1
+      - name: Build the probe for wasm32-wasip1
+        run: cargo build --release -p lark-wasm-probe --target wasm32-wasip1
+      - name: Full lifecycle under wasmtime
+        run: |
+          set -euo pipefail
+          d=$(mktemp -d)
+          wasmtime run --dir="$d::/data" \
+            target/wasm32-wasip1/release/lark-wasm-probe.wasm -- \
+            --profile embedded --records 5000 --sustained 20000 \
+            --probe-host --report-memory | tee wasip1-probe.txt
+          rm -rf "$d"
+      - name: Publish the wasm linear-memory high-water mark
+        run: |
+          {
+            echo "## wasm32-wasip1"
+            echo ""
+            echo '```'
+            cat wasip1-probe.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Tier A embedded: Linux-class targets with std (Cortex-A boards,
+  # ESP32-S3 under esp-idf). These compile today, and nothing stopped
+  # them regressing - a new `cfg(unix)` dependency or a
+  # `target_os = "linux"` assumption would break them silently between
+  # releases. Checking the examples too keeps the embedded measuring
+  # harness itself cross-compilable.
+  embedded-tier-a:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the library and tools
+        run: cargo check --workspace --target ${{ matrix.target }}
+      - name: Check the examples
+        run: cargo check --examples --target ${{ matrix.target }}
+
+  # The embedded budget is a measured claim, so it is re-measured on
+  # every run rather than quoted from a README. Both figures land in
+  # the job summary: memory high-water through a full lifecycle, and
+  # worst-case stack depth per code path.
+  embedded-budget:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v2
+      - name: Add the wasm target
+        run: rustup target add wasm32-wasip1
+      - uses: bytecodealliance/actions/wasmtime/setup@v1
+      - name: Memory high-water, every profile on both hosts
+        run: |
+          set -euo pipefail
+          just wasm-budget 20000 | tee profile-memory.txt
+      - name: Worst-case stack depth per path
+        run: |
+          set -euo pipefail
+          cargo run --release --example stack_depth -- \
+            "$RUNNER_TEMP/lark-stack" | tee stack-depth.txt
+      - name: Publish the embedded budget
+        run: |
+          {
+            echo "## Embedded budget"
+            echo ""
+            echo "### Memory high-water: embedded, wasm and default, on x86_64 and wasm32-wasip1"
+            echo '```'
+            cat profile-memory.txt
+            echo '```'
+            echo "### Stack depth"
+            echo '```'
+            cat stack-depth.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Loom model checking. Exhaustive over the C11 interleavings the
+  # memtable's publication protocol and the read horizon permit, which
+  # no amount of stress testing covers. Both profiles run: the skip
+  # list's single-writer guard is a `debug_assert`, so its calibration
+  # only exists in a debug build.
+  loom:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v2
+      - name: Loom models, release and debug
+        run: just loom-all
+
+  # The read-view chaos workload at full size. `cargo test` runs a smaller
+  # default so the ordinary gate stays fast; this job is what covers
+  # the full one.
+  chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v2
+      - name: Chaos workload, full size
+        run: just chaos
 
   deny:
     runs-on: ubuntu-latest
@@ -82,7 +247,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Run coverage
-        run: cargo llvm-cov --summary-only | tee coverage-summary.txt
+        run: just cov-summary | tee coverage-summary.txt
       - name: Publish coverage summary
         run: |
           {
@@ -97,7 +262,7 @@ jobs:
           # Pulls the percentage off the TOTAL row of `cargo llvm-cov`'s
           # summary table. The line-coverage column is the 10th field
           # (Filename, Regions, Missed, Cover, Functions, Missed, Cover,
-          # Lines, Missed, Cover). Soft gate — emits an annotation but
+          # Lines, Missed, Cover). Soft gate - emits an annotation but
           # never fails the job.
           total=$(awk '/^TOTAL/ {gsub("%", "", $10); print $10}' coverage-summary.txt)
           if [ -z "$total" ]; then
@@ -108,10 +273,52 @@ jobs:
             && echo "::warning::line coverage $total% is below the 90% soft floor" \
             || echo "line coverage $total% ≥ 90% ✓"
 
+  # Miri over the modules that carry the crate's `unsafe`: the arena's
+  # chunk layout and bump arithmetic, the skip list's node layout and
+  # publication, the memtable's arena-backed slices, and the block
+  # decoder. Interpreted execution is orders of magnitude slower than
+  # native, so this runs on the nightly schedule rather than per pull
+  # request. Two things are scaled down under `cfg(miri)` in the tests
+  # themselves, with every assertion left intact: the two spinning-reader
+  # stress tests are `#[ignore]`d in favour of an interpreter-sized
+  # equivalent, and the arena's multi-megabyte fills use a smaller
+  # budget.
+  miri:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      # Kovan's flag set, run the way kovan's own CI runs it, because
+      # `kovan-queue` backs the arena's chunk pool. Each flag is there
+      # for something miri cannot model rather than for a defect:
+      # `tree-borrows` because miri's default Stacked Borrows model
+      # rejects the pointer provenance a deferred-reclamation scheme
+      # uses, `ignore-leaks` because such a scheme defers frees by
+      # design and may legitimately still hold retired entries at exit,
+      # `permissive-provenance` for its int-to-pointer tagged pointers,
+      # and `+cmpxchg16b` for its double-width CAS, which miri cannot
+      # emulate in doctests - hence `--lib` only.
+      #
+      # Measured on this tree: lark's own modules also pass under miri's
+      # bare defaults, the arena tests that exercise `kovan-queue`'s ring
+      # included. These flags are headroom against kovan's internals, not
+      # cover for anything here, and a finding that originates inside
+      # kovan does not block this crate.
+      MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-ignore-leaks -Zmiri-tree-borrows
+      RUSTFLAGS: -C target-feature=+cmpxchg16b -D warnings
+      PROPTEST_CASES: '4'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - run: "cargo miri test --lib -- --test-threads=1 engine::arena:: engine::skiplist:: engine::memtable:: engine::block:: slice::tests::"
+
   # Long-running stress, soak, and fault-injection tests. Gated behind
   # `#[ignore]` in the main crate so `cargo test` stays fast for PRs;
   # this job unlocks them via `--ignored`. Runs on the nightly schedule,
-  # manual dispatch, or direct pushes to `main` — never on PRs.
+  # manual dispatch, or direct pushes to `main`, never on PRs.
   nightly-stress:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -121,4 +328,231 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run ignored tests (stress / soak / concurrency)
-        run: cargo test --workspace --release -- --ignored --nocapture
+        run: just test-slow
+
+  # Durability, split out from `test` because it fails for different
+  # reasons and is worth reading on its own: crash recovery, power loss,
+  # the fault shim, the lifecycle sweep and the MVCC invariants.
+  durability:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Crash recovery
+        run: just test-crash
+      - name: Power loss
+        run: just test-power
+      - name: Fault injection smoke
+        run: just test-fault
+      - name: Lifecycle
+        run: just test-lifecycle
+      - name: MVCC invariants
+        run: just mvcc
+
+  # The exhaustive halves of the same families. Every truncation offset
+  # and every bit flip is a large cross product, so these run nightly
+  # rather than on every PR.
+  durability-exhaustive:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Exhaustive corruption sweep
+        run: just test-corruption-slow
+      - name: Model-based durability proptest
+        run: just test-durability-slow
+      - name: Resource limits
+        run: just test-extremes
+
+  # Browser wasm. `wasm-wasip1` above covers the wasi target, which has a
+  # real `std::fs`; this covers `wasm32-unknown-unknown`, which has no
+  # filesystem at all and reaches storage through OPFS. OPFS's
+  # `createSyncAccessHandle` only exists inside a Web Worker, so there is
+  # no way to exercise it without a real browser.
+  wasm-browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: jetli/wasm-pack-action@v0.4.0
+      - name: OPFS round trip in headless Firefox
+        run: just wasm-browser
+
+  # Fuzz targets, smoke-run for a bounded time so a harness that stopped
+  # building is caught. Finding new crashes is the nightly job's work,
+  # not a gate on a PR.
+  fuzz:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_wal_decoder
+          - fuzz_sst_decoder
+          - fuzz_block_decoder
+          - fuzz_manifest_decoder
+          - fuzz_range_tombstone_decoder
+          - fuzz_writebatch
+          - fuzz_api_ops
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-fuzz --locked
+      - name: Fuzz ${{ matrix.target }}
+        run: just fuzz ${{ matrix.target }} 300
+
+  # Elle consistency checking. Its own job because it needs a JVM and the
+  # elle-cli distribution, and because it fails for a reason nothing else
+  # does: a history whose dependency graph has a cycle.
+  #
+  # elle-cli is not vendored (37 MB), so the job fetches a pinned release.
+  elle:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: extractions/setup-just@v2
+      - name: Fetch elle-cli
+        run: |
+          set -euo pipefail
+          v=0.1.7
+          curl -fsSL -o /tmp/elle-cli.zip \
+            "https://github.com/ligurio/elle-cli/releases/download/${v}/elle-cli-bin-${v}.zip"
+          unzip -q -o /tmp/elle-cli.zip -d /tmp/elle-cli
+          find /tmp/elle-cli -name '*.jar' -exec cp {} harness/elle/elle-cli.jar \;
+          test -s harness/elle/elle-cli.jar
+      - name: Every isolation level lark claims
+        run: just elle-matrix
+
+  # The performance artifact: one self-contained HTML page per commit on
+  # main, keyed by its sha and downloadable from the run.
+  #
+  # Last because it depends on everything above passing: publishing a
+  # perf page for a build whose tests failed invites reading numbers off
+  # a broken engine. Retention is 30 runs' worth of days rather than a
+  # count, which is the only retention GitHub offers; the prune step
+  # below deletes older ones explicitly so the count is what was asked
+  # for rather than what the calendar happened to leave.
+  # Each family on its own runner. A sweep that runs every benchmark in
+  # one job takes as long as the sum of them and reports nothing until
+  # the slowest finishes; split, the wall clock is the slowest single
+  # family and a failure names which one.
+  bench:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, clippy, fmt, doc, deny]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        family:
+          - point_read
+          - write_buffered
+          - write_durable
+          - scan
+          - batch
+          - large_value
+          - transaction
+          - memory
+          - size
+          - allocs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v2
+      - name: Refuse to measure a busy runner
+        id: guard
+        run: just loadguard
+        continue-on-error: true
+      - name: Run ${{ matrix.family }}
+        env:
+          LARK_BENCH_OUT: ${{ github.workspace }}/bench-${{ matrix.family }}.jsonl
+        run: cargo bench --bench ${{ matrix.family }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.family }}
+          path: bench-${{ matrix.family }}.jsonl
+          if-no-files-found: error
+          retention-days: 7
+
+  # Assemble every family into one run document, file it alongside every
+  # earlier run, and publish the dashboard that reads the whole set.
+  #
+  # The run documents are the artifact, not a rendered page. A page
+  # regenerated per run shows one run and loses the comparison the
+  # moment it is replaced; keeping the documents is what lets the
+  # dashboard plot a metric across every run ever recorded.
+  perf-site:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [bench]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bench-*
+          path: bench-artifacts
+          merge-multiple: true
+      - name: Assemble the run document
+        run: |
+          set -euo pipefail
+          cat bench-artifacts/*.jsonl > bench-out.jsonl
+          LARK_BENCH_OUT="$PWD/bench-out.jsonl" \
+            cargo run --release --bench collect -- \
+              --out "run-${GITHUB_SHA::12}.json" \
+              --commit "${GITHUB_SHA}" --label main
+      - name: Fetch the runs already published
+        run: |
+          set -euo pipefail
+          mkdir -p site
+          # `keep_files` on the publish step preserves what is already
+          # there, so only this run's document has to be produced here.
+          cp tools/perf-site/index.html site/index.html
+      - name: Fetch the existing history
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          git fetch origin gh-pages --depth=1
+          git --work-tree=site checkout origin/gh-pages -- runs 2>/dev/null || true
+      - name: File this run
+        run: python3 tools/perf-site/publish.py "run-${GITHUB_SHA::12}.json" site
+      - name: Publish
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          publish_branch: gh-pages
+          keep_files: true
+          commit_message: "perf: record run ${{ github.sha }}"
+      - name: Link
+        run: |
+          {
+            echo "## Performance dashboard"
+            echo ""
+            echo "https://${GITHUB_REPOSITORY%%/*}.github.io/${GITHUB_REPOSITORY##*/}/"
+          } >> "$GITHUB_STEP_SUMMARY"

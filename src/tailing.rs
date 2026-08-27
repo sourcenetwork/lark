@@ -6,8 +6,8 @@
 //!
 //! A standard [`crate::Iter`] captures an `Arc<Version>` at creation
 //! time, plus the set of active and frozen memtables. That pin
-//! gives it snapshot isolation — any flush, compaction, or new
-//! write after creation is invisible — at the cost of missing
+//! gives it snapshot isolation - any flush, compaction, or new
+//! write after creation is invisible - at the cost of missing
 //! later activity.
 //!
 //! A [`TailingIter`] holds an engine handle and, on top of that,
@@ -25,8 +25,8 @@
 //!   guarantees forward progress even after a refresh.
 //! * **Writes to keys sorted _before_ the current position are
 //!   permanently skipped.** That matches the typical tailing
-//!   workload — appending to a log at monotonically increasing
-//!   keys — and preserves the strict-ordering guarantee.
+//!   workload - appending to a log at monotonically increasing
+//!   keys - and preserves the strict-ordering guarantee.
 //!
 //! Tailing iterators are forward-only. There is no `prev` /
 //! `seek_for_prev` / `seek_to_last`, since reverse iteration
@@ -38,17 +38,17 @@
 //! Callers that want to see writes that arrived between the
 //! iterator's current position and the end of its current view
 //! can call [`TailingIter::refresh`] to force a rebuild. This is
-//! cheap — a few `Arc::clone` calls plus an in-memory merge-iter
-//! reconstruction — but not free, so tight polling loops should
+//! cheap - a few `Arc::clone` calls plus an in-memory merge-iter
+//! reconstruction - but not free, so tight polling loops should
 //! prefer to drain to exhaustion first and then refresh.
 
 use std::sync::Arc;
 
-use crate::column_family::{cf_upper_bound, prefix_key, ColumnFamilyHandle, DEFAULT_CF_ID};
-use crate::engine::iterator::LarkIterator;
-use crate::engine::LarkEngine;
-use crate::statistics::{Histogram, Statistics, Ticker, TimeScope};
 use crate::Result;
+use crate::column_family::{ColumnFamilyHandle, DEFAULT_CF_ID, cf_upper_bound, prefix_key};
+use crate::engine::LarkEngine;
+use crate::engine::iterator::LarkIterator;
+use crate::statistics::{Histogram, Statistics, Ticker, TimeScope};
 
 /// Forward-only tailing iterator. See the module docs.
 ///
@@ -59,7 +59,7 @@ use crate::Result;
 pub struct TailingIter {
     engine: Arc<LarkEngine>,
     inner: LarkIterator,
-    /// User key (with the CF prefix still attached — we match on
+    /// User key (with the CF prefix still attached - we match on
     /// the internal representation) of the most recently emitted
     /// entry. Used by [`Self::refresh`] to position the rebuilt
     /// cursor strictly past what the caller has already seen.
@@ -82,7 +82,7 @@ pub struct TailingIter {
 
 impl TailingIter {
     pub(crate) fn new(engine: Arc<LarkEngine>, cf_id: u32) -> Self {
-        let inner = engine.new_iter(u64::MAX);
+        let inner = engine.new_iter_at(u64::MAX);
         let stats = engine.statistics_arc();
         Self {
             engine,
@@ -163,7 +163,7 @@ impl TailingIter {
         }
 
         if !self.inner.valid() || !self.within_cf() {
-            // Current view exhausted. Try a refresh — this picks
+            // Current view exhausted. Try a refresh - this picks
             // up memtable rotations, L0 flushes, and anything
             // else that landed after the previous view was
             // captured. `refresh_and_reseek` handles the
@@ -194,7 +194,7 @@ impl TailingIter {
     fn refresh_and_reseek(&mut self) {
         // Rebuild the merging iterator against the engine's
         // latest `(active, frozen, version)` tuple.
-        self.inner = self.engine.new_iter(u64::MAX);
+        self.inner = self.engine.new_iter_at(u64::MAX);
 
         // Position strictly past the last key we already emitted.
         // If we haven't emitted anything yet, seek to the start
@@ -219,10 +219,11 @@ impl TailingIter {
     }
 
     fn record_current(&mut self) {
-        if self.inner.valid() && self.within_cf() {
-            if let Some(k) = self.inner.key() {
-                self.last_returned = Some(k.to_vec());
-            }
+        if self.inner.valid()
+            && self.within_cf()
+            && let Some(k) = self.inner.key()
+        {
+            self.last_returned = Some(k.to_vec());
         }
     }
 
@@ -268,7 +269,7 @@ impl TailingIter {
     }
 }
 
-/// Helper called from `Db::iter_tailing` — defaults to the default
+/// Helper called from `Db::iter_tailing` - defaults to the default
 /// column family so the common case doesn't need to pass a handle.
 pub(crate) fn new_default(engine: Arc<LarkEngine>) -> TailingIter {
     TailingIter::new(engine, DEFAULT_CF_ID)

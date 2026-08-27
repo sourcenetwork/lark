@@ -17,15 +17,21 @@
 //! entries flow through compaction, any whose embedded timestamp is
 //! older than the TTL is dropped.
 
+use crate::env::Env;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::options::{CompactionDecision, CompactionFilter};
-use crate::{Db, Error, Options, Result, WriteBatch, WriteBatchOp};
+use crate::{Db, DbSlice, Options, Result, WriteBatch, WriteBatchOp};
 
 const LEGACY_TS_LEN: usize = 4;
-const TTL_MAGIC: [u8; 4] = *b"LTTL";
+/// Identifier stamped into a TTL-carrying value. Values written by an
+/// earlier build carry `LTTL` and are still read, so a TTL database
+/// opens and migrates as its values are rewritten.
+const TTL_MAGIC: [u8; 4] = *b"RTTL";
+
+/// The identifier earlier builds wrote. Read, never written.
+const TTL_MAGIC_LEGACY: [u8; 4] = *b"LTTL";
 const TTL_MAGIC_LEN: usize = 4;
 const TTL_FORMAT_VERSION: u8 = 1;
 const TTL_TS_LEN: usize = 8;
@@ -35,12 +41,13 @@ const TTL_SUFFIX_LEN: usize = TTL_MAGIC_LEN + 1 + TTL_TS_LEN;
 /// value. Entries whose embedded timestamp is older than `ttl_seconds`
 /// read as `None` and are physically reclaimed at the next compaction.
 ///
-/// `ttl_seconds == 0` disables expiration entirely — the wrapper still
+/// `ttl_seconds == 0` disables expiration entirely - the wrapper still
 /// appends the TTL suffix for format consistency, but the filter
 /// keeps every entry and reads never treat any value as expired.
 pub struct DbWithTtl {
     inner: Db,
     ttl_seconds: u64,
+    env: Arc<dyn Env>,
 }
 
 impl std::fmt::Debug for DbWithTtl {
@@ -63,16 +70,45 @@ impl DbWithTtl {
                 "DbWithTtl::open replaces the caller's compaction_filter with TtlCompactionFilter"
             );
         }
-        opts.compaction_filter = Some(Arc::new(TtlCompactionFilter { ttl_seconds }));
+        // Every value carries a wall-clock stamp, so an environment
+        // without a wall clock cannot serve this wrapper at all. Say
+        // so at open rather than stamping every write with the epoch
+        // and expiring the whole database on the first compaction.
+        let env = Arc::clone(&opts.env);
+        if env.unix_secs().is_none() {
+            return Err(crate::Error::invalid_argument(
+                "a TTL database needs a wall clock, and this Env has none",
+            ));
+        }
+        opts.compaction_filter = Some(Arc::new(TtlCompactionFilter {
+            ttl_seconds,
+            env: Arc::clone(&env),
+        }));
         let inner = Db::open(path, opts)?;
-        Ok(Self { inner, ttl_seconds })
+        Ok(Self {
+            inner,
+            ttl_seconds,
+            env,
+        })
+    }
+
+    /// Seconds since the Unix epoch, from the environment this
+    /// database was opened on.
+    ///
+    /// [`DbWithTtl::open`] refuses an environment without a wall
+    /// clock, so this only reports an error if the host stopped
+    /// providing one after open.
+    fn now_seconds(&self) -> Result<u64> {
+        self.env.unix_secs().ok_or_else(|| {
+            crate::Error::invalid_argument("the TTL database's Env stopped reporting a wall clock")
+        })
     }
 
     /// Write `key → value` with the current wall-clock timestamp
     /// appended. The in-memory value is the stamped form until a
     /// matching [`DbWithTtl::get`] strips it off.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        let stamped = stamp(value, now_seconds());
+        let stamped = stamp(value, self.now_seconds()?);
         self.inner.put(key, &stamped)
     }
 
@@ -81,13 +117,33 @@ impl DbWithTtl {
     /// trailing TTL suffix is always stripped from the returned value.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         match self.inner.get(key)? {
-            Some(stamped) => Ok(self.filter_expired(stamped)),
+            Some(stamped) => self.filter_expired(stamped),
             None => Ok(None),
         }
     }
 
+    /// [`DbWithTtl::get`] without copying the value.
+    ///
+    /// The TTL suffix is dropped by narrowing the view, so the result
+    /// still borrows the bytes the database already owns. Same absence
+    /// semantics as [`DbWithTtl::get`]: an expired entry, and a value
+    /// with no decodable TTL suffix, both read as `Ok(None)`.
+    pub fn get_slice(&self, key: &[u8]) -> Result<Option<DbSlice>> {
+        let Some(stamped) = self.inner.get_slice(key)? else {
+            return Ok(None);
+        };
+        let Some(decoded) = decode_ttl_suffix(stamped.as_slice()) else {
+            return Ok(None);
+        };
+        let horizon = self.expiry_horizon()?;
+        if horizon > 0 && decoded.timestamp < horizon {
+            return Ok(None);
+        }
+        Ok(stamped.try_subslice(0..decoded.value_len))
+    }
+
     /// Delete `key`. Range deletes are delegated to the inner
-    /// [`Db::delete`] — tombstones don't carry timestamps.
+    /// [`Db::delete`] - tombstones don't carry timestamps.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         self.inner.delete(key)
     }
@@ -107,7 +163,7 @@ impl DbWithTtl {
         end: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let raw = self.inner.scan(start, end)?;
-        let horizon = self.expiry_horizon();
+        let horizon = self.expiry_horizon()?;
         let mut out = Vec::with_capacity(raw.len());
         for (k, stamped) in raw {
             if let Some(v) = strip_if_live(stamped, horizon) {
@@ -124,7 +180,7 @@ impl DbWithTtl {
     /// The input batch's original contents are consumed and the
     /// stamped/delegated version is applied.
     pub fn write(&self, batch: WriteBatch) -> Result<()> {
-        let ts = now_seconds();
+        let ts = self.now_seconds()?;
         let mut stamped_batch = WriteBatch::new();
         // Source batch keys are already CF-prefixed by the public
         // `put`/`delete`/... methods. Pass them through via raw
@@ -152,7 +208,7 @@ impl DbWithTtl {
     /// not wrap (streaming iterator, snapshots, compact_range).
     ///
     /// Values read through the inner `Db` still carry their trailing
-    /// TTL suffix — callers are responsible for stripping it via
+    /// TTL suffix - callers are responsible for stripping it via
     /// [`strip_timestamp`] if they want the user payload.
     pub fn inner(&self) -> &Db {
         &self.inner
@@ -173,16 +229,15 @@ impl DbWithTtl {
     /// Compute the "entries written before this Unix second have
     /// expired" threshold. Returns `0` when `ttl_seconds == 0` so
     /// every timestamp compares as live.
-    fn expiry_horizon(&self) -> u64 {
+    fn expiry_horizon(&self) -> Result<u64> {
         if self.ttl_seconds == 0 {
-            return 0;
+            return Ok(0);
         }
-        let now = now_seconds();
-        now.saturating_sub(self.ttl_seconds)
+        Ok(self.now_seconds()?.saturating_sub(self.ttl_seconds))
     }
 
-    fn filter_expired(&self, stamped: Vec<u8>) -> Option<Vec<u8>> {
-        strip_if_live(stamped, self.expiry_horizon())
+    fn filter_expired(&self, stamped: Vec<u8>) -> Result<Option<Vec<u8>>> {
+        Ok(strip_if_live(stamped, self.expiry_horizon()?))
     }
 }
 
@@ -219,11 +274,10 @@ fn timestamp_of(stamped: &[u8]) -> Option<u64> {
     decode_ttl_suffix(stamped).map(|decoded| decoded.timestamp)
 }
 
+/// Seconds since the Unix epoch from the standard environment.
+#[cfg(test)]
 fn now_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    crate::env::std_env().unix_secs().unwrap_or(0)
 }
 
 struct DecodedTtlSuffix {
@@ -235,7 +289,8 @@ fn decode_ttl_suffix(stamped: &[u8]) -> Option<DecodedTtlSuffix> {
     if stamped.len() >= TTL_SUFFIX_LEN {
         let suffix_start = stamped.len() - TTL_SUFFIX_LEN;
         let suffix = &stamped[suffix_start..];
-        if suffix[..TTL_MAGIC_LEN] == TTL_MAGIC {
+        let magic: [u8; TTL_MAGIC_LEN] = suffix[..TTL_MAGIC_LEN].try_into().unwrap();
+        if magic == TTL_MAGIC || magic == TTL_MAGIC_LEGACY {
             if suffix[TTL_MAGIC_LEN] != TTL_FORMAT_VERSION {
                 return None;
             }
@@ -270,14 +325,25 @@ fn decode_ttl_suffix(stamped: &[u8]) -> Option<DecodedTtlSuffix> {
 /// standalone if a caller prefers to manage the wrapper themselves.
 pub struct TtlCompactionFilter {
     ttl_seconds: u64,
+    env: Arc<dyn Env>,
 }
 
 impl TtlCompactionFilter {
     /// Construct a filter that expires values older than
-    /// `ttl_seconds`. A TTL of `0` is a no-op: every entry is kept
+    /// `ttl_seconds`, reading the wall clock from the standard
+    /// environment. A TTL of `0` is a no-op: every entry is kept
     /// regardless of its timestamp.
     pub fn new(ttl_seconds: u64) -> Self {
-        Self { ttl_seconds }
+        Self::with_env(ttl_seconds, crate::env::std_env())
+    }
+
+    /// Construct a filter that reads its wall clock from `env`.
+    ///
+    /// Match this to the [`crate::Options::env`] of the database the
+    /// filter is installed on, so compaction and the read path agree
+    /// on what "now" means.
+    pub fn with_env(ttl_seconds: u64, env: Arc<dyn Env>) -> Self {
+        Self { ttl_seconds, env }
     }
 }
 
@@ -289,7 +355,12 @@ impl CompactionFilter for TtlCompactionFilter {
         let Some(ts) = timestamp_of(value) else {
             return CompactionDecision::Keep;
         };
-        let now = now_seconds();
+        // No wall clock means nothing can be shown to have expired,
+        // so everything is kept. Dropping data on a guess is the one
+        // outcome this filter must never produce.
+        let Some(now) = self.env.unix_secs() else {
+            return CompactionDecision::Keep;
+        };
         // Saturating arithmetic so a clock skew into the past does
         // not accidentally expire everything.
         let horizon = now.saturating_sub(self.ttl_seconds);
@@ -317,9 +388,6 @@ impl WriteBatch {
 }
 
 // `Error` is plumbed via `crate::Result`; silence unused-import lint
-// in case Error becomes unreferenced after a future refactor.
-#[allow(dead_code)]
-type _ErrorAlias = Error;
 
 #[cfg(test)]
 mod tests {
@@ -507,6 +575,43 @@ mod tests {
             filter.filter(0, b"k", &legacy_stamp(b"stale", 1)),
             CompactionDecision::Remove
         );
+    }
+
+    #[test]
+    fn get_slice_strips_the_suffix_without_copying() {
+        let dir = TempDir::new().unwrap();
+        let db = DbWithTtl::open(dir.path(), tiny_opts(), 0).unwrap();
+        db.put(b"k", b"payload").unwrap();
+
+        let slice = db.get_slice(b"k").unwrap().expect("present");
+        assert_eq!(slice.as_slice(), b"payload");
+        assert_eq!(Some(slice.to_vec()), db.get(b"k").unwrap());
+        assert_eq!(db.get_slice(b"absent").unwrap(), None);
+    }
+
+    #[test]
+    fn get_slice_hides_an_expired_entry() {
+        let dir = TempDir::new().unwrap();
+        let db = DbWithTtl::open(dir.path(), tiny_opts(), 1).unwrap();
+        // Write straight through the inner `Db` with an ancient stamp so
+        // the test does not have to wait a wall-clock second.
+        db.inner()
+            .put(
+                b"stale",
+                &stamp(b"payload", now_seconds().saturating_sub(1000)),
+            )
+            .unwrap();
+        assert_eq!(db.get_slice(b"stale").unwrap(), None);
+        assert_eq!(db.get(b"stale").unwrap(), None);
+    }
+
+    #[test]
+    fn get_slice_hides_a_value_too_short_to_carry_a_suffix() {
+        let dir = TempDir::new().unwrap();
+        let db = DbWithTtl::open(dir.path(), tiny_opts(), 0).unwrap();
+        db.inner().put(b"raw", b"ab").unwrap();
+        assert_eq!(db.get_slice(b"raw").unwrap(), None);
+        assert_eq!(db.get(b"raw").unwrap(), None);
     }
 
     #[test]

@@ -11,8 +11,9 @@
 //! offset as a restart point, enabling binary search within the block.
 
 use std::io;
+use std::ops::ControlFlow;
 
-use super::internal_key::compare_internal_keys;
+use super::internal_key::{INTERNAL_KEY_SUFFIX_LEN, compare_internal_keys};
 
 /// Entries per restart point. Smaller = faster lookups, larger = better compression.
 pub(crate) const RESTART_INTERVAL: usize = 16;
@@ -32,7 +33,28 @@ pub(crate) struct Block {
 }
 
 impl Block {
+    /// Decode a block whose entry keys are opaque bytes.
+    ///
+    /// Only unit tests build blocks this way. Every production path
+    /// reads SSTable data blocks and must go through
+    /// [`Block::decode_data_block`], which additionally enforces the
+    /// internal-key shape that the decoders downstream assume.
+    #[cfg(test)]
     pub(crate) fn decode(data: Vec<u8>) -> io::Result<Self> {
+        Self::decode_inner(data, false)
+    }
+
+    /// Decode an SSTable data block.
+    ///
+    /// Rejects any entry whose key is shorter than
+    /// [`INTERNAL_KEY_SUFFIX_LEN`], so a truncated, tampered, or
+    /// foreign-produced file cannot hand a short key to
+    /// `decode_internal_key`, which indexes the trailer directly.
+    pub(crate) fn decode_data_block(data: Vec<u8>) -> io::Result<Self> {
+        Self::decode_inner(data, true)
+    }
+
+    fn decode_inner(data: Vec<u8>, require_internal_keys: bool) -> io::Result<Self> {
         if data.len() < 4 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -60,7 +82,7 @@ impl Block {
                 data[offset..offset + 4].try_into().unwrap(),
             ));
         }
-        validate_restarts_and_entries(&data[..entries_end], &restarts)?;
+        validate_restarts_and_entries(&data[..entries_end], &restarts, require_internal_keys)?;
 
         Ok(Self {
             data,
@@ -94,6 +116,62 @@ impl Block {
         self.restarts[idx] as usize
     }
 
+    /// Borrow `offset..offset + len` of the block's entry region.
+    ///
+    /// Returns `None` when the range escapes that region, so a value
+    /// handle recovered from a corrupt block can never widen into the
+    /// restart array or past the buffer.
+    pub(crate) fn entry_bytes(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        let end = offset.checked_add(len)?;
+        if end > self.entries_end {
+            return None;
+        }
+        self.data.get(offset..end)
+    }
+
+    /// Scan forward from the restart point covering `target`, invoking
+    /// `f` with each entry's reconstructed key and the position of its
+    /// **borrowed** value inside the entry region.
+    ///
+    /// Returns as soon as `f` yields [`ControlFlow::Break`], or `None`
+    /// when the block is exhausted. Keys are reconstructed into
+    /// `key_buf`, which the caller owns and reuses across blocks, so a
+    /// scan allocates nothing once that buffer has grown.
+    ///
+    /// The closure receives `(key, value_offset, value_len)` rather than
+    /// a value slice so it can build an owning view over the whole block
+    /// (see [`crate::DbSlice`]) without holding a borrow of it.
+    pub(crate) fn scan_from<F, R>(
+        &self,
+        target: &[u8],
+        key_buf: &mut Vec<u8>,
+        mut f: F,
+    ) -> Option<R>
+    where
+        F: FnMut(&[u8], usize, usize) -> ControlFlow<R>,
+    {
+        let data = self.entry_data();
+        let mut pos = self.restart_start_for(target);
+        // Restart entries never share a prefix, so an empty buffer is
+        // the correct starting state for the walk.
+        key_buf.clear();
+        let mut below_target = true;
+        while pos < data.len() {
+            let (consumed, value_offset, value_len) = decode_entry_at(data, pos, key_buf);
+            pos += consumed;
+            if below_target {
+                if compare_internal_keys(key_buf, target).is_lt() {
+                    continue;
+                }
+                below_target = false;
+            }
+            if let ControlFlow::Break(result) = f(key_buf, value_offset, value_len) {
+                return Some(result);
+            }
+        }
+        None
+    }
+
     /// Iterate all entries in this block in sorted order.
     #[cfg(test)]
     pub(crate) fn iter(&self) -> BlockIterator<'_> {
@@ -108,8 +186,12 @@ impl Block {
     /// Iterate entries starting at the first key `>= target`.
     ///
     /// The iterator begins at the restart point immediately before
-    /// `target` and skips entries until the lower bound is reached. The
-    /// skipped entries only reconstruct keys; their values are not copied.
+    /// `target` and skips entries until the lower bound is reached.
+    ///
+    /// Copies every key and value it yields. The read paths use
+    /// [`Block::scan_from`] instead, which borrows; this is retained for
+    /// the block round-trip tests.
+    #[cfg(test)]
     pub(crate) fn iter_from<'a>(&'a self, target: &'a [u8]) -> BlockIterator<'a> {
         BlockIterator {
             data: self.entry_data(),
@@ -120,46 +202,26 @@ impl Block {
     }
 
     /// Return the first `(key, value)` entry with `key >= target`, if any.
-    ///
-    /// This is the primitive SSTable readers use for MVCC point lookups: the
-    /// caller constructs a search key from `(user_key, snapshot_seq)` and
-    /// inspects the returned entry to decide whether it satisfies the query.
-    ///
-    /// Retained for tests and for the iterator's `seek` path even
-    /// though the merge-aware SSTable reader walks blocks manually
-    /// to skip past `Merge` entries.
-    #[allow(dead_code)]
-    pub(crate) fn seek_ge(&self, target: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
-        let start = self.restart_start_for(target);
-
-        let mut pos = start;
-        let mut current_key = Vec::new();
-        let data = self.entry_data();
-        while pos < data.len() {
-            let (key, value) = decode_block_entry(data, pos, &current_key);
-            let entry_size = encoded_entry_size(data, pos);
-            pos += entry_size;
-            current_key = key;
-
-            if compare_internal_keys(&current_key, target).is_ge() {
-                return Some((current_key, value));
-            }
-        }
-
-        None
-    }
-
     /// Binary-search restart points for the first entry whose key could be
     /// `>= target`; returns the byte offset to start the linear walk from.
     fn restart_start_for(&self, target: &[u8]) -> usize {
         let data = self.entry_data();
+        if data.is_empty() {
+            return 0;
+        }
         let mut left = 0;
         let mut right = self.restarts.len();
         while left < right {
             let mid = left + (right - left) / 2;
             let restart_pos = self.restarts[mid] as usize;
-            let (key, _) = decode_block_entry(data, restart_pos, &[]);
-            if compare_internal_keys(&key, target).is_lt() {
+            let header =
+                decode_entry_header(data, restart_pos).expect("block entry validated at decode");
+            // `Block::decode` rejects a restart entry that shares a key
+            // prefix, so the unshared bytes are the whole key and the
+            // probe needs no reconstruction buffer.
+            debug_assert_eq!(header.shared, 0);
+            let key = &data[header.key_offset..header.key_offset + header.unshared];
+            if compare_internal_keys(key, target).is_lt() {
                 left = mid + 1;
             } else {
                 right = mid;
@@ -173,6 +235,7 @@ impl Block {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct BlockIterator<'a> {
     data: &'a [u8],
     pos: usize,
@@ -180,6 +243,7 @@ pub(crate) struct BlockIterator<'a> {
     lower_bound: Option<&'a [u8]>,
 }
 
+#[cfg(test)]
 impl<'a> Iterator for BlockIterator<'a> {
     type Item = (Vec<u8>, Vec<u8>);
 
@@ -227,16 +291,17 @@ impl BlockBuilder {
     }
 
     pub(crate) fn add(&mut self, key: &[u8], value: &[u8]) {
-        let shared = if self.entry_count % self.restart_interval == 0 && self.entry_count > 0 {
-            self.restarts.push(self.buffer.len() as u32);
-            0 // Restart point: no prefix sharing.
-        } else {
-            self.last_key
-                .iter()
-                .zip(key.iter())
-                .take_while(|(a, b)| a == b)
-                .count()
-        };
+        let shared =
+            if self.entry_count.is_multiple_of(self.restart_interval) && self.entry_count > 0 {
+                self.restarts.push(self.buffer.len() as u32);
+                0 // Restart point: no prefix sharing.
+            } else {
+                self.last_key
+                    .iter()
+                    .zip(key.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count()
+            };
 
         let unshared = key.len() - shared;
 
@@ -277,17 +342,15 @@ pub(crate) fn decode_entry_at(
     pos: usize,
     prev_key: &mut Vec<u8>,
 ) -> (usize, usize, usize) {
-    let decoded =
-        decode_block_entry_checked(data, pos, prev_key).expect("block entry validated at decode");
-    *prev_key = decoded.key;
-    (decoded.consumed, decoded.value_offset, decoded.value_len)
-}
-
-fn decode_block_entry(data: &[u8], pos: usize, prev_key: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let decoded =
-        decode_block_entry_checked(data, pos, prev_key).expect("block entry validated at decode");
-    let value = data[decoded.value_offset..decoded.value_offset + decoded.value_len].to_vec();
-    (decoded.key, value)
+    let header = decode_entry_header(data, pos).expect("block entry validated at decode");
+    assert!(
+        header.shared <= prev_key.len(),
+        "block entry validated at decode"
+    );
+    let key_end = header.key_offset + header.unshared;
+    prev_key.truncate(header.shared);
+    prev_key.extend_from_slice(&data[header.key_offset..key_end]);
+    (header.consumed, key_end, header.value_len)
 }
 
 pub(crate) fn encoded_entry_size(data: &[u8], pos: usize) -> usize {
@@ -324,8 +387,6 @@ fn invalid_data(message: &'static str) -> io::Error {
 struct DecodedEntry {
     key: Vec<u8>,
     consumed: usize,
-    value_offset: usize,
-    value_len: usize,
 }
 
 struct EntryHeader {
@@ -336,13 +397,22 @@ struct EntryHeader {
     consumed: usize,
 }
 
-fn validate_restarts_and_entries(data: &[u8], restarts: &[u32]) -> io::Result<()> {
+fn validate_restarts_and_entries(
+    data: &[u8],
+    restarts: &[u32],
+    require_internal_keys: bool,
+) -> io::Result<()> {
     let mut entry_offsets = Vec::new();
     let mut pos = 0usize;
     let mut prev_key = Vec::new();
     while pos < data.len() {
         entry_offsets.push(pos);
         let entry = decode_block_entry_checked(data, pos, &prev_key)?;
+        if require_internal_keys && entry.key.len() < INTERNAL_KEY_SUFFIX_LEN {
+            return Err(invalid_data(
+                "block entry key is shorter than the internal-key trailer",
+            ));
+        }
         pos += entry.consumed;
         prev_key = entry.key;
     }
@@ -401,13 +471,10 @@ fn decode_block_entry_checked(
     let mut key = Vec::with_capacity(key_len);
     key.extend_from_slice(&prev_key[..header.shared]);
     key.extend_from_slice(&data[header.key_offset..header.key_offset + header.unshared]);
-    let value_offset = header.key_offset + header.unshared;
 
     Ok(DecodedEntry {
         key,
         consumed: header.consumed,
-        value_offset,
-        value_len: header.value_len,
     })
 }
 
@@ -465,6 +532,75 @@ fn read_varint(data: &[u8], offset: &mut usize) -> io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Collect `(key, value)` pairs the way the read paths do, through
+    /// the borrowing scan.
+    fn scan_pairs(block: &Block, target: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut key_buf = Vec::new();
+        let done: Option<()> = block.scan_from(target, &mut key_buf, |key, off, len| {
+            out.push((
+                key.to_vec(),
+                block
+                    .entry_bytes(off, len)
+                    .expect("value in range")
+                    .to_vec(),
+            ));
+            ControlFlow::Continue(())
+        });
+        assert!(done.is_none(), "a Continue-only scan runs to the end");
+        out
+    }
+
+    #[test]
+    fn scan_from_matches_the_copying_iterator() {
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..64)
+            .map(|i| {
+                (
+                    format!("key_{i:04}").into_bytes(),
+                    format!("value_{i}").into_bytes(),
+                )
+            })
+            .collect();
+        let refs: Vec<(&[u8], &[u8])> = pairs
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        let block = build_block(&refs);
+
+        for target in [
+            b"".as_ref(),
+            b"key_0000",
+            b"key_0001",
+            b"key_0016",
+            b"key_0017_suffix",
+            b"key_0063",
+            b"zzzz",
+        ] {
+            let expected: Vec<_> = block.iter_from(target).collect();
+            assert_eq!(scan_pairs(&block, target), expected, "target {target:?}");
+        }
+    }
+
+    #[test]
+    fn scan_from_reuses_the_key_buffer_across_calls() {
+        let block = build_block(&[(b"aaaa", b"1"), (b"aaab", b"2"), (b"bbbb", b"3")]);
+        let mut key_buf = Vec::new();
+        for target in [b"aaaa".as_ref(), b"bbbb", b"aaab"] {
+            let first: Option<Vec<u8>> = block.scan_from(target, &mut key_buf, |key, _, _| {
+                ControlFlow::Break(key.to_vec())
+            });
+            assert_eq!(first.as_deref(), Some(target));
+        }
+    }
+
+    #[test]
+    fn entry_bytes_rejects_a_range_past_the_entry_region() {
+        let block = build_block(&[(b"k", b"v")]);
+        assert!(block.entry_bytes(0, block.entry_data().len()).is_some());
+        assert!(block.entry_bytes(0, block.entry_data().len() + 1).is_none());
+        assert!(block.entry_bytes(usize::MAX, 1).is_none());
+    }
 
     fn build_block(pairs: &[(&[u8], &[u8])]) -> Block {
         let mut builder = BlockBuilder::new(4);
@@ -527,29 +663,6 @@ mod tests {
     }
 
     // ── block encode/decode ─────────────────────────────────────
-
-    #[test]
-    fn test_block_seek_ge() {
-        let block = build_block(&[
-            (b"apple", b"red"),
-            (b"application", b"software"),
-            (b"banana", b"yellow"),
-        ]);
-
-        assert_eq!(
-            block.seek_ge(b"apple"),
-            Some((b"apple".to_vec(), b"red".to_vec()))
-        );
-        assert_eq!(
-            block.seek_ge(b"applicatio"),
-            Some((b"application".to_vec(), b"software".to_vec()))
-        );
-        assert_eq!(
-            block.seek_ge(b"b"),
-            Some((b"banana".to_vec(), b"yellow".to_vec()))
-        );
-        assert_eq!(block.seek_ge(b"cherry"), None);
-    }
 
     #[test]
     fn empty_block_iterates_nothing() {
@@ -717,32 +830,6 @@ mod tests {
 
     // ── seek_ge edge cases ──────────────────────────────────────
 
-    #[test]
-    fn seek_ge_before_first_key_returns_first() {
-        let block = build_block(&[(b"b", b"2"), (b"c", b"3")]);
-        // Empty target sorts before every key — the ordering function
-        // short-circuits on suffix-length so any user key > "" wins.
-        assert_eq!(block.seek_ge(b""), Some((b"b".to_vec(), b"2".to_vec())));
-    }
-
-    #[test]
-    fn seek_ge_matches_every_key_after_binary_search() {
-        // 100 sorted keys with restart interval 4 exercises the
-        // binary-search path over ~25 restart points.
-        let keys: Vec<Vec<u8>> = (0..100)
-            .map(|i| format!("key_{:05}", i).into_bytes())
-            .collect();
-        let mut b = BlockBuilder::new(4);
-        for k in &keys {
-            b.add(k, b"v");
-        }
-        let block = Block::decode(b.finish()).unwrap();
-
-        for k in &keys {
-            assert_eq!(block.seek_ge(k), Some((k.clone(), b"v".to_vec())));
-        }
-    }
-
     // ── cache accounting / builder internals ───────────────────
 
     #[test]
@@ -798,5 +885,43 @@ mod tests {
             consumed += size;
         }
         assert_eq!(consumed, data_len);
+    }
+}
+
+#[cfg(test)]
+mod scan_properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// The borrowing scan must visit exactly the entries the
+        /// copying iterator does, in the same order, with the same
+        /// bytes, for any block shape and any seek target.
+        #[test]
+        fn scan_from_agrees_with_iter_from(
+            mut keys in proptest::collection::vec(
+                proptest::collection::vec(any::<u8>(), 1..12), 1..48),
+            target in proptest::collection::vec(any::<u8>(), 0..12),
+        ) {
+            keys.sort();
+            keys.dedup();
+            let mut builder = BlockBuilder::new(RESTART_INTERVAL);
+            for (i, key) in keys.iter().enumerate() {
+                builder.add(key, format!("v{i}").as_bytes());
+            }
+            let block = Block::decode(builder.finish())?;
+
+            let expected: Vec<(Vec<u8>, Vec<u8>)> = block.iter_from(&target).collect();
+
+            let mut got = Vec::new();
+            let mut key_buf = Vec::new();
+            let stopped: Option<()> = block.scan_from(&target, &mut key_buf, |key, off, len| {
+                let value = block.entry_bytes(off, len).expect("value in range");
+                got.push((key.to_vec(), value.to_vec()));
+                ControlFlow::Continue(())
+            });
+            prop_assert!(stopped.is_none());
+            prop_assert_eq!(got, expected);
+        }
     }
 }

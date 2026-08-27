@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>regolith performance</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Funnel+Display:wght@300;400;500;600;700;800&display=swap');
+:root{
+  --green:#06b250; --green-2:#0ad866; --green-dim:#064f28;
+  --bg:#000; --panel:#0c0d0c; --panel-2:#111311; --line:#1e211e;
+  --text:#f2f4f2; --muted:#7d857d; --dim:#4a504a;
+  --bad:#e0503c; --bad-dim:#5c1f16; --warn:#e0a93a;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{-webkit-text-size-adjust:100%}
+body{
+  background:var(--bg); color:var(--text);
+  font-family:'Funnel Display',ui-sans-serif,system-ui,-apple-system,sans-serif;
+  font-size:15px; line-height:1.5; -webkit-font-smoothing:antialiased;
+  font-variant-numeric:tabular-nums;
+}
+.wrap{width:100%;margin:0;padding:0 clamp(20px,3vw,44px) 100px}
+
+/* ---- verdict hero: the first and largest thing on the page ---- */
+.hero{padding:72px 0 40px;border-bottom:1px solid var(--line)}
+.eyebrow{
+  font-size:11px;letter-spacing:.22em;text-transform:uppercase;
+  color:var(--muted);font-weight:600;margin-bottom:20px
+}
+.verdict{display:flex;align-items:baseline;gap:20px;flex-wrap:wrap}
+.verdict h1{
+  font-size:clamp(46px,8vw,86px);font-weight:800;letter-spacing:-.035em;
+  line-height:.95
+}
+.v-pass h1{color:var(--green)}
+.v-regressed h1{color:var(--bad)}
+.v-unverified h1{color:var(--warn)}
+.v-baseline h1{color:var(--text)}
+.verdict .because{color:var(--muted);font-size:16px;max-width:46ch;font-weight:400}
+.counts{display:flex;gap:36px;margin-top:34px;flex-wrap:wrap}
+.count .n{font-size:34px;font-weight:700;letter-spacing:-.02em;line-height:1}
+.count .l{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-top:7px;font-weight:600}
+.count.good .n{color:var(--green)}
+.count.bad .n{color:var(--bad)}
+.count.warn .n{color:var(--warn)}
+.runmeta{display:flex;gap:8px 30px;flex-wrap:wrap;margin-top:34px;font-size:13px;color:var(--muted)}
+.runmeta b{color:var(--text);font-weight:500}
+
+h2{
+  font-size:12px;font-weight:700;letter-spacing:.2em;text-transform:uppercase;
+  color:var(--muted);margin:64px 0 18px;display:flex;align-items:center;gap:14px
+}
+h2::after{content:"";flex:1;height:1px;background:var(--line)}
+
+/* ---- the regression table: the thing that gets read ---- */
+table{width:100%;border-collapse:collapse;font-size:14px}
+th{
+  text-align:left;font-size:10.5px;font-weight:700;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--dim);padding:0 14px 12px 0;
+  border-bottom:1px solid var(--line);white-space:nowrap
+}
+th.r,td.r{text-align:right}
+td{padding:13px 14px 13px 0;border-bottom:1px solid var(--line);vertical-align:baseline}
+tr:last-child td{border-bottom:0}
+tbody tr{position:relative}
+tbody tr:hover{background:var(--panel)}
+td.metric{font-weight:500}
+td.num{font-variant-numeric:tabular-nums;color:var(--muted)}
+td.delta{font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap}
+.d-regressed{color:var(--bad)} .d-improved{color:var(--green)}
+.d-noise{color:var(--dim)} .d-unverified{color:var(--warn)}
+.stripe{display:inline-block;width:3px;height:15px;border-radius:2px;margin-right:11px;vertical-align:-2px}
+.s-regressed{background:var(--bad)} .s-improved{background:var(--green)}
+.s-noise{background:var(--dim)} .s-unverified{background:var(--warn)}
+.why{color:var(--dim);font-size:12.5px;font-weight:400}
+
+/* ---- charts ---- */
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:14px;align-items:start}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:22px 24px 18px}
+.card h3{font-size:15px;font-weight:600;margin-bottom:3px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.card .note{color:var(--muted);font-size:12.5px;margin-bottom:18px;line-height:1.45}
+.card .headline{font-size:26px;font-weight:700;letter-spacing:-.02em;margin:2px 0 14px}
+svg{width:100%;height:auto;display:block;overflow:visible}
+.tick{fill:var(--dim);font-size:10.5px;font-family:'Funnel Display',sans-serif}
+.axis{fill:var(--dim);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase}
+.legend{display:flex;gap:20px;margin-top:14px;font-size:11.5px;color:var(--muted)}
+.key i{display:inline-block;width:14px;height:3px;border-radius:2px;margin-right:8px;vertical-align:middle}
+.pill{
+  display:inline-block;padding:3px 10px;border-radius:999px;font-size:10px;
+  font-weight:700;letter-spacing:.1em;text-transform:uppercase
+}
+.p-clean{color:var(--green);background:var(--green-dim)}
+.p-contaminated{color:var(--warn);background:#3d2e0d}
+.p-absent{color:var(--muted);background:#1a1c1a}
+.bars{display:flex;flex-direction:column;gap:13px}
+.barrow{display:grid;grid-template-columns:minmax(150px,1.4fr) 3fr minmax(118px,auto);
+  align-items:center;gap:16px}
+.barlab{font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bartrack{position:relative;height:16px;display:flex;align-items:center}
+.bar{position:absolute;height:5px;border-radius:3px}
+.bar.ghost{background:#333833;top:2px}
+.bar.now{background:var(--green);bottom:2px;box-shadow:0 0 12px rgba(6,178,80,.35)}
+.barval{font-size:13px;text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+.barval .unit{color:var(--dim);font-size:11.5px}
+.empty{
+  border:1px dashed var(--line);border-radius:10px;padding:26px;text-align:center;
+  color:var(--dim);font-size:13px
+}
+footer{margin-top:80px;padding-top:26px;border-top:1px solid var(--line);color:var(--dim);font-size:12.5px;line-height:1.7}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--muted)}
+@media(max-width:640px){.wrap{padding:0 16px 70px}.grid{grid-template-columns:1fr}.hero{padding:44px 0 30px}}
+</style></head>
+<body><div class="wrap">
+<div class="hero v-baseline"><div class="eyebrow">regolith performance</div><div class="verdict"><h1>BASELINE</h1><p class="because">No earlier run to compare against, so this one is the record future runs are measured from rather than a verdict.</p></div><div class="runmeta"><div>commit <b>d1ec2e7</b></div><div>Intel Xeon W-2295 @ 3.00GHz, <b>36</b> cores</div><div>NVMe / btrfs (tmpfs discarded: fsync is free there)</div></div></div>
+
+<h2>Throughput</h2><div class="grid"><div class="card"><h3>read<span class="pill p-clean">clean</span></h3><p class="note">4 independent sessions agree: 4.78x, 5.59x, 5.31x on 8 threads. Spread within a session is ~4%.</p><div class="headline">3.62M <span style="font-size:14px;color:#7d857d">ops/s @ 8t</span> <span style="font-size:13px;color:#7d857d">&nbsp;5.31x scaling</span></div><svg viewBox="0 0 520 240" preserveAspectRatio="none" role="img"><defs><linearGradient id="g0" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#06b250" stop-opacity=".28"/><stop offset="1" stop-color="#06b250" stop-opacity="0"/></linearGradient></defs><line x1="58" y1="14.0" x2="506" y2="14.0" stroke="#1e211e" stroke-width="1"/><text x="49" y="17.5" text-anchor="end" class="tick">3.62M</text><line x1="58" y1="79.3" x2="506" y2="79.3" stroke="#1e211e" stroke-width="1"/><text x="49" y="82.8" text-anchor="end" class="tick">2.41M</text><line x1="58" y1="144.7" x2="506" y2="144.7" stroke="#1e211e" stroke-width="1"/><text x="49" y="148.2" text-anchor="end" class="tick">1.21M</text><line x1="58" y1="210.0" x2="506" y2="210.0" stroke="#1e211e" stroke-width="1"/><text x="49" y="213.5" text-anchor="end" class="tick">0</text><path d="M58.0,173.1 L122.0,137.2 L250.0,72.5 L506.0,14.0 L506.0,210.0 L58.0,210.0 Z" fill="url(#g0)"/><path d="M58.0,173.1 L122.0,137.2 L250.0,72.5 L506.0,14.0" fill="none" stroke="#06b250" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"/><circle cx="506.0" cy="14.0" r="4.5" fill="#06b250"/><circle cx="506.0" cy="14.0" r="8" fill="#06b250" opacity=".18"/><text x="58.0" y="229" text-anchor="middle" class="tick">1</text><text x="122.0" y="229" text-anchor="middle" class="tick">2</text><text x="250.0" y="229" text-anchor="middle" class="tick">4</text><text x="506.0" y="229" text-anchor="middle" class="tick">8</text><text x="58" y="239" class="axis">threads</text></svg><div class="legend"><span class="key"><i style="background:#06b250"></i>this run</span></div></div><div class="card"><h3>buffered write<span class="pill p-contaminated">busy host</span></h3><p class="note">1-thread samples span 1,682 to 239,047 ops/s, a 140x spread. Throughput is not usable. The CPU-per-op RISE with thread count is reproducible across sessions (2.5-&gt;5.88 and 3.0-&gt;5.00) and is retained as directional evidence only.</p><div class="headline">229.6k <span style="font-size:14px;color:#7d857d">ops/s @ 8t</span> <span style="font-size:13px;color:#7d857d">&nbsp;19.91x scaling</span></div><svg viewBox="0 0 520 240" preserveAspectRatio="none" role="img"><defs><linearGradient id="g0" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#06b250" stop-opacity=".28"/><stop offset="1" stop-color="#06b250" stop-opacity="0"/></linearGradient></defs><line x1="58" y1="14.0" x2="506" y2="14.0" stroke="#1e211e" stroke-width="1"/><text x="49" y="17.5" text-anchor="end" class="tick">302.4k</text><line x1="58" y1="79.3" x2="506" y2="79.3" stroke="#1e211e" stroke-width="1"/><text x="49" y="82.8" text-anchor="end" class="tick">201.6k</text><line x1="58" y1="144.7" x2="506" y2="144.7" stroke="#1e211e" stroke-width="1"/><text x="49" y="148.2" text-anchor="end" class="tick">100.8k</text><line x1="58" y1="210.0" x2="506" y2="210.0" stroke="#1e211e" stroke-width="1"/><text x="49" y="213.5" text-anchor="end" class="tick">0</text><path d="M58.0,202.5 L122.0,14.0 L250.0,69.7 L506.0,61.2 L506.0,210.0 L58.0,210.0 Z" fill="url(#g0)"/><path d="M58.0,202.5 L122.0,14.0 L250.0,69.7 L506.0,61.2" fill="none" stroke="#06b250" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"/><circle cx="506.0" cy="61.2" r="4.5" fill="#06b250"/><circle cx="506.0" cy="61.2" r="8" fill="#06b250" opacity=".18"/><text x="58.0" y="229" text-anchor="middle" class="tick">1</text><text x="122.0" y="229" text-anchor="middle" class="tick">2</text><text x="250.0" y="229" text-anchor="middle" class="tick">4</text><text x="506.0" y="229" text-anchor="middle" class="tick">8</text><text x="58" y="239" class="axis">threads</text></svg><div class="legend"><span class="key"><i style="background:#06b250"></i>this run</span></div></div><div class="card"><h3>durable write<span class="pill p-contaminated">busy host</span></h3><p class="note">NOT CHARACTERIZABLE on this host: 4 sessions gave medians disagreeing 2-3x, and 8-thread samples span 126 to 337 ops/s</p><div class="empty">no points recorded</div></div></div><h2>Resident memory</h2><div class="grid"><div class="card"><h3>RSS over a sustained workload<span class="pill p-clean">clean</span></h3><p class="note">RSS over a sustained mixed workload: 55% writes/overwrites, 20% point reads, 15% short range scans, 8% deletes, 2% snapshot hold-and-release over a 400k keyspace with 4 KiB values.</p><svg viewBox="0 0 520 240" preserveAspectRatio="none" role="img"><defs><linearGradient id="g1" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#06b250" stop-opacity=".28"/><stop offset="1" stop-color="#06b250" stop-opacity="0"/></linearGradient></defs><line x1="58" y1="14.0" x2="506" y2="14.0" stroke="#1e211e" stroke-width="1"/><text x="49" y="17.5" text-anchor="end" class="tick">2,453.7</text><line x1="58" y1="79.3" x2="506" y2="79.3" stroke="#1e211e" stroke-width="1"/><text x="49" y="82.8" text-anchor="end" class="tick">1,635.8</text><line x1="58" y1="144.7" x2="506" y2="144.7" stroke="#1e211e" stroke-width="1"/><text x="49" y="148.2" text-anchor="end" class="tick">817.9</text><line x1="58" y1="210.0" x2="506" y2="210.0" stroke="#1e211e" stroke-width="1"/><text x="49" y="213.5" text-anchor="end" class="tick">0</text><path d="M58.0,198.7 L58.6,187.0 L59.4,180.7 L60.6,176.8 L61.8,171.6 L62.9,169.6 L64.4,167.2 L65.8,157.1 L67.2,152.9 L68.8,150.4 L70.1,142.8 L71.6,137.9 L73.1,135.6 L74.9,128.3 L76.2,122.9 L78.0,120.2 L79.8,113.2 L81.2,109.5 L83.1,107.3 L84.9,101.2 L86.4,96.4 L88.4,93.3 L90.1,87.9 L91.9,85.1 L93.9,82.4 L95.5,78.0 L97.1,74.9 L98.6,71.8 L100.1,68.4 L101.8,66.0 L103.4,63.9 L105.1,60.6 L106.8,57.9 L108.2,55.4 L109.9,52.5 L111.4,50.8 L113.1,48.4 L114.6,46.7 L117.0,45.5 L119.2,43.1 L121.2,41.3 L123.1,40.5 L124.9,38.8 L127.4,37.7 L129.5,36.9 L131.1,35.3 L132.8,34.1 L134.9,33.0 L136.5,31.7 L138.2,31.0 L141.5,29.7 L147.0,46.7 L148.8,43.6 L150.6,40.5 L152.2,38.4 L154.1,36.6 L155.6,35.2 L157.6,33.7 L160.8,33.2 L169.2,32.4 L180.2,31.3 L186.2,30.4 L192.2,29.3 L194.1,28.4 L196.6,27.8 L198.8,26.9 L200.8,26.1 L202.8,25.6 L205.0,24.7 L207.0,24.1 L209.2,23.6 L211.2,22.9 L213.0,22.6 L215.1,22.1 L217.1,21.7 L219.3,21.2 L221.1,20.8 L223.0,20.4 L225.1,20.1 L227.1,19.8 L229.8,19.5 L231.6,19.2 L233.6,18.8 L235.6,18.5 L237.5,18.4 L239.9,18.1 L241.8,17.8 L243.8,17.6 L245.9,17.4 L247.8,17.2 L250.0,17.0 L251.8,16.8 L253.4,16.7 L255.4,16.5 L257.2,17.5 L259.0,18.5 L261.1,18.3 L262.9,18.0 L264.9,17.8 L266.9,18.0 L268.9,17.7 L271.1,17.5 L272.9,17.3 L274.9,17.3 L277.0,18.2 L278.9,18.8 L280.8,18.4 L282.5,18.4 L284.8,18.9 L286.8,19.0 L288.6,18.8 L290.6,18.5 L292.6,18.2 L294.5,18.1 L296.8,17.8 L298.6,17.6 L300.9,17.4 L302.8,17.1 L304.5,17.0 L306.9,16.9 L308.5,16.7 L310.4,16.5 L312.1,16.3 L314.8,16.2 L316.8,16.1 L319.5,16.0 L324.9,15.9 L326.8,16.0 L333.1,15.8 L339.4,15.7 L346.5,15.6 L349.8,15.5 L354.6,15.4 L356.8,15.3 L358.8,15.2 L360.5,15.1 L362.2,15.1 L364.0,15.0 L365.5,15.0 L367.5,14.9 L369.1,14.9 L370.6,14.8 L372.6,14.8 L374.4,14.7 L376.6,14.7 L378.5,14.6 L380.3,14.6 L382.1,14.6 L383.8,14.5 L385.9,14.5 L387.4,14.5 L389.1,14.4 L391.1,14.4 L392.8,14.4 L395.4,14.4 L397.0,14.4 L398.9,14.3 L401.8,14.3 L403.4,14.3 L405.2,14.3 L407.4,14.3 L409.6,14.3 L411.9,14.3 L413.6,14.2 L415.0,14.2 L417.1,14.2 L418.9,14.2 L420.8,14.2 L422.5,14.2 L424.3,14.2 L426.1,14.2 L428.0,14.1 L429.8,14.1 L431.4,14.1 L434.6,14.1 L436.6,14.1 L438.8,14.1 L440.8,14.1 L442.5,14.1 L444.2,14.1 L446.3,14.1 L447.9,14.1 L449.5,14.1 L451.3,14.0 L452.8,14.0 L455.0,14.0 L456.9,14.0 L458.8,14.0 L461.0,14.0 L462.9,14.0 L464.9,14.0 L466.6,14.0 L468.4,14.0 L470.5,14.0 L472.1,14.0 L474.1,14.0 L475.8,14.0 L482.4,14.0 L490.0,14.0 L495.4,14.0 L499.6,14.0" fill="none" stroke="#333833" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"/><circle cx="499.6" cy="14.0" r="4.5" fill="#333833"/><circle cx="499.6" cy="14.0" r="8" fill="#333833" opacity=".18"/><path d="M58.0,209.4 L59.8,196.6 L61.1,191.2 L62.9,189.4 L64.2,189.4 L65.9,188.7 L67.5,187.9 L69.2,187.8 L71.1,185.7 L72.8,185.7 L74.6,185.3 L76.4,185.3 L78.4,185.3 L81.4,185.3 L86.2,185.1 L88.1,185.1 L90.1,185.1 L92.6,185.1 L94.6,185.0 L96.9,185.0 L98.6,185.0 L100.9,185.0 L102.9,185.0 L105.0,184.9 L106.9,184.9 L109.9,184.9 L113.6,184.9 L118.9,184.9 L121.0,184.9 L122.9,184.9 L125.2,184.9 L127.4,184.9 L129.6,184.9 L131.6,184.9 L133.6,184.9 L135.8,184.9 L137.8,184.9 L139.9,184.9 L141.9,184.9 L143.9,184.9 L146.0,184.9 L148.2,184.9 L150.2,184.9 L152.6,184.9 L154.4,184.9 L156.5,184.9 L158.5,184.9 L160.5,184.9 L162.4,184.9 L164.4,184.9 L166.5,184.9 L168.5,184.9 L170.8,184.9 L172.6,184.9 L174.9,184.9 L176.9,184.9 L179.0,184.9 L181.1,184.9 L183.1,184.9 L185.2,184.9 L187.4,184.9 L189.5,184.9 L191.6,184.9 L193.5,184.9 L195.5,184.9 L197.6,184.9 L199.6,184.9 L201.8,184.8 L203.6,184.9 L205.8,184.8 L207.8,184.8 L209.8,184.8 L212.0,184.8 L213.9,184.8 L215.9,184.8 L218.0,184.8 L220.1,184.9 L222.1,184.9 L224.1,184.9 L226.4,184.9 L228.5,184.8 L230.8,184.8 L232.8,184.8 L234.6,184.8 L236.9,184.8 L238.9,184.8 L241.0,184.8 L242.8,184.8 L245.1,184.8 L247.1,184.8 L249.2,184.8 L251.4,184.8 L253.2,184.8 L255.3,184.8 L257.4,184.8 L259.4,184.8 L261.4,184.8 L263.2,184.8 L265.4,184.8 L268.0,184.8 L270.4,184.8 L272.4,185.0 L274.2,185.0 L277.0,184.9 L280.9,184.9 L283.0,184.9 L286.0,184.9 L287.6,184.9 L289.8,184.9 L291.8,184.9 L293.9,184.8 L295.9,184.8 L297.9,184.8 L300.0,184.8 L302.2,184.8 L304.5,185.0 L306.6,185.0 L308.5,185.0 L310.6,185.0 L313.0,184.9 L315.9,184.9 L318.5,184.8 L320.5,184.8 L322.8,184.8 L325.0,184.8 L327.1,184.8 L330.1,184.8 L333.0,184.8 L336.6,184.7 L338.4,184.7 L342.2,184.7 L345.8,184.7 L348.5,184.7 L352.0,184.7 L354.8,184.7 L360.4,184.7 L366.5,184.7 L368.2,184.8 L370.5,185.2 L372.6,185.1 L375.1,185.0 L380.0,184.9 L381.9,184.9 L384.9,184.9 L387.1,184.9 L390.1,184.9 L392.8,184.8 L395.5,184.8 L397.8,184.8 L399.9,185.0 L401.9,185.0 L404.1,184.9 L406.0,184.9 L408.4,184.9 L410.4,184.9 L412.4,184.9 L414.4,184.9 L416.6,184.9 L419.4,184.8 L421.5,184.8 L423.6,184.8 L425.5,184.8 L427.8,184.8 L429.9,184.8 L432.0,184.8 L434.0,184.8 L435.9,184.8 L438.1,184.8 L440.2,184.8 L442.4,184.8 L444.4,184.8 L446.3,184.8 L448.2,184.8 L450.3,184.8 L452.5,184.8 L454.6,184.8 L456.8,184.8 L458.8,184.8 L461.0,184.8 L463.0,184.8 L465.0,184.8 L466.8,184.8 L468.9,184.8 L471.0,184.8 L473.1,184.8 L475.2,184.9 L476.9,184.9 L479.0,184.9 L481.0,184.9 L483.1,184.9 L485.3,184.9 L487.1,184.9 L489.2,184.9 L491.4,184.9 L493.9,184.9 L495.6,184.9 L497.8,184.9 L499.8,184.9 L501.9,184.9 L504.0,184.9 L506.0,184.9 L506.0,210.0 L58.0,210.0 Z" fill="url(#g1)"/><path d="M58.0,209.4 L59.8,196.6 L61.1,191.2 L62.9,189.4 L64.2,189.4 L65.9,188.7 L67.5,187.9 L69.2,187.8 L71.1,185.7 L72.8,185.7 L74.6,185.3 L76.4,185.3 L78.4,185.3 L81.4,185.3 L86.2,185.1 L88.1,185.1 L90.1,185.1 L92.6,185.1 L94.6,185.0 L96.9,185.0 L98.6,185.0 L100.9,185.0 L102.9,185.0 L105.0,184.9 L106.9,184.9 L109.9,184.9 L113.6,184.9 L118.9,184.9 L121.0,184.9 L122.9,184.9 L125.2,184.9 L127.4,184.9 L129.6,184.9 L131.6,184.9 L133.6,184.9 L135.8,184.9 L137.8,184.9 L139.9,184.9 L141.9,184.9 L143.9,184.9 L146.0,184.9 L148.2,184.9 L150.2,184.9 L152.6,184.9 L154.4,184.9 L156.5,184.9 L158.5,184.9 L160.5,184.9 L162.4,184.9 L164.4,184.9 L166.5,184.9 L168.5,184.9 L170.8,184.9 L172.6,184.9 L174.9,184.9 L176.9,184.9 L179.0,184.9 L181.1,184.9 L183.1,184.9 L185.2,184.9 L187.4,184.9 L189.5,184.9 L191.6,184.9 L193.5,184.9 L195.5,184.9 L197.6,184.9 L199.6,184.9 L201.8,184.8 L203.6,184.9 L205.8,184.8 L207.8,184.8 L209.8,184.8 L212.0,184.8 L213.9,184.8 L215.9,184.8 L218.0,184.8 L220.1,184.9 L222.1,184.9 L224.1,184.9 L226.4,184.9 L228.5,184.8 L230.8,184.8 L232.8,184.8 L234.6,184.8 L236.9,184.8 L238.9,184.8 L241.0,184.8 L242.8,184.8 L245.1,184.8 L247.1,184.8 L249.2,184.8 L251.4,184.8 L253.2,184.8 L255.3,184.8 L257.4,184.8 L259.4,184.8 L261.4,184.8 L263.2,184.8 L265.4,184.8 L268.0,184.8 L270.4,184.8 L272.4,185.0 L274.2,185.0 L277.0,184.9 L280.9,184.9 L283.0,184.9 L286.0,184.9 L287.6,184.9 L289.8,184.9 L291.8,184.9 L293.9,184.8 L295.9,184.8 L297.9,184.8 L300.0,184.8 L302.2,184.8 L304.5,185.0 L306.6,185.0 L308.5,185.0 L310.6,185.0 L313.0,184.9 L315.9,184.9 L318.5,184.8 L320.5,184.8 L322.8,184.8 L325.0,184.8 L327.1,184.8 L330.1,184.8 L333.0,184.8 L336.6,184.7 L338.4,184.7 L342.2,184.7 L345.8,184.7 L348.5,184.7 L352.0,184.7 L354.8,184.7 L360.4,184.7 L366.5,184.7 L368.2,184.8 L370.5,185.2 L372.6,185.1 L375.1,185.0 L380.0,184.9 L381.9,184.9 L384.9,184.9 L387.1,184.9 L390.1,184.9 L392.8,184.8 L395.5,184.8 L397.8,184.8 L399.9,185.0 L401.9,185.0 L404.1,184.9 L406.0,184.9 L408.4,184.9 L410.4,184.9 L412.4,184.9 L414.4,184.9 L416.6,184.9 L419.4,184.8 L421.5,184.8 L423.6,184.8 L425.5,184.8 L427.8,184.8 L429.9,184.8 L432.0,184.8 L434.0,184.8 L435.9,184.8 L438.1,184.8 L440.2,184.8 L442.4,184.8 L444.4,184.8 L446.3,184.8 L448.2,184.8 L450.3,184.8 L452.5,184.8 L454.6,184.8 L456.8,184.8 L458.8,184.8 L461.0,184.8 L463.0,184.8 L465.0,184.8 L466.8,184.8 L468.9,184.8 L471.0,184.8 L473.1,184.8 L475.2,184.9 L476.9,184.9 L479.0,184.9 L481.0,184.9 L483.1,184.9 L485.3,184.9 L487.1,184.9 L489.2,184.9 L491.4,184.9 L493.9,184.9 L495.6,184.9 L497.8,184.9 L499.8,184.9 L501.9,184.9 L504.0,184.9 L506.0,184.9" fill="none" stroke="#06b250" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"/><circle cx="506.0" cy="184.9" r="4.5" fill="#06b250"/><circle cx="506.0" cy="184.9" r="8" fill="#06b250" opacity=".18"/><text x="58.0" y="229" text-anchor="middle" class="tick">0.0</text><text x="135.8" y="229" text-anchor="middle" class="tick">62.2</text><text x="229.8" y="229" text-anchor="middle" class="tick">137.4</text><text x="312.1" y="229" text-anchor="middle" class="tick">203.3</text><text x="415.0" y="229" text-anchor="middle" class="tick">285.6</text><text x="506.0" y="229" text-anchor="middle" class="tick">358.4</text><text x="58" y="239" class="axis">seconds</text></svg><div class="legend"><span class="key"><i style="background:#333833"></i>before (default, 64 cache shards)</span> <span class="key"><i style="background:#06b250"></i>after G2 only (cache sized from budget)</span></div></div><div class="card"><h3>Peak RSS</h3><p class="note">The number a memory budget has to cover.</p><div class="bars"><div class="barrow"><div class="barlab">before (default, 64 cache shards)</div><div class="bartrack"><div class="bar now" style="width:100.0%"></div></div><div class="barval">2,453.7<span class="unit"> MiB</span> </div></div><div class="barrow"><div class="barlab">after G2 only (cache sized from budget)</div><div class="bartrack"><div class="bar now" style="width:12.9%"></div></div><div class="barval">316.2<span class="unit"> MiB</span> </div></div></div></div></div><h2>Binary size</h2><div class="grid"><div class="card"><h3>regolith's own contribution<span class="pill p-clean">clean</span></h3><p class="note">Deterministic: byte-identical across rebuilds, independent of host load. Measured as (binary linking lark) minus (an empty binary on the same profile), so it isolates lark&#x27;s own contribution rather than counting std.</p><div class="bars"><div class="barrow"><div class="barlab">native</div><div class="bartrack"><div class="bar now" style="width:100.0%"></div></div><div class="barval">359.4<span class="unit"> KiB</span> </div></div><div class="barrow"><div class="barlab">wasm32-wasip1</div><div class="bartrack"><div class="bar now" style="width:97.3%"></div></div><div class="barval">349.6<span class="unit"> KiB</span> </div></div><div class="barrow"><div class="barlab">wasm32-wasip1+opt-Oz</div><div class="bartrack"><div class="bar now" style="width:85.9%"></div></div><div class="barval">308.9<span class="unit"> KiB</span> </div></div></div></div></div>
+<h2>Retracted from this run</h2><div class="card"><p class="note">Claims withdrawn rather than deleted, so a reader of an older artifact can see what changed.</p><ul style="margin-left:18px;color:#7d857d;font-size:13px"><li>{&#x27;claim&#x27;: &#x27;block_size drives retained memory 16x (1,270 vs 792 MiB at 4 vs 64 KiB)&#x27;, &#x27;why&#x27;: &quot;Collected during the contaminated window. A clean re-measure at 2 GiB gave 2380 / 2380 / 2296 / 2374 / 2369 MiB for 4/8/16/32/64 KiB blocks: no significant effect. G5&#x27;s index-retention cost must be re-derived before it is claimed.&quot;, &#x27;affected&#x27;: &#x27;G5 size cost&#x27;}</li><li>{&#x27;claim&#x27;: &#x27;durable writes regress 136 -&gt; 65 ops/s (0.48x) across 8 threads&#x27;, &#x27;why&#x27;: &#x27;Single unreproducible sample. Four sessions gave medians disagreeing 2-3x and 8-thread samples spanning 126-337 ops/s. Not characterizable on this host.&#x27;, &#x27;affected&#x27;: &#x27;G4 scaling figure&#x27;}</li></ul></div>
+<footer>
+Rendered from a schema v1 run file by <code>tools/perf-report/render_html.py</code>.
+A metric that could not be compared is listed as unverified rather than dropped, and a
+family measured on a busy host carries that on its heading. A delta counts as real only
+when it clears the 3% threshold <em>and</em> the two runs' measured ranges do
+not overlap, because a percentage computed across overlapping ranges is a description of
+the machine rather than of the code.
+</footer>
+</div></body></html>

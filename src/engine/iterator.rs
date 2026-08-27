@@ -25,13 +25,13 @@
 //! - Drops entries with `seq > snapshot_seq` (not visible at the captured
 //!   snapshot).
 //! - Deduplicates by user key, keeping only the newest visible version.
-//! - Treats a tombstone as "this user key is deleted" — the whole group
+//! - Treats a tombstone as "this user key is deleted" - the whole group
 //!   is skipped, and any older versions in lower levels are suppressed.
 //!
 //! # Forward vs reverse materialization
 //!
 //! In **forward** mode, entries within a user-key group are visited newest-
-//! seq first, so the first visible entry we see is the answer — the rest
+//! seq first, so the first visible entry we see is the answer - the rest
 //! of the group can be consumed quickly.
 //!
 //! In **reverse** mode, entries within a user-key group are visited
@@ -45,7 +45,7 @@
 //! Calling `next()` while in reverse mode (or vice versa) flips the
 //! direction. To avoid yielding the already-emitted user key again, the
 //! iterator re-seeks every level to the position just past the current
-//! user key in the new direction — see [`LarkIterator::flip_to_forward`]
+//! user key in the new direction - see [`LarkIterator::flip_to_forward`]
 //! and [`LarkIterator::flip_to_reverse`].
 //!
 //! # Safety against concurrent compaction
@@ -60,16 +60,18 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use super::block::encoded_entry_size;
-use super::block::{decode_entry_at, Block, RESTART_INTERVAL};
+use super::block::{Block, RESTART_INTERVAL, decode_entry_at};
 use super::block_cache::BlockCache;
 use super::internal_key::{
-    compare_internal_keys, decode_internal_key, lookup_key, user_key_of, INTERNAL_KEY_SUFFIX_LEN,
-    VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE,
+    INTERNAL_KEY_SUFFIX_LEN, VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE,
+    compare_internal_keys, decode_internal_key, encode_internal_key, user_key_of,
 };
+use super::lookup_key::LookupKey;
 use super::manifest::Version;
 use super::memtable::MemTable;
 use super::range_tombstone::{RangeTombstone, RangeTombstoneSet};
 use super::sstable::{LiveSst, SsTableBlockCursor, SsTableReader};
+use crate::DbSlice;
 use crate::options::MergeOperator;
 use crate::options::PrefixExtractor;
 
@@ -143,7 +145,7 @@ impl LevelIter {
                 Ok(())
             }
             Self::SsTable(it) => {
-                if !it.reader.may_have_prefix(prefix) {
+                if !it.reader.may_have_prefix(prefix, &it.cache)? {
                     it.valid = false;
                     return Ok(());
                 }
@@ -203,24 +205,34 @@ impl LevelIter {
     fn value(&self) -> Option<&[u8]> {
         match self {
             Self::Memtable(it) => it.curr.as_ref().map(|(_, v)| v.as_slice()),
-            Self::SsTable(it) => {
-                if it.valid {
-                    let data = it.block.as_ref().unwrap().entry_data();
-                    Some(
-                        &data[it.cached_value_offset..it.cached_value_offset + it.cached_value_len],
-                    )
-                } else {
-                    None
-                }
-            }
+            Self::SsTable(it) => it.value(),
             Self::LevelConcat(it) => it.value(),
+        }
+    }
+
+    /// The current value as an owning view, so it survives the cursor
+    /// moving on. Free for an SSTable source (one reference count on
+    /// the block already in memory); a copy for a memtable source,
+    /// whose values are separately owned buffers.
+    fn value_slice(&self) -> Option<DbSlice> {
+        match self {
+            Self::Memtable(it) => it.curr.as_ref().map(|(_, v)| v.clone()),
+            Self::SsTable(it) => it.value_slice(),
+            Self::LevelConcat(it) => it.value_slice(),
         }
     }
 }
 
+/// Cursor over one memtable.
+///
+/// The skip list has no back pointers, so every step is a fresh
+/// `O(log N)` seek from the current key. Both halves of `curr` are
+/// arena-backed views rather than copies, so a step costs two reference
+/// counts and no allocation; the previous step's views are dropped only
+/// after the new seek has read the key it seeks from.
 struct MemtableLevelIter {
     mt: Arc<MemTable>,
-    curr: Option<(Vec<u8>, Vec<u8>)>,
+    curr: Option<(DbSlice, DbSlice)>,
 }
 
 impl MemtableLevelIter {
@@ -229,31 +241,33 @@ impl MemtableLevelIter {
     }
 
     fn seek_to_first(&mut self) {
-        self.curr = self.mt.first_entry_from(Bound::Unbounded);
+        self.curr = self.mt.first_slice_from(Bound::Unbounded);
     }
 
     fn seek_to_last(&mut self) {
-        self.curr = self.mt.last_entry_before(Bound::Unbounded);
+        self.curr = self.mt.last_slice_before(Bound::Unbounded);
     }
 
     fn seek(&mut self, target: &[u8]) {
-        self.curr = self.mt.first_entry_from(Bound::Included(target));
+        self.curr = self.mt.first_slice_from(Bound::Included(target));
     }
 
     fn seek_for_prev(&mut self, target: &[u8]) {
-        self.curr = self.mt.last_entry_before(Bound::Included(target));
+        self.curr = self.mt.last_slice_before(Bound::Included(target));
     }
 
     fn advance(&mut self) {
-        if let Some((k, _)) = self.curr.take() {
-            self.curr = self.mt.first_entry_from(Bound::Excluded(k.as_slice()));
-        }
+        let Some((key, _)) = self.curr.take() else {
+            return;
+        };
+        self.curr = self.mt.first_slice_from(Bound::Excluded(key.as_slice()));
     }
 
     fn advance_backward(&mut self) {
-        if let Some((k, _)) = self.curr.take() {
-            self.curr = self.mt.last_entry_before(Bound::Excluded(k.as_slice()));
-        }
+        let Some((key, _)) = self.curr.take() else {
+            return;
+        };
+        self.curr = self.mt.last_slice_before(Bound::Excluded(key.as_slice()));
     }
 }
 
@@ -294,6 +308,27 @@ impl SsTableLevelIter {
         }
     }
 
+    /// The current value, borrowed from the decoded block holding it.
+    fn value(&self) -> Option<&[u8]> {
+        if !self.valid {
+            return None;
+        }
+        let data = self.block.as_ref()?.entry_data();
+        let end = self
+            .cached_value_offset
+            .checked_add(self.cached_value_len)?;
+        data.get(self.cached_value_offset..end)
+    }
+
+    /// The current value as an owning view over the block holding it.
+    fn value_slice(&self) -> Option<DbSlice> {
+        if !self.valid {
+            return None;
+        }
+        let block = Arc::clone(self.block.as_ref()?);
+        DbSlice::from_block(block, self.cached_value_offset, self.cached_value_len)
+    }
+
     fn load_block(&mut self, cursor: SsTableBlockCursor) -> io::Result<()> {
         self.block = Some(self.reader.load_block_at_cursor(&cursor, &self.cache)?);
         self.block_cursor = Some(cursor);
@@ -324,7 +359,7 @@ impl SsTableLevelIter {
     }
 
     fn seek_to_first(&mut self) -> io::Result<()> {
-        let Some(cursor) = self.reader.first_block_cursor()? else {
+        let Some(cursor) = self.reader.first_block_cursor(&self.cache)? else {
             self.valid = false;
             return Ok(());
         };
@@ -334,7 +369,7 @@ impl SsTableLevelIter {
     }
 
     fn seek(&mut self, target: &[u8]) -> io::Result<()> {
-        let cursor = match self.reader.seek_block_cursor(target)? {
+        let cursor = match self.reader.seek_block_cursor(target, &self.cache)? {
             Some(cursor) => cursor,
             None => {
                 self.valid = false;
@@ -357,10 +392,10 @@ impl SsTableLevelIter {
             }
             self.entry_pos = self.next_entry_pos;
         }
-        // Fell off end of block — try next block.
+        // Fell off end of block - try next block.
         let next = self
             .reader
-            .next_block_cursor(self.block_cursor.as_ref().unwrap())?;
+            .next_block_cursor(self.block_cursor.as_ref().unwrap(), &self.cache)?;
         let Some(next) = next else {
             self.valid = false;
             return Ok(());
@@ -371,9 +406,9 @@ impl SsTableLevelIter {
     }
 
     fn seek_for_prev(&mut self, target: &[u8]) -> io::Result<()> {
-        let cursor = match self.reader.seek_block_cursor(target)? {
+        let cursor = match self.reader.seek_block_cursor(target, &self.cache)? {
             Some(cursor) => cursor,
-            None => match self.reader.last_block_cursor()? {
+            None => match self.reader.last_block_cursor(&self.cache)? {
                 Some(cursor) => cursor,
                 None => {
                     self.valid = false;
@@ -403,14 +438,17 @@ impl SsTableLevelIter {
             None => {
                 let prev = self
                     .reader
-                    .prev_block_cursor(self.block_cursor.as_ref().unwrap())?;
+                    .prev_block_cursor(self.block_cursor.as_ref().unwrap(), &self.cache)?;
                 let Some(prev) = prev else {
                     self.valid = false;
                     return Ok(());
                 };
                 self.load_block(prev)?;
                 self.build_entry_offsets();
-                let last = self.entry_offsets.as_ref().unwrap().len() - 1;
+                let Some(last) = self.last_entry_index() else {
+                    self.valid = false;
+                    return Ok(());
+                };
                 self.replay_key_to_index(last);
                 self.valid = true;
             }
@@ -427,7 +465,7 @@ impl SsTableLevelIter {
         if self.entry_pos >= data.len() {
             let next = self
                 .reader
-                .next_block_cursor(self.block_cursor.as_ref().unwrap())?;
+                .next_block_cursor(self.block_cursor.as_ref().unwrap(), &self.cache)?;
             let Some(next) = next else {
                 self.valid = false;
                 return Ok(());
@@ -439,18 +477,16 @@ impl SsTableLevelIter {
     }
 
     fn seek_to_last(&mut self) -> io::Result<()> {
-        let Some(cursor) = self.reader.last_block_cursor()? else {
+        let Some(cursor) = self.reader.last_block_cursor(&self.cache)? else {
             self.valid = false;
             return Ok(());
         };
         self.load_block(cursor)?;
         self.build_entry_offsets();
-        let offsets = self.entry_offsets.as_ref().unwrap();
-        if offsets.is_empty() {
+        let Some(last) = self.last_entry_index() else {
             self.valid = false;
             return Ok(());
-        }
-        let last = offsets.len() - 1;
+        };
         self.replay_key_to_index(last);
         self.valid = true;
         Ok(())
@@ -472,19 +508,17 @@ impl SsTableLevelIter {
         if cur_idx == 0 {
             let prev = self
                 .reader
-                .prev_block_cursor(self.block_cursor.as_ref().unwrap())?;
+                .prev_block_cursor(self.block_cursor.as_ref().unwrap(), &self.cache)?;
             let Some(prev) = prev else {
                 self.valid = false;
                 return Ok(());
             };
             self.load_block(prev)?;
             self.build_entry_offsets();
-            let offsets = self.entry_offsets.as_ref().unwrap();
-            if offsets.is_empty() {
+            let Some(last) = self.last_entry_index() else {
                 self.valid = false;
                 return Ok(());
-            }
-            let last = offsets.len() - 1;
+            };
             self.replay_key_to_index(last);
             self.valid = true;
             return Ok(());
@@ -503,6 +537,16 @@ impl SsTableLevelIter {
             pos += encoded_entry_size(data, pos);
         }
         self.entry_offsets = Some(offsets);
+    }
+
+    /// Index of the last entry in the currently loaded block, or `None`
+    /// when that block holds no entries.
+    ///
+    /// A range-tombstone-only SSTable has zero data entries, so every
+    /// reverse-stepping path has to treat an empty block as "keep
+    /// walking back" rather than indexing one before the start.
+    fn last_entry_index(&self) -> Option<usize> {
+        self.entry_offsets.as_ref()?.len().checked_sub(1)
     }
 
     /// Replay key reconstruction from the nearest restart point up to
@@ -731,20 +775,17 @@ impl LevelConcatIter {
     }
 
     fn value(&self) -> Option<&[u8]> {
-        self.current.as_ref().and_then(|it| {
-            if it.valid {
-                let data = it.block.as_ref().unwrap().entry_data();
-                Some(&data[it.cached_value_offset..it.cached_value_offset + it.cached_value_len])
-            } else {
-                None
-            }
-        })
+        self.current.as_ref().and_then(|it| it.value())
+    }
+
+    fn value_slice(&self) -> Option<DbSlice> {
+        self.current.as_ref().and_then(|it| it.value_slice())
     }
 }
 
 /// Merges multiple `LevelIter`s into a single stream of internal-key /
 /// value pairs in ascending internal-key order. Picks the winning source
-/// on every step via linear scan — for the small number of levels lark
+/// on every step via linear scan - for the small number of levels lark
 /// produces (≤ 30 in worst case) this beats a heap's overhead.
 struct MergingIter {
     levels: Vec<LevelIter>,
@@ -826,6 +867,10 @@ impl MergingIter {
         self.current_idx.and_then(|i| self.levels[i].value())
     }
 
+    fn value_slice(&self) -> Option<DbSlice> {
+        self.current_idx.and_then(|i| self.levels[i].value_slice())
+    }
+
     fn pick_smallest(&mut self) {
         let mut best: Option<usize> = None;
         for (i, lvl) in self.levels.iter().enumerate() {
@@ -893,7 +938,7 @@ pub(crate) struct LarkIterator {
     /// once at construction so per-key visibility checks do not re-lock
     /// memtables or scan unrelated ranges.
     range_tombstones: RangeTombstoneSet,
-    /// Pinning handle — keeping this alive guarantees compaction cannot
+    /// Pinning handle - keeping this alive guarantees compaction cannot
     /// drop SSTable metadata out from under us. The SsTableReaders owned
     /// by the level iterators similarly keep file handles live.
     _version: Arc<Version>,
@@ -928,6 +973,12 @@ pub(crate) struct LarkIterator {
     /// halving the number of `advance() + pick_smallest()` cycles
     /// per visible entry in a single-version sequential scan.
     pending_consume: bool,
+    /// Last user key handed to the caller during forward iteration.
+    /// A sorted merge must yield strictly increasing user keys; a file
+    /// whose index has been corrupted into pointing back at a block
+    /// already visited would otherwise stream duplicate keys forever,
+    /// so a violation is reported as corruption instead of scanned.
+    last_forward_user_key: Option<Vec<u8>>,
 }
 
 /// Compute the exclusive upper bound of all keys that start with
@@ -952,7 +1003,7 @@ impl LarkIterator {
     /// at the given snapshot sequence. SSTable readers come directly from
     /// the pinned `Version`, which holds `Arc<LiveSst>`s whose file
     /// descriptors are guaranteed to stay open for the lifetime of any
-    /// version that still references them — so the iterator is immune to
+    /// version that still references them - so the iterator is immune to
     /// concurrent compaction unlinking files.
     pub(crate) fn new(
         active: Arc<MemTable>,
@@ -980,10 +1031,18 @@ impl LarkIterator {
                 Arc::clone(&cache),
             )));
         }
-        // L1+: use a single concatenation iterator per level instead
-        // of one LevelIter per file. Point files are non-overlapping;
-        // RT-only files have no entries and are skipped by the concat
-        // iterator.
+        // L1+: one concatenation iterator per level rather than one
+        // LevelIter per file, which `LevelConcatIter` may do only because
+        // the files it is handed are sorted and non-overlapping.
+        //
+        // Compaction also emits range-tombstone-only files, whose key
+        // range is the tombstone's and therefore *does* overlap the data
+        // files beside it. They carry zero point entries, and their
+        // tombstones are collected below for every file in the level
+        // regardless, so they are dropped from the concat list: leaving
+        // one in place lets `seek_for_prev` bisect onto an empty file and
+        // report "no key <= target" while a live key sits in the data
+        // file that sorts after it.
         for level in 1..version.levels.len() {
             if version.levels[level].is_empty() {
                 continue;
@@ -991,8 +1050,14 @@ impl LarkIterator {
             for file in &version.levels[level] {
                 range_tombstones.extend(file.reader.range_tombstones().iter().cloned());
             }
-            let mut sorted: Vec<Arc<LiveSst>> =
-                version.levels[level].iter().map(Arc::clone).collect();
+            let mut sorted: Vec<Arc<LiveSst>> = version.levels[level]
+                .iter()
+                .filter(|f| f.meta.num_entries > 0)
+                .map(Arc::clone)
+                .collect();
+            if sorted.is_empty() {
+                continue;
+            }
             sorted.sort_by(|a, b| a.meta.smallest_key.cmp(&b.meta.smallest_key));
             levels.push(LevelIter::LevelConcat(LevelConcatIter::new(
                 sorted,
@@ -1016,6 +1081,7 @@ impl LarkIterator {
             prefix_extractor,
             merge_operator,
             pending_consume: false,
+            last_forward_user_key: None,
         }
     }
 
@@ -1035,6 +1101,7 @@ impl LarkIterator {
         }
         self.error = None;
         self.valid_entry = false;
+        self.last_forward_user_key = None;
         self.merge_result = None;
         self.reverse_curr = None;
         self.pending_consume = false;
@@ -1053,6 +1120,7 @@ impl LarkIterator {
         }
         self.error = None;
         self.valid_entry = false;
+        self.last_forward_user_key = None;
         self.merge_result = None;
         self.reverse_curr = None;
         self.pending_consume = false;
@@ -1071,6 +1139,7 @@ impl LarkIterator {
         }
         self.error = None;
         self.valid_entry = false;
+        self.last_forward_user_key = None;
         self.merge_result = None;
         self.reverse_curr = None;
         self.pending_consume = false;
@@ -1079,8 +1148,8 @@ impl LarkIterator {
         // Smallest internal key for `target` at any seq: `target || !u64::MAX || 0`.
         // This positions the merging iterator at the newest version of the
         // target user key, or the first user key > target if none exists.
-        let search_key = lookup_key(target, u64::MAX);
-        if let Err(e) = self.inner.seek(&search_key) {
+        let search_key = LookupKey::from_prefixed(target, u64::MAX);
+        if let Err(e) = self.inner.seek(search_key.internal()) {
             self.error = Some(e);
             return;
         }
@@ -1093,6 +1162,7 @@ impl LarkIterator {
         }
         self.error = None;
         self.valid_entry = false;
+        self.last_forward_user_key = None;
         self.merge_result = None;
         self.reverse_curr = None;
         self.pending_consume = false;
@@ -1118,12 +1188,60 @@ impl LarkIterator {
     /// files that demonstrably cannot contain `prefix` are skipped
     /// entirely; files built without a prefix bloom are consulted
     /// normally (safe superset).
+    /// Position the cursor at the newest visible entry whose user key
+    /// is strictly below `exclusive_upper`, and switch to reverse
+    /// iteration.
+    ///
+    /// This is the primitive a bounded reverse scan needs.
+    /// [`Self::seek_for_prev`] takes an **inclusive** bound, and a
+    /// caller holding an exclusive one cannot build an inclusive probe
+    /// from it: byte strings have no predecessor, so no suffix of
+    /// `0xff` bytes is an upper bound for user keys of every length.
+    pub(crate) fn seek_to_last_before(&mut self, exclusive_upper: &[u8]) {
+        if self.terminal_error {
+            return;
+        }
+        self.error = None;
+        self.valid_entry = false;
+        self.last_forward_user_key = None;
+        self.merge_result = None;
+        self.reverse_curr = None;
+        self.pending_consume = false;
+        self.upper_bound = None;
+        self.direction = Direction::Reverse;
+        // `lookup_key(bound, u64::MAX)` encodes as `bound || 00*8 ||
+        // 00`, the smallest internal key any entry for user key `bound`
+        // could carry. Every internal key strictly below it belongs to
+        // a user key strictly below `bound`, whatever its length.
+        let probe = encode_internal_key(exclusive_upper, u64::MAX, VALUE_TYPE_DELETION);
+        if let Err(e) = self.inner.seek_for_prev(&probe) {
+            self.error = Some(e);
+            return;
+        }
+        // `seek_for_prev` is inclusive, so step back over the one entry
+        // shape that can equal the probe: user key `bound` at seq
+        // `u64::MAX`. The engine never allocates that sequence, so this
+        // normally runs zero times; the loop makes the bound exact
+        // rather than exact in practice.
+        while let Some(k) = self.inner.key() {
+            if user_key_of(k) < exclusive_upper {
+                break;
+            }
+            if let Err(e) = self.inner.advance_backward() {
+                self.error = Some(e);
+                return;
+            }
+        }
+        self.materialize_prev_visible();
+    }
+
     pub(crate) fn seek_prefix(&mut self, prefix: &[u8]) {
         if self.terminal_error {
             return;
         }
         self.error = None;
         self.valid_entry = false;
+        self.last_forward_user_key = None;
         self.merge_result = None;
         self.reverse_curr = None;
         self.pending_consume = false;
@@ -1140,11 +1258,12 @@ impl LarkIterator {
             .as_ref()
             .and_then(|ex| ex.extract_query(prefix).map(|p| p.to_vec()));
 
-        let search_key = lookup_key(prefix, u64::MAX);
+        let search_key = LookupKey::from_prefixed(prefix, u64::MAX);
         let res = if let Some(probe) = bloom_probe.as_deref() {
-            self.inner.seek_with_prefix_skip(&search_key, probe)
+            self.inner
+                .seek_with_prefix_skip(search_key.internal(), probe)
         } else {
-            self.inner.seek(&search_key)
+            self.inner.seek(search_key.internal())
         };
         if let Err(e) = res {
             self.error = Some(e);
@@ -1224,6 +1343,28 @@ impl LarkIterator {
         }
     }
 
+    /// The current value as an owning view over whatever already holds
+    /// it. Zero-copy while iterating SSTables in forward order; a copy
+    /// for a memtable-resident entry, a merge result, or the reverse
+    /// path, all of which own their bytes separately.
+    pub(crate) fn value_slice(&self) -> Option<DbSlice> {
+        match self.direction {
+            Direction::Forward => {
+                if let Some((_, v)) = &self.merge_result {
+                    return Some(DbSlice::from_vec(v.clone()));
+                }
+                if !self.valid_entry {
+                    return None;
+                }
+                self.inner.value_slice()
+            }
+            Direction::Reverse => self
+                .reverse_curr
+                .as_ref()
+                .map(|(_, v)| DbSlice::from_vec(v.clone())),
+        }
+    }
+
     pub(crate) fn status(&self) -> io::Result<()> {
         match &self.error {
             Some(e) => Err(io::Error::new(e.kind(), e.to_string())),
@@ -1249,7 +1390,7 @@ impl LarkIterator {
     /// in non-overlapping scopes so the borrow checker is satisfied.
     fn consume_curr_user_key_forward(&mut self) {
         // The inner iterator is positioned at the entry we just
-        // yielded. Advance past it unconditionally — we know it
+        // yielded. Advance past it unconditionally - we know it
         // matches curr_user_key, so the first-iteration check is
         // wasted work. This saves one decode_internal_key +
         // one comparison per visible entry in the common case.
@@ -1285,10 +1426,22 @@ impl LarkIterator {
             };
             let (uk, seq, vt) = decode_internal_key(ik);
 
-            if let Some(ub) = self.upper_bound.as_deref() {
-                if uk >= ub {
-                    return;
-                }
+            let went_backwards = self
+                .last_forward_user_key
+                .as_deref()
+                .is_some_and(|last| uk <= last);
+            if went_backwards {
+                self.error = Some(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SSTable iteration went backwards: file index or data block is corrupt",
+                ));
+                return;
+            }
+
+            if let Some(ub) = self.upper_bound.as_deref()
+                && uk >= ub
+            {
+                return;
             }
 
             if seq > self.snapshot_seq {
@@ -1326,6 +1479,7 @@ impl LarkIterator {
                         Ok(Some(v)) => {
                             self.curr_user_key.clear();
                             self.curr_user_key.extend_from_slice(&uk_owned);
+                            self.last_forward_user_key = Some(uk_owned.clone());
                             self.merge_result = Some((uk_owned, v));
                             self.pending_consume = false;
                             return;
@@ -1343,6 +1497,13 @@ impl LarkIterator {
                     // key()/value() delegate to self.inner.
                     self.curr_user_key.clear();
                     self.curr_user_key.extend_from_slice(uk);
+                    match self.last_forward_user_key.as_mut() {
+                        Some(last) => {
+                            last.clear();
+                            last.extend_from_slice(uk);
+                        }
+                        None => self.last_forward_user_key = Some(uk.to_vec()),
+                    }
                     self.valid_entry = true;
                     self.pending_consume = true;
                     return;
@@ -1375,7 +1536,7 @@ impl LarkIterator {
         let merge_op = match self.merge_operator.clone() {
             Some(op) => op,
             None => {
-                // No merge operator — can't collapse. Treat
+                // No merge operator - can't collapse. Treat
                 // merges as invisible: without an operator there
                 // is no way to produce a value from the chain, so
                 // reads see the key as missing.
@@ -1405,7 +1566,7 @@ impl LarkIterator {
             }
             if rt_seq > 0 && seq <= rt_seq {
                 // Range tombstone hides this and every older entry
-                // for the same user key — synthesize a deletion
+                // for the same user key - synthesize a deletion
                 // terminator and stop.
                 base = None;
                 had_terminator = true;
@@ -1438,7 +1599,7 @@ impl LarkIterator {
         let _ = had_terminator;
 
         if operands_newest_first.is_empty() {
-            // No merges — shouldn't happen because caller saw a
+            // No merges - shouldn't happen because caller saw a
             // merge at the head, but handle it safely.
             return Ok(base);
         }
@@ -1463,7 +1624,7 @@ impl LarkIterator {
     /// In reverse walk, a user-key group is visited in *ascending* seq
     /// order (because higher seq produces a smaller internal key, which
     /// comes later in reverse order). We scan the whole group, keeping
-    /// track of the highest visible seq we see — that is the winning
+    /// track of the highest visible seq we see - that is the winning
     /// version. If it's a tombstone the group is skipped; otherwise it
     /// is emitted.
     fn materialize_prev_visible(&mut self) {
@@ -1578,6 +1739,7 @@ impl LarkIterator {
         }
         self.reverse_curr = None;
         self.direction = Direction::Forward;
+        self.last_forward_user_key = None;
     }
 
     /// Switch from forward to reverse iteration. After a forward pass
@@ -1595,8 +1757,8 @@ impl LarkIterator {
         if uk.is_empty() {
             return;
         }
-        let probe = lookup_key(&uk, u64::MAX);
-        if let Err(e) = self.inner.seek_for_prev(&probe) {
+        let probe = LookupKey::from_prefixed(&uk, u64::MAX);
+        if let Err(e) = self.inner.seek_for_prev(probe.internal()) {
             self.error = Some(e);
         }
         self.valid_entry = false;

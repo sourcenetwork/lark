@@ -1,19 +1,27 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self};
 use std::path::{Path, PathBuf};
+
+// The module's own tests craft corrupt manifests byte by byte, which
+// is the one thing that has to bypass the environment.
+#[cfg(test)]
+use std::fs::OpenOptions;
 use std::sync::Arc;
+
+use crate::env::{BufferedWriter, Env, WriteMode};
 
 use parking_lot::RwLock;
 
-use super::sstable::{sst_filename, LiveSst, SsTableMeta, SsTableReader};
-use super::{checksum, durability};
+use super::checksum;
+use super::sstable::{
+    LiveSst, MetadataPolicy, SsTableMeta, SsTableReader, sst_filename, table_carries_data,
+};
 
 /// Maximum number of levels in the LSM tree.
 pub(crate) const MAX_LEVELS: usize = 7;
 
 /// A snapshot of which SSTables exist at each level.
 ///
-/// Each level holds `Arc<LiveSst>` — the metadata plus an open reader —
+/// Each level holds `Arc<LiveSst>` - the metadata plus an open reader -
 /// so that every file referenced by a live version has a pinned file
 /// descriptor. Concurrent compaction can safely `unlink` a file as soon
 /// as it's removed from the *current* version because the Arcs in older
@@ -254,11 +262,43 @@ fn validate_level_index(level: usize) -> io::Result<()> {
     ))
 }
 
+/// Identifier at the head of a MANIFEST: `REGOMAN` plus a format byte.
+const MANIFEST_MAGIC: [u8; 7] = *b"REGOMAN";
+
+/// On-disk MANIFEST format this build writes.
+const MANIFEST_FORMAT_V1: u8 = 1;
+
+/// Stamp layout: magic, format, checksum.
+const MANIFEST_STAMP_LEN: usize = 12;
+
+/// How far past its canonical size a MANIFEST may grow before it is
+/// rewritten.
+///
+/// The log is append-only, so without this it grows for the life of the
+/// database and recovery replays every edit ever made. Rewriting costs
+/// one record per live SSTable, and only after the log has grown to a
+/// multiple of that, so the amortized cost per edit is constant while
+/// the file stays within a bounded factor of its minimum.
+const MANIFEST_COMPACT_FACTOR: u64 = 4;
+
+/// Floor for the rewrite trigger, so a small database does not rewrite
+/// its manifest on almost every edit.
+const MANIFEST_COMPACT_FLOOR: u64 = 64 * 1024;
+
+/// Rough size of one `AddFile` record, used only to size the rewrite
+/// trigger. Being approximate costs a slightly different trigger point,
+/// never correctness: the rewrite is driven by the real file length.
+const APPROX_ADD_FILE_RECORD_BYTES: u64 = 256;
+
 /// Manages the current version and persists version edits to a manifest log.
 pub(crate) struct VersionSet {
     current: Arc<RwLock<Arc<Version>>>,
     manifest_path: PathBuf,
-    manifest_writer: Option<BufWriter<File>>,
+    /// Bytes the manifest holds on disk, tracked rather than stat'ed so
+    /// the rewrite check costs nothing on the common path.
+    manifest_bytes: u64,
+    manifest_writer: Option<BufferedWriter>,
+    env: Arc<dyn Env>,
 }
 
 struct ManifestReplay {
@@ -266,37 +306,98 @@ struct ManifestReplay {
     valid_len: usize,
 }
 
+/// An unreferenced `*.sst` file that the discarded-table guard could not
+/// dismiss as a crash artifact, with the reason it counts.
+struct SuspectTable {
+    path: PathBuf,
+    /// `None` when the file's metadata could not be read.
+    len: Option<u64>,
+    reason: String,
+}
+
+/// How many suspects the guard's error message names before summarising
+/// the rest. The cap is reported in the message so a long list never
+/// reads as a short one.
+const SUSPECTS_NAMED: usize = 8;
+
+fn describe_suspects(suspects: &[SuspectTable]) -> String {
+    let mut out = suspects
+        .iter()
+        .take(SUSPECTS_NAMED)
+        .map(|s| match s.len {
+            Some(len) => format!("{} ({len} bytes, {})", s.path.display(), s.reason),
+            None => format!("{} (size unknown, {})", s.path.display(), s.reason),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if suspects.len() > SUSPECTS_NAMED {
+        out.push_str(&format!(
+            ", and {} more not named here",
+            suspects.len() - SUSPECTS_NAMED
+        ));
+    }
+    out
+}
+
 impl VersionSet {
-    /// Create or recover a VersionSet from the given directory. During
-    /// recovery every SSTable referenced by the manifest is opened
-    /// eagerly so the returned version is fully populated with live
-    /// readers.
-    pub(crate) fn open(db_dir: &Path, sst_dir: &Path) -> io::Result<Self> {
+    /// Create or recover a VersionSet from the given directory, with an
+    /// explicit policy for how the readers it opens hold their index and
+    /// filter blocks.
+    ///
+    /// Recovery is where this matters most: it opens a reader for every
+    /// SSTable the manifest references, so the policy decides whether
+    /// that whole set of indexes and filters is pinned or bounded by
+    /// the block cache.
+    pub(crate) fn open_with_policy(
+        env: &Arc<dyn Env>,
+        db_dir: &Path,
+        sst_dir: &Path,
+        policy: MetadataPolicy,
+    ) -> io::Result<Self> {
         let manifest_path = db_dir.join("MANIFEST");
 
-        let (version, writer) = if manifest_path.exists() {
-            let data = fs::read(&manifest_path)?;
-            let replay = Self::replay_manifest(&data, sst_dir)?;
+        let manifest_bytes;
+        let (version, writer) = if env.exists(&manifest_path) {
+            let data = env.read(&manifest_path)?;
+            let replay = Self::replay_manifest(env, &data, sst_dir, policy)?;
+            Self::reject_discarded_tables(&**env, &replay, data.len(), sst_dir, &manifest_path)?;
 
-            let file = OpenOptions::new().append(true).open(&manifest_path)?;
+            let mut file = env.open_write(&manifest_path, WriteMode::Append)?;
             if replay.valid_len < data.len() {
                 file.set_len(replay.valid_len as u64)?;
                 file.sync_all()?;
             }
-            (replay.version, BufWriter::new(file))
+            manifest_bytes = replay.valid_len as u64;
+            (replay.version, BufferedWriter::new(file))
         } else {
             let version = Version::new();
-            let file = File::create(&manifest_path)?;
+            let mut file = env.open_write(&manifest_path, WriteMode::Truncate)?;
+            file.write_all(&Self::encode_stamp())?;
             file.sync_all()?;
-            durability::sync_parent_dir(&manifest_path)?;
-            (version, BufWriter::new(file))
+            crate::env::sync_parent_dir(&**env, &manifest_path)?;
+            manifest_bytes = MANIFEST_STAMP_LEN as u64;
+            (version, BufferedWriter::new(file))
         };
 
         Ok(Self {
             current: Arc::new(RwLock::new(Arc::new(version))),
             manifest_path,
+            manifest_bytes,
             manifest_writer: Some(writer),
+            env: Arc::clone(env),
         })
+    }
+
+    /// Create or recover a VersionSet through the standard
+    /// environment.
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub(crate) fn open(db_dir: &Path, sst_dir: &Path) -> io::Result<Self> {
+        Self::open_with_policy(
+            &crate::env::std_env(),
+            db_dir,
+            sst_dir,
+            MetadataPolicy::Pinned,
+        )
     }
 
     /// Recover an existing VersionSet without mutating the manifest.
@@ -304,15 +405,23 @@ impl VersionSet {
     /// This is used by read-only opens: replay still tolerates a
     /// truncated trailing record exactly like the read-write path, but
     /// the file is not repaired in place and no append writer is kept.
-    pub(crate) fn open_read_only(db_dir: &Path, sst_dir: &Path) -> io::Result<Self> {
+    pub(crate) fn open_read_only(
+        env: &Arc<dyn Env>,
+        db_dir: &Path,
+        sst_dir: &Path,
+        policy: MetadataPolicy,
+    ) -> io::Result<Self> {
         let manifest_path = db_dir.join("MANIFEST");
-        let data = fs::read(&manifest_path)?;
-        let replay = Self::replay_manifest(&data, sst_dir)?;
+        let data = env.read(&manifest_path)?;
+        let replay = Self::replay_manifest(env, &data, sst_dir, policy)?;
+        Self::reject_discarded_tables(&**env, &replay, data.len(), sst_dir, &manifest_path)?;
 
         Ok(Self {
             current: Arc::new(RwLock::new(Arc::new(replay.version))),
             manifest_path,
+            manifest_bytes: replay.valid_len as u64,
             manifest_writer: None,
+            env: Arc::clone(env),
         })
     }
 
@@ -373,20 +482,40 @@ impl VersionSet {
         let requires_sync = edits.iter().any(VersionEdit::requires_manifest_sync);
         if let Some(writer) = &mut self.manifest_writer {
             writer.write_all(&encoded)?;
-            writer.flush()?;
             if requires_sync {
-                writer.get_ref().sync_all()?;
+                writer.sync_all()?;
+            } else {
+                writer.flush()?;
             }
         }
 
+        let live_files: u64 = version.levels.iter().map(|l| l.len() as u64).sum();
         *self.current.write() = Arc::new(version);
+        self.manifest_bytes += encoded.len() as u64;
+
+        // The log is append-only, so a database that runs for years
+        // replays every edit it ever made unless the file is rewritten.
+        // Rewriting costs one record per live table and happens only once
+        // the log has grown to a multiple of that, so the cost per edit
+        // is constant and the file stays within a bounded factor of its
+        // smallest possible size.
+        if self.manifest_bytes > Self::compact_threshold(live_files) {
+            self.compact_manifest()?;
+        }
 
         Ok(())
     }
 
+    /// Size at which the manifest is rewritten, from the number of live
+    /// SSTables it has to name.
+    fn compact_threshold(live_files: u64) -> u64 {
+        let canonical = MANIFEST_STAMP_LEN as u64 + live_files * APPROX_ADD_FILE_RECORD_BYTES;
+        MANIFEST_COMPACT_FLOOR.max(canonical.saturating_mul(MANIFEST_COMPACT_FACTOR))
+    }
+
     /// Rewrite the manifest from scratch, emitting the current version as
     /// a single compact sequence of records. Readers in the live
-    /// `Version` are preserved — we never close their file descriptors.
+    /// `Version` are preserved - we never close their file descriptors.
     pub(crate) fn compact_manifest(&mut self) -> io::Result<()> {
         let version = self.current();
 
@@ -407,17 +536,60 @@ impl VersionSet {
 
         let tmp_path = self.manifest_path.with_extension("tmp");
         {
-            let mut file = File::create(&tmp_path)?;
+            let mut file = self.env.open_write(&tmp_path, WriteMode::Truncate)?;
+            file.write_all(&Self::encode_stamp())?;
             file.write_all(&encoded)?;
             file.sync_all()?;
         }
-        fs::rename(&tmp_path, &self.manifest_path)?;
-        durability::sync_parent_dir(&self.manifest_path)?;
+        self.env.rename(&tmp_path, &self.manifest_path)?;
+        crate::env::sync_parent_dir(&*self.env, &self.manifest_path)?;
+        self.manifest_bytes = (MANIFEST_STAMP_LEN + encoded.len()) as u64;
 
-        let file = OpenOptions::new().append(true).open(&self.manifest_path)?;
-        self.manifest_writer = Some(BufWriter::new(file));
+        let file = self
+            .env
+            .open_write(&self.manifest_path, WriteMode::Append)?;
+        self.manifest_writer = Some(BufferedWriter::new(file));
 
         Ok(())
+    }
+
+    /// Encode the stamp a manifest begins with.
+    fn encode_stamp() -> [u8; MANIFEST_STAMP_LEN] {
+        let mut out = [0u8; MANIFEST_STAMP_LEN];
+        out[0..7].copy_from_slice(&MANIFEST_MAGIC);
+        out[7] = MANIFEST_FORMAT_V1;
+        let checksum = checksum::manifest_record(0, &out[0..8]);
+        out[8..12].copy_from_slice(&checksum.to_le_bytes());
+        out
+    }
+
+    /// Length of the stamp at the head of `data`, or `None` when the
+    /// manifest predates the stamp and begins directly with a record.
+    fn stamp_len(data: &[u8]) -> io::Result<usize> {
+        if data.len() < MANIFEST_STAMP_LEN || data[0..7] != MANIFEST_MAGIC {
+            // A manifest written before the stamp existed. It is read as
+            // it was written, and the next compaction rewrites it with a
+            // stamp, so a database migrates by being used.
+            return Ok(0);
+        }
+        let format = data[7];
+        let stored = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+        if stored != checksum::manifest_record(0, &data[0..8]) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MANIFEST stamp checksum mismatch",
+            ));
+        }
+        if format > MANIFEST_FORMAT_V1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "MANIFEST format {format} was written by a newer lark than this build, \
+                     which understands up to {MANIFEST_FORMAT_V1}"
+                ),
+            ));
+        }
+        Ok(MANIFEST_STAMP_LEN)
     }
 
     fn encode_records(records: &[ManifestRecord]) -> Vec<u8> {
@@ -436,9 +608,133 @@ impl VersionSet {
         buf
     }
 
-    fn replay_manifest(data: &[u8], sst_dir: &Path) -> io::Result<ManifestReplay> {
+    /// Refuse to open when a manifest that did not replay cleanly ends up
+    /// referencing no SSTable at all while the table directory still holds
+    /// one that could carry data.
+    ///
+    /// Replay stops at the first unreadable record and the tail is
+    /// discarded, which is correct for a record that a crash left half
+    /// written. When the *first* record is unreadable the same rule
+    /// silently turns a populated database into an empty one, so that
+    /// combination is reported instead of served: the table files are
+    /// still on disk and only the manifest needs repairing.
+    ///
+    /// A crash inside the very first flush leaves the opposite shape: a
+    /// table file that holds nothing, next to a WAL that holds every
+    /// acknowledged write. Refusing on that file would lose the writes
+    /// the WAL still has, so `suspect_tables` rules it out
+    /// before the count is taken.
+    fn reject_discarded_tables(
+        env: &dyn Env,
+        replay: &ManifestReplay,
+        manifest_len: usize,
+        sst_dir: &Path,
+        manifest_path: &Path,
+    ) -> io::Result<()> {
+        let replayed_cleanly = manifest_len > 0 && replay.valid_len == manifest_len;
+        if replayed_cleanly || replay.version.levels.iter().any(|level| !level.is_empty()) {
+            return Ok(());
+        }
+        let suspects = Self::suspect_tables(env, sst_dir);
+        if suspects.is_empty() {
+            return Ok(());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} is corrupt: it references no SSTable, but {} table file(s) in {} may still hold data. \
+                 Opening would discard them, so the database is left untouched. Suspect tables: {}",
+                manifest_path.display(),
+                suspects.len(),
+                sst_dir.display(),
+                describe_suspects(&suspects),
+            ),
+        ))
+    }
+
+    /// The unreferenced `*.sst` files that could plausibly hold live data.
+    ///
+    /// A zero-length table, or one whose footer records no entry and no
+    /// range tombstone, is what a crash inside a flush leaves behind: the
+    /// directory entry reached the journal, the delayed-allocated data
+    /// blocks did not. Such a file cannot be a live table the manifest is
+    /// about to discard, so it is logged and skipped rather than counted.
+    ///
+    /// Everything else counts, including a file whose footer will not
+    /// parse. An unreadable file cannot be proved empty, and keeping the
+    /// database shut preserves it for repair.
+    ///
+    /// Nothing is deleted here, so a crash part way through recovery
+    /// leaves the directory exactly as this pass found it and the next
+    /// open reaches the same verdict.
+    fn suspect_tables(env: &dyn Env, sst_dir: &Path) -> Vec<SuspectTable> {
+        let entries = match env.read_dir(sst_dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!(
+                    dir = %sst_dir.display(),
+                    error = %e,
+                    "could not list the SSTable directory while checking for discarded tables"
+                );
+                return Vec::new();
+            }
+        };
+
+        let mut suspects = Vec::new();
+        for entry in entries {
+            let path = entry.path.clone();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("sst") {
+                continue;
+            }
+            let len = match env.metadata(&path) {
+                Ok(meta) => Some(meta.len),
+                Err(e) => {
+                    suspects.push(SuspectTable {
+                        path,
+                        len: None,
+                        reason: format!("unreadable: {e}"),
+                    });
+                    continue;
+                }
+            };
+            if len == Some(0) {
+                tracing::warn!(
+                    path = %path.display(),
+                    "ignoring a zero-length orphan SSTable left by a crash inside a flush"
+                );
+                continue;
+            }
+            match table_carries_data(env, &path) {
+                Ok(true) => suspects.push(SuspectTable {
+                    path,
+                    len,
+                    reason: "carries data".to_string(),
+                }),
+                Ok(false) => tracing::warn!(
+                    path = %path.display(),
+                    "ignoring an orphan SSTable whose footer records no entry and no range tombstone"
+                ),
+                Err(e) => suspects.push(SuspectTable {
+                    path,
+                    len,
+                    reason: format!("unreadable footer: {e}"),
+                }),
+            }
+        }
+        suspects.sort_by(|a, b| a.path.cmp(&b.path));
+        suspects
+    }
+
+    /// Replay every record, then open a reader for each surviving file
+    /// through `env` under `policy`.
+    fn replay_manifest(
+        env: &Arc<dyn Env>,
+        data: &[u8],
+        sst_dir: &Path,
+        policy: MetadataPolicy,
+    ) -> io::Result<ManifestReplay> {
         // Two-pass replay. The first pass walks every record and tracks
-        // the *logical* state of each level — which file ids are live —
+        // the *logical* state of each level - which file ids are live -
         // without touching the filesystem. Only after replay completes
         // do we open readers for the surviving files.
         //
@@ -452,8 +748,12 @@ impl VersionSet {
         let mut last_seq: u64 = 0;
         let mut next_file_id: u64 = 1;
         let mut min_wal_id: u64 = 0;
-        let mut offset = 0;
-        let mut valid_len = 0;
+        // The stamp is not a record. `valid_len` starts past it so a
+        // clean replay ends exactly at the file length, which is what
+        // `reject_discarded_tables` compares against.
+        let stamp = Self::stamp_len(data)?;
+        let mut offset = stamp;
+        let mut valid_len = stamp;
 
         while offset < data.len() {
             if offset + 4 > data.len() {
@@ -525,9 +825,11 @@ impl VersionSet {
         for (level, files) in surviving.into_iter().enumerate() {
             for meta in files {
                 let path = sst_dir.join(sst_filename(meta.file_id));
-                let reader = Arc::new(SsTableReader::open(&path, meta.file_id).map_err(|e| {
-                    std::io::Error::new(e.kind(), format!("open {}: {e}", path.display()))
-                })?);
+                let reader = Arc::new(
+                    SsTableReader::open_with(env, &path, meta.file_id, policy).map_err(|e| {
+                        std::io::Error::new(e.kind(), format!("open {}: {e}", path.display()))
+                    })?,
+                );
                 version.levels[level].push(LiveSst::new(meta, reader));
             }
         }
@@ -544,7 +846,7 @@ mod tests {
     /// Build a real on-disk SSTable and open a reader for it. Used by
     /// tests that need a non-trivial `LiveSst` instance.
     fn make_live_sst(dir: &Path, file_id: u64, smallest: &[u8], largest: &[u8]) -> Arc<LiveSst> {
-        use super::super::internal_key::{encode_internal_key, VALUE_TYPE_VALUE};
+        use super::super::internal_key::{VALUE_TYPE_VALUE, encode_internal_key};
         use super::super::sstable::SsTableWriter;
         use crate::options::CompressionType;
 
@@ -579,8 +881,10 @@ mod tests {
 
     fn second_record_checksum_offset(path: &Path) -> usize {
         let data = std::fs::read(path).unwrap();
-        let first_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-        let second_start = 4 + first_len + 4;
+        // Records begin after the stamp.
+        let base = MANIFEST_STAMP_LEN;
+        let first_len = u32::from_le_bytes(data[base..base + 4].try_into().unwrap()) as usize;
+        let second_start = base + 4 + first_len + 4;
         let second_len =
             u32::from_le_bytes(data[second_start..second_start + 4].try_into().unwrap()) as usize;
         second_start + 4 + second_len
@@ -616,7 +920,13 @@ mod tests {
         data.extend_from_slice(&record);
         data.extend_from_slice(&checksum::legacy_payload_u32(&record).to_le_bytes());
 
-        let replay = VersionSet::replay_manifest(&data, dir.path()).unwrap();
+        let replay = VersionSet::replay_manifest(
+            &crate::env::std_env(),
+            &data,
+            dir.path(),
+            MetadataPolicy::Pinned,
+        )
+        .unwrap();
         assert_eq!(replay.version.last_seq, 7);
         assert_eq!(replay.valid_len, data.len());
     }
@@ -682,7 +992,7 @@ mod tests {
         .unwrap();
 
         // Holding a snapshot of the version *before* removal keeps both
-        // files alive — this is the invariant that lets get/iter reads
+        // files alive - this is the invariant that lets get/iter reads
         // survive concurrent compaction.
         let pinned = vs.current();
         assert_eq!(pinned.levels[0].len(), 2);
@@ -758,7 +1068,7 @@ mod tests {
                 Ok(Some(d)) => d,
                 other => panic!("expected decoded record, got {:?}", other.is_ok()),
             };
-            // Re-encode and compare — equality via round-trip avoids
+            // Re-encode and compare - equality via round-trip avoids
             // having to add PartialEq to ManifestRecord.
             let mut rebuf = Vec::new();
             decoded.encode(&mut rebuf);
@@ -880,7 +1190,7 @@ mod tests {
         vs.apply(&[VersionEdit::SetLastSeq(50)]).unwrap();
         drop(vs);
 
-        // Truncate 2 bytes off the end — enough to damage the final
+        // Truncate 2 bytes off the end - enough to damage the final
         // record's checksum or tail.
         let path = dir.path().join("MANIFEST");
         let current = std::fs::metadata(&path).unwrap().len();
@@ -994,6 +1304,78 @@ mod tests {
 
         let vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
         assert_eq!(vs.current().last_seq, 99);
+    }
+
+    /// The manifest is an append-only log, so without a rewrite trigger a
+    /// database that runs for years replays every edit it ever made. This
+    /// applies far more edits than the trigger allows and asserts the
+    /// file stays bounded rather than growing with the history.
+    #[test]
+    fn a_long_running_manifest_stays_bounded_instead_of_growing_forever() {
+        let dir = TempDir::new().unwrap();
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+        let path = dir.path().join("MANIFEST");
+
+        let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+        // No files are ever added, so the canonical form stays tiny and
+        // the floor is the whole budget.
+        for seq in 0..20_000u64 {
+            vs.apply(&[VersionEdit::SetLastSeq(seq)]).unwrap();
+        }
+        drop(vs);
+
+        let len = std::fs::metadata(&path).unwrap().len();
+        let bound = VersionSet::compact_threshold(0);
+        assert!(
+            len <= bound,
+            "manifest grew to {len} bytes against a {bound}-byte bound: \
+             an append-only log that is never rewritten grows without limit"
+        );
+
+        // And it still replays to the state those edits describe.
+        let reopened = VersionSet::open(dir.path(), &sst_dir).unwrap();
+        assert_eq!(reopened.current().last_seq, 19_999);
+    }
+
+    /// A manifest written before the stamp existed still opens, and is
+    /// rewritten with a stamp once it is compacted.
+    #[test]
+    fn an_unstamped_manifest_opens_and_gains_a_stamp_when_rewritten() {
+        let dir = TempDir::new().unwrap();
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+        let path = dir.path().join("MANIFEST");
+
+        // A manifest in the pre-stamp shape: records, no header.
+        let records = [ManifestRecord::SetLastSeq(42)];
+        std::fs::write(&path, VersionSet::encode_records(&records)).unwrap();
+
+        let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+        assert_eq!(vs.current().last_seq, 42, "an unstamped manifest must open");
+
+        vs.compact_manifest().unwrap();
+        let data = std::fs::read(&path).unwrap();
+        assert_eq!(&data[0..7], b"REGOMAN", "a rewrite must stamp the file");
+        assert_eq!(
+            VersionSet::stamp_len(&data).unwrap(),
+            MANIFEST_STAMP_LEN,
+            "the written stamp must validate"
+        );
+        drop(vs);
+        let reopened = VersionSet::open(dir.path(), &sst_dir).unwrap();
+        assert_eq!(reopened.current().last_seq, 42);
+    }
+
+    #[test]
+    fn a_manifest_from_a_newer_format_is_refused() {
+        let mut stamp = VersionSet::encode_stamp();
+        stamp[7] = MANIFEST_FORMAT_V1 + 1;
+        let checksum = checksum::manifest_record(0, &stamp[0..8]);
+        stamp[8..12].copy_from_slice(&checksum.to_le_bytes());
+
+        let err = VersionSet::stamp_len(&stamp).expect_err("a newer format must not be parsed");
+        assert!(err.to_string().contains("newer lark"), "{err}");
     }
 
     #[test]

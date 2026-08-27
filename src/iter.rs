@@ -2,8 +2,8 @@
 //!
 //! An [`Iter`] is obtained from [`Db::iter`](crate::Db::iter) or
 //! [`Snapshot::iter`](crate::Snapshot::iter) and yields user keys in
-//! ascending order. It honors MVCC snapshot visibility — keys written
-//! after the iterator was created are invisible — and hides tombstoned
+//! ascending order. It honors MVCC snapshot visibility - keys written
+//! after the iterator was created are invisible - and hides tombstoned
 //! keys from the stream. The iterator is safe against concurrent
 //! background compaction: it holds pinned references to every SSTable
 //! file that existed at creation time, so compaction can unlink files
@@ -12,10 +12,10 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::engine::iterator::LarkIterator;
 use crate::engine::LarkEngine;
+use crate::engine::iterator::LarkIterator;
 use crate::statistics::{Histogram, Statistics, Ticker, TimeScope};
-use crate::Result;
+use crate::{DbSlice, Result};
 
 /// Streaming iterator over a consistent view of the database.
 ///
@@ -140,13 +140,22 @@ impl<'a> Iter<'a> {
         self.inner.seek_to_last();
     }
 
+    /// Position the iterator at the last user key strictly below
+    /// `exclusive_upper`, and set the scan direction to reverse. Used
+    /// by the column-family iterator, whose upper bound is exclusive.
+    pub(crate) fn seek_to_last_before(&mut self, exclusive_upper: &[u8]) {
+        self.tick_seek();
+        let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterSeek);
+        self.inner.seek_to_last_before(exclusive_upper);
+    }
+
     /// Advance to the next user key alphabetically. If the iterator was
     /// walking backward, direction flips before the advance. A no-op if
     /// the iterator is not valid.
     pub fn next(&mut self) {
         let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterNext);
         self.inner.next();
-        // Only count the step when it produced a key — an
+        // Only count the step when it produced a key - an
         // end-of-stream `next` that invalidates the iterator
         // should not inflate the counter.
         if self.inner.valid() {
@@ -182,6 +191,20 @@ impl<'a> Iter<'a> {
     /// positioned on a live entry.
     pub fn value(&self) -> Option<&[u8]> {
         self.inner.value()
+    }
+
+    /// Returns the current value as a [`DbSlice`], or `None` if the
+    /// iterator isn't positioned on a live entry.
+    ///
+    /// Unlike [`Iter::value`], the returned slice does not borrow the
+    /// iterator, so it stays valid after [`Iter::next`] moves on. While
+    /// scanning SSTables forward this costs one reference count and no
+    /// copy; a memtable-resident entry, a merge result and the reverse
+    /// path all own their bytes separately and are copied once.
+    ///
+    /// Holding one pins its owner: see [`DbSlice`].
+    pub fn value_slice(&self) -> Option<DbSlice> {
+        self.inner.value_slice()
     }
 
     /// Returns `Ok(())` if the iterator has not encountered an I/O error,

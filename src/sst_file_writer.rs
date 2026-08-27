@@ -10,15 +10,15 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::column_family::{prefix_key, ColumnFamilyHandle, DEFAULT_CF_ID};
-use crate::engine::internal_key::{encode_internal_key, VALUE_TYPE_DELETION, VALUE_TYPE_VALUE};
+use crate::column_family::{ColumnFamilyHandle, DEFAULT_CF_ID, prefix_key};
+use crate::engine::internal_key::{VALUE_TYPE_DELETION, VALUE_TYPE_VALUE, encode_internal_key};
 use crate::engine::sstable::SsTableWriter;
 use crate::options::Options;
 
 /// Writes a standalone SSTable file that a running [`crate::Db`] can
 /// bulk-ingest via [`crate::Db::ingest_external_files`].
 ///
-/// Keys must be supplied in **strictly ascending** user-key order —
+/// Keys must be supplied in **strictly ascending** user-key order -
 /// duplicates and out-of-order keys are rejected with an error. Every
 /// entry is written with a placeholder sequence number of `0`; the
 /// real sequence number is assigned by the engine when the file is
@@ -52,7 +52,7 @@ pub struct IngestOptions {
     /// Advisory: whether to treat the source file as movable. In the
     /// current implementation the engine always re-emits the ingest
     /// file (to rewrite sequence numbers), so the source path is left
-    /// untouched regardless of this flag — the caller is free to
+    /// untouched regardless of this flag - the caller is free to
     /// delete or re-ingest it.
     pub move_files: bool,
     /// Reject the ingest if any live snapshot is pinned. Ingest
@@ -84,7 +84,8 @@ impl SstFileWriter {
     pub fn create<P: AsRef<Path>>(path: P, opts: &Options) -> crate::Result<Self> {
         opts.validate()?;
         let path = path.as_ref().to_path_buf();
-        let inner = SsTableWriter::new(
+        let inner = SsTableWriter::new_in(
+            &opts.env,
             &path,
             opts.block_size,
             opts.bloom_bits_per_key,
@@ -153,12 +154,12 @@ impl SstFileWriter {
                 self.max_value_size
             )));
         }
-        if let Some(last) = &self.last_user_key {
-            if key <= last.as_slice() {
-                return Err(crate::Error::invalid_argument(
-                    "SstFileWriter keys must arrive in strictly ascending order",
-                ));
-            }
+        if let Some(last) = &self.last_user_key
+            && key <= last.as_slice()
+        {
+            return Err(crate::Error::invalid_argument(
+                "SstFileWriter keys must arrive in strictly ascending order",
+            ));
         }
         let internal = encode_internal_key(key, 0, value_type);
         self.inner
@@ -169,7 +170,7 @@ impl SstFileWriter {
         Ok(())
     }
 
-    /// Finalize the file. Errors if no entries were written — an empty
+    /// Finalize the file. Errors if no entries were written - an empty
     /// ingest file is almost certainly a bug and would be rejected at
     /// ingest time anyway.
     pub fn finish(self) -> crate::Result<SstFileMeta> {
@@ -380,7 +381,7 @@ mod tests {
         db.ingest_external_files(&[sst_path], opts).unwrap();
 
         assert_eq!(db.get(b"zzz").unwrap(), Some(b"z".to_vec()));
-        // Placed at the bottommost level — not L0.
+        // Placed at the bottommost level - not L0.
         assert_eq!(db.level_file_count(0), 0);
     }
 
@@ -453,7 +454,7 @@ mod tests {
         // Live db sees both.
         assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
         assert_eq!(db.get(b"b").unwrap(), Some(b"2".to_vec()));
-        // Pre-ingest snapshot sees only the original key — the
+        // Pre-ingest snapshot sees only the original key - the
         // ingested entry carries a higher seq than the snapshot's.
         assert_eq!(snap.get(b"a").unwrap(), Some(b"1".to_vec()));
         assert_eq!(snap.get(b"b").unwrap(), None);
