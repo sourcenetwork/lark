@@ -77,6 +77,17 @@
 //! and stays in the default `cargo test`. `just test-power` runs it with
 //! output shown, which is how the measured `Eventual` loss is read off.
 
+//! # Linux only
+//!
+//! Every test here drives a child process under the `LD_PRELOAD` fault
+//! shim, which is how unsynced bytes are discarded to model a power
+//! cut rather than a process kill. `LD_PRELOAD` interposition is a
+//! glibc mechanism, so on any other target the shim cannot be built.
+//! The file is compiled out there rather than failing at run time: a
+//! test that panics because the platform cannot host its mechanism
+//! reports a defect that does not exist.
+#![cfg(target_os = "linux")]
+
 mod common;
 
 use std::path::Path;
