@@ -183,29 +183,44 @@ fn every_publisher_of_the_read_view_running_at_once_stays_live() {
         }));
     }
 
+    // The stall threshold has to fit inside the window it is watching.
+    // It was a flat 60 seconds against an 8 second run, so
+    // `stalled.elapsed()` could never reach it, `wedged` was always
+    // `None`, and the assertion below was `assert!(true)`: the wedge
+    // detector this test exists for had never run.
+    let stall_limit = Duration::from_secs(secs / 4).max(Duration::from_secs(1));
     let mut last = 0u64;
     let mut stalled = Instant::now();
     let mut wedged = None;
     while Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(10));
         let now = progress.load(Ordering::Relaxed);
         if now != last {
             last = now;
             stalled = Instant::now();
-        } else if stalled.elapsed() > Duration::from_secs(60) {
+        } else if stalled.elapsed() > stall_limit {
             wedged = Some(now);
             break;
         }
     }
     stop.store(true, Ordering::Relaxed);
+
+    // Asserted before the join: a genuinely wedged reader never returns
+    // to check `stop`, so joining first would hang and bury the reason.
+    let rounds = progress.load(Ordering::Relaxed);
+    assert!(
+        wedged.is_none(),
+        "the read view wedged: no reader progressed for {stall_limit:?} at {rounds} rounds",
+    );
+    // And a run where the readers never got going proves nothing either
+    // way, so it is a failure rather than a quiet pass.
+    assert!(
+        rounds > 0,
+        "no reader completed a round in {secs}s, so nothing was observed"
+    );
     for h in handles {
         h.join().expect("worker panicked");
     }
-    assert!(
-        wedged.is_none(),
-        "the read view wedged: no reader progressed for 60s at {} rounds",
-        wedged.unwrap_or(0),
-    );
     println!(
         "liveness: {} reader rounds over {secs}s with rotation, compaction, drop_all and \
          background compaction all publishing",

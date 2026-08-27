@@ -430,12 +430,21 @@ fn a_batch_larger_than_the_group_cap_stays_atomic() {
     let width = 4_000usize;
     let stop = Arc::new(AtomicBool::new(false));
     let torn = Arc::new(AtomicUsize::new(0));
+    // `torn` only ever counts violations, so a reader that was never
+    // scheduled leaves it at zero and the test passes having observed
+    // nothing. Counting the snapshots taken is what turns "never torn"
+    // into a claim, and the floor below is what makes the reader keep
+    // looking until it has one.
+    const MIN_SNAPSHOTS: usize = 200;
+    let snapshots = Arc::new(AtomicUsize::new(0));
     let reader = {
         let db = Arc::clone(&db);
         let stop = Arc::clone(&stop);
         let torn = Arc::clone(&torn);
+        let snapshots = Arc::clone(&snapshots);
         thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
+            while !stop.load(Ordering::Relaxed) || snapshots.load(Ordering::Relaxed) < MIN_SNAPSHOTS
+            {
                 let snap = db.snapshot();
                 let present = (0..width)
                     .step_by(97)
@@ -445,6 +454,7 @@ fn a_batch_larger_than_the_group_cap_stays_atomic() {
                 if present != 0 && present != sampled {
                     torn.fetch_add(1, Ordering::Relaxed);
                 }
+                snapshots.fetch_add(1, Ordering::Relaxed);
             }
         })
     };
@@ -455,10 +465,14 @@ fn a_batch_larger_than_the_group_cap_stays_atomic() {
         batch.put(format!("huge_{k:05}").as_bytes(), &[b'h'; 512]);
     }
     db.write(batch).unwrap();
-    thread::sleep(std::time::Duration::from_millis(50));
     stop.store(true, Ordering::Relaxed);
     reader.join().unwrap();
 
+    let snapshots = snapshots.load(Ordering::Relaxed);
+    assert!(
+        snapshots >= MIN_SNAPSHOTS,
+        "the reader took only {snapshots} snapshots, so a torn batch could not have been seen"
+    );
     assert_eq!(
         torn.load(Ordering::Relaxed),
         0,
