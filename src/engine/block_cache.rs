@@ -547,8 +547,11 @@ impl CacheShard {
 ///   ring mutex the moment the hand takes the slot.
 ///
 /// Together those put live heap above the budget at saturation by a
-/// fixed margin: 24% measured with 1 KiB blocks, 30% with 256-byte
-/// blocks, where a byte of block payload carries the most bookkeeping.
+/// fixed margin. Both costs are per entry rather than per byte, so the
+/// margin is set by the block size: measured 1.25x with 1 KiB blocks and
+/// 1.54x with 256-byte blocks, which are a quarter and a sixteenth of
+/// the default `block_size`, so a default-configured cache sits well
+/// inside the tighter of the two.
 /// The margin is a constant, not a leak, and
 /// `tests/adv_block_cache_overhead.rs` proves it on every run by
 /// tripling the churn through the same budget and requiring resident

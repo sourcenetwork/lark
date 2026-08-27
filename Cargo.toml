@@ -98,6 +98,27 @@ wasm-bindgen-test = "0.3"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
 
+# The test suite is compute-bound: compaction merges, checksums, bloom
+# hashing and skip-list walks, driven millions of times by the
+# adversarial and property tests. Unoptimized those dominate the gate's
+# wall clock while proving nothing extra, so the dev profile carries
+# enough optimization to make the suite tractable and keeps every check
+# that makes a debug build worth running.
+#
+# `debug-assertions` and `overflow-checks` stay on deliberately: the skip
+# list's single-writer invariant (S2) and the arena's bounds checks are
+# `debug_assert`-backed, so turning them off would silently remove the
+# thing several of these tests exist to catch.
+[profile.dev]
+opt-level = 1
+debug-assertions = true
+overflow-checks = true
+
+# Dependencies are compiled once and never stepped through. Compression,
+# hashing and the reclamation machinery are all in this set.
+[profile.dev.package."*"]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
 lto = true
