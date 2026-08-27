@@ -378,6 +378,11 @@ jobs:
           git --work-tree=site checkout origin/gh-pages -- runs 2>/dev/null || true
       - name: File this run
         run: python3 tools/perf-site/publish.py "run-${GITHUB_SHA::12}.json" site
+      # Refuse to publish a dashboard that would drop a family it
+      # collected. A blank section is not an error to the browser, so
+      # without this the job stays green and the site goes quiet.
+      - name: Check the page renders every collected family
+        run: node tools/perf-site/render_check.mjs site
       - name: Publish
         uses: peaceiris/actions-gh-pages@v4
         with:

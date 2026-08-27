@@ -40,6 +40,7 @@ tr:last-child td{border-bottom:none}
 .pill.clean{color:var(--green);border-color:#0b3a1f}
 .pill.contaminated{color:var(--amber);border-color:#3a2f0b}
 .pill.absent{color:var(--mute)}
+.pill.per-entry{color:var(--ink);border-color:var(--line)}
 .bar{height:9px;border-radius:99px;background:#141814;overflow:hidden}
 .bar i{display:block;height:100%;background:var(--green)}
 .bar i.regress{background:var(--red)}
@@ -75,13 +76,16 @@ function fmt(n,unit){
   if(a>=100)return Math.round(n).toLocaleString();
   return (Math.round(n*100)/100).toString();
 }
-// Higher is better for rates; lower is better for size, memory and latency.
-const LOWER_BETTER=/rss|size|mib|kib|bytes|latency|ns|us|ms|alloc/i;
-function delta(cur,base,name,unit){
+// Which direction is an improvement is carried on the row, because it
+// cannot be read off the name: "MiB/s" is a rate to maximise and "MiB"
+// is a footprint to minimise, and both contain "mib". The regex is the
+// fallback for rows that predate the explicit flag.
+const LOWER_BETTER=/rss|size|\bmib\b|\bkib\b|bytes|latency|alloc/i;
+function delta(cur,base,name,unit,lower){
   if(base===null||base===undefined||cur===null||cur===undefined||!base)return null;
   const pct=100*(cur-base)/Math.abs(base);
-  const lower=LOWER_BETTER.test(name+" "+(unit||""));
-  return {pct, good:lower? pct<0 : pct>0};
+  const down=lower===undefined?LOWER_BETTER.test(name+" "+(unit||"")):!!lower;
+  return {pct, good:down? pct<0 : pct>0};
 }
 function pill(t){return t?`<span class="pill ${esc(t)}">${esc(t)}</span>`:""}
 
@@ -124,13 +128,14 @@ function bars(rows,unit,threshold){
   return `<div class="scroll"><table><thead><tr><th>${esc(unit?"":"item")}</th>
     <th class="num">baseline</th><th class="num">this run</th><th class="num">delta</th><th style="width:34%"></th></tr></thead><tbody>`
     + rows.map(r=>{
-        const d=delta(r.cur,r.base,r.name,unit);
+        const u=r.unit===undefined?unit:r.unit;
+        const d=delta(r.cur,r.base,r.name,u,r.lower);
         const cls=!d?"flat":Math.abs(d.pct)<threshold?"flat":d.good?"up":"down";
         const txt=!d?"":(d.pct>0?"+":"")+d.pct.toFixed(1)+"%";
         const regress=d&&!d.good&&Math.abs(d.pct)>=threshold;
         return `<tr><td>${esc(r.name)}</td>
-          <td class="num">${fmt(r.base,unit)}</td>
-          <td class="num">${fmt(r.cur,unit)}</td>
+          <td class="num">${fmt(r.base,u)}</td>
+          <td class="num">${fmt(r.cur,u)}</td>
           <td class="num ${cls}">${txt}</td>
           <td><div class="bar"><i class="${regress?"regress":""}" style="width:${(100*Math.abs(r.cur||0)/max).toFixed(1)}%"></i></div></td></tr>`;
       }).join("")
@@ -142,24 +147,192 @@ function card(title,note,body,trust){
     ${note?`<p class="note">${esc(note)}</p>`:""}${body}</div>`;
 }
 
+// ---- reading a run document -------------------------------------------
+//
+// Every comparable scalar a run document holds, in one place. The
+// overview table, the trend chart and each section's cards all read
+// through this, so they cannot disagree about what a metric is called,
+// what unit it carries, or which direction is an improvement. Anything
+// the benches record and this does not name is a metric that silently
+// never reaches the page, which is the failure this exists to prevent.
+
+function scalars(doc){
+  const out=[], m=doc?.metrics||{}, w=m.throughput?.workloads||{};
+  const add=(key,name,value,unit,lower)=>{
+    if(typeof value==="number"&&Number.isFinite(value))
+      out.push({key,name,value,unit,lower});
+  };
+
+  add("read.hot","read, hot cache",w.read?.hot_cache_ops_per_s,"ops/s",false);
+  add("read.cold","read, cold cache",w.read?.cold_cache_ops_per_s,"ops/s",false);
+  add("read.scaling","read scaling 1 to 8",w.read?.scaling_1_to_8,"x",false);
+  for(const r of w.read?.threads||[])
+    add(`read.t${r.threads}`,`read at ${r.threads} threads`,r.ops_per_s,"ops/s",false);
+
+  for(const nm of ["buffered_write","durable_write"]){
+    const label=nm.replace("_"," ");
+    for(const r of w[nm]?.by_threads||[])
+      add(`${nm}.t${r.threads}`,`${label} at ${r.threads} threads`,r.ops_per_sec_median,"ops/s",false);
+  }
+
+  add("scan.stream","scan stream rate",w.scan?.stream_mib_per_s,"MiB/s",false);
+
+  for(const r of w.batch?.by_batch_size||[])
+    add(`batch.b${r.batch_ops}`,`batch of ${r.batch_ops}`,r.median,"ops/s",false);
+  add("batch.bulk","bulk load",w.batch?.bulk_load?.median,"MiB/s",false);
+
+  for(const r of w.large_value?.sizes||[]){
+    add(`lv.put${r.value_mib}`,`large value put, ${r.value_mib} MiB`,r.put_mib_per_s,"MiB/s",false);
+    add(`lv.get${r.value_mib}`,`large value get, ${r.value_mib} MiB`,r.get_mib_per_s,"MiB/s",false);
+  }
+
+  const rss=m.rss||{};
+  add("rss.baseline","baseline RSS",rss.baseline_rss_kib,"KiB",true);
+  for(const r of rss.shard_sweep||[])
+    add(`rss.shard${r.shard_bits}`,`RSS at ${r.requested_shards} cache shards`,r.rss_kib,"KiB",true);
+  for(const r of rss.write_sweep||[])
+    add(`rss.write${r.written_mib}`,`RSS after writing ${r.written_mib} MiB`,r.rss_kib,"KiB",true);
+  add("rss.replay","RSS replaying the WAL",rss.wal_replay?.replay_rss_kib,"KiB",true);
+  add("rss.replay_open","WAL replay open time",rss.wal_replay?.open_s,"s",true);
+  add("rss.replay_ratio","replay RSS over log size",rss.wal_replay?.peak_over_log,"x",true);
+  for(const r of rss.open_floor||[])
+    if(r.opened&&r.usable) add(`rss.floor${r.scale_bytes}`,`open floor at ${fmtBytes(r.scale_bytes)}`,r.rss_kib,"KiB",true);
+  add("rss.embedded_empty","embedded profile, empty",rss.embedded?.empty_rss_kib,"KiB",true);
+  add("rss.embedded","embedded profile, loaded",rss.embedded?.rss_kib,"KiB",true);
+  for(const s of rss.soaks||[]){
+    const n=s.label||s.variant||"soak";
+    add(`rss.soak.${n}.end`,`${n} soak, RSS at end`,s.rss_end_mib,"MiB",true);
+    add(`rss.soak.${n}.peak`,`${n} soak, peak RSS`,s.rss_peak_mib,"MiB",true);
+  }
+
+  for(const f of m.binary_size?.families||[])
+    if(f.available!==false) add(`size.${f.name}`,`${f.name} binary`,f.regolith_kib,"KiB",true);
+
+  for(const c of m.isolation?.matrix||[]){
+    const n=`${c.flavor} / ${c.isolation}`;
+    add(`iso.${c.flavor}.${c.isolation}.unc`,`${n}, uncontended`,c.uncontended_commits_per_s,"commits/s",false);
+    add(`iso.${c.flavor}.${c.isolation}.con`,`${n}, contended`,c.contended_commits_per_s,"commits/s",false);
+  }
+
+  for(const c of m.correctness?.matrix||[]){
+    const n=`${c.flavor} / ${c.isolation}`;
+    add(`ok.${c.flavor}.${c.isolation}.survival`,`${n}, increments surviving`,
+        c.correctness?.survival_pct_median,"%",false);
+  }
+
+  for(const p of m.allocs?.paths||[])
+    add(`allocs.${p.path}`,`${p.path}`,p.achieved,"allocs/op",true);
+
+  return out;
+}
+
+function fmtBytes(n){
+  if(!Number.isFinite(n))return String(n);
+  if(n>=1<<30)return (n/(1<<30)).toFixed(1)+" GiB";
+  if(n>=1<<20)return (n/(1<<20)).toFixed(0)+" MiB";
+  if(n>=1024)return (n/1024).toFixed(0)+" KiB";
+  return n+" B";
+}
+
+/// Join this run's scalars to the baseline's by key, so every row on the
+/// page is a comparison rather than a lone number.
+function compare(cur,base){
+  const bmap={};
+  for(const s of scalars(base)) bmap[s.key]=s.value;
+  return scalars(cur).map(s=>({name:s.name,cur:s.value,base:bmap[s.key],
+                               unit:s.unit,lower:s.lower,key:s.key}));
+}
+
+/// Two chart series, this run against the chosen baseline, over the same
+/// x/y fields of a list the benches recorded.
+function pair(curArr,baseArr,xk,yk){
+  const pts=a=>(a||[]).filter(r=>r&&Number.isFinite(r[xk])&&Number.isFinite(r[yk]))
+                      .map(r=>[r[xk],r[yk]]);
+  return [{name:"baseline",color:DIM,dash:true,pts:pts(baseArr)},
+          {name:"this run",color:GREEN,thick:true,pts:pts(curArr)}];
+}
+
+/// Rows for `bars`, matching each of this run's entries to the baseline
+/// entry with the same identity.
+function rows(curArr,baseArr,idf,valf,namef,unit,lower){
+  const bmap={};
+  for(const b of baseArr||[]) bmap[idf(b)]=valf(b);
+  return (curArr||[]).filter(c=>Number.isFinite(valf(c)))
+    .map(c=>({name:namef(c),cur:valf(c),base:bmap[idf(c)],unit,lower}));
+}
+
+/// A card that says why it is empty instead of vanishing. A section that
+/// disappears when its family was not collected is indistinguishable
+/// from one that was never written.
+function gap(title,why){
+  return card(title,why,`<p class="note" style="margin:0">not measured in this run</p>`,"absent");
+}
+
 function throughputSection(cur,base,threshold){
-  const cw=cur?.metrics?.throughput?.workloads||{};
-  const bw=base?.metrics?.throughput?.workloads||{};
-  const names=Object.keys(cw);
-  if(!names.length)return "";
-  const cards=names.map(n=>{
-    const pts=(cw[n].points||[]).map(p=>[p.threads,p.ops]);
-    const bpts=((bw[n]||{}).points||[]).map(p=>[p.threads,p.ops]);
-    const top=pts.length?pts.reduce((a,b)=>b[0]>a[0]?b:a):null;
-    const one=Object.fromEntries(pts)[1];
-    const head=top?`<div class="headline">${fmt(top[1])} <small>ops/s @ ${top[0]}t</small>
-      ${one?`<small>&nbsp;${(top[1]/one).toFixed(2)}x scaling</small>`:""}</div>`:"";
-    return card(n.replace(/_/g," "),cw[n].note||"",
-      head+lineChart([{name:"baseline",color:DIM,pts:bpts,dash:true},
-                      {name:"this run",color:GREEN,pts,thick:true}],{ylab:"ops/s"}),
-      cw[n].trust);
-  }).join("");
-  return `<h2>Throughput</h2><div class="grid">${cards}</div>`;
+  const w=cur?.metrics?.throughput?.workloads||{}, b=base?.metrics?.throughput?.workloads||{};
+  if(!Object.keys(w).length)return "";
+  const cards=[];
+
+  cards.push(w.read
+    ? card("Point read",
+        `${fmt(w.read.keys)} keys of ${w.read.value_bytes} B. Hot cache against cold, then scaling across threads.`,
+        `<div class="headline">${fmt(w.read.hot_cache_ops_per_s)} <small>ops/s hot</small>
+         <small>&nbsp;${fmt(w.read.cold_cache_ops_per_s)} cold</small>
+         <small>&nbsp;${(w.read.scaling_1_to_8||0).toFixed(2)}x over 1 to 8 threads</small></div>`
+        +lineChart(pair(w.read.threads,b.read?.threads,"threads","ops_per_s"),{ylab:"ops/s"})
+        +bars(rows(w.read.threads,b.read?.threads,r=>r.threads,r=>r.ops_per_s,
+                   r=>`${r.threads} threads`,"ops/s",false),"",threshold),
+        w.read.trust)
+    : gap("Point read","the point_read family"));
+
+  for(const [key,title,note] of [
+      ["buffered_write","Buffered write","No fsync per write. The OS decides when it reaches the platter."],
+      ["durable_write","Durable write","fsync per write. What a commit actually costs."]]){
+    const c=w[key], bb=b[key];
+    cards.push(c
+      ? card(title,`${note} ${c.value_bytes} B values, ${c.stability||""}.`,
+          lineChart(pair(c.by_threads,bb?.by_threads,"threads","ops_per_sec_median"),{ylab:"ops/s"})
+          +bars(rows(c.by_threads,bb?.by_threads,r=>r.threads,r=>r.ops_per_sec_median,
+                     r=>`${r.threads} threads`,"ops/s",false),"",threshold),
+          c.trust)
+      : gap(title,`the ${key} family`));
+  }
+
+  cards.push(w.scan
+    ? card("Scan",
+        `${fmt(w.scan.keys)} keys of ${w.scan.value_bytes} B, ${fmtBytes(w.scan.scanned_bytes)} streamed in ${w.scan.wall_s}s.`,
+        `<div class="headline">${fmt(w.scan.stream_mib_per_s)} <small>MiB/s</small></div>`
+        +bars([{name:"stream rate",cur:w.scan.stream_mib_per_s,base:b.scan?.stream_mib_per_s,unit:"MiB/s",lower:false},
+               {name:"working set",cur:w.scan.working_set_bytes,base:b.scan?.working_set_bytes,unit:"B",lower:true}],"",threshold),
+        w.scan.trust)
+    : gap("Scan","the scan family"));
+
+  cards.push(w.batch
+    ? card("Write batch",
+        `${w.batch.value_bytes} B values. Throughput against batch size, and a bulk load with the closing flush included.`,
+        lineChart(pair(w.batch.by_batch_size,b.batch?.by_batch_size,"batch_ops","median"),{xlab:"ops per batch",ylab:"ops/s"})
+        +bars(rows(w.batch.by_batch_size,b.batch?.by_batch_size,r=>r.batch_ops,r=>r.median,
+                   r=>`${r.batch_ops} ops per batch`,"ops/s",false)
+              .concat(w.batch.bulk_load?[{name:`bulk load, ${w.batch.bulk_load.payload_mib} MiB`,
+                 cur:w.batch.bulk_load.median,base:b.batch?.bulk_load?.median,unit:"MiB/s",lower:false}]:[]),
+              "",threshold),
+        w.batch.trust)
+    : gap("Write batch","the batch family"));
+
+  cards.push(w.large_value
+    ? card("Large values",
+        `${w.large_value.compression} compression, ceiling ${w.large_value.default_max_value_mib} MiB. ${w.large_value.gib_note||""}`,
+        lineChart([...pair(w.large_value.sizes,b.large_value?.sizes,"value_mib","put_mib_per_s"),
+                   {name:"get, this run",color:"#6fae8c",pts:(w.large_value.sizes||[]).map(r=>[r.value_mib,r.get_mib_per_s])}],
+                  {xlab:"value MiB",ylab:"MiB/s"})
+        +bars(rows(w.large_value.sizes,b.large_value?.sizes,r=>r.value_mib,r=>r.put_mib_per_s,
+                   r=>`put ${r.value_mib} MiB`,"MiB/s",false)
+              .concat(rows(w.large_value.sizes,b.large_value?.sizes,r=>r.value_mib,r=>r.get_mib_per_s,
+                   r=>`get ${r.value_mib} MiB`,"MiB/s",false)),"",threshold),
+        w.large_value.trust)
+    : gap("Large values","the large_value family"));
+
+  return `<h2>Throughput</h2><div class="grid">${cards.join("")}</div>`;
 }
 
 function isolationSection(cur,base,threshold){
@@ -192,32 +365,123 @@ function isolationSection(cur,base,threshold){
   </div>`;
 }
 
+function correctnessSection(cur,base,threshold){
+  const c=cur?.metrics?.correctness||{}, cells=c.matrix||[];
+  if(!cells.length)return "";
+  const bcells=base?.metrics?.correctness?.matrix||[];
+  const id=x=>x.flavor+"/"+x.isolation, nm=x=>`${x.flavor} / ${x.isolation}`;
+  const sum=(x,k)=>(x.correctness?.runs||[]).reduce((a,r)=>a+(r.attempts?.[k]||0),0);
+  const lost=cells.filter(x=>(x.correctness?.survival_pct_min??100)<100);
+  return `<h2>Transaction correctness</h2><div class="grid">
+    ${card("Increments that survived",
+      lost.length
+        ? `${lost.length} level(s) lost an increment: ${lost.map(nm).join(", ")}. Anything under 100% is a lost update.`
+        : `Every level kept every increment across ${cells[0].correctness?.runs?.length||0} runs of ${cells[0].correctness?.threads||0} threads. 100% is the only passing number.`,
+      bars(rows(cells,bcells,id,x=>x.correctness?.survival_pct_median,nm,"%",false),"",threshold),
+      c.trust)}
+    ${card("What the level refused",
+      "Commits against the attempts it turned away. A stricter level refuses more, and the refusals are the work it is doing.",
+      bars(cells.map(x=>({name:nm(x)+", commits",cur:sum(x,"commits"),
+                          base:(bcells.find(y=>id(y)===id(x))?(bcells.find(y=>id(y)===id(x)).correctness?.runs||[]).reduce((a,r)=>a+(r.attempts?.commits||0),0):undefined),
+                          unit:"",lower:false}))
+           .concat(cells.map(x=>({name:nm(x)+", conflicts",cur:sum(x,"conflicts"),base:undefined,unit:"",lower:undefined}))),
+           "",threshold),
+      c.trust)}
+    ${card("Commits per second by level",
+      "The throughput the transaction bench saw while proving the level correct, uncontended against contended.",
+      bars(rows(cells,bcells,id,x=>x.throughput?.uncontended_commits_per_s?.median,x=>nm(x)+", uncontended","commits/s",false)
+           .concat(rows(cells,bcells,id,x=>x.throughput?.contended_commits_per_s?.median,x=>nm(x)+", contended","commits/s",false)),
+           "",threshold),
+      c.trust)}</div>`;
+}
 function rssSection(cur,base,threshold){
-  const cr=cur?.metrics?.rss||{}, soaks=cr.soaks||[];
-  if(!soaks.length)return "";
-  const series=soaks.map((s,i)=>({name:s.label||s.variant||("soak "+i),
-    color:/after/.test(s.variant||"")?GREEN:DIM, thick:/after/.test(s.variant||""),
-    pts:(s.samples_t_rss_ops||[]).filter(r=>Array.isArray(r)&&r.length>=2).map(r=>[r[0],r[1]])}));
-  const bmap={};
-  for(const s of (base?.metrics?.rss?.soaks)||[]) bmap[s.label||s.variant]=s.rss_peak_mib;
-  const rows=soaks.filter(s=>s.rss_peak_mib!=null)
-    .map(s=>({name:(s.label||s.variant)+" peak RSS",cur:s.rss_peak_mib,base:bmap[s.label||s.variant]}));
-  return `<h2>Resident memory</h2><div class="grid">
-    ${card("RSS over a sustained workload",cr.workload||"",
-        lineChart(series,{xlab:"seconds",ylab:"MiB"}),cr.trust)}
-    ${card("Peak RSS","The number a memory budget has to cover. Lower is better.",
-        bars(rows,"MiB",threshold))}</div>`;
+  const c=cur?.metrics?.rss||{}, b=base?.metrics?.rss||{};
+  const has=k=>Array.isArray(c[k])?c[k].length:c[k]!=null;
+  if(!["soaks","shard_sweep","write_sweep","wal_replay","open_floor","embedded"].some(has))return "";
+  const cards=[];
+
+  if((c.shard_sweep||[]).length)
+    cards.push(card("Cache shards",
+      `Block cache pinned at ${fmtBytes(c.pinned_cache_bytes)} while the shard count sweeps. Baseline process RSS is ${fmt(c.baseline_rss_kib)} KiB, so what matters is the column above it.`,
+      lineChart(pair(c.shard_sweep,b.shard_sweep,"requested_shards","rss_kib"),{xlab:"cache shards",ylab:"KiB"})
+      +bars(rows(c.shard_sweep,b.shard_sweep,r=>r.shard_bits,r=>r.over_baseline_kib,
+                 r=>`${r.requested_shards} shards, over baseline`,"KiB",true),"",threshold),
+      c.trust));
+
+  if((c.write_sweep||[]).length)
+    cards.push(card("RSS against bytes written",
+      "The question a memory budget asks: does resident memory track the write volume, or the configured buffers.",
+      lineChart(pair(c.write_sweep,b.write_sweep,"written_mib","rss_kib"),{xlab:"MiB written",ylab:"KiB"})
+      +bars(rows(c.write_sweep,b.write_sweep,r=>r.written_mib,r=>r.rss_kib,
+                 r=>`after ${r.written_mib} MiB`,"KiB",true),"",threshold),
+      c.trust));
+
+  if(c.wal_replay)
+    cards.push(card("WAL replay after a crash",
+      `Killed with SIGKILL after ${c.wal_replay.written_mib} MiB, then reopened. The log was ${fmtBytes(c.wal_replay.log_bytes)}${c.wal_replay.first_key_present?" and the first key came back":""}.`,
+      bars([{name:"replay RSS",cur:c.wal_replay.replay_rss_kib,base:b.wal_replay?.replay_rss_kib,unit:"KiB",lower:true},
+            {name:"peak over log size",cur:c.wal_replay.peak_over_log,base:b.wal_replay?.peak_over_log,unit:"x",lower:true},
+            {name:"open time",cur:c.wal_replay.open_s,base:b.wal_replay?.open_s,unit:"s",lower:true}],"",threshold),
+      c.trust));
+
+  if((c.open_floor||[]).length){
+    const usable=(c.open_floor||[]).filter(r=>r.opened&&r.usable);
+    const refused=(c.open_floor||[]).filter(r=>!(r.opened&&r.usable));
+    cards.push(card("Open floor",
+      refused.length
+        ? `The smallest configuration that opens and serves. ${refused.length} smaller one(s) refused: ${refused.map(r=>fmtBytes(r.scale_bytes)).join(", ")}.`
+        : "The smallest configuration that opens and serves.",
+      bars(rows(usable,(b.open_floor||[]).filter(r=>r.opened&&r.usable),
+                r=>r.scale_bytes,r=>r.rss_kib,r=>fmtBytes(r.scale_bytes),"KiB",true),"",threshold),
+      c.trust));
+  }
+
+  if(c.embedded)
+    cards.push(card("Embedded profile",
+      `Nominal budget ${fmt(c.embedded.nominal_kib)} KiB, then ${c.embedded.written_mib} MiB written into it.`,
+      bars([{name:"empty",cur:c.embedded.empty_rss_kib,base:b.embedded?.empty_rss_kib,unit:"KiB",lower:true},
+            {name:"loaded",cur:c.embedded.rss_kib,base:b.embedded?.rss_kib,unit:"KiB",lower:true},
+            {name:"peak",cur:c.embedded.peak_kib,base:b.embedded?.peak_kib,unit:"KiB",lower:true}],"",threshold),
+      c.trust));
+
+  const soaks=c.soaks||[];
+  if(soaks.length){
+    const series=soaks.map((s,i)=>({name:s.label||s.variant||("soak "+i),
+      color:i?GREEN:DIM,thick:!!i,
+      pts:(s.samples_t_rss_ops||[]).filter(r=>Array.isArray(r)&&r.length>=2).map(r=>[r[0],r[1]])}));
+    cards.push(card("RSS over a sustained workload",c.workload||"",
+      lineChart(series,{xlab:"seconds",ylab:"MiB"})
+      +bars(rows(soaks,b.soaks,s=>s.label||s.variant,s=>s.rss_peak_mib??s.rss_end_mib,
+                 s=>`${s.label||s.variant} peak RSS`,"MiB",true),"",threshold),
+      c.trust));
+  }else{
+    cards.push(gap("RSS over a sustained workload",
+      "The soak family. It is a long-running harness and is not in the bench matrix, so a scheduled run has to record it."));
+  }
+
+  return `<h2>Resident memory</h2><div class="grid">${cards.join("")}</div>`;
 }
 
 function sizeSection(cur,base,threshold){
-  const cs=cur?.metrics?.binary_size||{}, rows=cs.rows||[];
-  if(!rows.length)return "";
-  const bmap={};
-  for(const r of (base?.metrics?.binary_size?.rows)||[]) bmap[r.artifact]=r.regolith_cost_kib;
-  return `<h2>Binary size</h2><div class="grid">${card("regolith's own contribution",
-    cs.note||"Lower is better.",
-    bars(rows.map(r=>({name:r.artifact,cur:r.regolith_cost_kib,base:bmap[r.artifact]})),"KiB",threshold),
-    cs.trust)}</div>`;
+  const c=cur?.metrics?.binary_size||{}, fams=c.families||[];
+  if(!fams.length)return "";
+  const bfam=base?.metrics?.binary_size?.families||[];
+  const built=fams.filter(f=>f.available!==false);
+  const missing=fams.filter(f=>f.available===false);
+  const note=[c.surface?`Surface linked: ${c.surface}.`:"",c.profile?`Built ${c.profile}.`:"",
+    missing.length?`Not built here: ${missing.map(f=>f.name+(f.reason?" ("+f.reason+")":"")).join(", ")}.`:""]
+    .filter(Boolean).join(" ");
+  return `<h2>Binary size</h2><div class="grid">
+    ${card("regolith's own contribution",
+        note||"Linked size minus the same program without regolith. Lower is better.",
+        bars(rows(built,bfam,f=>f.name,f=>f.regolith_kib,f=>f.name,"KiB",true),"",threshold),
+        c.trust)}
+    ${card("Linked against baseline",
+        "The whole binary next to the empty program it is measured against, so the contribution above can be checked.",
+        bars(rows(built,bfam,f=>f.name,f=>f.linked_bytes,f=>f.name+" linked","B",true)
+             .concat(rows(built,bfam,f=>f.name,f=>f.baseline_bytes,f=>f.name+" baseline","B",true)),
+             "",threshold),
+        c.trust)}</div>`;
 }
 
 function allocsSection(cur,base,threshold){
@@ -237,83 +501,77 @@ function allocsSection(cur,base,threshold){
     bars(budgets,"allocs/op",threshold), ca.trust)}</div>`;
 }
 
-function trendSection(all,metricPick){
-  // The reason the history is kept: one run answers "is this fast",
-  // the series answers "when did this change".
-  const pts={};
+function trendSection(all){
+  // The reason the history is kept: one run answers "is this fast", the
+  // series answers "when did this change".
+  const byKey={}, names={};
   for(const r of all){
     const t=Date.parse(r.doc?.run?.timestamp||"")||0;
-    const w=r.doc?.metrics?.throughput?.workloads||{};
-    for(const [n,v] of Object.entries(w)){
-      const top=(v.points||[]).reduce((a,p)=>!a||p.threads>a.threads?p:a,null);
-      if(top){ (pts[n]=pts[n]||[]).push([t,top.ops]); }
+    for(const s of scalars(r.doc)){
+      (byKey[s.key]=byKey[s.key]||[]).push([t,s.value]);
+      names[s.key]={name:s.name,unit:s.unit};
     }
   }
-  const names=Object.keys(pts);
-  if(!names.length)return "";
-  const norm=n=>{
-    const p=pts[n].sort((a,b)=>a[0]-b[0]);
-    const x0=p[0][0];
-    return p.map(q=>[(q[0]-x0)/86400000,q[1]]);
-  };
-  const series=names.map((n,i)=>({name:n,color:i?[GREEN,"#3b7f5a","#6fae8c","#9ed0b4"][i%4]:GREEN,
-    thick:i===0,pts:norm(n)}));
+  const keys=Object.keys(byKey).filter(k=>byKey[k].length>0).sort();
+  if(!keys.length)return "";
+  if(!keys.includes(TREND_METRIC))
+    TREND_METRIC=keys.find(k=>k==="read.hot")||keys[0];
+  const pts=[...byKey[TREND_METRIC]].sort((a,b)=>a[0]-b[0]);
+  const x0=pts.length?pts[0][0]:0;
+  const series=[{name:names[TREND_METRIC].name,color:GREEN,thick:true,
+    pts:pts.map(q=>[(q[0]-x0)/86400000,q[1]])}];
+  const opts=keys.map(k=>`<option value="${esc(k)}"${k===TREND_METRIC?" selected":""}>${esc(names[k].name)}</option>`).join("");
+  const picker=`<p class="note" style="margin:0 0 10px">
+    <label for="trendmetric" style="display:inline;margin-right:6px">Metric</label>
+    <select id="trendmetric">${opts}</select></p>`;
   return `<h2>Trend across every recorded run</h2><div class="grid">
-    ${card("Peak throughput over time",
-      "Each line is one workload at its highest thread count, across all "+all.length+" runs on file. This is what the history is for: a step in this line is where the change happened.",
-      lineChart(series,{xlab:"days since first run",ylab:"ops/s",w:1100,h:280}))}</div>`;
+    ${card(names[TREND_METRIC].name+(names[TREND_METRIC].unit?" ("+names[TREND_METRIC].unit+")":""),
+      `${pts.length} of ${all.length} run(s) on file recorded this metric. A step in this line is where the change happened.`,
+      picker+lineChart(series,{xlab:"days since first run",ylab:names[TREND_METRIC].unit||"",w:1100,h:280}))}</div>`;
 }
 
 function overview(cur,base,threshold){
   // No verdict. This page exists to show what the numbers did, and a
   // pass/fail badge only hides the shape of the change behind a word.
-  const rows=[];
-  const cw=cur?.metrics?.throughput?.workloads||{}, bw=base?.metrics?.throughput?.workloads||{};
-  for(const [n,v] of Object.entries(cw)){
-    const top=(v.points||[]).reduce((a,p)=>!a||p.threads>a.threads?p:a,null);
-    const bt=((bw[n]||{}).points||[]).reduce((a,p)=>!a||p.threads>a.threads?p:a,null);
-    if(top)rows.push({name:n.replace(/_/g," ")+" ops/s",cur:top.ops,base:bt?bt.ops:null});
-  }
-  for(const s of (cur?.metrics?.rss?.soaks)||[]){
-    if(s.rss_peak_mib!=null)rows.push({name:(s.label||s.variant)+" peak RSS MiB",cur:s.rss_peak_mib,
-      base:((base?.metrics?.rss?.soaks)||[]).find(b=>(b.label||b.variant)===(s.label||s.variant))?.rss_peak_mib});
-  }
-  for(const r of (cur?.metrics?.binary_size?.rows)||[]){
-    rows.push({name:r.artifact+" KiB",cur:r.regolith_cost_kib,
-      base:((base?.metrics?.binary_size?.rows)||[]).find(b=>b.artifact===r.artifact)?.regolith_cost_kib});
-  }
-  const bIso={};
-  for(const c of (base?.metrics?.isolation?.matrix)||[]) bIso[c.flavor+"/"+c.isolation]=c;
-  for(const c of (cur?.metrics?.isolation?.matrix)||[]){
-    const b=bIso[c.flavor+"/"+c.isolation]||{};
-    rows.push({name:`${c.flavor}/${c.isolation} uncontended commits/s`,
-      cur:c.uncontended_commits_per_s,base:b.uncontended_commits_per_s});
-    rows.push({name:`${c.flavor}/${c.isolation} contended commits/s`,
-      cur:c.contended_commits_per_s,base:b.contended_commits_per_s});
-  }
-  for(const p of (cur?.metrics?.allocs?.paths)||[]){
-    rows.push({name:p.path+" allocs/op",cur:p.achieved,
-      base:((base?.metrics?.allocs?.paths)||[]).find(b=>b.path===p.path)?.achieved});
-  }
+  const all=compare(cur,base);
   const r=cur?.run||{};
   const guard=r.loadguard?.passed;
+  // A family whose entries each carry their own trust has none of its
+  // own. Rendering that as `absent` would report a gap over data that
+  // was collected, so it is named for what it is.
+  const famTrust=v=>{
+    if(typeof v.trust==="string")return v.trust;
+    const body=Object.keys(v).filter(k=>!["trust","trust_note","unit","note"].includes(k));
+    return body.length?"per-entry":"absent";
+  };
+  const fams=Object.entries(cur?.metrics||{})
+    .filter(([,v])=>v&&typeof v==="object")
+    .map(([k,v])=>`<tr><td>${esc(k.replace(/_/g," "))}</td><td class="num">${pill(famTrust(v))}</td></tr>`)
+    .join("");
   const meta=`<table><tbody>
     <tr><td>commit</td><td class="num">${esc((r.commit||"").slice(0,12))}</td></tr>
     <tr><td>label</td><td class="num">${esc(r.label||"")}</td></tr>
     <tr><td>recorded</td><td class="num">${esc(r.timestamp||"")}</td></tr>
     <tr><td>toolchain</td><td class="num">${esc(r.toolchain||"")}</td></tr>
     <tr><td>load guard</td><td class="num ${guard===false?"down":""}">${guard===false?"did not pass":guard===true?"passed":"n/a"}</td></tr>
+    <tr><td>metrics compared</td><td class="num">${all.filter(x=>x.base!=null).length} of ${all.length}</td></tr>
   </tbody></table>`;
   const warn=guard===false?`<p class="note" style="color:var(--amber)">The load guard did not pass, so the timings on this run were taken on a busy machine and are not comparable.</p>`:"";
   return `<div class="grid" style="padding-top:16px">
     ${card("This run","",meta+warn)}
+    ${card("What each family reported",
+      "Every family the collector knows about. `absent` means the family was not collected in this run, never that it measured zero.",
+      `<table><tbody>${fams}</tbody></table>`)}
     ${card("Every number, side by side",
-      "Higher is better for rates, lower for memory and size; the delta column already accounts for which.",
-      bars(rows,"",threshold))}
+      base
+        ? "Every scalar this run recorded, against the run selected above. Direction is carried per metric, so the delta column already knows whether higher or lower is the improvement."
+        : "Every scalar this run recorded. Pick a run to compare with to fill the baseline column.",
+      bars(all,"",threshold))}
   </div>`;
 }
 
 let RUNS=[];
+let TREND_METRIC=null;
 
 // The controls are meaningless with nothing to select, and a pair of
 // empty dropdowns reads as a broken page rather than an empty one.
@@ -326,11 +584,13 @@ function emptyState(title, detail){
       `<p class="note" style="margin:0">Once a run is published this page shows, for every
        recorded run and against any other run you pick:</p>
        <table><tbody>
-         <tr><td>Throughput</td><td class="num">ops/s per workload, across thread counts</td></tr>
+         <tr><td>Throughput</td><td class="num">read, write, scan, batch and large values</td></tr>
          <tr><td>Transaction isolation</td><td class="num">commits/s and conflict rate per level</td></tr>
-         <tr><td>Resident memory</td><td class="num">RSS over a soak, and its peak</td></tr>
+         <tr><td>Transaction correctness</td><td class="num">increments surviving, per level</td></tr>
+         <tr><td>Resident memory</td><td class="num">shard and write sweeps, WAL replay, open floor, embedded</td></tr>
          <tr><td>Binary size</td><td class="num">regolith's own contribution, per artifact</td></tr>
-         <tr><td>Trend</td><td class="num">each metric across every run on file</td></tr>
+         <tr><td>Allocations</td><td class="num">per-operation counts against their budgets</td></tr>
+         <tr><td>Trend</td><td class="num">any metric across every run on file</td></tr>
        </tbody></table>`)}
     ${card("How a run gets here","",
       `<p class="note" style="margin:0 0 10px">The <code>bench</code> matrix runs each family on
@@ -381,8 +641,12 @@ function draw(){
   const base=RUNS.find(r=>r.meta.file===$("#base").value)?.doc||null;
   const th=parseFloat($("#thresh").value);
   $("#main").innerHTML=overview(cur,base,th)+throughputSection(cur,base,th)
-    +isolationSection(cur,base,th)+rssSection(cur,base,th)+sizeSection(cur,base,th)
-    +allocsSection(cur,base,th)+trendSection(RUNS,null);
+    +isolationSection(cur,base,th)+correctnessSection(cur,base,th)+rssSection(cur,base,th)
+    +sizeSection(cur,base,th)+allocsSection(cur,base,th)+trendSection(RUNS);
+  // Re-attached after every redraw: the picker lives inside the markup
+  // that redraw replaces.
+  const tm=$("#trendmetric");
+  if(tm)tm.addEventListener("change",e=>{TREND_METRIC=e.target.value;draw();});
 }
 boot();
 </script>
