@@ -13,7 +13,26 @@
 # resolver; `cargo deny` surfaces them here so they're one
 # consolidated signal.
 yanked = "warn"
-ignore = []
+ignore = [
+    # RUSTSEC-2026-0253: `LruCache::pop()` is not panic-safe. The
+    # documented precondition is a key type whose `Drop` can panic:
+    # the node is freed from the map while still linked, and a later
+    # eviction walks the dangling pointer.
+    #
+    # This cache cannot reach it. `block_cache::CacheKey` is a `Copy`
+    # struct of two `u64`s, and a `Copy` type cannot implement `Drop`,
+    # so `pop()` has no destructor to run and nothing to unwind
+    # through. `block_cache.rs` asserts that at compile time, so the
+    # ignore fails to build rather than rotting if the key ever gains
+    # a field with a destructor.
+    #
+    # The fix is `lru` 0.18.2, which pulls `hashbrown` 0.17 and with it
+    # edition2024, so taking it would raise this crate MSRV from 1.82
+    # to 1.85. That is a user-facing promise, so it is not changed
+    # here. Later in this stack the block cache stops using `lru`
+    # entirely and the ignore goes with it.
+    { id = "RUSTSEC-2026-0253", reason = "unreachable: the cache key is Copy, so pop() runs no destructor" },
+]
 
 [licenses]
 # Only allow licenses we've vetted as compatible with our
