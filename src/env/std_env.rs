@@ -73,7 +73,7 @@ impl Env for StdEnv {
         Ok(Box::new(StdReadFile {
             file: File::open(path)?,
             #[cfg(not(any(unix, windows)))]
-            cursor: parking_lot::Mutex::new(()),
+            cursor: crate::sync::Mutex::new(()),
         }))
     }
 
@@ -201,7 +201,7 @@ fn drop_page_cache_for(_file: &File) {
 struct StdReadFile {
     file: File,
     #[cfg(not(any(unix, windows)))]
-    cursor: parking_lot::Mutex<()>,
+    cursor: crate::sync::Mutex<()>,
 }
 
 impl ReadFile for StdReadFile {

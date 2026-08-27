@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::env::{BufferedWriter, Env, WriteMode};
 
-use parking_lot::RwLock;
+use crate::sync::RwLock;
 
 use super::checksum;
 use super::sstable::{

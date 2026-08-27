@@ -9,7 +9,7 @@
 //!
 //! # What loom here does and does not prove
 //!
-//! Loom sees the atomics that come from `engine::sync` and the locks
+//! Loom sees the atomics that come from `crate::sync` and the locks
 //! built on them, and nothing else. It therefore checks:
 //!
 //! - that a reader which observes a node observes the links that were
@@ -26,8 +26,8 @@
 //!
 //! The version models in [`version`] are protocol models and say so:
 //! the production `VersionSet` writes a manifest record and opens an
-//! SSTable reader inside `apply`, and its locks come from `parking_lot`
-//! rather than from `engine::sync`, so loom can neither run it nor see
+//! SSTable reader inside `apply`, and its locks come from `std::sync`
+//! rather than from `crate::sync`, so loom can neither run it nor see
 //! its ordering. What they reproduce is the part loom can decide - the
 //! `Arc<Version>` pin, the clone-mutate-store, and the lock scope around
 //! it - with the table contents stood in for.

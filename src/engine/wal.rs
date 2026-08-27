@@ -360,7 +360,7 @@ impl Wal {
 pub(crate) mod fault {
     use std::path::{Path, PathBuf};
 
-    use parking_lot::Mutex;
+    use crate::sync::Mutex;
 
     /// Every directory currently armed. A list rather than a single
     /// slot because tests run in parallel in one process: with one slot,

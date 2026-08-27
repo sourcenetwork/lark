@@ -17,6 +17,15 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+# Every `run` step goes through `bash -eo pipefail` rather than
+# GitHub's default `bash -e`. Without `pipefail` a step like
+# `just cov-summary | tee summary.txt` reports `tee`'s exit status,
+# so a recipe that died with "command not found" still concluded
+# green and published an empty report.
+defaults:
+  run:
+    shell: bash
+
 jobs:
 
   test:
@@ -137,6 +146,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v2
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -191,6 +201,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run ignored tests (stress / soak / concurrency)
@@ -221,6 +232,7 @@ jobs:
           - fuzz_api_ops
     steps:
       - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v2
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-fuzz --locked

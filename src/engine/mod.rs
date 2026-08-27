@@ -20,7 +20,6 @@ pub(crate) mod read_view;
 pub(crate) mod skiplist;
 pub(crate) mod snapshot_registry;
 pub(crate) mod sstable;
-pub(crate) mod sync;
 pub(crate) mod wal;
 pub(crate) mod wal_replay;
 
@@ -29,8 +28,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::sync::{Gate, Mutex, OwnedGateWriteGuard};
 use kovan_queue::array_queue::ArrayQueue;
-use parking_lot::{Mutex, RwLock};
 
 use block_cache::BlockCache;
 use commit::{Pipeline, StallSignal, WriteSlot};
@@ -365,7 +364,7 @@ pub(crate) struct LarkEngine {
     /// `ingest_external_files`, `checkpoint_capture`) hold the write
     /// lock to exclude all background activity for the duration of
     /// their pass.
-    compaction_lock: Arc<RwLock<()>>,
+    compaction_lock: Arc<Gate>,
     /// Tracks the sequence numbers of every live snapshot so compaction
     /// can drop versions that no snapshot and no current reader can
     /// see. A snapshot registers itself on creation and releases on
@@ -530,7 +529,7 @@ impl LarkEngine {
         );
         let compaction_opts = options.to_compaction_options();
 
-        let compaction_lock = Arc::new(RwLock::new(()));
+        let compaction_lock = Arc::new(Gate::new());
         let snapshot_registry = Arc::new(SnapshotRegistry::with_env(Arc::clone(&env)));
         let stall_signal = Arc::new(StallSignal::new());
         let compaction_in_progress = Arc::new(Mutex::new(HashSet::new()));
@@ -679,7 +678,7 @@ impl LarkEngine {
             version: versions.lock().current(),
         }));
         versions.attach_view(Arc::clone(&view));
-        let compaction_lock = Arc::new(RwLock::new(()));
+        let compaction_lock = Arc::new(Gate::new());
         let snapshot_registry = Arc::new(SnapshotRegistry::with_env(Arc::clone(&env)));
         let stall_signal = Arc::new(StallSignal::new());
         let wal_id = next_wal_id(version.next_file_id, &wal_files);
@@ -2778,7 +2777,7 @@ impl LarkEngine {
         // because flushing needs it.
         self.drain_memtables(ActiveFlush::Always)?;
 
-        let compaction_guard = self.compaction_lock.write_arc();
+        let compaction_guard = self.compaction_lock.write_owned();
         self.ensure_writable()?;
 
         let version;
@@ -3349,7 +3348,7 @@ pub(crate) struct CheckpointSnapshot {
     pub(crate) manifest_bytes: Vec<u8>,
     pub(crate) sst_dir: PathBuf,
     /// Compaction lock guard, scoped to the snapshot's lifetime.
-    _compaction_guard: parking_lot::ArcRwLockWriteGuard<parking_lot::RawRwLock, ()>,
+    _compaction_guard: OwnedGateWriteGuard,
 }
 
 impl CheckpointSnapshot {

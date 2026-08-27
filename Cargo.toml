@@ -37,10 +37,7 @@ critical-section = ["portable-atomic/critical-section"]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [dependencies]
-# Used only by the CLOCK block cache now; the memtable has its own
-# arena skip list (`src/engine/skiplist.rs`).
-crossbeam-epoch = "0.9"
-crossbeam-skiplist = "0.1"
+kovan = "0.1.20"
 kovan-map = "0.1.20"
 kovan-mvcc = "0.1.20"
 kovan-queue = "0.1.20"
@@ -57,7 +54,6 @@ portable-atomic = { version = "1", default-features = false, features = [
 lz4_flex = "0.11"
 snap = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-parking_lot = { version = "0.12", features = ["arc_lock"] }
 tracing = "0.1"
 thiserror = "1.0"
 

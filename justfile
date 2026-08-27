@@ -371,8 +371,19 @@ wasm-native records="5000" sustained="20000":
             --probe-host --report-memory
     done
 
+# The OPFS contract against a real browser. `wasm-pack test` cannot
+# drive these: it appends `--tests`, which builds every target in
+# `tests/`, and all but the three `wasm_opfs*` files are native-only.
+# The runner is named per target instead, so only the named test
+# binaries are built.
 wasm-browser:
-    wasm-pack test --headless --firefox
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner
+    for suite in wasm_opfs wasm_opfs_main wasm_opfs_memory; do
+        echo "== $suite =="
+        cargo test --target wasm32-unknown-unknown --test "$suite"
+    done
 
 embedded:
     cargo run --release --bench memory -- --profile embedded

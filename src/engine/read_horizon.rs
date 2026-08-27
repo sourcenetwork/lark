@@ -28,7 +28,7 @@
 //!   exception and it is only reachable from `drop_all`, which holds the
 //!   pipeline mutex and has already discarded every memtable.
 
-use super::sync::{AtomicU64, Ordering};
+use crate::sync::{AtomicU64, Ordering};
 
 /// The published read horizon. See the module documentation for the
 /// ordering invariants H1 to H3.

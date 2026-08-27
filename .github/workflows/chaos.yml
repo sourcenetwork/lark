@@ -14,6 +14,15 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+# Every `run` step goes through `bash -eo pipefail` rather than
+# GitHub's default `bash -e`. Without `pipefail` a step like
+# `just cov-summary | tee summary.txt` reports `tee`'s exit status,
+# so a recipe that died with "command not found" still concluded
+# green and published an empty report.
+defaults:
+  run:
+    shell: bash
+
 jobs:
 
   # The read-view chaos workload at full size. `cargo test` runs a smaller

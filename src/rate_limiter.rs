@@ -22,7 +22,7 @@ use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
 
-use parking_lot::{Condvar, Mutex};
+use crate::sync::{Condvar, Mutex};
 
 /// Priority of a rate-limited I/O request. High-priority waiters are
 /// always served before low-priority waiters; within a priority class
@@ -222,7 +222,11 @@ impl TokenBucketRateLimiter {
             } else {
                 wait
             };
-            self.cv.wait_for(&mut state, wait);
+            state = self
+                .cv
+                .wait_timeout(state, wait)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
         };
 
         state.waiters.remove(&key);

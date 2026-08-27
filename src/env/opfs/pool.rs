@@ -10,7 +10,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use parking_lot::Mutex;
+use crate::sync::Mutex;
 
 use super::sah::{self, MountId, Slot, SlotHeader};
 use super::{children, not_found, register_ancestors};

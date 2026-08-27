@@ -35,7 +35,7 @@
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, OnceLock};
 
-use parking_lot::{Mutex, MutexGuard, RwLock};
+use crate::sync::{Mutex, MutexGuard, RwLock};
 
 use super::manifest::{Version, VersionSet};
 use super::memtable::MemTable;

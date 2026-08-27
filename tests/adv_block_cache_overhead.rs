@@ -216,7 +216,7 @@ entries={} excess_per_entry={:.2} charged_per_entry={:.1}",
     );
 
     // Saturated: the hand runs constantly, so this also carries
-    // whatever crossbeam-epoch has retired but not yet reclaimed.
+    // whatever the cache's map has retired but not yet reclaimed.
     let tight = run(2 * 1024 * 1024);
     let tight_real = tight.heap - off.heap;
     println!(

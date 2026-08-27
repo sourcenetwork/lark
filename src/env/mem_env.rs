@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use crate::sync::Mutex;
 
 use super::db_lock::DirectoryRegistry;
 use super::{

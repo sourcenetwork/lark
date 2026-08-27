@@ -20,8 +20,8 @@
 
 use std::sync::Arc;
 
+use crate::sync::Mutex;
 use kovan_mvcc::{LockInfo, Storage, Value, WriteInfo, WriteKind};
-use parking_lot::Mutex;
 
 use super::layout;
 use crate::WriteBatchOp;

@@ -546,7 +546,7 @@ impl LarkEngine {
 mod tests {
     use super::super::{EngineOptions, wal::fault};
     use super::*;
-    use parking_lot::Mutex;
+    use crate::sync::Mutex;
     use tempfile::TempDir;
 
     fn open_engine(dir: &TempDir) -> Arc<LarkEngine> {

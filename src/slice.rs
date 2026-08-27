@@ -9,7 +9,7 @@ use crate::engine::block::Block;
 /// The arena's reference count, which is a `loom::sync::Arc` in a
 /// `--cfg loom` build so the model checker can see the handoff that
 /// keeps an arena alive under a live slice (invariant A5).
-use crate::engine::sync::Arc as ArenaArc;
+use crate::sync::Arc as ArenaArc;
 
 /// A borrowed, refcounted view of a value.
 ///

@@ -16,8 +16,8 @@ use super::internal_key::{
 use super::lookup_key::LookupKey;
 use super::range_tombstone::{RangeTombstone, RangeTombstoneSet};
 use super::skiplist::{ArenaSkipList, NodeRef};
-use super::sync::{Arc, AtomicUsize, Mutex, Ordering};
 use crate::DbSlice;
+use crate::sync::{Arc, AtomicUsize, Mutex, Ordering};
 
 /// Everything a memtable needs to build its arena: the engine-wide chunk
 /// pool, the per-memtable byte budget, and the chunk sizing policy.
@@ -366,7 +366,7 @@ impl MemTable {
     /// [`MemTable::last_slice_before`] is checked against.
     ///
     /// The skip list has no back pointers, so a reverse step is an
-    /// `O(log N)` re-seek, exactly as it was with the crossbeam skip list.
+    /// `O(log N)` re-seek.
     #[cfg(test)]
     pub(crate) fn last_entry_before(
         &self,

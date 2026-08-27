@@ -6,7 +6,7 @@
 //! - **LZ4 compression** for data blocks
 //! - **Bloom filters** for fast negative lookups
 //! - **Level-based compaction** on a dedicated OS thread
-//! - **Lock-free reads** via crossbeam skip list memtable
+//! - **Lock-free reads** via an arena-backed skip list memtable
 //!
 //! # Quick Start
 //!
@@ -61,6 +61,7 @@ mod rate_limiter;
 mod slice;
 mod sst_file_writer;
 mod statistics;
+mod sync;
 mod tailing;
 mod transaction;
 mod ttl;
@@ -6512,7 +6513,7 @@ mod tests {
                 *self.captured.lock() = Some(info.clone());
             }
         }
-        use parking_lot::Mutex;
+        use crate::sync::Mutex;
 
         let listener = Arc::new(CaptureListener {
             captured: Mutex::new(None),
