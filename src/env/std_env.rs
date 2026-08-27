@@ -95,6 +95,10 @@ impl Env for StdEnv {
             // On Unix the pair is what the docs say it is, identical to
             // append alone, because `ftruncate` only needs a writable
             // descriptor and `O_APPEND` is one.
+            // `clippy::ineffective_open_options` is reasoning from the
+            // Unix semantics quoted above, where the pair really is
+            // redundant. It is not on Windows, which is the whole point.
+            #[allow(clippy::ineffective_open_options)]
             WriteMode::Append => OpenOptions::new()
                 .create(true)
                 .write(true)
