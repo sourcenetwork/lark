@@ -293,21 +293,61 @@ function overview(cur,base,threshold){
 }
 
 let RUNS=[];
+
+// The controls are meaningless with nothing to select, and a pair of
+// empty dropdowns reads as a broken page rather than an empty one.
+function showControls(on){ document.querySelector(".controls").style.display = on ? "" : "none"; }
+
+function emptyState(title, detail){
+  showControls(false);
+  return `<div class="grid" style="padding-top:16px">
+    ${card(title, detail,
+      `<p class="note" style="margin:0">Once a run is published this page shows, for every
+       recorded run and against any other run you pick:</p>
+       <table><tbody>
+         <tr><td>Throughput</td><td class="num">ops/s per workload, across thread counts</td></tr>
+         <tr><td>Transaction isolation</td><td class="num">commits/s and conflict rate per level</td></tr>
+         <tr><td>Resident memory</td><td class="num">RSS over a soak, and its peak</td></tr>
+         <tr><td>Binary size</td><td class="num">regolith's own contribution, per artifact</td></tr>
+         <tr><td>Trend</td><td class="num">each metric across every run on file</td></tr>
+       </tbody></table>`)}
+    ${card("How a run gets here","",
+      `<p class="note" style="margin:0 0 10px">The <code>bench</code> matrix runs each family on
+       its own runner and uploads its results. <code>perf-site</code> merges them into one run
+       document, files it under <code>runs/</code> beside every earlier run, and republishes this
+       page. The documents are the artifact; this page is only a reader over them.</p>
+       <p class="note" style="margin:0">Nothing is rendered from a run that does not exist, so an
+       empty page here means no run has been published, not that a run measured zero.</p>`)}
+  </div>`;
+}
+
 async function boot(){
   let manifest;
   try{
-    manifest=await (await fetch("runs/index.json",{cache:"no-store"})).json();
+    const r=await fetch("runs/index.json",{cache:"no-store"});
+    if(!r.ok) throw new Error(r.status);
+    manifest=await r.json();
   }catch(e){
-    $("#main").innerHTML=`<div class="empty">No runs published yet. The first CI run on the default branch will create <code>runs/index.json</code>.</div>`;
+    $("#main").innerHTML=emptyState("No runs published yet",
+      "This page reads the run documents under runs/. There are none yet.");
     return;
   }
   const list=manifest.runs||[];
-  if(!list.length){$("#main").innerHTML=`<div class="empty">The manifest is empty.</div>`;return;}
-  RUNS=await Promise.all(list.map(async m=>{
+  if(!list.length){
+    $("#main").innerHTML=emptyState("The run index is empty",
+      "runs/index.json exists but lists no runs, so there is nothing to plot.");
+    return;
+  }
+  RUNS=(await Promise.all(list.map(async m=>{
     try{ return {meta:m, doc:await (await fetch("runs/"+m.file,{cache:"no-store"})).json()}; }
-    catch(e){ return {meta:m, doc:null}; }
-  }));
-  RUNS=RUNS.filter(r=>r.doc);
+    catch(e){ return null; }
+  }))).filter(Boolean);
+  if(!RUNS.length){
+    $("#main").innerHTML=emptyState("Every run document failed to load",
+      `The index lists ${list.length} run(s), but none of the files could be read.`);
+    return;
+  }
+  showControls(true);
   const opt=r=>`<option value="${esc(r.meta.file)}">${esc((r.meta.commit||"").slice(0,10))} ${esc(r.meta.label||"")} ${esc((r.meta.timestamp||"").slice(0,16))}</option>`;
   $("#cur").innerHTML=RUNS.map(opt).join("");
   $("#base").innerHTML=`<option value="">(none)</option>`+RUNS.map(opt).join("");
