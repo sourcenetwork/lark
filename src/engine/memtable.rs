@@ -8,6 +8,9 @@
 //! node (header, tower, internal key, value, rounded to alignment)
 //! rather than only the key and value payload the old counter measured.
 
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
 use super::arena::{Arena, ArenaProfile, ChunkPool};
 use super::internal_key::{
     INTERNAL_KEY_SUFFIX_LEN, VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE,
@@ -16,8 +19,8 @@ use super::internal_key::{
 use super::lookup_key::LookupKey;
 use super::range_tombstone::{RangeTombstone, RangeTombstoneSet};
 use super::skiplist::{ArenaSkipList, NodeRef};
-use super::sync::{Arc, AtomicUsize, Mutex, Ordering};
 use crate::DbSlice;
+use crate::sync::{Arc, AtomicUsize, Mutex, Ordering};
 
 /// Everything a memtable needs to build its arena: the engine-wide chunk
 /// pool, the per-memtable byte budget, and the chunk sizing policy.
@@ -79,6 +82,29 @@ pub(crate) struct MemTable {
     /// memtable that does not live in the arena, so they are counted
     /// separately and added into [`MemTable::approximate_size`].
     range_tombstone_bytes: AtomicUsize,
+    /// The write-ahead log that backs this memtable's contents, recorded
+    /// when the memtable is sealed and the log rotated away from it.
+    ///
+    /// A flush unlinks this log once an SSTable holding the same records
+    /// is in the published version, so the memtable has to carry it
+    /// rather than the flush being handed one: the caller that seals a
+    /// memtable and the flush that persists it are not necessarily
+    /// looking at the same memtable, and a flush that unlinked the
+    /// caller's log would delete the only durable copy of a memtable
+    /// nobody has flushed yet. A crash then loses every write in it.
+    sealed_wal: OnceLock<PathBuf>,
+    /// The highest sequence number this memtable can contain, recorded
+    /// when it is sealed.
+    ///
+    /// Exact, and free. Sealing happens under the commit pipeline's
+    /// mutex, so every write acknowledged before the seal is already in
+    /// this memtable and no later write can enter it: the global
+    /// sequence counter read at that instant is precisely this
+    /// memtable's ceiling. A flush stamps it into the manifest, which is
+    /// what makes `last_seq` mean "durable in an SSTable through here"
+    /// rather than "the newest sequence the engine had handed out when
+    /// the flush happened to finish".
+    sealed_seq: OnceLock<u64>,
 }
 
 impl MemTable {
@@ -102,6 +128,8 @@ impl MemTable {
             list,
             range_tombstones: Mutex::new(RangeTombstoneSet::default()),
             range_tombstone_bytes: AtomicUsize::new(0),
+            sealed_wal: OnceLock::new(),
+            sealed_seq: OnceLock::new(),
         })
     }
 
@@ -113,6 +141,34 @@ impl MemTable {
     #[cfg(loom)]
     pub(crate) fn list(&self) -> &ArenaSkipList {
         &self.list
+    }
+
+    /// Record the log that backs this memtable, at the moment the
+    /// memtable is sealed and the log rotated away from it.
+    ///
+    /// Set once. A memtable is sealed exactly once, and the log it was
+    /// written through never changes after that.
+    pub(crate) fn seal_wal(&self, path: PathBuf) {
+        let _ = self.sealed_wal.set(path);
+    }
+
+    /// Record this memtable's sequence ceiling, at the moment it is
+    /// sealed. Set once, like the log.
+    pub(crate) fn seal_seq(&self, seq: u64) {
+        let _ = self.sealed_seq.set(seq);
+    }
+
+    /// The highest sequence this memtable can hold, if it has been
+    /// sealed.
+    pub(crate) fn sealed_seq(&self) -> Option<u64> {
+        self.sealed_seq.get().copied()
+    }
+
+    /// The log this memtable's records were written through, if it has
+    /// been sealed. `None` for the active memtable, whose log is still
+    /// the one writers are appending to.
+    pub(crate) fn sealed_wal(&self) -> Option<&Path> {
+        self.sealed_wal.get().map(PathBuf::as_path)
     }
 
     /// Insert a key-value pair with the given sequence number.
@@ -366,7 +422,7 @@ impl MemTable {
     /// [`MemTable::last_slice_before`] is checked against.
     ///
     /// The skip list has no back pointers, so a reverse step is an
-    /// `O(log N)` re-seek, exactly as it was with the crossbeam skip list.
+    /// `O(log N)` re-seek.
     #[cfg(test)]
     pub(crate) fn last_entry_before(
         &self,

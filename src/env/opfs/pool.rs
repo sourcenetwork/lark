@@ -10,7 +10,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use parking_lot::Mutex;
+use crate::sync::Mutex;
 
 use super::sah::{self, MountId, Slot, SlotHeader};
 use super::{children, not_found, register_ancestors};
@@ -131,13 +131,18 @@ impl SahPool {
     }
 
     /// Resolve or create a path for writing, returning the slot, its
-    /// generation, and the offset the first write lands at.
-    pub(super) fn open_write(&self, path: &Path, append: bool) -> io::Result<(usize, u64, u64)> {
+    /// generation, and the current end of the file.
+    ///
+    /// `keep` preserves the existing bytes. Only [`WriteMode::Truncate`]
+    /// passes `false`; `Append` and `Update` both keep what is there and
+    /// differ only in where the caller's first write lands, which the
+    /// caller decides.
+    pub(super) fn open_write(&self, path: &Path, keep: bool) -> io::Result<(usize, u64, u64)> {
         sah::check_path_fits(path)?;
         let mut state = self.state.lock();
 
         if let Some(&slot) = state.by_path.get(path) {
-            if append {
+            if keep {
                 let entry = &state.slots[slot];
                 return Ok((slot, entry.generation, entry.len));
             }

@@ -21,6 +21,14 @@
 //! would gate what is being measured, turning a real property into a
 //! reading of the harness.
 
+// The whole file measures descriptors through `/proc/self/fd`, and its
+// subject is the POSIX behaviour where an unlinked file keeps its bytes
+// until the last descriptor closes. Windows has neither: there is no
+// procfs to read, so every count comes back zero and the assertions
+// become vacuous, and a file unlinked with a handle open stays
+// delete-pending rather than becoming an unlinked-but-open inode.
+#![cfg(target_os = "linux")]
+
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};

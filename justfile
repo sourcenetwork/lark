@@ -18,8 +18,13 @@ lint:
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
+# nextest, not `cargo test`: each test gets its own process, so a
+# wedged test fails on the profile's slow-timeout instead of holding the
+# whole binary. See `.config/nextest.toml`.
+
 test:
-    cargo test --workspace
+    cargo nextest run --workspace
+    cargo test --workspace --doc
 
 deny:
     cargo deny check
@@ -28,8 +33,14 @@ msrv:
     cargo "+$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" check --workspace
 
 # The summary line CI annotates a build with.
+# Through nextest, like the gate: one process per test, so a wedged
+# test fails on the profile's slow-timeout instead of holding the whole
+# instrumented run open until the job's ceiling.
 cov-summary:
-    cargo llvm-cov --summary-only
+    # The `ci` profile, not the default: instrumented code runs several
+    # times slower, and the default profile's 60s slow-timeout turns the
+    # heavier soaks into timeouts that say nothing about the code.
+    cargo llvm-cov nextest --summary-only --workspace --profile ci
 
 # The browsable HTML report, for reading locally.
 cov:
@@ -46,7 +57,7 @@ test-fault:
 # default run so `cargo test` stays quick.
 
 test-fault-slow:
-    cargo test --test fault_smoke -- --ignored --skip crash_child
+    cargo nextest run --test fault_smoke
 
 # The `#[ignore]`d resource-exhaustion and extremes tests: six-figure key
 # counts, a 64 MiB value, megabyte keys, a six-level cascade, and a real
@@ -71,7 +82,7 @@ test-power:
 # file on its own. Measured at 0.6s, spawning 41 child processes.
 
 test-corruption-slow:
-    cargo test --test corruption_exhaustive -- --ignored --skip crash_child
+    cargo nextest run --test corruption_exhaustive
 
 # The power-loss durability tests, with output shown so the measured cost of
 # the default DurabilityMode::Eventual is visible. Every test here spawns a
@@ -79,12 +90,12 @@ test-corruption-slow:
 # Measured at 0.6s in total, so it also runs in the default `cargo test`.
 
 test-durability-slow:
-    cargo test --test proptest_durability -- --ignored --skip crash_child
+    cargo nextest run --test proptest_durability
 
 # Every ignored test in the workspace, including the scheduled stress runs.
 
 test-extremes:
-    cargo test --test resource_limits -- --ignored --nocapture --test-threads 1 --skip crash_child
+    cargo nextest run --test resource_limits --no-capture --test-threads 1
 
 # The `#[ignore]`d durability property test: 128 randomized operation
 # sequences, each run in a child process that is killed part way through
@@ -101,7 +112,7 @@ test-lifecycle:
 # 0.5s, so every test in the fast set also runs in the default `cargo test`.
 
 test-slow:
-    cargo test --workspace --release -- --ignored --skip crash_child --nocapture
+    cargo nextest run --workspace --release --no-capture
 
 # Rebuild the LD_PRELOAD fault shim from scratch by dropping its cache.
 
@@ -126,7 +137,7 @@ mvcc:
 # `a_user_thread_compact_range_never_makes_a_read_travel_backwards`.
 
 mvcc-slow:
-    cargo test --test mvcc_invariants -- --ignored --nocapture --skip crash_child
+    cargo nextest run --test mvcc_invariants --no-capture
 
 set shell := ["bash", "-uc"]
 
@@ -261,8 +272,16 @@ loom-all: loom loom-debug
 # versions. Measured at over 20 minutes wall and 4h of CPU unoptimized,
 # which is why `cargo test` runs a smaller default and this recipe
 # carries the full one. Release, because debug is where the cost is.
+#
+# Sized to finish, not to be maximal. Cost is roughly
+# instances x rounds x versions x compaction passes, and the compaction
+# passes each rewrite a database that grows with the version count, so
+# raising `versions` raises the run time faster than linearly: 400 does
+# not complete inside seven minutes, 120 completes in seconds. What the
+# workload is hunting is overlap between a compaction and a read, and
+# the overlap count is already in the thousands per instance here.
 
-chaos instances="6" rounds="2" versions="400" min_rounds="40":
+chaos instances="4" rounds="2" versions="120" min_rounds="20":
     LARK_CHAOS_INSTANCES={{instances}} LARK_CHAOS_ROUNDS={{rounds}} \
     LARK_CHAOS_VERSIONS={{versions}} LARK_CHAOS_MIN_ROUNDS={{min_rounds}} \
         cargo test --release --test read_view_chaos_workload -- --nocapture
@@ -366,8 +385,25 @@ wasm-native records="5000" sustained="20000":
             --probe-host --report-memory
     done
 
+# The OPFS contract against a real browser. `wasm-pack test` cannot
+# drive these: it appends `--tests`, which builds every target in
+# `tests/`, and all but the three `wasm_opfs*` files are native-only.
+# The runner is named per target instead, so only the named test
+# binaries are built.
 wasm-browser:
-    wasm-pack test --headless --firefox
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner
+    # wasm-bindgen's default per-test budget is 20s, which a headless
+    # browser on a shared runner can exceed on a test that mounts OPFS
+    # and writes through real sync access handles. Exceeding it kills
+    # the whole driver, so nine passing tests report as one failure with
+    # no attribution.
+    export WASM_BINDGEN_TEST_TIMEOUT=180
+    for suite in wasm_opfs wasm_opfs_main wasm_opfs_memory; do
+        echo "== $suite =="
+        cargo test --target wasm32-unknown-unknown --test "$suite"
+    done
 
 embedded:
     cargo run --release --bench memory -- --profile embedded

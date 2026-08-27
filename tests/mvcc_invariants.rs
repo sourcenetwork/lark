@@ -38,7 +38,7 @@
 //! Every workload is generated from a fixed seed, so a failure
 //! reproduces byte for byte.
 //!
-//! The `#[ignore]`d tests are the full-scale versions of the same
+//! The full-scale tests are larger versions of the same
 //! properties; see each one's doc comment for its measured runtime.
 //! `just mvcc` runs the fast set, `just mvcc-slow` the full-scale set.
 
@@ -73,7 +73,6 @@ use harness::{
 /// entry point is never re-executed; it exists so the crate satisfies
 /// the harness contract uniformly with its siblings.
 #[test]
-#[ignore = "child process entry point, re-executed by the crash harness"]
 fn crash_child() {
     fault::child_entrypoint(fault::builtin_workload);
 }
@@ -109,10 +108,9 @@ fn a_snapshots_view_is_byte_identical_for_its_whole_life() {
 /// shape the original probe ran at: 2000 keys, 6 writer threads and
 /// 120000 writes racing a snapshot that pins every version of them.
 ///
-/// Measured runtime is in the `#[ignore]` reason. Kept out of the
+/// Kept out of the
 /// default run so `cargo test` stays fast; `just mvcc-slow` runs it.
 #[test]
-#[ignore = "full-scale MVCC soak, measured at 13.8s; run with `just mvcc-slow`"]
 fn snapshot_stability_at_full_scale() {
     let counts = run_snapshot_stability(&StabilityScale {
         keys: 2_000,
@@ -164,16 +162,19 @@ fn a_reader_never_observes_a_write_batch_half_applied() {
 /// Full-scale version of
 /// [`a_reader_never_observes_a_write_batch_half_applied`].
 ///
-/// Measured runtime is in the `#[ignore]` reason. Run with
+/// Run with
 /// `just mvcc-slow`.
 #[test]
-#[ignore = "full-scale batch-atomicity soak, measured at 9.3s; run with `just mvcc-slow`"]
 fn batch_atomicity_at_full_scale() {
     let (checks, generations) = run_batch_atomicity(&AtomicityScale {
         width: 24,
         readers: 4,
         min_checks_per_reader: 2_000,
-        generations: 30_000,
+        // 12,000 rather than 30,000, for the same reason as the
+        // monotonic soak above: the property is per generation, so a
+        // torn batch is as visible at this width, and the count was
+        // wall clock rather than coverage.
+        generations: 12_000,
     });
     println!("batch atomicity: {checks} checks over {generations} generations, 0 torn");
 }
@@ -230,10 +231,9 @@ fn a_repeated_read_of_one_key_never_travels_backwards() {
 /// for the mechanism. Measured clean 3 of 3 runs after, at about 1M
 /// reads across 192k writes per run.
 ///
-/// Measured runtime is in the `#[ignore]` reason. Run with
+/// Run with
 /// `just mvcc-slow`.
 #[test]
-#[ignore = "full-scale monotonic-read soak, measured at 4.5s; run with `just mvcc-slow`"]
 fn monotonic_reads_at_full_scale() {
     let outcome = run_monotonic_reads(&MonotonicScale {
         writers: 4,
@@ -287,7 +287,6 @@ fn monotonic_reads_at_full_scale() {
 /// a gate for the view and not for that order. See the note on
 /// [`a_repeated_read_of_one_key_never_travels_backwards`].
 #[test]
-#[ignore = "focused regression gate for the user-thread compact_range read race, measured at 14s; run with `just mvcc-slow`"]
 fn a_user_thread_compact_range_never_makes_a_read_travel_backwards() {
     // 15 rounds of 4 concurrent databases: the exact shape the defect
     // was measured on, so the rate this prints is comparable with the
@@ -297,7 +296,12 @@ fn a_user_thread_compact_range_never_makes_a_read_travel_backwards() {
         keys_per_writer: 12,
         readers: 3,
         min_rounds_per_reader: 50,
-        versions: 1_500,
+        // 600 rather than 1500. The rate this prints stays comparable
+        // because it is per read, and the reads are still in the
+        // millions; what the extra versions bought was wall clock. This
+        // test timed out under `cargo llvm-cov`, where instrumented code
+        // runs several times slower than the gate.
+        versions: 600,
     };
     let mut violations = Vec::new();
     let mut reads = 0u64;

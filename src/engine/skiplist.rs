@@ -1,10 +1,10 @@
 //! Insert-only concurrent skip list over a bump [`Arena`].
 //!
-//! Replaces `crossbeam_skiplist::SkipMap<InternalKey, Vec<u8>>`. Where
-//! that cost three heap allocations per write (internal key, value, node)
-//! plus epoch garbage, one node here is a single arena bump that holds
-//! its header, tower, key bytes and value bytes inline, so a steady-state
-//! write touches the global allocator zero times.
+//! One node is a single arena bump holding its header, tower, key bytes
+//! and value bytes inline, so a steady-state write touches the global
+//! allocator zero times. A general-purpose concurrent map would instead
+//! cost three heap allocations per write (internal key, value, node)
+//! plus the garbage its reclamation scheme defers.
 //!
 //! # Node layout
 //!
@@ -24,7 +24,6 @@
 //!
 //! Exactly one thread inserts at a time (the engine serializes writers on
 //! its write lock); any number of threads read concurrently and lock-free.
-//! This is the same contract the crossbeam-backed memtable documented.
 //!
 //! The safety of the whole module rests on these invariants, named at
 //! every `unsafe` site that relies on them. They are what the loom and
@@ -69,7 +68,7 @@ use std::ptr::NonNull;
 
 use super::arena::Arena;
 use super::internal_key::{INTERNAL_KEY_SUFFIX_LEN, compare_internal_keys, compare_internal_split};
-use super::sync::{Arc, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use crate::sync::{Arc, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 /// Maximum tower height. With [`BRANCHING`] 4, height 12 indexes about
 /// 16.7M entries, which covers a 64 MiB memtable of 64-byte entries with
@@ -255,7 +254,7 @@ pub(crate) struct ArenaSkipList {
     rnd: AtomicU64,
     count: AtomicUsize,
     #[cfg(debug_assertions)]
-    inserting: super::sync::AtomicBool,
+    inserting: crate::sync::AtomicBool,
 }
 
 // SAFETY (S8): the only cross-thread communication is through the tower's
@@ -288,7 +287,7 @@ impl ArenaSkipList {
             rnd: AtomicU64::new(0x2545_F491_4F6C_DD1D),
             count: AtomicUsize::new(0),
             #[cfg(debug_assertions)]
-            inserting: super::sync::AtomicBool::new(false),
+            inserting: crate::sync::AtomicBool::new(false),
         })
     }
 
@@ -550,11 +549,11 @@ unsafe fn init_node_header(node: *mut u8, key_len: usize, value_len: usize, heig
 
 /// Debug-only enforcement of S2: exactly one thread inside `insert`.
 #[cfg(debug_assertions)]
-struct SingleWriterGuard<'a>(&'a super::sync::AtomicBool);
+struct SingleWriterGuard<'a>(&'a crate::sync::AtomicBool);
 
 #[cfg(debug_assertions)]
 impl<'a> SingleWriterGuard<'a> {
-    fn enter(flag: &'a super::sync::AtomicBool) -> Self {
+    fn enter(flag: &'a crate::sync::AtomicBool) -> Self {
         let busy = flag.swap(true, Ordering::Acquire);
         debug_assert!(
             !busy,

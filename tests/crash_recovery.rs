@@ -35,7 +35,7 @@
 //!
 //! Every test here is in the default run: the whole file spawns 41 child
 //! processes and is measured at 0.6s with the default test parallelism
-//! (0.9s serial), so nothing needs `#[ignore]`. The only ignored function
+//! (0.9s serial). The only non-test function
 //! is `crash_child`, which is the child entry point and not a test. Run
 //! the file on its own with `just test-crash`.
 
@@ -65,7 +65,6 @@ use tempfile::TempDir;
 /// re-executed by the crash harness, so a normal `cargo test` run never
 /// executes a workload here.
 #[test]
-#[ignore = "child process entry point, re-executed by the crash harness"]
 fn crash_child() {
     fault::child_entrypoint(dispatch);
 }
@@ -896,7 +895,7 @@ fn cycle_workload(spec: &ChildSpec) {
 /// and any slow leak of state that only shows after several generations.
 ///
 /// Runtime: measured at 0.66s, spawning 24 child processes, so it stays in
-/// the default run rather than behind `#[ignore]`.
+/// the default run.
 #[test]
 fn twenty_four_crash_and_reopen_cycles_accumulate_data_monotonically() {
     let tmp = TempDir::new().unwrap();

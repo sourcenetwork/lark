@@ -6,7 +6,7 @@
 //! of these assert that the fault actually fired, not merely that nothing
 //! blew up.
 //!
-//! Runtime: the default set finishes in a few seconds. The two `#[ignore]`
+//! Runtime: the default set finishes in a few seconds. The two
 //! tests are called out individually below; run them with
 //! `just test-fault-slow`.
 
@@ -37,7 +37,6 @@ use tempfile::TempDir;
 /// re-executed by the crash harness, so a normal `cargo test` run never
 /// executes a workload here.
 #[test]
-#[ignore = "child process entry point, re-executed by the crash harness"]
 fn crash_child() {
     fault::child_entrypoint(fault::builtin_workload);
 }
@@ -519,7 +518,6 @@ fn the_locators_find_the_wal_manifest_and_sstable() {
 ///
 /// Runtime: measured at 0.04s of test time; it spawns two child processes.
 #[test]
-#[ignore = "spawns child processes; run with `just test-fault-slow`"]
 fn a_crash_inside_one_write_batch_applies_all_of_it_or_none() {
     let tmp = TempDir::new().unwrap();
 
@@ -580,7 +578,6 @@ fn a_crash_inside_one_write_batch_applies_all_of_it_or_none() {
 ///
 /// Runtime: measured at 0.2s of test time; it spawns one child process.
 #[test]
-#[ignore = "spawns a child process; run with `just test-fault-slow`"]
 fn a_crash_during_a_background_sstable_write_recovers_to_a_valid_prefix() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("db");

@@ -1,4 +1,4 @@
-//! Adversarial probes for reverse iteration's upper-bound probe (reverse iteration).
+//! Adversarial probes for the reverse-iteration upper-bound probe.
 //!
 //! The defect was a probe built as "the CF upper bound with its last
 //! byte decremented, followed by eight `0xff` bytes", which is only an

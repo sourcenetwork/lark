@@ -7,7 +7,7 @@
 //! `block_cache_size = 0`. The difference in live heap is what the
 //! block cache costs; `lark.block-cache-usage` is what it claims to
 //! cost. If the claim is under the cost, the budget stops bounding
-//! memory and G2 is back in a new costume.
+//! memory and the over-allocation defect is back in a new costume.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -69,6 +69,7 @@ const KEYS: u32 = 60_000;
 const DIR_ENV: &str = "LARK_ADV_OVERHEAD_DIR";
 const CACHE_ENV: &str = "LARK_ADV_OVERHEAD_CACHE";
 const BS_ENV: &str = "LARK_ADV_OVERHEAD_BS";
+const ROUNDS_ENV: &str = "LARK_ADV_OVERHEAD_ROUNDS";
 
 fn key(i: u32) -> Vec<u8> {
     format!("k{i:07}").into_bytes()
@@ -99,8 +100,12 @@ fn adv_overhead_child() {
     )
     .unwrap();
 
+    let rounds: u32 = std::env::var(ROUNDS_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
     let heap_open = LIVE.load(Ordering::Relaxed);
-    for _ in 0..2 {
+    for _ in 0..rounds {
         for i in 0..KEYS {
             assert!(db.get(&key(i)).unwrap().is_some());
         }
@@ -153,11 +158,12 @@ fn a_cached_entry_costs_no_more_heap_than_it_is_charged() {
         capacity: i64,
         adds: i64,
     }
-    let run_in = |data: &std::path::Path, cache_bytes: usize| -> Row {
+    let run_rounds = |data: &std::path::Path, cache_bytes: usize, rounds: u32| -> Row {
         let out = std::process::Command::new(&exe)
             .args(["--exact", "adv_overhead_child", "--nocapture"])
             .env(DIR_ENV, data)
             .env(CACHE_ENV, cache_bytes.to_string())
+            .env(ROUNDS_ENV, rounds.to_string())
             .output()
             .expect("spawn child");
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -185,6 +191,7 @@ fn a_cached_entry_costs_no_more_heap_than_it_is_charged() {
             adds: field("adds="),
         }
     };
+    let run_in = |data: &std::path::Path, cache_bytes: usize| run_rounds(data, cache_bytes, 2);
     let run = |cache_bytes: usize| run_in(dir.path(), cache_bytes);
 
     // Baseline: the same reads with no cache at all. A disabled cache
@@ -216,7 +223,7 @@ entries={} excess_per_entry={:.2} charged_per_entry={:.1}",
     );
 
     // Saturated: the hand runs constantly, so this also carries
-    // whatever crossbeam-epoch has retired but not yet reclaimed.
+    // whatever the cache's map has retired but not yet reclaimed.
     let tight = run(2 * 1024 * 1024);
     let tight_real = tight.heap - off.heap;
     println!(
@@ -252,13 +259,64 @@ charged_per_entry={:.1} over_capacity={} ratio={:.4}",
         "an unevicted entry costs {} heap bytes more than the charge it is charged",
         roomy_excess as f64 / roomy.adds as f64
     );
-    for (label, real, capacity) in [
-        ("1 KiB blocks", tight_real, tight.capacity),
-        ("256 B blocks", tiny_real, tiny.capacity),
+    // The margin a saturated cache carries over its byte budget: the
+    // bookkeeping `ENTRY_OVERHEAD` charges but `usage()` reports outside
+    // the block bytes, plus whatever the map's deferred reclamation has
+    // retired and not yet freed.
+    //
+    // Both are per ENTRY, not per byte, so the margin is set by how many
+    // entries a budget holds and therefore by the block size. These two
+    // arms bracket it from the wrong end deliberately: 1 KiB blocks are
+    // a quarter of the default `block_size` and 256-byte blocks a
+    // sixteenth, so a default-configured cache sits well inside the
+    // tighter of the two. Measured 1.25x at 1 KiB and 1.54x at 256
+    // bytes, against 3.8x and rising if the reclamation is left
+    // undrained, which is what the flatness check below guards.
+    for (label, real, capacity, ceiling) in [
+        ("1 KiB blocks", tight_real, tight.capacity, 18),
+        ("256 B blocks", tiny_real, tiny.capacity, 24),
     ] {
         assert!(
-            real <= capacity * 5 / 4,
-            "a saturated cache with {label} holds {real} heap bytes against a {capacity}-byte budget"
+            real <= capacity * ceiling / 10,
+            "a saturated cache with {label} holds {real} heap bytes against a {capacity}-byte              budget, past the {:.1}x this configuration is allowed",
+            ceiling as f64 / 10.0
         );
     }
+
+    // The margin has to be a constant, not a leak. Tripling the churn
+    // through the same budget must not move resident memory much: if it
+    // does, the drain that reclaims evicted map nodes has stopped
+    // keeping up, and the byte budget bounds only what the cache
+    // accounts rather than what it holds. Undrained that measures 144
+    // bytes retained per insert: 7.9 MB after 40,000 inserts, 19.5 MB
+    // after 120,000 and 71.3 MB after 480,000, with no ceiling.
+    let churned = run_rounds(small_dir.path(), 2 * 1024 * 1024, 6);
+    let churned_real = churned.heap - tiny_off.heap;
+    println!(
+        "ADVOVERHEAD churn_flat rounds=2 real={tiny_real} adds={} | rounds=6 real={churned_real} adds={} ratio={:.4}",
+        tiny.adds,
+        churned.adds,
+        churned_real as f64 / tiny_real as f64
+    );
+    assert!(
+        churned.adds > tiny.adds,
+        "the longer run cached no more entries than the short one, so it is not more churn:          {} against {}",
+        churned.adds,
+        tiny.adds
+    );
+    let extra = churned_real.saturating_sub(tiny_real);
+    let per_add = extra as f64 / (churned.adds - tiny.adds).max(1) as f64;
+    println!("ADVOVERHEAD retained_per_insert={per_add:.1} bytes");
+    // The rate, not exact flatness. How much the drain keeps up with
+    // depends on how much CPU the process gets: measured 0.2 bytes per
+    // insert on an idle machine and 14.1 with the rest of the suite
+    // running alongside. Undrained it is 144, so a ceiling of 40 keeps
+    // roughly three times the loaded figure in hand and still fails by a
+    // wide margin if the drain stops working.
+    assert!(
+        per_add <= 40.0,
+        "the cache retains {per_add:.1} bytes per insert, so resident memory grows with churn \
+         rather than with the working set. Undrained this measures 144 bytes per insert, and a \
+         working drain measures under 15 even on a loaded machine"
+    );
 }

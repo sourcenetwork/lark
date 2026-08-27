@@ -71,7 +71,7 @@ use std::ptr::NonNull;
 
 use kovan_queue::array_queue::ArrayQueue;
 
-use super::sync::{Arc, AtomicUsize, Mutex, Ordering};
+use crate::sync::{Arc, AtomicUsize, Mutex, Ordering};
 
 /// Alignment every chunk is allocated at. Covers every alignment the
 /// skip-list asks for, so a fresh chunk never needs leading padding.

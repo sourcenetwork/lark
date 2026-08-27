@@ -17,6 +17,9 @@ use lark_kv::{ArenaProfile, Db, DbSlice, Options, WriteBatch};
 use tempfile::TempDir;
 
 const BATCH_WIDTH: usize = 24;
+/// Floor the read side must clear before it stops, so the assertion
+/// at the end states what the loops enforce.
+const MIN_READS: usize = 200_000;
 
 fn opts() -> Options {
     Options {
@@ -100,7 +103,12 @@ fn one_long_lived_snapshot_agrees_with_itself_across_every_read_surface() {
             // Each reader also takes its own short-lived snapshots, so
             // both the fresh-snapshot and the long-held-snapshot paths
             // run against the same commit stream.
-            while !stop.load(Ordering::Relaxed) {
+            // Stop only once the writers are done AND the read floor is
+            // cleared. The writers commit a quota, so `reads` is
+            // otherwise the ratio of the two sides' throughput on
+            // whatever host is running, and the floor asserted at the
+            // end becomes a speed test rather than a coverage claim.
+            while !stop.load(Ordering::Relaxed) || reads.load(Ordering::Relaxed) < MIN_READS {
                 let fresh = db.snapshot();
                 for w in 0..writers {
                     let at = frontier[w].load(Ordering::Acquire);
@@ -137,7 +145,7 @@ fn one_long_lived_snapshot_agrees_with_itself_across_every_read_surface() {
         );
         let pinned = pinned.clone();
         thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
+            while !stop.load(Ordering::Relaxed) || reads.load(Ordering::Relaxed) < MIN_READS {
                 for (key, value) in &pinned {
                     let got = snap.get(key).unwrap();
                     let has = snap.has(key).unwrap();
@@ -164,8 +172,10 @@ fn one_long_lived_snapshot_agrees_with_itself_across_every_read_surface() {
         let db = Arc::clone(&db);
         let stop = Arc::clone(&stop);
         thread::spawn(move || {
+            // At least one pass, so "a compaction ran underneath the
+            // probe" is enforced rather than hoped for.
             let mut n = 0usize;
-            while !stop.load(Ordering::Relaxed) {
+            while n == 0 || !stop.load(Ordering::Relaxed) {
                 db.compact_range(None, None).unwrap();
                 n += 1;
             }
@@ -202,7 +212,10 @@ fn one_long_lived_snapshot_agrees_with_itself_across_every_read_surface() {
         disagreed, 0,
         "{disagreed} disagreements between get / has / get_size / get_slice on one snapshot"
     );
-    assert!(reads > 200_000, "probe was too weak: only {reads} reads");
+    assert!(
+        reads >= MIN_READS,
+        "probe was too weak: only {reads} reads against a floor of {MIN_READS}"
+    );
     assert!(compactions > 0, "no compaction ran underneath the probe");
 
     // And the snapshot is still intact after everything above.

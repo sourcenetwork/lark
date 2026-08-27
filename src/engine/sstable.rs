@@ -3401,7 +3401,7 @@ mod tests {
         );
     }
 
-    // -- G5: index and filter blocks through the block cache ---------
+    // -- index and filter blocks through the block cache -------------
 
     /// A flat-index fixture large enough that its index and filter are
     /// worth measuring.

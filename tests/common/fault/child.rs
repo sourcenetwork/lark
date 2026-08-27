@@ -3,7 +3,7 @@
 //! A crash test needs a real process that really dies, so the workload runs
 //! in a child. The child is the test binary re-executing itself: a separate
 //! `bin` target would not see the test crate's code, so instead the parent
-//! spawns `current_exe()` with `--exact --ignored <entry test>` and an
+//! spawns `current_exe()` with `--exact <entry test>` and an
 //! environment describing the workload. The entry test returns immediately
 //! when that environment is absent, so a normal `cargo test` run never
 //! notices it.
@@ -14,8 +14,7 @@
 //! mod common;
 //!
 //! #[test]
-//! #[ignore = "child process entry point, re-executed by the crash harness"]
-//! fn crash_child() {
+//! //! fn crash_child() {
 //!     common::fault::child_entrypoint(common::fault::builtin_workload);
 //! }
 //! ```
@@ -46,7 +45,12 @@ use super::shim;
 pub const DEFAULT_SEED: u64 = 0x1A12_5EED_C0FF_EE01;
 
 pub const CHILD_ENV: &str = "LARK_CRASH_CHILD";
-/// Name of the `#[test] #[ignore]` function the parent re-executes.
+/// Name of the `#[test]` function the parent re-executes.
+///
+/// An ordinary test, not an ignored one. [`child_entrypoint`] returns
+/// immediately when [`CHILD_ENV`] is unset, so in a normal run it costs
+/// one no-op test rather than needing to be switched off; a switched-off
+/// test is one nobody notices has stopped compiling.
 pub const CHILD_TEST: &str = "crash_child";
 
 #[cfg(unix)]
@@ -453,7 +457,7 @@ impl CrashRun {
         self.trigger = trigger;
         self
     }
-    /// Name of the `#[test] #[ignore]` entry point in the calling crate.
+    /// Name of the `#[test]` entry point in the calling crate.
     pub fn entry_test(mut self, name: impl Into<String>) -> Self {
         self.entry_test = name.into();
         self
@@ -490,7 +494,7 @@ impl CrashRun {
 
         let exe = std::env::current_exe().expect("crash run: current_exe");
         let mut cmd = Command::new(exe);
-        cmd.args(["--exact", "--nocapture", "--ignored", &self.entry_test])
+        cmd.args(["--exact", "--nocapture", &self.entry_test])
             .stdin(Stdio::null())
             .stdout(Stdio::from(
                 File::create(&stdout_path).expect("crash run: stdout file"),
@@ -545,7 +549,7 @@ impl CrashRun {
         assert!(
             started_path.is_file(),
             "the child never entered the workload. The test crate needs the entry point:\n\n    \
-             #[test]\n    #[ignore = \"child process entry point\"]\n    fn {}() {{\n        \
+             #[test]\n    fn {}() {{\n        \
              common::fault::child_entrypoint(common::fault::builtin_workload);\n    }}\n\n\
              child stdout:\n{}\nchild stderr:\n{}",
             self.entry_test,

@@ -22,7 +22,7 @@ use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
 
-use parking_lot::{Condvar, Mutex};
+use crate::sync::{Condvar, Mutex};
 
 /// Priority of a rate-limited I/O request. High-priority waiters are
 /// always served before low-priority waiters; within a priority class
@@ -87,7 +87,7 @@ struct State {
 /// Default rate-limiter implementation: a single token bucket refilled
 /// at `bytes_per_second` bytes/sec with a burst capacity of `burst_bytes`.
 ///
-/// All waiters share one [`Mutex`] and one [`Condvar`]; on wakeup, each
+/// All waiters share one mutex and one condition variable; on wakeup, each
 /// waiter checks whether it is at the front of the FIFO queue (highest
 /// priority, lowest seq) and, if so, whether enough tokens have
 /// accumulated. Waiters that aren't at the front simply go back to
@@ -222,7 +222,11 @@ impl TokenBucketRateLimiter {
             } else {
                 wait
             };
-            self.cv.wait_for(&mut state, wait);
+            state = self
+                .cv
+                .wait_timeout(state, wait)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
         };
 
         state.waiters.remove(&key);

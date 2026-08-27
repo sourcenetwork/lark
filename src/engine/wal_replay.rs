@@ -12,6 +12,8 @@ use std::collections::VecDeque;
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
+
 use crate::env::{Env, ReadFile, ReadFileCursor};
 
 /// Where a WAL file sits in the recovery order.
@@ -66,6 +68,10 @@ pub(crate) struct WalReplayIter {
     tail: Option<TailVerdict>,
     /// Whether the torn-tail rule applies to this file at all.
     position: WalPosition,
+    /// Kept for the whole life of the iterator: classifying a torn or
+    /// unusable tail re-reads the log, and that read has to reach the
+    /// same filesystem the records came from.
+    env: Arc<dyn Env>,
 }
 
 /// Read up to `buf.len()` bytes, returning how many were available.
@@ -91,7 +97,7 @@ impl WalReplayIter {
     /// same filesystem the database was written to, and for an OPFS
     /// database in a browser `std::fs` is not merely the wrong file,
     /// it reports `Unsupported` and no reopen can ever replay.
-    pub(crate) fn open(env: &dyn Env, path: &Path, position: WalPosition) -> io::Result<Self> {
+    pub(crate) fn open(env: &Arc<dyn Env>, path: &Path, position: WalPosition) -> io::Result<Self> {
         let cursor = ReadFileCursor::new(env.open_read(path)?)?;
         let file_len = cursor.len();
         let mut reader = BufReader::new(cursor);
@@ -122,6 +128,7 @@ impl WalReplayIter {
             pending: VecDeque::new(),
             tail: None,
             position,
+            env: Arc::clone(env),
         })
     }
 
@@ -141,7 +148,11 @@ impl WalReplayIter {
                 if self.position == WalPosition::Earlier {
                     return Err(self.damage_in_a_closed_file(record_start, "ends inside a record"));
                 }
-                self.tail = Some(classify_incomplete_record(&self.path, record_start)?);
+                self.tail = Some(classify_incomplete_record(
+                    &*self.env,
+                    &self.path,
+                    record_start,
+                )?);
                 Ok(None)
             }
             // A record that framed cleanly but carries an unusable type
@@ -154,7 +165,11 @@ impl WalReplayIter {
                         self.damage_in_a_closed_file(record_start, "carries an unusable record")
                     );
                 }
-                self.tail = Some(classify_unusable_record(&self.path, record_start)?);
+                self.tail = Some(classify_unusable_record(
+                    &*self.env,
+                    &self.path,
+                    record_start,
+                )?);
                 Ok(None)
             }
             other => other,
@@ -278,7 +293,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn drain(path: &Path) -> io::Result<Vec<WalEntry>> {
-        let mut iter = WalReplayIter::open(&*crate::env::std_env(), path, WalPosition::Newest)?;
+        let mut iter = WalReplayIter::open(&crate::env::std_env(), path, WalPosition::Newest)?;
         let mut out = Vec::new();
         while let Some(entry) = iter.next_entry()? {
             out.push(entry);
@@ -386,7 +401,7 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         let mut iter =
-            WalReplayIter::open(&*crate::env::std_env(), &path, WalPosition::Newest).unwrap();
+            WalReplayIter::open(&crate::env::std_env(), &path, WalPosition::Newest).unwrap();
         assert!(
             iter.next_entry().unwrap().is_some(),
             "first record is whole"
@@ -416,7 +431,7 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         let mut iter =
-            WalReplayIter::open(&*crate::env::std_env(), &path, WalPosition::Newest).unwrap();
+            WalReplayIter::open(&crate::env::std_env(), &path, WalPosition::Newest).unwrap();
         let err = iter.next_entry().expect_err("checksum must not pass");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
@@ -431,7 +446,7 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         let mut iter =
-            WalReplayIter::open(&*crate::env::std_env(), &path, WalPosition::Newest).unwrap();
+            WalReplayIter::open(&crate::env::std_env(), &path, WalPosition::Newest).unwrap();
         // Nothing follows the bogus length, so it reads as a torn tail.
         // The point of the test is the allocation, not the verdict.
         assert!(iter.next_entry().unwrap().is_none());
@@ -454,7 +469,7 @@ mod tests {
             wal.sync_data().unwrap();
         }
         let mut iter =
-            WalReplayIter::open(&*crate::env::std_env(), &path, WalPosition::Newest).unwrap();
+            WalReplayIter::open(&crate::env::std_env(), &path, WalPosition::Newest).unwrap();
         let mut count = 0;
         while iter.next_entry().unwrap().is_some() {
             count += 1;

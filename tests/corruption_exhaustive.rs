@@ -8,7 +8,7 @@
 //!
 //! **Coverage.** Every byte offset of the WAL, of an SSTable and of the
 //! MANIFEST is truncated, and every bit of every byte is flipped, by the
-//! `#[ignore]`d sweeps. The default run takes a seeded, evenly spread
+//! exhaustive sweeps. The default run takes a seeded, evenly spread
 //! sample of the same offsets so `cargo test` stays fast. The sample is
 //! deterministic, so an offset that fails once fails every time.
 //!
@@ -49,17 +49,28 @@ mod harness;
 
 use common::fault::{
     builtin_workload, child_entrypoint, flip_bit, garbage, overwrite_range, truncate_at,
-    validate_prefix_of_state,
 };
+// Used only by the WAL sweeps, which are linux-only.
+#[cfg(target_os = "linux")]
+use common::fault::validate_prefix_of_state;
 use harness::{
     BLOOM, DATA, FOOTER, INDEX, Recovered, SAMPLE, SEED, TAG_ADD_FILE, Tally,
-    assert_engine_never_panicked, batch_fixture, every, exactly, manifest_frames, never_invents,
-    read_state, region, sample, sst_regions, table_fixture, trial, valid_prefix, wal_fixture,
-    wal_frames, watch,
+    assert_engine_never_panicked, every, exactly, manifest_frames, never_invents, read_state,
+    region, sample, sst_regions, table_fixture, trial, watch,
 };
+// The WAL fixtures are built by killing a child process, so they exist
+// only where "was it killed" has an answer. The SSTable and MANIFEST
+// sweeps below use `table_fixture`, which spawns nothing, and run
+// everywhere.
+#[cfg(target_os = "linux")]
+use harness::{batch_fixture, valid_prefix, wal_fixture, wal_frames};
 
 // ─── WAL: truncation ────────────────────────────────────────────────────
 
+// The fixture this uses is built by killing a child process, and
+// "was it killed" is a POSIX signal question that Windows cannot
+// answer, so the assertion would be vacuous there.
+#[cfg(target_os = "linux")]
 /// Truncating the WAL must leave the database holding the state after
 /// some whole number of the intended writes. A cut leaves every record
 /// before it byte-for-byte as the process wrote it and only the record it
@@ -110,6 +121,10 @@ fn wal_truncation_sweep(cuts: &[u64], what: &str, progress: &AtomicU64) {
     tally.finish(what);
 }
 
+// The fixture this uses is built by killing a child process, and
+// "was it killed" is a POSIX signal question that Windows cannot
+// answer, so the assertion would be vacuous there.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_wal_truncated_at_a_sampled_offset_replays_whole_records_or_refuses() {
     watch("wal truncation sample", |progress| {
@@ -123,10 +138,13 @@ fn a_wal_truncated_at_a_sampled_offset_replays_whole_records_or_refuses() {
     });
 }
 
+// The fixture this uses is built by killing a child process, and
+// "was it killed" is a POSIX signal question that Windows cannot
+// answer, so the assertion would be vacuous there.
+#[cfg(target_os = "linux")]
 /// The exhaustive twin of the sampled sweep: every byte offset of the
 /// WAL, with no sampling to hide behind.
 #[test]
-#[ignore = "exhaustive sweep, measured at 0.04s: run `just test-corruption-slow`"]
 fn a_wal_truncated_at_every_offset_replays_whole_records_or_refuses() {
     watch("wal truncation exhaustive", |progress| {
         let fixture = wal_fixture();
@@ -135,6 +153,10 @@ fn a_wal_truncated_at_every_offset_replays_whole_records_or_refuses() {
     });
 }
 
+// The fixture this uses is built by killing a child process, and
+// "was it killed" is a POSIX signal question that Windows cannot
+// answer, so the assertion would be vacuous there.
+#[cfg(target_os = "linux")]
 /// A `WriteBatch` is atomic, so a WAL cut inside the record that carries
 /// one must leave none of it applied, in every durability mode. Cutting
 /// at every offset inside the final batch record catches a replay that
@@ -165,6 +187,10 @@ fn a_write_batch_record_cut_in_half_is_never_half_applied() {
 
 // ─── WAL: bit rot ───────────────────────────────────────────────────────
 
+// The fixture this uses is built by killing a child process, and
+// "was it killed" is a POSIX signal question that Windows cannot
+// answer, so the assertion would be vacuous there.
+#[cfg(target_os = "linux")]
 /// Every byte of a WAL record is covered by its checksum: the length, the
 /// type byte and the payload all feed `checksum::wal_record`, and the
 /// stored checksum is the last four bytes. So every single-bit flip must
@@ -224,6 +250,10 @@ fn wal_flip_sweep(positions: &[u64], what: &str, progress: &AtomicU64) {
     tally.finish(what);
 }
 
+// The fixture this uses is built by killing a child process, and
+// "was it killed" is a POSIX signal question that Windows cannot
+// answer, so the assertion would be vacuous there.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_sampled_bit_flip_anywhere_in_the_wal_is_caught_by_the_record_checksum() {
     watch("wal bit flips sample", |progress| {
@@ -237,9 +267,12 @@ fn a_sampled_bit_flip_anywhere_in_the_wal_is_caught_by_the_record_checksum() {
     });
 }
 
+// The fixture this uses is built by killing a child process, and
+// "was it killed" is a POSIX signal question that Windows cannot
+// answer, so the assertion would be vacuous there.
+#[cfg(target_os = "linux")]
 /// The exhaustive twin: every bit of every byte of the WAL.
 #[test]
-#[ignore = "exhaustive sweep, measured at 0.23s: run `just test-corruption-slow`"]
 fn every_bit_flip_in_the_wal_is_caught_by_the_record_checksum() {
     watch("wal bit flips exhaustive", |progress| {
         let fixture = wal_fixture();
@@ -250,6 +283,10 @@ fn every_bit_flip_in_the_wal_is_caught_by_the_record_checksum() {
 
 // ─── WAL: torn and trailing bytes ───────────────────────────────────────
 
+// The fixture this uses is built by killing a child process, and
+// "was it killed" is a POSIX signal question that Windows cannot
+// answer, so the assertion would be vacuous there.
+#[cfg(target_os = "linux")]
 /// A record header that promises more payload than the file holds is the
 /// signature of a write torn by a crash, and what replay owes depends on
 /// where it sits.
@@ -333,6 +370,10 @@ fn a_wal_record_header_promising_more_bytes_than_exist_is_refused_unless_it_is_t
     });
 }
 
+// The fixture this uses is built by killing a child process, and
+// "was it killed" is a POSIX signal question that Windows cannot
+// answer, so the assertion would be vacuous there.
+#[cfg(target_os = "linux")]
 /// Garbage appended after the last valid record is what a crash mid-write
 /// plus a filesystem that pads with whatever was in the block leaves
 /// behind. It must never be replayed as data. Catches a replay loop that
@@ -359,6 +400,10 @@ fn garbage_appended_after_a_valid_wal_is_never_replayed_as_data() {
     });
 }
 
+// The fixture this uses is built by killing a child process, and
+// "was it killed" is a POSIX signal question that Windows cannot
+// answer, so the assertion would be vacuous there.
+#[cfg(target_os = "linux")]
 /// A WAL truncated to nothing is a legal state: the writes it held are
 /// lost, but the database must open, serve whatever the tables hold and
 /// keep working. Catches an open path that treats a zero-length WAL as
@@ -443,7 +488,6 @@ fn an_sstable_truncated_at_a_sampled_offset_refuses_to_open_and_keeps_the_file()
 
 /// The exhaustive twin: every byte offset of the table.
 #[test]
-#[ignore = "exhaustive sweep, measured at 0.04s: run `just test-corruption-slow`"]
 fn an_sstable_truncated_at_every_offset_refuses_to_open_and_keeps_the_file() {
     watch("sst truncation exhaustive", |progress| {
         let fixture = table_fixture();
@@ -580,7 +624,6 @@ fn a_bit_flip_in_the_sstable_footer_is_caught_or_harmless() {
 /// The exhaustive twin: every bit of every byte of the table, tallied by
 /// region so an unprotected region is named rather than merely counted.
 #[test]
-#[ignore = "exhaustive sweep, measured at 1.3s: run `just test-corruption-slow`"]
 fn every_bit_flip_in_an_sstable_is_caught_or_harmless() {
     watch("sst flips exhaustive", |progress| {
         let fixture = table_fixture();
@@ -677,7 +720,6 @@ fn a_manifest_truncated_at_a_sampled_offset_never_serves_invented_data() {
 
 /// The exhaustive twin: every byte offset of the MANIFEST.
 #[test]
-#[ignore = "exhaustive sweep, measured at 0.06s: run `just test-corruption-slow`"]
 fn a_manifest_truncated_at_every_offset_never_serves_invented_data() {
     watch("manifest truncation exhaustive", |progress| {
         let fixture = table_fixture();
@@ -728,7 +770,6 @@ fn a_sampled_bit_flip_in_the_manifest_stops_replay_without_inventing_data() {
 
 /// The exhaustive twin: every bit of every byte of the MANIFEST.
 #[test]
-#[ignore = "exhaustive sweep, measured at 0.45s: run `just test-corruption-slow`"]
 fn every_bit_flip_in_the_manifest_stops_replay_without_inventing_data() {
     watch("manifest flips exhaustive", |progress| {
         let fixture = table_fixture();
@@ -838,7 +879,6 @@ fn a_manifest_that_names_the_same_table_twice_never_serves_an_inconsistent_view(
 // ─── child entry point ──────────────────────────────────────────────────
 
 #[test]
-#[ignore = "child process entry point, re-executed by the crash harness"]
 fn crash_child() {
     child_entrypoint(builtin_workload);
 }

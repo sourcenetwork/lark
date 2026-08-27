@@ -84,7 +84,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::{Condvar, Mutex};
+use crate::sync::{Condvar, Mutex};
 
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
 use crate::engine::{CommitOutcome, LarkEngine};
@@ -894,7 +894,11 @@ impl LockManager {
                         }
                         _ => timeout,
                     };
-                    let result = self.cvar.wait_for(&mut guard, remaining);
+                    let (next, result) = self
+                        .cvar
+                        .wait_timeout(guard, remaining)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    guard = next;
                     if result.timed_out() && guard.get(key).is_some_and(|&h| h != tx_id) {
                         return Err(());
                     }

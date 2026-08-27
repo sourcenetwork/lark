@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::env::{BufferedWriter, Env, WriteMode};
 
-use parking_lot::RwLock;
+use crate::sync::RwLock;
 
 use super::checksum;
 use super::sstable::{
@@ -362,11 +362,18 @@ impl VersionSet {
             let replay = Self::replay_manifest(env, &data, sst_dir, policy)?;
             Self::reject_discarded_tables(&**env, &replay, data.len(), sst_dir, &manifest_path)?;
 
-            let mut file = env.open_write(&manifest_path, WriteMode::Append)?;
+            // Trim through its own handle, and close it before the
+            // append handle is opened. A torn or corrupt tail is the
+            // ordinary shape of a crash, so this runs on a normal
+            // reopen; shortening a file needs write access that an
+            // append handle does not carry on every platform, which is
+            // what [`WriteMode::Update`] exists for.
             if replay.valid_len < data.len() {
-                file.set_len(replay.valid_len as u64)?;
-                file.sync_all()?;
+                let mut trim = env.open_write(&manifest_path, WriteMode::Update)?;
+                trim.set_len(replay.valid_len as u64)?;
+                trim.sync_all()?;
             }
+            let file = env.open_write(&manifest_path, WriteMode::Append)?;
             manifest_bytes = replay.valid_len as u64;
             (replay.version, BufferedWriter::new(file))
         } else {
@@ -541,6 +548,14 @@ impl VersionSet {
             file.write_all(&encoded)?;
             file.sync_all()?;
         }
+        // Close the log before replacing it. Windows refuses to replace
+        // a file that still has an open handle, so a rewrite performed
+        // while this writer was live failed with "Access is denied" and
+        // took every manifest rewrite on that platform with it. On unix
+        // the rename would have worked either way: the old inode simply
+        // outlives its name. Dropping the writer first is correct on
+        // both, and the reopen below is where the new log is picked up.
+        self.manifest_writer = None;
         self.env.rename(&tmp_path, &self.manifest_path)?;
         crate::env::sync_parent_dir(&*self.env, &self.manifest_path)?;
         self.manifest_bytes = (MANIFEST_STAMP_LEN + encoded.len()) as u64;
@@ -1318,10 +1333,21 @@ mod tests {
         let path = dir.path().join("MANIFEST");
 
         let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
-        // No files are ever added, so the canonical form stays tiny and
-        // the floor is the whole budget.
-        for seq in 0..20_000u64 {
-            vs.apply(&[VersionEdit::SetLastSeq(seq)]).unwrap();
+        // `SetNextFileId`, not `SetLastSeq`: it is the one edit that
+        // does not force a sync (`requires_manifest_sync`), and it grows
+        // the log by the same record size, so it exercises exactly the
+        // growth-and-rewrite behaviour under test without paying an
+        // fsync per iteration. That distinction is the whole cost here.
+        // At roughly 17 bytes a record this appends about 136 KiB
+        // against a 64 KiB rewrite threshold, so the assertion below can
+        // only pass if the log was rewritten at least twice.
+        //
+        // With the syncing edit this was 8,000 fsyncs, which a Windows
+        // CI disk served at about 75 ms each and took past ten minutes,
+        // while Linux finished it in milliseconds.
+        const EDITS: u64 = 8_000;
+        for id in 1..=EDITS {
+            vs.apply(&[VersionEdit::SetNextFileId(id)]).unwrap();
         }
         drop(vs);
 
@@ -1335,7 +1361,7 @@ mod tests {
 
         // And it still replays to the state those edits describe.
         let reopened = VersionSet::open(dir.path(), &sst_dir).unwrap();
-        assert_eq!(reopened.current().last_seq, 19_999);
+        assert_eq!(reopened.current().next_file_id, EDITS);
     }
 
     /// A manifest written before the stamp existed still opens, and is

@@ -73,7 +73,7 @@ impl Env for StdEnv {
         Ok(Box::new(StdReadFile {
             file: File::open(path)?,
             #[cfg(not(any(unix, windows)))]
-            cursor: parking_lot::Mutex::new(()),
+            cursor: crate::sync::Mutex::new(()),
         }))
     }
 
@@ -85,6 +85,14 @@ impl Env for StdEnv {
                 .truncate(true)
                 .open(path)?,
             WriteMode::Append => OpenOptions::new().create(true).append(true).open(path)?,
+            // `truncate(false)` is stated rather than left to default:
+            // keeping the contents is the whole difference between this
+            // mode and `Truncate`.
+            WriteMode::Update => OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(path)?,
         };
         Ok(Box::new(StdWriteFile { file }))
     }
@@ -201,7 +209,7 @@ fn drop_page_cache_for(_file: &File) {
 struct StdReadFile {
     file: File,
     #[cfg(not(any(unix, windows)))]
-    cursor: parking_lot::Mutex<()>,
+    cursor: crate::sync::Mutex<()>,
 }
 
 impl ReadFile for StdReadFile {
@@ -320,6 +328,56 @@ impl JoinHandle for StdJoinHandle {
         // has already been reported on its own thread, and shutdown
         // must not turn it into a second one here.
         let _ = self.0.join();
+    }
+}
+
+#[cfg(test)]
+mod update_mode_tests {
+    use super::*;
+    use crate::env::WriteMode;
+
+    /// The regression this guards: manifest recovery trims a torn tail
+    /// with `set_len`, and it used to do that through the same append
+    /// handle it then wrote through. On Windows an append handle is
+    /// opened without `FILE_WRITE_DATA`, which `SetEndOfFile` needs, so
+    /// every reopen of a database whose MANIFEST had a torn tail failed
+    /// with "Access is denied" - which is to say, every reopen after the
+    /// ordinary kind of crash.
+    #[test]
+    fn a_file_opened_for_update_keeps_its_contents_and_can_be_shortened() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("log");
+        let env = StdEnv::new();
+
+        {
+            let mut w = Env::open_write(&env, &path, WriteMode::Truncate).expect("create");
+            w.write_all(b"0123456789").expect("write");
+            w.sync_all().expect("sync");
+        }
+
+        {
+            let mut w = Env::open_write(&env, &path, WriteMode::Update).expect("open update");
+            w.set_len(4).expect(
+                "shortening through an Update handle is what manifest recovery does on every \
+                 reopen after a crash",
+            );
+            w.sync_all().expect("sync");
+        }
+
+        assert_eq!(
+            Env::read(&env, &path).expect("read"),
+            b"0123456789"[..4].to_vec(),
+            "Update must keep what it did not remove",
+        );
+
+        // And the log is still appendable afterwards, which is the next
+        // thing recovery does.
+        {
+            let mut w = Env::open_write(&env, &path, WriteMode::Append).expect("open append");
+            w.write_all(b"xy").expect("append");
+            w.sync_all().expect("sync");
+        }
+        assert_eq!(Env::read(&env, &path).expect("read"), b"0123xy".to_vec());
     }
 }
 
@@ -472,7 +530,9 @@ mod tests {
         let env = std_env();
         let path = dir.path().join("trunc");
         env.write(&path, b"0123456789").unwrap();
-        let mut w = env.open_write(&path, WriteMode::Append).unwrap();
+        // `Update`, not `Append`: shortening needs write access that an
+        // append handle does not carry on Windows.
+        let mut w = env.open_write(&path, WriteMode::Update).unwrap();
         w.set_len(3).unwrap();
         w.sync_all().unwrap();
         assert_eq!(w.len().unwrap(), 3);

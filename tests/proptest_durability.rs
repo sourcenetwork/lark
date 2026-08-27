@@ -77,6 +77,13 @@
 //! PROPTEST_CASES=512 cargo test --test proptest_durability
 //! ```
 
+// The whole file drives the `LD_PRELOAD` syscall shim, which exists only
+// on Linux: macOS blocks the loader equivalent under system integrity
+// protection and Windows has none. Gated at the file level, like the
+// other shim-backed suites, so the tests are absent where the substrate
+// cannot run rather than failing there.
+#![cfg(target_os = "linux")]
+
 mod common;
 // A test crate's submodules resolve against `tests/`, and every
 // `tests/*.rs` is its own test binary, so the model cannot simply live
@@ -100,7 +107,6 @@ use tempfile::TempDir;
 /// Child process entry point, re-executed by the crash harness. Returns
 /// immediately in a normal `cargo test` run.
 #[test]
-#[ignore = "child process entry point, re-executed by the crash harness"]
 fn crash_child() {
     fault::child_entrypoint(workload);
 }
@@ -682,12 +688,10 @@ proptest! {
     ///
     /// Runtime: measured at 1.1s for the 128 cases configured here, one
     /// child process each (2.5s for 300 cases when the count is raised
-    /// by hand). `#[ignore]`d for two reasons: it spawns a process per
-    /// case, and it needs the `LD_PRELOAD` shim, which exists only on
-    /// Linux and would panic the default run elsewhere. Run it with
-    /// `just test-durability-slow`.
+    /// by hand). It spawns a process per case and needs the
+    /// `LD_PRELOAD` shim, so it is Linux-only: the whole module is
+    /// gated on that rather than on the test being switched off.
     #[test]
-    #[ignore = "spawns a child process per case; run with `just test-durability-slow`"]
     fn a_power_cut_at_a_random_point_leaves_a_prefix_of_the_model(
         seed in any::<u64>(),
         count in 60usize..=140,

@@ -39,7 +39,7 @@
 //!
 //! The default `cargo test` run only holds the fast boundary and
 //! degenerate-input tests. Everything that writes six figures of
-//! operations, a 64 MiB value, or fills a filesystem is `#[ignore]`d
+//! operations, a 64 MiB value, or fills a filesystem is sized
 //! with its measured runtime stated at the test.
 
 use std::collections::BTreeMap;
@@ -52,7 +52,6 @@ use tempfile::TempDir;
 mod common;
 
 #[test]
-#[ignore = "child process entry point, re-executed by the crash harness"]
 fn crash_child() {
     common::fault::child_entrypoint(common::fault::builtin_workload);
 }
@@ -486,7 +485,6 @@ fn one_byte_over_the_default_limits_is_rejected() {
 /// block, index or WAL frame whose own length field is narrower than the
 /// limit the API advertises. Measured runtime: 12.7 s, peak RSS 497 MiB.
 #[test]
-#[ignore = "round-trips a 64 MiB value and an 8 MiB key; 12.7 s, ~497 MiB peak RSS"]
 fn the_default_size_maxima_round_trip_at_exactly_the_limit() {
     measured("64 MiB value + 8 MiB key at the limit", || {
         let dir = TempDir::new().unwrap();
@@ -527,7 +525,6 @@ fn the_default_size_maxima_round_trip_at_exactly_the_limit() {
 /// version because no snapshot pins them, which would turn a hot counter
 /// key into unbounded disk growth. Measured runtime: 0.8 s, peak RSS 27 MiB.
 #[test]
-#[ignore = "100 000 writes plus the compaction that collapses them; 0.8 s"]
 fn one_key_overwritten_100_000_times_collapses_to_a_single_version() {
     measured("100 000 overwrites of one key", || {
         const WRITES: usize = 100_000;
@@ -571,7 +568,6 @@ fn one_key_overwritten_100_000_times_collapses_to_a_single_version() {
 /// boundary, which a small-N scan test would never reach. Measured
 /// runtime: 3.8 s, peak RSS 27 MiB.
 #[test]
-#[ignore = "100 000 distinct keys plus a full ordered scan; 3.8 s"]
 fn one_hundred_thousand_distinct_keys_scan_in_order() {
     measured("100 000 distinct keys, full ordered scan", || {
         const KEYS: usize = 100_000;
@@ -622,7 +618,6 @@ fn one_hundred_thousand_distinct_keys_scan_in_order() {
 /// some size, and a WAL record framing that cannot carry a batch this
 /// large. Measured runtime: 1.9 s, peak RSS 52 MiB.
 #[test]
-#[ignore = "builds and applies a 100 000-operation batch; 1.9 s"]
 fn a_write_batch_of_100_000_operations_applies_atomically() {
     measured("100 000-operation WriteBatch", || {
         const OPS: usize = 100_000;
@@ -686,7 +681,6 @@ fn a_write_batch_of_100_000_operations_applies_atomically() {
 /// interval that assumes short keys, and a comparator that stops at a
 /// fixed prefix. Measured runtime: 1.8 s, peak RSS 99 MiB.
 #[test]
-#[ignore = "writes ~11 MiB of key bytes and compacts them; 1.8 s"]
 fn megabyte_keys_mixed_with_short_keys_survive_prefix_compression() {
     measured("1 MiB keys mixed with short keys", || {
         const MIB: usize = 1024 * 1024;
@@ -768,7 +762,6 @@ fn megabyte_keys_mixed_with_short_keys_survive_prefix_compression() {
 /// that drops entries as it promotes them. Measured runtime: 0.3 s, peak
 /// RSS 8 MiB.
 #[test]
-#[ignore = "waits on the background compaction scheduler, so its runtime is set by another thread rather than by this one; 0.3 s measured"]
 fn a_deep_level_structure_still_answers_every_read() {
     measured("cascade to L6", || {
         const KEYS: usize = 6_000;

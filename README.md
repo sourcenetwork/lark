@@ -1,254 +1,194 @@
-# Lark
+<h1 align="center">
+    <img src="https://github.com/sourcenetwork/regolith/raw/master/art/regolith_banner_2048x512.png"/>
+</h1>
+<div align="center">
+ <strong>
+   ACID, performance oriented, embedded key-value database engine for edge systems
+ </strong>
+<hr>
 
-A pure Rust, embedded key-value store built from scratch on an LSM-tree architecture inspired by LevelDB. The public API is shaped to slot into common embedded-KV abstraction layers, so callers that already hide a storage backend behind a trait can add lark as another implementation with minimal glue.
+[![Crates.io](https://img.shields.io/crates/v/regolith.svg)](https://crates.io/crates/regolith)
+[![Documentation](https://docs.rs/regolith/badge.svg)](https://docs.rs/regolith)
 
-> **Status:** pre-1.0. The public surface (`Db`, `Snapshot`, `WriteBatch`, `Options`, `Iter`, `TailingIter`, transactions, column families) is small and stable-shaped, but breakage is allowed until 1.0.
+[![CI](https://github.com/sourcenetwork/regolith/actions/workflows/ci.yml/badge.svg)](https://github.com/sourcenetwork/regolith/actions/workflows/ci.yml)
+[![Transactional Verification](https://github.com/sourcenetwork/regolith/actions/workflows/transactional-verification.yml/badge.svg)](https://github.com/sourcenetwork/regolith/actions/workflows/transactional-verification.yml)
+[![Durability](https://github.com/sourcenetwork/regolith/actions/workflows/durability.yml/badge.svg)](https://github.com/sourcenetwork/regolith/actions/workflows/durability.yml)
+[![Concurrency Model Checking](https://github.com/sourcenetwork/regolith/actions/workflows/model-checking.yml/badge.svg)](https://github.com/sourcenetwork/regolith/actions/workflows/model-checking.yml)
+[![Chaos](https://github.com/sourcenetwork/regolith/actions/workflows/chaos.yml/badge.svg)](https://github.com/sourcenetwork/regolith/actions/workflows/chaos.yml)
+[![WASM](https://github.com/sourcenetwork/regolith/actions/workflows/wasm.yml/badge.svg)](https://github.com/sourcenetwork/regolith/actions/workflows/wasm.yml)
+[![Embedded](https://github.com/sourcenetwork/regolith/actions/workflows/embedded.yml/badge.svg)](https://github.com/sourcenetwork/regolith/actions/workflows/embedded.yml)
 
-## Features
+</div>
 
-- **Pure Rust** - no C/C++ dependencies, no FFI, no linker surprises
-- **LSM-tree architecture** - write-optimized with background compaction
-- **Three compaction styles** - leveled (default), FIFO, and universal / size-tiered
-- **MVCC snapshots** - point-in-time consistent reads via sequence numbers
-- **WAL crash recovery** - write-ahead log with xxhash-checksummed records. The default
-  `DurabilityMode::Eventual` does not fsync, so a committed write survives a process crash
-  but not a power loss or OS crash; `DurabilityMode::Immediate` fsyncs every write
-- **Column families** - isolated keyspaces within one `Db`, atomic across CFs
-- **Transactions** - optimistic (OCC, write-write conflicts detected at commit) and
-  pessimistic (exclusive key locks held until commit or rollback). Both provide snapshot
-  isolation and both prevent lost updates: a key that a transaction read and then wrote is
-  validated at commit against the sequence it was read at, so a concurrent write aborts the
-  transaction instead of being overwritten. `get_for_update` additionally takes the key lock
-  before it reads, which turns contention into waiting rather than retrying. Not
-  serializable: a key that is read and never written is not validated
-- **Merge operator** - user-defined associative merges, compaction-aware
-- **Tailing iterators** - forward-only iterators that pick up new writes
-- **Range deletes** - `delete_range` as a single range tombstone, not N point tombstones
-- **Pluggable compression** - LZ4 (default) or Snappy, both pure-Rust
-- **Bloom filters** - 10 bits/key for fast negative lookups, plus optional prefix bloom
-- **Sharded block cache** - 64 LRU shards by default (fewer for a small cache).
-  `block_cache_size` is a hard bound: every entry is charged its block bytes plus its
-  bookkeeping, nothing is preallocated, and the total the cache holds does not move with the
-  shard count, the block size, or the value size
-- **Back-pressure** - write stalls, token-bucket rate limiter, per-write `no_slowdown`.
-  These shape write admission; they do not bound process memory, which is dominated by the
-  memtables, the block cache, and in-flight values
-- **Observability** - tickers + histograms, properties API, `EventListener` callbacks
-- **Checkpoint / BackupEngine** - hardlinked snapshots and content-addressed backups
-- **Lock-free reads** - concurrent readers via a crossbeam skip list memtable. Measured:
-  5.31x scaling from 1 to 8 threads, 3.6M reads/s at 8 threads, reproduced across 4 sessions
-- **No async runtime required** - compaction runs on a dedicated OS thread. A platform that
-  cannot spawn that thread (a single-threaded target such as wasm) makes `Db::open` return an
-  error instead of aborting
+> **Pre-1.0.** The public surface is small and stable-shaped, but breakage is allowed until 1.0.
 
-## Usage
+## Install
+
+```toml
+[dependencies]
+regolith = "0.1"
+```
+
+## Quick start
 
 ```rust
-use lark_kv::{Db, Options, WriteBatch};
+use regolith::{Db, Options, WriteBatch};
 
 let db = Db::open("/tmp/my_db", Options::default())?;
 
-// Write
 db.put(b"hello", b"world")?;
-
-// Read
-assert_eq!(db.get(b"hello")?, Some(b"world".to_vec()));
-
-// Delete
+assert_eq!(db.get(b"hello")?.as_deref(), Some(&b"world"[..]));
 db.delete(b"hello")?;
 
-// Batch write (atomic)
+// A batch applies atomically: all of it, or none of it.
 let mut batch = WriteBatch::new();
-batch.put(b"key1", b"val1");
-batch.put(b"key2", b"val2");
-batch.delete(b"key3");
+batch.put(b"a", b"1");
+batch.put(b"b", b"2");
 db.write(batch)?;
 
-// Snapshot isolation
+// A snapshot is a point in time. Later writes are invisible to it.
 let snap = db.snapshot();
-db.put(b"key1", b"new_val")?;
-assert_eq!(snap.get(b"key1")?, Some(b"val1".to_vec())); // still sees the old value
+db.put(b"a", b"changed")?;
+assert_eq!(snap.get(b"a")?.as_deref(), Some(&b"1"[..]));
 
-// Range scan
-let results = db.scan(Some(b"a"), Some(b"z"))?;
+for (key, value) in db.scan(Some(b"a"), Some(b"z"))? {
+    println!("{key:?} = {value:?}");
+}
 ```
 
-## Architecture
+Reads that should not copy use `get_slice`, which borrows the bytes the database already
+holds:
 
-```text
-                   ┌──────────────┐
-         writes ──>│  MemTable    │──> reads
-                   │ (skip list)  │
-                   └──────┬───────┘
-                          │ flush
-                   ┌──────▼───────┐
-                   │   L0 SSTs    │  (may overlap)
-                   └──────┬───────┘
-                          │ compaction
-                   ┌──────▼───────┐
-                   │   L1 SSTs    │  (sorted, non-overlapping)
-                   ├──────────────┤
-                   │   L2 SSTs    │  (10× larger)
-                   ├──────────────┤
-                   │     ...      │
-                   └──────────────┘
+```rust
+if let Some(slice) = db.get_slice(b"a")? {
+    assert_eq!(&*slice, b"1");
+}
 ```
 
-**Write path:** WAL append → MemTable insert → (when full) flush to an L0 SSTable → background compaction merges levels.
+## Transactions
 
-**Read path:** active MemTable → frozen MemTables → L0 SSTables (bloom-filter pre-check) → L1+ SSTables (binary search over non-overlapping files).
+Pick the isolation a unit of work actually needs. The level decides how much of the
+transaction's footprint is validated at commit, so a stricter level refuses more and
+commits fewer.
+
+```rust
+use regolith::{IsolationLevel, OptimisticTransactionDb, Options};
+
+let db = OptimisticTransactionDb::open("/tmp/txn_db", Options::default())?;
+
+let mut txn = db.begin_transaction_with(IsolationLevel::Serializable);
+let balance = txn.get(b"account")?.unwrap_or_default();
+txn.put(b"account", b"debited")?;
+txn.commit()?;
+```
+
+| Level | Lost update | Read skew | Write skew |
+|---|---|---|---|
+| `ReadCommitted` | prevented | possible | possible |
+| `SnapshotIsolation` (default) | prevented | prevented | possible |
+| `Serializable` | prevented | prevented | prevented |
+
+`TransactionDb` is the pessimistic flavour: it takes key locks, so contention waits
+instead of retrying. `OptimisticTransactionDb` validates at commit and retries.
+
+Commits report the sequence they landed at, so an upper layer can order its own versions
+against the store without a lock of its own:
+
+```rust
+let seq = db.write_sequenced(batch)?;
+assert!(db.snapshot().sequence() >= seq);
+```
+
+## Durability
+
+`DurabilityMode::Eventual` (default) hands every write to the kernel but does not fsync: a
+committed write survives a process crash, not a power loss. `DurabilityMode::Immediate`
+fsyncs, and every write that returned `Ok` survives a power cut.
+
+Either way, recovery reaches a **valid prefix** of the write history: some number of
+writes applied, in order, no gaps, no half-applied batch. A `WriteBatch` is atomic under
+both modes.
+
+## Platforms
+
+| Target | Status |
+|---|---|
+| Linux, macOS (x86_64, aarch64) | full |
+| `wasm32-wasip1` | full, via a preopened directory |
+| `wasm32-unknown-unknown` | full, via OPFS (`Options::wasm()`) |
+| Embedded Linux (Cortex-A, ESP32-S3) | `Options::embedded()`, ~1-4 MiB working set |
+
+Pure Rust throughout: no C toolchain, no FFI, no linker surprises. Compaction runs on an
+ordinary OS thread; no async runtime is required. On a target without threads, set
+`max_background_compactions = 0` and compaction runs on the calling thread.
 
 ## Configuration
 
 ```rust
-use lark_kv::{CompressionType, Options};
+use regolith::{CompressionType, Options};
 
 let opts = Options {
-    write_buffer_size: 64 * 1024 * 1024,    // 64 MB memtable
-    block_cache_size: 512 * 1024 * 1024,    // 512 MB block cache
-    block_size: 16 * 1024,                  // 16 KB data blocks
-    bloom_bits_per_key: 10,                 // ~1% false positive rate
-    compression: CompressionType::Lz4,      // LZ4 block compression
-    l0_compaction_trigger: 4,               // compact after 4 L0 files
-    level_base_bytes: 256 * 1024 * 1024,    // 256 MB L1 target
-    level_size_multiplier: 10,              // 10× between levels
-    target_file_size: 64 * 1024 * 1024,     // 64 MB SSTable target
-    max_value_size: 64 * 1024 * 1024,       // 64 MiB cap on a single value
+    write_buffer_size: 64 * 1024 * 1024,
+    block_cache_size: 512 * 1024 * 1024,
+    compression: CompressionType::Lz4,
     ..Default::default()
 };
-
-let db = lark_kv::Db::open("/path/to/db", opts)?;
 ```
 
-### Write back-pressure and compaction style
+Three ready-made profiles: `Options::default()` for a server, `Options::embedded()` for a
+1-4 MiB budget, and `Options::wasm()` for a browser or wasi module. Every value and the
+reasoning behind it is documented on the profile itself.
 
-`level0_slowdown_writes_trigger` and `level0_stop_writes_trigger` count L0 *files*, and
-only `CompactionStyle::Level` reduces that count in response. FIFO never merges L0 files
-at all, and universal merges on its own size-ratio and amplification rules, which a
-healthy size tier satisfies while holding more L0 files than the trigger allows. Under
-either of those styles the trigger can be reached and never relieved, and writes then fail
-with `Error::Busy` whose message names the style and the knob. Set both triggers to `0`
-with FIFO or universal, and bound memory with `max_write_buffer_number` and
-`hard_pending_compaction_bytes_limit`, which apply to every style. This is long-standing
-behaviour, not new; what changed is that the writer now returns rather than blocking
-forever.
+Two knobs deserve a warning:
 
-### Value size
+- **Value size.** `max_value_size` defaults to 64 MiB. Values are stored inline, with no
+  key-value separation, so a large value is rewritten in full by every compaction that
+  touches its key. A 1 GiB value peaked at 3719 MiB RSS.
+- **Back-pressure under FIFO and universal compaction.** `level0_stop_writes_trigger`
+  counts L0 files, and only `CompactionStyle::Level` reduces that count. Under the other
+  styles the trigger can be reached and never relieved, and writes then fail with
+  `Error::Busy` naming the knob. Set both L0 triggers to `0` there and bound memory with
+  `max_write_buffer_number` and `hard_pending_compaction_bytes_limit`.
 
-`max_value_size` defaults to 64 MiB; a write above the limit is rejected with an error.
-Raising it works, but lark stores values inline with keys, with no key-value separation: a
-large value is rewritten in full by every compaction that touches its key, and writing a
-1 GiB value peaked at 3719 MiB RSS.
+## How it works
 
-### Embedded and small-memory hosts
-
-Two profiles replace the server-shaped defaults with values bounded by a memory budget
-rather than by throughput.
-
-`Options::embedded()` targets a host whose whole working set has to fit in roughly
-1-4 MiB: a Linux-class board (Cortex-A, ESP32-S3 under esp-idf). A 256 KiB write buffer,
-no block cache at all, 4 KiB blocks, 256 KiB SSTables, an L0 stop trigger of 8, and
-`max_background_compactions: 0`, which runs compaction on the calling thread instead of a
-background worker.
-
-`Options::wasm()` targets a wasm module, in a browser or under a wasi host. It is not an
-alias for `embedded()`, because wasm is not merely a small machine:
-
-- **No threads, and no way to wait for one.** `max_background_compactions` is `0`, and on
-  a wasm target `Options::validate()` *rejects* anything else, so the failure arrives at
-  the option rather than out of the middle of `Db::open`. This holds on every wasm target,
-  with or without the `atomics` feature, so `Options::default()` also opens there.
-- **No OS page cache.** This is the sharpest split from `embedded()`, which sets
-  `block_cache_size` to `0` precisely *because* a Linux-class board has a page cache to
-  absorb the re-reads. A wasm module has none, so `wasm()` keeps a 1 MiB single-shard
-  cache of decompressed blocks, buying back both the host call and the LZ4 decompression.
-- **Linear memory grows in 64 KiB pages and never shrinks**, so the high-water mark *is*
-  the footprint. The arena caps a chunk at exactly one page and the memtable pool recycles
-  pages, so `memory.grow` runs once per size class rather than once per flush.
-
-```rust
-let db = lark_kv::Db::open("/path/to/db", lark_kv::Options::embedded())?;
-let db = lark_kv::Db::open("/path/to/db", lark_kv::Options::wasm())?;
+```text
+         writes ──> WAL ──> MemTable ──> reads
+                             │ flush
+                        ┌────▼─────┐
+                        │  L0 SSTs │  may overlap
+                        └────┬─────┘
+                             │ compaction
+                        ┌────▼─────┐
+                        │ L1..L6   │  sorted, non-overlapping, 10x each
+                        └──────────┘
 ```
 
-Every value and the reasoning behind it is documented on `Options::embedded` and
-`Options::wasm` themselves.
+**Write:** append to the WAL, insert into an arena-backed skip-list memtable, and when it
+fills, flush to an L0 SSTable. Background compaction merges levels.
 
-#### Measured budget
+**Read:** active memtable, then frozen memtables, then L0 (bloom pre-check), then L1+ by
+binary search. First hit wins.
 
-Every figure comes from a checked-in example, re-run by the `embedded-budget` CI job
-rather than quoted from here. Reproduce with:
+**MVCC:** every write takes a sequence number. A snapshot captures the current one and
+ignores anything newer, so reads need no locks.
+
+## Testing
+
+The suite is the argument for trusting any of the above.
 
 ```sh
-just wasm-budget    # both columns of the table below, all three profiles
-cargo run --release --example stack_depth -- /tmp/lark-stack
-cargo run --release --example read_scaling -- /tmp/lark-scale 500000 3
+just gate       # format, lint, docs, tests, dependency audit
+just test       # the whole suite under cargo-nextest
+just loom-all   # exhaustive model checking of the publication protocols
+just elle       # Elle consistency checking of transaction histories
+just chaos      # the full-size read-view chaos workload
+just wasm       # the wasm32-wasip1 lifecycle under wasmtime
 ```
 
-Full lifecycle (open, 20k x 128 B puts, sampled reads, page scan, compact, close, reopen,
-read back), x86_64 Linux and wasm32-wasip1 under wasmtime, one run per cell:
-
-| profile      | Linux RSS attributable to lark | wasm linear memory high-water            |
-| ------------ | ------------------------------ | ---------------------------------------- |
-| `embedded()` | 1.12 MiB                       | 1.56 MiB total, 0.50 MiB over baseline   |
-| `wasm()`     | 4.00 MiB                       | 4.38 MiB total, 3.31 MiB over baseline   |
-| `default()`  | 7.42 MiB                       | 11.19 MiB total, 10.13 MiB over baseline |
-
-RSS is machine- and allocator-dependent and moves between runs; the wasm column does not,
-because linear memory only ever grows. Treat the wasm figures as the reproducible ones.
-
-#### Stack requirement
-
-**A release build of lark needs at least 16 KiB of stack on any thread that calls it. A
-debug build needs at least 64 KiB.** Worst-case measured depth is 11.6 KiB for `Db::open`,
-on x86_64 with the release profile. Every measured path exceeds the 4 KiB that a small
-Cortex-M stack provides:
-
-| path                                 | bytes |
-| ------------------------------------ | ----- |
-| `Db::open` (multi-level, WAL replay) | 11840 |
-| 8000 puts crossing a flush boundary  | 11424 |
-| compaction merge (`compact_range`)   | 11400 |
-| iterator seek + 50-entry walk        |  8328 |
-| `scan_page` of 1000 rows             |  7695 |
-| point read                           |  4552 |
-
-The table is the release profile. An unoptimized build does not inline the same frames and
-measures roughly 4x deeper: `examples/stack_probe.rs` runs each path on a thread of a
-chosen size, and in debug every one of them overflows a 32 KiB stack and fits a 64 KiB one.
-That probe cannot resolve below 16 KiB, because `std::thread::Builder` raises any smaller
-request to the platform minimum; the table above comes from the painting harness, which
-can.
-Provision for the profile you are actually flashing, and remember that bring-up is
-usually the debug one.
-
-On Linux, where the default thread stack is 8 MiB, this costs nothing. On an esp-idf task
-it is a `CONFIG_ESP_MAIN_TASK_STACK_SIZE` you must set. These are host numbers: frame
-layout is target-specific, so re-run `stack_depth` on the target before treating any of
-them as a budget for it. They have not been measured on ARM or RISC-V.
-
-### Target tiers
-
-| tier | targets | status |
-| ---- | ------- | ------ |
-| Tier A, Linux-class with `std` | `aarch64-unknown-linux-gnu`, `armv7-unknown-linux-gnueabihf` | supported, checked in CI |
-| Tier A, same by construction | ESP32-S3 under esp-idf | unverified, no toolchain in CI |
-| wasm | `wasm32-wasip1` | supported, full lifecycle run under wasmtime in CI |
-| Tier B, bare metal | `thumbv7em-none-eabi`, `riscv32imac-unknown-none-elf` | not supported; lark is `std`-only |
-
-Tier B needs `no_std` plus `alloc`. lark does not build there today, and the first failure
-is a dependency (`crossbeam-utils`), not lark's own code.
-
-## On-disk format
-
-| Component    | Format                                                                  |
-| ------------ | ----------------------------------------------------------------------- |
-| WAL          | `[len:u32][type:u8][data][crc:u32]` per record                          |
-| SSTable      | Data blocks + bloom filter + index block + 64-byte footer               |
-| Data block   | Prefix-compressed entries with restart points, block-level compression  |
-| Bloom filter | Double-hashing with xxh3, 10 bits/key default                           |
-| Manifest     | Append-only log of `VersionEdit` records with checksums                 |
+Each badge above is a workflow of its own, so a red one names exactly which property
+regressed.
 
 ## License
 
-Apache-2.0 OR MIT
+Dual-licensed under Apache-2.0 or MIT, at your option.

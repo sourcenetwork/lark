@@ -18,6 +18,18 @@ pub enum WriteMode {
     /// Create if absent, then position at the end. Reopening the
     /// MANIFEST for further appends.
     Append,
+    /// Create if absent, keep the contents, and position at the start
+    /// with full write access.
+    ///
+    /// The one thing [`Append`](WriteMode::Append) cannot do is shorten
+    /// a file. On Windows an append handle is opened without
+    /// `FILE_WRITE_DATA`, which `SetEndOfFile` requires, so
+    /// [`WriteFile::set_len`] through one fails with "Access is denied";
+    /// and asking for write access alongside append does not help,
+    /// because Rust's access-mode mapping lets append win. Manifest
+    /// recovery, which trims a torn tail before reopening the log for
+    /// appends, is the only caller.
+    Update,
 }
 
 /// One entry from [`Env::read_dir`].

@@ -10,6 +10,13 @@
 //! If that shape can reach the last WAL record, an ordinary crash
 //! refuses the open and every earlier acknowledged write goes with it.
 
+// The whole file drives the `LD_PRELOAD` syscall shim, which exists only
+// on Linux: macOS blocks the loader equivalent under system integrity
+// protection and Windows has none. Gated at the file level, like the
+// other shim-backed suites, so the tests are absent where the substrate
+// cannot run rather than failing there.
+#![cfg(target_os = "linux")]
+
 mod common;
 
 use common::fault::{
@@ -21,7 +28,6 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 #[test]
-#[ignore = "child process entry point, re-executed by the crash harness"]
 fn crash_child() {
     fault::child_entrypoint(fault::builtin_workload);
 }

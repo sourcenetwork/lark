@@ -27,7 +27,7 @@
 
 use crate::portability::{AtomicU64, Ordering};
 
-use parking_lot::Mutex;
+use crate::sync::Mutex;
 
 /// Enumerated counters incremented by the engine. Every variant
 /// is backed by one `AtomicU64` slot in [`Statistics`]; looking

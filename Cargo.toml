@@ -14,7 +14,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
 license = "Apache-2.0 OR MIT"
-description = "A pure Rust, embedded LSM-tree key-value store built from scratch"
+description = "ACID, performance oriented, embedded key-value database engine for edge systems"
 repository = "https://github.com/sourcenetwork/lark"
 homepage = "https://github.com/sourcenetwork/lark"
 readme = "README.md"
@@ -37,10 +37,7 @@ critical-section = ["portable-atomic/critical-section"]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [dependencies]
-# Used only by the CLOCK block cache now; the memtable has its own
-# arena skip list (`src/engine/skiplist.rs`).
-crossbeam-epoch = "0.9"
-crossbeam-skiplist = "0.1"
+kovan = "0.1.20"
 kovan-map = "0.1.20"
 kovan-mvcc = "0.1.20"
 kovan-queue = "0.1.20"
@@ -57,7 +54,6 @@ portable-atomic = { version = "1", default-features = false, features = [
 lz4_flex = "0.11"
 snap = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-parking_lot = { version = "0.12", features = ["arc_lock"] }
 tracing = "0.1"
 thiserror = "1.0"
 
@@ -101,6 +97,27 @@ wasm-bindgen-test = "0.3"
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
+
+# The test suite is compute-bound: compaction merges, checksums, bloom
+# hashing and skip-list walks, driven millions of times by the
+# adversarial and property tests. Unoptimized those dominate the gate's
+# wall clock while proving nothing extra, so the dev profile carries
+# enough optimization to make the suite tractable and keeps every check
+# that makes a debug build worth running.
+#
+# `debug-assertions` and `overflow-checks` stay on deliberately: the skip
+# list's single-writer invariant (S2) and the arena's bounds checks are
+# `debug_assert`-backed, so turning them off would silently remove the
+# thing several of these tests exist to catch.
+[profile.dev]
+opt-level = 1
+debug-assertions = true
+overflow-checks = true
+
+# Dependencies are compiled once and never stepped through. Compression,
+# hashing and the reclamation machinery are all in this set.
+[profile.dev.package."*"]
+opt-level = 3
 
 [profile.release]
 opt-level = 3

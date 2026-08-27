@@ -930,7 +930,15 @@ pub(crate) struct LarkIterator {
     /// Owned storage used only by the reverse iteration path
     /// (materialize_prev_visible), which must accumulate multiple
     /// entries before deciding which one to yield.
-    reverse_curr: Option<(Vec<u8>, Vec<u8>)>,
+    /// The user key and value the reverse cursor is parked on.
+    ///
+    /// A [`DbSlice`] rather than a `Vec<u8>`: the value is already
+    /// resident in a decompressed block or an arena chunk, and holding a
+    /// reference to it costs one refcount where copying it costs the
+    /// whole value. A reverse scan over large rows is exactly the read
+    /// shape chosen to avoid materialising, so paying a copy per row
+    /// here would defeat the reason the caller asked for it.
+    reverse_curr: Option<(Vec<u8>, DbSlice)>,
     /// Owned storage for the rare merge-result case, where the
     /// value is computed rather than borrowed from a block.
     merge_result: Option<(Vec<u8>, Vec<u8>)>,
@@ -1344,9 +1352,9 @@ impl LarkIterator {
     }
 
     /// The current value as an owning view over whatever already holds
-    /// it. Zero-copy while iterating SSTables in forward order; a copy
-    /// for a memtable-resident entry, a merge result, or the reverse
-    /// path, all of which own their bytes separately.
+    /// it. Zero-copy in both directions while iterating SSTables; a copy
+    /// for a memtable-resident entry and for a merge result, both of
+    /// which own their bytes separately.
     pub(crate) fn value_slice(&self) -> Option<DbSlice> {
         match self.direction {
             Direction::Forward => {
@@ -1358,10 +1366,7 @@ impl LarkIterator {
                 }
                 self.inner.value_slice()
             }
-            Direction::Reverse => self
-                .reverse_curr
-                .as_ref()
-                .map(|(_, v)| DbSlice::from_vec(v.clone())),
+            Direction::Reverse => self.reverse_curr.as_ref().map(|(_, v)| v.clone()),
         }
     }
 
@@ -1637,7 +1642,7 @@ impl LarkIterator {
             let group = uk.to_vec();
 
             let rt_seq = self.covering_rt_seq(&group);
-            let mut collected: Vec<(u64, u8, Vec<u8>)> = Vec::new();
+            let mut collected: Vec<(u64, u8, DbSlice)> = Vec::new();
 
             while let Some(ik2) = self.inner.key() {
                 let (uk2, seq, vt) = decode_internal_key(ik2);
@@ -1645,7 +1650,7 @@ impl LarkIterator {
                     break;
                 }
                 if seq <= self.snapshot_seq && (rt_seq == 0 || seq > rt_seq) {
-                    let v = self.inner.value().map(|s| s.to_vec()).unwrap_or_default();
+                    let v = self.inner.value_slice().unwrap_or_else(DbSlice::empty);
                     collected.push((seq, vt, v));
                 }
                 if let Err(e) = self.inner.advance_backward() {
@@ -1691,9 +1696,10 @@ impl LarkIterator {
                 continue;
             };
             let operand_refs: Vec<&[u8]> = operand_slice.iter().map(|e| e.2.as_slice()).collect();
-            match merge_op.full_merge(&group, base.as_deref(), &operand_refs) {
+            let base_bytes = base.as_ref().map(DbSlice::as_slice);
+            match merge_op.full_merge(&group, base_bytes, &operand_refs) {
                 Some(v) => {
-                    self.reverse_curr = Some((group, v));
+                    self.reverse_curr = Some((group, DbSlice::from_vec(v)));
                     return;
                 }
                 None => {

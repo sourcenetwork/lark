@@ -4,8 +4,8 @@
 //! This is a protocol model, and deliberately so. The production
 //! `engine::manifest::VersionSet` writes a manifest record and
 //! opens an `engine::sstable::SsTableReader` inside `apply`, and
-//! its locks come from `parking_lot` rather than from
-//! `engine::sync`, so loom can neither run it nor see its
+//! its locks come from `std::sync` rather than from
+//! `crate::sync`, so loom can neither run it nor see its
 //! ordering. What is reproduced here is the part loom can decide:
 //!
 //! - `current()` clones the `Arc<Version>` under a read lock, so a

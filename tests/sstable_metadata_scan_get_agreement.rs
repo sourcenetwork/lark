@@ -1,4 +1,4 @@
-//! Adversarial probe for the metadata checksum fix's actual symptom: `scan` and `get`
+//! Adversarial probe for the symptom an unchecksummed footer produces: `scan` and `get`
 //! disagreeing after a corrupted SSTable is served.
 //!
 //! The shipped sweeps flip single bits and assert "refused or correct".

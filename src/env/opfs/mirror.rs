@@ -26,7 +26,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use parking_lot::Mutex;
+use crate::sync::Mutex;
 use wasm_bindgen::JsValue;
 
 use super::js;

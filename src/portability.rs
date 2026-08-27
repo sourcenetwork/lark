@@ -65,36 +65,25 @@
 //! | `lru` | already `#![no_std]`, hashbrown-backed | none |
 //! | `rustix` | already `cfg(unix)`-gated | none |
 //! | `tracing` | `no_std` via `default-features = false` | low |
-//! | `crossbeam-skiplist` | has an `alloc` feature | low: `default-features = false, features = ["alloc"]` |
 //! | `lz4_flex` | `no_std` covers the block format, which is all lark uses | low: `default-features = false` |
 //! | `thiserror` 1.0 | no `no_std` support | medium: bump to 2.x |
 //! | `snap` | no `no_std` path at all; lark uses only `snap::raw` | medium: upstream a feature, vendor `raw.rs`, or drop Snappy on `no_std` |
-//! | **`parking_lot`** | **`std`-only, and its wasm parker panics** | **high, see below** |
+//! | `kovan-mvcc` | pulls `parking_lot`, which is `std`-only | medium: the transactional layer is not part of a tier-B build and can be feature-gated off |
+//! | **locks** | **[`crate::sync`] is `std::sync`-backed** | **medium, see below** |
 //!
-//! ## `parking_lot`, specifically
+//! ## Locks, specifically
 //!
-//! `parking_lot` is the largest single dependency blocker for tier B
-//! and it fails in two distinct ways.
+//! Every `Mutex`, `RwLock` and `Gate` in the engine comes from
+//! [`crate::sync`], which is `std::sync` on a normal build and
+//! `loom::sync` under `--cfg loom`. That is one seam rather than sixty
+//! call sites, so the remaining work for tier B is to add a third arm
+//! to that module backed by `spin` or `critical-section`.
 //!
-//! * **It requires `std`.** `parking_lot_core` is one of the five
-//!   crates that fail to compile for `thumbv7em-none-eabi` before
-//!   lark's own code is even reached. It needs thread parking, which
-//!   means a thread registry and a futex or equivalent, neither of
-//!   which exists on bare metal.
-//! * **Its wasm parker panics unconditionally.** `Condvar::wait` on
-//!   `wasm32` reaches `thread_parker::imp::ThreadParker::prepare_park`
-//!   and panics with "Parking not supported on this platform". That is
-//!   a panic on a production path, not a degraded mode.
-//!
-//! Cost to clear: `Mutex` and `RwLock` map onto `std::sync` on a `std`
-//! target and onto `spin` or `critical-section` on `no_std`, which is
-//! a mechanical substitution across roughly 60 call sites. The
-//! `arc_lock` feature lark enables today has no `std::sync`
-//! equivalent, so the handful of `ArcRwLockReadGuard` users have to be
-//! restructured to hold a plain guard or an owned `Arc` instead. The
-//! `Condvar` half is more subtle than the `Mutex` half: on a
+//! The `Condvar` half is more subtle than the `Mutex` half: on a
 //! single-threaded target there is no other thread to wake, so a
-//! blocking wait has to be replaced by the caller doing the work
-//! itself rather than by a different condvar.
+//! blocking wait has to be replaced by the caller doing the work itself
+//! rather than by a different condvar. Two waits exist today, both
+//! outside the engine's storage path: the rate limiter's refill wait
+//! and the pessimistic transaction lock table's acquisition wait.
 
 pub(crate) use portable_atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};

@@ -78,7 +78,6 @@
 //! the stamp's `format` field is what lets that arrive without breaking
 //! the logs written before it.
 
-use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -174,7 +173,13 @@ pub(crate) enum WalEntry {
 impl Wal {
     /// Create a new WAL file at the given path.
     pub(crate) fn create_in(env: &Arc<dyn Env>, path: &Path) -> io::Result<Self> {
-        let mut file = env.open_write(path, WriteMode::Truncate)?;
+        // Named on failure: creating a log at a path a previous log was
+        // unlinked from is the interesting case, because on Windows an
+        // unlinked file whose handle is still open keeps its name until
+        // that handle closes, and creating over it is refused.
+        let mut file = env.open_write(path, WriteMode::Truncate).map_err(|e| {
+            io::Error::new(e.kind(), format!("creating wal {}: {e}", path.display()))
+        })?;
         // Every log this build creates is stamped. That is what makes the
         // format identifiable and versioned from here on, so a later
         // build can change the framing and still know what it is holding.
@@ -330,7 +335,7 @@ impl Wal {
     #[cfg(test)]
     pub(crate) fn replay(path: &Path) -> io::Result<Vec<WalEntry>> {
         let mut iter = super::wal_replay::WalReplayIter::open(
-            &*crate::env::std_env(),
+            &crate::env::std_env(),
             path,
             super::wal_replay::WalPosition::Newest,
         )?;
@@ -361,30 +366,117 @@ impl Wal {
 pub(crate) mod fault {
     use std::path::{Path, PathBuf};
 
-    use parking_lot::Mutex;
+    use crate::sync::Mutex;
 
     /// Every directory currently armed. A list rather than a single
     /// slot because tests run in parallel in one process: with one slot,
     /// arming for a second directory silently disarms the first and
     /// disarming from either clears both, which makes both tests flaky.
-    static ARMED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    static ARMED: Mutex<Vec<Arm>> = Mutex::new(Vec::new());
+
+    /// One armed directory and how its syncs fail.
+    struct Arm {
+        dir: PathBuf,
+        /// `0` fails every sync. `n > 0` fails every sync except each
+        /// `n`th one, so `2` alternates fail, succeed, fail, succeed.
+        period: u64,
+        /// Syncs matched under `dir` so far, which is what `period`
+        /// counts against.
+        seen: u64,
+    }
 
     /// Make every `sync_data` on a WAL under `dir` fail until disarmed.
+    ///
+    /// Both the path as given and its resolved form are armed. On macOS
+    /// the temporary directory sits under `/var/folders`, which is a
+    /// symlink to `/private/var/folders`, so a prefix test against only
+    /// one of the two never matches and the fault silently never fires:
+    /// the test then sees every write acknowledged and fails on its own
+    /// "the fault must produce a mix" assertion rather than on anything
+    /// the engine did.
     pub(crate) fn arm_sync_failure(dir: &Path) {
-        ARMED.lock().push(dir.to_path_buf());
+        arm(dir, 0);
+    }
+
+    /// Make every sync under `dir` fail except each `period`th one.
+    ///
+    /// A test that needs both outcomes cannot get them from a fault that
+    /// only ever fails: it has to rely on something else to supply the
+    /// successes, and the only thing available is which writers happen
+    /// to land in the same commit group. That is decided by thread
+    /// timing, so on a slower machine every group can contain a writer
+    /// that asked for a sync, every group fails, and the test that
+    /// wanted a mix gets none. Alternating here makes the mix a property
+    /// of the fault rather than of the scheduler.
+    pub(crate) fn arm_flapping_sync_failure(dir: &Path, period: u64) {
+        assert!(period > 1, "a flapping fault needs a period above one");
+        arm(dir, period);
+    }
+
+    fn arm(dir: &Path, period: u64) {
+        let mut armed = ARMED.lock();
+        armed.push(Arm {
+            dir: dir.to_path_buf(),
+            period,
+            seen: 0,
+        });
+        if let Some(real) = resolved(dir)
+            && real != dir
+        {
+            armed.push(Arm {
+                dir: real,
+                period,
+                seen: 0,
+            });
+        }
+    }
+
+    /// `dir` with symlinks resolved, and without Windows' verbatim
+    /// prefix.
+    ///
+    /// Two platforms need this and neither is optional. On macOS the
+    /// temporary directory sits under `/var/folders`, a symlink to
+    /// `/private/var/folders`. On Windows `canonicalize` hands back a
+    /// `\\?\C:\...` verbatim path, which no path built by joining
+    /// ever matches. Either way a prefix test against one form alone
+    /// silently never matches, the fault never fires, and the test fails
+    /// on its own "the fault must produce a mix" assertion rather than
+    /// on anything the engine did.
+    fn resolved(dir: &Path) -> Option<PathBuf> {
+        let real = dir.canonicalize().ok()?;
+        let text = real.to_str()?;
+        Some(match text.strip_prefix(r"\\?\") {
+            Some(plain) => PathBuf::from(plain),
+            None => real,
+        })
     }
 
     /// Stop failing syncs under `dir`, leaving any other test's arming
     /// in place.
     pub(crate) fn disarm_sync_failure(dir: &Path) {
         let mut armed = ARMED.lock();
-        if let Some(at) = armed.iter().rposition(|d| d == dir) {
-            armed.remove(at);
-        }
+        let real = resolved(dir);
+        armed.retain(|a| a.dir != dir && Some(&a.dir) != real.as_ref());
     }
 
     pub(super) fn should_fail_sync(path: &Path) -> bool {
-        ARMED.lock().iter().any(|dir| path.starts_with(dir))
+        let mut armed = ARMED.lock();
+        // The log itself may not exist yet, so the resolved form is
+        // taken from its directory.
+        let real = path.parent().and_then(resolved);
+        for arm in armed.iter_mut() {
+            let matched = path.starts_with(&arm.dir)
+                || real.as_ref().is_some_and(|r| r.starts_with(&arm.dir));
+            if !matched {
+                continue;
+            }
+            if arm.period == 0 {
+                return true;
+            }
+            arm.seen += 1;
+            return arm.seen % arm.period != 0;
+        }
+        false
     }
 }
 
@@ -648,10 +740,15 @@ fn frame_at(bytes: &[u8], offset: usize) -> Option<Frame<'_>> {
 /// records follow the damage, so the tail is loss rather than a torn
 /// write, and the open is refused.
 pub(super) fn classify_incomplete_record(
+    env: &dyn crate::env::Env,
     path: &Path,
     record_start: u64,
 ) -> io::Result<TailVerdict> {
-    let bytes = fs::read(path)?;
+    // Through `Env`, like every other read on the recovery path. A
+    // `std::fs::read` here would look on the real filesystem, so a
+    // database on any other backend could not reopen the moment its
+    // newest log had a partial tail: the ordinary shape of a crash.
+    let bytes = env.read(path)?;
     let pos = usize::try_from(record_start)
         .unwrap_or(usize::MAX)
         .min(bytes.len());
@@ -667,8 +764,12 @@ pub(super) fn classify_incomplete_record(
 /// is the end of the log, not damage: there is nothing after it to lose.
 /// A bad record with anything non-zero behind it is real corruption and
 /// refuses the open.
-pub(super) fn classify_unusable_record(path: &Path, record_start: u64) -> io::Result<TailVerdict> {
-    let bytes = fs::read(path)?;
+pub(super) fn classify_unusable_record(
+    env: &dyn crate::env::Env,
+    path: &Path,
+    record_start: u64,
+) -> io::Result<TailVerdict> {
+    let bytes = env.read(path)?;
     let pos = usize::try_from(record_start)
         .unwrap_or(usize::MAX)
         .min(bytes.len());

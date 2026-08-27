@@ -84,7 +84,6 @@ fn assert_shard_invariants(cache: &BlockCache, context: &str) {
             live.len()
         );
 
-        let guard = epoch::pin();
         for (i, entry) in &live {
             assert_eq!(
                 entry.slot as usize, *i,
@@ -93,12 +92,14 @@ fn assert_shard_invariants(cache: &BlockCache, context: &str) {
             let found = shard
                 .map
                 .get()
-                .and_then(|m| m.get(&entry.key, &guard))
+                .and_then(|m| m.get(&entry.key))
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
                 .unwrap_or_else(|| {
                     panic!("{context}: shard {idx} slot {i} is not reachable through the map")
                 });
             assert!(
-                Arc::ptr_eq(found.value(), entry),
+                Arc::ptr_eq(&found, entry),
                 "{context}: shard {idx} slot {i} and the map disagree on the entry"
             );
         }
@@ -681,7 +682,7 @@ struct LruShard {
     capacity: usize,
     used: usize,
     tick: u64,
-    entries: std::collections::BTreeMap<CacheKey, (usize, u64)>,
+    entries: std::collections::HashMap<CacheKey, (usize, u64)>,
     order: std::collections::BTreeMap<u64, CacheKey>,
 }
 

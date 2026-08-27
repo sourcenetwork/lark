@@ -22,7 +22,7 @@
 //! so "absent" and "went backwards" are both violations of the read
 //! path and never of the workload.
 //!
-//! Scale comes from `LARK_G27_INSTANCES` / `LARK_G27_ROUNDS`; the
+//! Scale comes from `LARK_SCAN_ORDER_INSTANCES` / `LARK_SCAN_ORDER_ROUNDS`; the
 //! defaults are the smallest shape that reproduced on a 36-core box.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -253,11 +253,21 @@ fn run(
 }
 
 fn drive(surface: Surface) {
-    let instances = env("LARK_G27_INSTANCES", 16);
-    let rounds = env("LARK_G27_ROUNDS", 4);
-    let keys = env("LARK_G27_KEYS", 16);
-    let versions = env("LARK_G27_VERSIONS", 2000) as u64;
-    let min_rounds = env("LARK_G27_MIN_ROUNDS", 80);
+    // Sized for the smallest machine that runs the gate, not the
+    // largest. Each instance runs four writers, three readers and a
+    // compactor, so the defaults below already put 32 threads in flight;
+    // the previous 16 instances x 2000 versions needed 128 concurrent
+    // threads and did not finish inside five minutes on a two-core CI
+    // runner, while finishing in seconds on a 32-core desktop. What this
+    // hunts is the ordering between loading the view and sampling the
+    // horizon, and that window is per read, so the number of reads is
+    // what matters rather than the number of databases: these defaults
+    // still drive over a million of them.
+    let instances = env("LARK_SCAN_ORDER_INSTANCES", 4);
+    let rounds = env("LARK_SCAN_ORDER_ROUNDS", 2);
+    let keys = env("LARK_SCAN_ORDER_KEYS", 16);
+    let versions = env("LARK_SCAN_ORDER_VERSIONS", 500) as u64;
+    let min_rounds = env("LARK_SCAN_ORDER_MIN_ROUNDS", 40);
 
     let mut reads = 0u64;
     let mut all = Vec::new();

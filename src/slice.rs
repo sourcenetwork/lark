@@ -9,7 +9,7 @@ use crate::engine::block::Block;
 /// The arena's reference count, which is a `loom::sync::Arc` in a
 /// `--cfg loom` build so the model checker can see the handoff that
 /// keeps an arena alive under a live slice (invariant A5).
-use crate::engine::sync::Arc as ArenaArc;
+use crate::sync::Arc as ArenaArc;
 
 /// A borrowed, refcounted view of a value.
 ///
@@ -22,6 +22,17 @@ use crate::engine::sync::Arc as ArenaArc;
 /// slice taken from a memtable keeps the memtable's value bytes alive
 /// across a flush. Both are cheap to hold briefly and expensive to hold
 /// forever; call [`DbSlice::to_vec`] if the value must outlive the read.
+///
+/// # Values, not keys
+///
+/// There is no `key_slice`, and there is no way to add one that would
+/// mean anything. A data block stores keys prefix-compressed against
+/// their restart point, so the key a cursor reports is reassembled into
+/// a buffer the iterator owns rather than addressed in place: the bytes
+/// the caller wants are not contiguous anywhere in the block. A
+/// `key_slice` would therefore copy, which [`crate::Iter::key`] already
+/// does at the point of use and more cheaply. Values are stored whole,
+/// which is why they can be handed out by reference.
 ///
 /// # Comparing against `Option`
 ///

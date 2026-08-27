@@ -1,4 +1,4 @@
-//! Independent adversarial review of the G27 read-view fix.
+//! Independent adversarial review of the published read view.
 //!
 //! The fix publishes the active memtable, the frozen memtables and the
 //! version as one immutable object, so a read resolves every source at
@@ -67,8 +67,8 @@ fn a_never_deleted_key_never_reads_absent_under_compaction_and_rotation() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let reads = Arc::new(AtomicU64::new(0));
-    let violations: Arc<parking_lot::Mutex<Vec<String>>> =
-        Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let violations: Arc<std::sync::Mutex<Vec<String>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
 
     thread::scope(|s| {
         // Each writer owns a disjoint slice of the key space, so the
@@ -108,25 +108,29 @@ fn a_never_deleted_key_never_reads_absent_under_compaction_and_rotation() {
                 while !stop.load(Ordering::Relaxed) {
                     for i in 0..KEYS {
                         match db.get(&key(i)) {
-                            Ok(None) => violations.lock().push(format!(
+                            Ok(None) => violations.lock().expect("violations").push(format!(
                                 "k{i:05} read ABSENT though it is only ever overwritten"
                             )),
                             Ok(Some(v)) => {
                                 let Some(st) = stamp(&v) else {
                                     violations
                                         .lock()
+                                        .expect("violations")
                                         .push(format!("k{i:05} served unparsable {v:02x?}"));
                                     continue;
                                 };
                                 let prev = last[i as usize];
                                 if st < prev {
-                                    violations.lock().push(format!(
+                                    violations.lock().expect("violations").push(format!(
                                         "k{i:05} travelled backwards: {prev} then {st}"
                                     ));
                                 }
                                 last[i as usize] = st.max(prev);
                             }
-                            Err(e) => violations.lock().push(format!("k{i:05} errored: {e}")),
+                            Err(e) => violations
+                                .lock()
+                                .expect("violations")
+                                .push(format!("k{i:05} errored: {e}")),
                         }
                         reads.fetch_add(1, Ordering::Relaxed);
                     }
@@ -139,7 +143,7 @@ fn a_never_deleted_key_never_reads_absent_under_compaction_and_rotation() {
         let _ = compactor;
     });
 
-    let v = violations.lock();
+    let v = violations.lock().expect("violations");
     println!(
         "overwrite-only invariant: {} reads, {} violation(s)",
         reads.load(Ordering::Relaxed),
@@ -163,8 +167,8 @@ fn drop_all_under_read_load_never_serves_a_value_that_was_never_written() {
     let stop = Arc::new(AtomicBool::new(false));
     let reads = Arc::new(AtomicU64::new(0));
     let drops = Arc::new(AtomicU64::new(0));
-    let violations: Arc<parking_lot::Mutex<Vec<String>>> =
-        Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let violations: Arc<std::sync::Mutex<Vec<String>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
 
     thread::scope(|s| {
         for w in 0..2 {
@@ -204,13 +208,14 @@ fn drop_all_under_read_load_never_serves_a_value_that_was_never_written() {
                             Ok(None) => {}
                             Ok(Some(v)) => {
                                 if stamp(&v).is_none() {
-                                    violations.lock().push(format!(
+                                    violations.lock().expect("violations").push(format!(
                                         "k{i:05} served a value that was never written: {v:02x?}"
                                     ));
                                 }
                             }
                             Err(e) => violations
                                 .lock()
+                                .expect("violations")
                                 .push(format!("k{i:05} errored during drop_all: {e}")),
                         }
                         reads.fetch_add(1, Ordering::Relaxed);
@@ -220,14 +225,17 @@ fn drop_all_under_read_load_never_serves_a_value_that_was_never_written() {
                         Ok(pairs) => {
                             for pair in pairs.windows(2) {
                                 if pair[0].0 >= pair[1].0 {
-                                    violations.lock().push(format!(
+                                    violations.lock().expect("violations").push(format!(
                                         "scan out of order: {:02x?} then {:02x?}",
                                         pair[0].0, pair[1].0
                                     ));
                                 }
                             }
                         }
-                        Err(e) => violations.lock().push(format!("scan errored: {e}")),
+                        Err(e) => violations
+                            .lock()
+                            .expect("violations")
+                            .push(format!("scan errored: {e}")),
                     }
                 }
             });
@@ -236,7 +244,7 @@ fn drop_all_under_read_load_never_serves_a_value_that_was_never_written() {
         stop.store(true, Ordering::Relaxed);
     });
 
-    let v = violations.lock();
+    let v = violations.lock().expect("violations");
     println!(
         "drop_all under load: {} reads, {} drop_all calls, {} violation(s)",
         reads.load(Ordering::Relaxed),

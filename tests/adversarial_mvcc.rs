@@ -60,6 +60,7 @@ fn many_writers_never_let_a_snapshot_see_a_torn_batch() {
     }
 
     let torn = Arc::new(AtomicUsize::new(0));
+    const MIN_READS: usize = 100_000;
     let reads = Arc::new(AtomicUsize::new(0));
     let mut readers = Vec::new();
     for _ in 0..4 {
@@ -69,7 +70,12 @@ fn many_writers_never_let_a_snapshot_see_a_torn_batch() {
         let torn = Arc::clone(&torn);
         let reads = Arc::clone(&reads);
         readers.push(thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
+            // Stop only once the writers are done AND the read floor is
+            // cleared. The writers have a quota, so without this the
+            // count below is just the ratio of the two sides' throughput
+            // on whatever host is running, and a slow one fails a probe
+            // that has nothing to do with the property.
+            while !stop.load(Ordering::Relaxed) || reads.load(Ordering::Relaxed) < MIN_READS {
                 let snap = db.snapshot();
                 for w in 0..writers {
                     let at = frontier[w].load(Ordering::Acquire);
@@ -121,7 +127,10 @@ fn many_writers_never_let_a_snapshot_see_a_torn_batch() {
         torn, 0,
         "{torn} torn batches observed across {reads} snapshot reads and {rounds} compactions"
     );
-    assert!(reads > 100_000, "probe was too weak: only {reads} reads");
+    assert!(
+        reads >= MIN_READS,
+        "probe was too weak: only {reads} reads against a floor of {MIN_READS}"
+    );
 
     for w in 0..writers {
         for round in [0usize, batches_per_writer / 2, batches_per_writer - 1] {
@@ -157,15 +166,22 @@ fn a_held_snapshot_never_changes_under_concurrent_commits() {
         .map(|k| (k.clone(), snap.get(k).unwrap()))
         .collect();
 
+    // Each writer commits a fixed quota rather than racing the reader
+    // to a stop flag. With a flag, how much either side achieves is
+    // decided by the scheduler: on a two-core runner the reader finished
+    // its 25,600 checks while the writers managed six batches between
+    // them, and the run failed on "writers barely ran" for a reason that
+    // has nothing to do with snapshot stability. A quota makes both
+    // sides' work a property of the test.
+    const BATCHES_PER_WRITER: usize = 8;
     let stop = Arc::new(AtomicBool::new(false));
     let mut writers = Vec::new();
     for w in 0..6 {
         let db = Arc::clone(&db);
-        let stop = Arc::clone(&stop);
         let probe_keys = probe_keys.clone();
         writers.push(thread::spawn(move || {
             let mut round = 1usize;
-            while !stop.load(Ordering::Relaxed) {
+            while round <= BATCHES_PER_WRITER {
                 let mut batch = WriteBatch::new();
                 for k in &probe_keys {
                     batch.put(k, format!("v{round}_w{w}").as_bytes());
@@ -191,6 +207,8 @@ fn a_held_snapshot_never_changes_under_concurrent_commits() {
         })
     };
 
+    // A fixed number of probe rounds. The writers have their own quota,
+    // so neither side's work depends on the other finishing first.
     let mut checks = 0usize;
     for _ in 0..400 {
         for k in &probe_keys {
@@ -212,15 +230,18 @@ fn a_held_snapshot_never_changes_under_concurrent_commits() {
         }
     }
 
-    stop.store(true, Ordering::Relaxed);
     let mut total_gens = 0usize;
     for w in writers {
         total_gens += w.join().unwrap();
     }
+    stop.store(true, Ordering::Relaxed);
     compactor.join().unwrap();
     println!("snapshot_stability_checks={checks} writer_batches={total_gens}");
     assert!(checks >= 25_000, "probe was too weak: {checks} checks");
-    assert!(total_gens > 12, "writers barely ran: {total_gens} batches");
+    assert!(
+        total_gens >= 6 * BATCHES_PER_WRITER,
+        "writers did not finish their quota: {total_gens} batches"
+    );
 }
 
 /// Every write the caller was told committed with `sync = true` must

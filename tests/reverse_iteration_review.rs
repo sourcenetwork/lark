@@ -1,4 +1,4 @@
-//! Independent adversarial review of the G29 reverse-iteration fix.
+//! Independent adversarial review of reverse iteration.
 //!
 //! `seek_to_last` used to build an upper-bound probe by appending eight
 //! `0xff` bytes, which is an upper bound only for user keys of eight

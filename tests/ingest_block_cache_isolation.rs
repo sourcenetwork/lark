@@ -1,5 +1,6 @@
 //! Regression gate for a silent data-loss bug in
-//! `Db::ingest_external_files`, found while reviewing G24 and not one of
+//! `Db::ingest_external_files`, found while reviewing the metadata
+//! checksums and not one of
 //! the six fixes under review.
 //!
 //! Every source file was pre-opened as `SsTableReader::open(path, 0)` and

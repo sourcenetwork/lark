@@ -73,7 +73,7 @@
 //!
 //! Each test's doc comment states its measured runtime. Every test spawns
 //! at least one child process, and the slowest takes 0.31s, so none of them
-//! is hidden behind `#[ignore]`: the whole file runs in well under a second
+//! is switched off: the whole file runs in well under a second
 //! and stays in the default `cargo test`. `just test-power` runs it with
 //! output shown, which is how the measured `Eventual` loss is read off.
 
@@ -104,7 +104,6 @@ use tempfile::TempDir;
 /// re-executed by the crash harness, so a normal `cargo test` run never
 /// executes a workload here.
 #[test]
-#[ignore = "child process entry point, re-executed by the crash harness"]
 fn crash_child() {
     fault::child_entrypoint(dispatch);
 }

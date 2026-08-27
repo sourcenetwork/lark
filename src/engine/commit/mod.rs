@@ -546,7 +546,7 @@ impl LarkEngine {
 mod tests {
     use super::super::{EngineOptions, wal::fault};
     use super::*;
-    use parking_lot::Mutex;
+    use crate::sync::Mutex;
     use tempfile::TempDir;
 
     fn open_engine(dir: &TempDir) -> Arc<LarkEngine> {
@@ -582,6 +582,13 @@ mod tests {
     /// untouched.
     fn arm_sync_failure(dir: &TempDir) -> FaultGuard {
         fault::arm_sync_failure(dir.path());
+        FaultGuard(dir.path().to_path_buf())
+    }
+
+    /// Arm the WAL sync fault for `dir` so it fails every sync but each
+    /// second one, and disarm that directory when the test scope ends.
+    fn arm_flapping_sync_failure(dir: &TempDir) -> FaultGuard {
+        fault::arm_flapping_sync_failure(dir.path(), 2);
         FaultGuard(dir.path().to_path_buf())
     }
 
@@ -1001,13 +1008,18 @@ mod tests {
                 .submit(durable_put(b"before", b"kept"))
                 .expect("the pre-failure write commits");
 
-            let _fault = arm_sync_failure(&dir);
-            // Half the writers ask for Immediate durability and half for
-            // Eventual. An Eventual-only group never syncs and commits;
-            // an Eventual writer that lands in the same group as an
-            // Immediate one must fail with it. Which is which is decided
-            // by group formation, so the split is genuinely mixed without
-            // touching the global injector mid-run.
+            // Alternating, so both outcomes are guaranteed. Half the
+            // writers ask for Immediate durability and half for
+            // Eventual: an Eventual-only group never syncs and commits,
+            // and an Eventual writer that lands in a group with an
+            // Immediate one shares that group's fate. Which groups form
+            // is decided by thread timing, so leaving the mix to group
+            // formation alone makes the test a machine-speed test: on a
+            // slow two-core runner every group contained a syncing
+            // writer, every group failed, and the run reported 0 of 480
+            // acknowledged. A flapping fault supplies the successes
+            // itself.
+            let _fault = arm_flapping_sync_failure(&dir);
             let acknowledged = Arc::new(Mutex::new(Vec::new()));
             let mut handles = Vec::with_capacity(WRITERS);
             for w in 0..WRITERS {

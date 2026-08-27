@@ -62,6 +62,7 @@ fn seeded_db(keys: usize) -> TempDir {
 
 /// Permission-based cases are meaningless for a process that ignores
 /// permissions, so they are skipped rather than falsely passing.
+#[cfg(unix)]
 fn permissions_are_enforced(dir: &Path) -> bool {
     let probe = dir.join("write-probe");
     let enforced = fs::File::create(&probe).is_err();
@@ -79,6 +80,9 @@ fn open_on_a_regular_file_path_errors() {
     assert!(Db::open(&path, Options::default()).is_err());
 }
 
+// POSIX permission bits: Windows has no equivalent of a mode that
+// makes a directory unreadable or unsearchable to its owner.
+#[cfg(unix)]
 #[test]
 fn open_inside_a_read_only_parent_errors() {
     use std::os::unix::fs::PermissionsExt;
@@ -93,6 +97,9 @@ fn open_inside_a_read_only_parent_errors() {
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+// POSIX permission bits: Windows has no equivalent of a mode that
+// makes a directory unreadable or unsearchable to its owner.
+#[cfg(unix)]
 #[test]
 fn open_under_an_unsearchable_parent_errors() {
     use std::os::unix::fs::PermissionsExt;

@@ -295,6 +295,13 @@ pub trait WriteFile: Send {
     /// Truncate or extend the file to exactly `len` bytes, leaving the
     /// write position at `len`.
     ///
+    /// The handle must have been opened [`WriteMode::Truncate`] or
+    /// [`WriteMode::Update`]. Shortening through a
+    /// [`WriteMode::Append`] handle is not supported: Windows opens an
+    /// append handle without `FILE_WRITE_DATA`, which the truncate
+    /// needs, so it fails there with "Access is denied" while
+    /// succeeding on unix.
+    ///
     /// The position matters: WAL rollback truncates a partly written
     /// group and then appends again, so a writer that left its cursor
     /// past the new end would write into a hole. An implementation whose

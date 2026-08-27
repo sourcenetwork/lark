@@ -109,14 +109,14 @@ impl CompactionScheduler {
     // shared handles the workers would have taken unread.
     #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
     pub(crate) fn start(
-        compaction_lock: Arc<parking_lot::RwLock<()>>,
+        compaction_lock: Arc<crate::sync::Gate>,
         snapshot_registry: Arc<SnapshotRegistry>,
         versions: Arc<VersionStore>,
         sst_dir: Arc<Path>,
         cache: Arc<BlockCache>,
         opts: CompactionOptions,
         stall_signal: Arc<crate::engine::StallSignal>,
-        in_progress: Arc<parking_lot::Mutex<HashSet<u64>>>,
+        in_progress: Arc<crate::sync::Mutex<HashSet<u64>>>,
     ) -> std::io::Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let (trigger, receiver) = kovan_channel::unbounded::<()>();
@@ -377,14 +377,14 @@ fn compaction_loop(
     shutdown: Arc<AtomicBool>,
     trigger: Receiver<()>,
     pending: Arc<AtomicBool>,
-    compaction_lock: Arc<parking_lot::RwLock<()>>,
+    compaction_lock: Arc<crate::sync::Gate>,
     snapshot_registry: Arc<SnapshotRegistry>,
     versions: Arc<VersionStore>,
     sst_dir: Arc<Path>,
     cache: Arc<BlockCache>,
     opts: CompactionOptions,
     stall_signal: Arc<crate::engine::StallSignal>,
-    in_progress: Arc<parking_lot::Mutex<HashSet<u64>>>,
+    in_progress: Arc<crate::sync::Mutex<HashSet<u64>>>,
 ) {
     loop {
         // Wait for a trigger, or fall through on the periodic poll.
@@ -489,7 +489,7 @@ pub(crate) fn pick_and_run_compaction(
     cache: &BlockCache,
     opts: &CompactionOptions,
     pin_seq: u64,
-    in_progress: &parking_lot::Mutex<HashSet<u64>>,
+    in_progress: &crate::sync::Mutex<HashSet<u64>>,
 ) -> std::io::Result<CompactionOutcome> {
     match opts.compaction_style {
         crate::options::CompactionStyle::Level => {
@@ -704,7 +704,7 @@ fn pick_and_run_level_compaction(
     cache: &BlockCache,
     opts: &CompactionOptions,
     pin_seq: u64,
-    in_progress: &parking_lot::Mutex<HashSet<u64>>,
+    in_progress: &crate::sync::Mutex<HashSet<u64>>,
 ) -> std::io::Result<CompactionOutcome> {
     let version = versions.lock().current();
 
@@ -820,7 +820,7 @@ fn compact_l0(
     cache: &BlockCache,
     opts: &CompactionOptions,
     pin_seq: u64,
-    in_progress: &parking_lot::Mutex<HashSet<u64>>,
+    in_progress: &crate::sync::Mutex<HashSet<u64>>,
 ) -> std::io::Result<CompactionOutcome> {
     // If any L0 file is already being compacted by another worker,
     // skip - L0 files may overlap so concurrent picks would produce
@@ -848,7 +848,7 @@ fn compact_level(
     opts: &CompactionOptions,
     level: usize,
     pin_seq: u64,
-    in_progress: &parking_lot::Mutex<HashSet<u64>>,
+    in_progress: &crate::sync::Mutex<HashSet<u64>>,
 ) -> std::io::Result<CompactionOutcome> {
     let target_level = level + 1;
     if target_level >= MAX_LEVELS {
@@ -2145,14 +2145,14 @@ mod tests {
         let started = {
             let _guard = SpawnFailureGuard::allowing(2);
             CompactionScheduler::start(
-                Arc::new(parking_lot::RwLock::new(())),
+                Arc::new(crate::sync::Gate::new()),
                 Arc::new(SnapshotRegistry::new()),
                 Arc::clone(&versions),
                 Arc::from(sst_dir.as_path()),
                 Arc::new(BlockCache::new(4096)),
                 opts,
                 Arc::new(crate::engine::StallSignal::new()),
-                Arc::new(parking_lot::Mutex::new(HashSet::new())),
+                Arc::new(crate::sync::Mutex::new(HashSet::new())),
             )
         };
 
@@ -2245,14 +2245,14 @@ mod tests {
         let started = {
             let _guard = SpawnFailureGuard::allowing(7);
             CompactionScheduler::start(
-                Arc::new(parking_lot::RwLock::new(())),
+                Arc::new(crate::sync::Gate::new()),
                 Arc::new(SnapshotRegistry::new()),
                 Arc::clone(&versions),
                 Arc::from(sst_dir.as_path()),
                 Arc::new(BlockCache::new(4096)),
                 opts,
                 Arc::new(crate::engine::StallSignal::new()),
-                Arc::new(parking_lot::Mutex::new(HashSet::new())),
+                Arc::new(crate::sync::Mutex::new(HashSet::new())),
             )
         };
         let elapsed = start.elapsed();

@@ -48,6 +48,7 @@ use crate::Result;
 use crate::column_family::{ColumnFamilyHandle, DEFAULT_CF_ID, cf_upper_bound, prefix_key};
 use crate::engine::LarkEngine;
 use crate::engine::iterator::LarkIterator;
+use crate::slice::DbSlice;
 use crate::statistics::{Histogram, Statistics, Ticker, TimeScope};
 
 /// Forward-only tailing iterator. See the module docs.
@@ -261,6 +262,23 @@ impl TailingIter {
             return None;
         }
         self.inner.value()
+    }
+
+    /// Current value as a [`DbSlice`], or `None` if the iterator is not
+    /// valid.
+    ///
+    /// Unlike [`TailingIter::value`], the returned slice does not borrow
+    /// the iterator, so it stays valid after [`TailingIter::next`] moves
+    /// on and after the refresh that a tailing iterator performs when it
+    /// catches up to new writes. Scanning an SSTable forward this costs
+    /// one reference count and no copy.
+    ///
+    /// Holding one pins its owner: see [`DbSlice`].
+    pub fn value_slice(&self) -> Option<DbSlice> {
+        if !self.valid() {
+            return None;
+        }
+        self.inner.value_slice()
     }
 
     /// Propagate any I/O error from the underlying cursor.
