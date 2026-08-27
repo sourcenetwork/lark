@@ -99,6 +99,33 @@ impl ReadViewCell {
         out
     }
 
+    /// Drop one memtable from the frozen list, by identity.
+    ///
+    /// Called once a flush has published an SSTable holding that
+    /// memtable's contents, or once the memtable proved to be empty.
+    ///
+    /// By identity and not by position, because position is not stable.
+    /// A flush reads `frozen.first()` at entry and gets here only after
+    /// writing a whole SSTable, and in that interval a rotation can
+    /// append and another flush can retire. Dropping "index 0" would
+    /// then drop a memtable this flush never wrote, whose contents are
+    /// in no published version, and every write it held would vanish:
+    /// a key that was only ever overwritten would read as an older
+    /// version or as absent.
+    ///
+    /// Retiring a memtable that is already gone is a no-op, which is
+    /// what makes this safe on every exit path a flush has.
+    pub(crate) fn retire_memtable(&self, flushed: &Arc<MemTable>) {
+        self.update_memtables(|active, frozen| {
+            let next = frozen
+                .iter()
+                .filter(|mt| !Arc::ptr_eq(mt, flushed))
+                .cloned()
+                .collect();
+            (Arc::clone(active), next, ())
+        });
+    }
+
     /// Replace the version half of the view. Called by
     /// [`VersionGuard::drop`] and by nothing else.
     fn publish_version(&self, version: Arc<Version>) {
@@ -221,6 +248,68 @@ mod tests {
         }));
         store.attach_view(Arc::clone(&cell));
         (dir, store, cell)
+    }
+
+    /// The defect this guards: a flush chose its victim as
+    /// `frozen.first()` and then retired "index 0", which is not the
+    /// same memtable once anything else has touched the list. Two
+    /// flushes could then retire the same memtable twice and drop a
+    /// second one nothing had written, losing every acknowledged write
+    /// it held.
+    #[test]
+    fn retiring_a_memtable_drops_that_one_and_leaves_the_rest_in_order() {
+        let (_dir, _store, cell) = store_with_view();
+        let frozen: Vec<Arc<MemTable>> = (0..3)
+            .map(|i| {
+                let mt = Arc::new(MemTable::new(&test_memtable_config()).unwrap());
+                mt.put(
+                    format!("k{i}").as_bytes(),
+                    format!("v{i}").as_bytes(),
+                    i + 1,
+                );
+                mt
+            })
+            .collect();
+        cell.update_memtables(|active, _| (Arc::clone(active), frozen.clone(), ()));
+
+        // Retire the middle one, which is what a flush that started
+        // before a rotation and finished after another retirement is
+        // holding. Positional retirement would take index 0 here.
+        cell.retire_memtable(&frozen[1]);
+
+        let after = cell.load();
+        assert_eq!(after.frozen.len(), 2, "exactly one memtable must go");
+        assert!(
+            Arc::ptr_eq(&after.frozen[0], &frozen[0]),
+            "retiring the middle memtable dropped the oldest one instead: every write in it is \
+             in no published version and is now unreachable",
+        );
+        assert!(
+            Arc::ptr_eq(&after.frozen[1], &frozen[2]),
+            "the newest memtable did not keep its place",
+        );
+    }
+
+    /// Every exit path of a flush retires, including the ones that
+    /// found nothing to write, so retiring twice has to be harmless.
+    #[test]
+    fn retiring_a_memtable_that_is_already_gone_changes_nothing() {
+        let (_dir, _store, cell) = store_with_view();
+        let frozen: Vec<Arc<MemTable>> = (0..2)
+            .map(|_| Arc::new(MemTable::new(&test_memtable_config()).unwrap()))
+            .collect();
+        cell.update_memtables(|active, _| (Arc::clone(active), frozen.clone(), ()));
+
+        cell.retire_memtable(&frozen[0]);
+        cell.retire_memtable(&frozen[0]);
+
+        let after = cell.load();
+        assert_eq!(
+            after.frozen.len(),
+            1,
+            "a second retirement of the same memtable took a different one with it",
+        );
+        assert!(Arc::ptr_eq(&after.frozen[0], &frozen[1]));
     }
 
     #[test]

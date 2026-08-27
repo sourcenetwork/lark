@@ -382,6 +382,19 @@ pub(crate) struct LarkEngine {
     /// (`compact_range`, `ingest_external_files`, `checkpoint_capture`,
     /// `drop_all`, `close`) take it blockingly; no follower ever does.
     pipeline: Mutex<Pipeline>,
+    /// Serializes [`Self::flush_frozen_memtable`] against itself.
+    ///
+    /// Not the same exclusion as `pipeline`. Three of the four paths
+    /// into a flush hold the pipeline mutex, but `drain_memtables`
+    /// releases it before it flushes (a flush writes a whole SSTable
+    /// and must not block writers for that long), so a checkpoint's
+    /// drain and a writer's rotation could both be inside the flush at
+    /// once. They would then both take `frozen.first()` as their victim
+    /// and both retire index 0, and the second retirement would drop a
+    /// memtable whose contents are in no published version: an
+    /// acknowledged write disappears, and a reader that had already seen
+    /// it reads an older version instead.
+    flushing: Mutex<()>,
     /// Latched write-path failure. Set only when a failed commit group
     /// could not be rolled back out of the WAL, which leaves the log with
     /// a tail no later write may extend. Once set, every write fails loud
@@ -569,6 +582,7 @@ impl LarkEngine {
             options,
             commit_ring: Self::new_commit_ring(),
             pipeline: Mutex::new(Pipeline::new()),
+            flushing: Mutex::new(()),
             wal_failure: Mutex::new(None),
             wal_failed: AtomicBool::new(false),
             stall_signal,
@@ -708,6 +722,7 @@ impl LarkEngine {
             options,
             commit_ring: Self::new_commit_ring(),
             pipeline: Mutex::new(Pipeline::new()),
+            flushing: Mutex::new(()),
             wal_failure: Mutex::new(None),
             wal_failed: AtomicBool::new(false),
             stall_signal,
@@ -1691,14 +1706,19 @@ impl LarkEngine {
         Arc::clone(&self.view.load().version)
     }
 
-    /// Retire the oldest frozen memtable in one publication. Called
-    /// only once its contents are durable in an SSTable the published
-    /// version already references, or once they proved to be empty.
-    fn retire_oldest_frozen(&self) {
-        self.view.update_memtables(|active, frozen| {
-            let next = frozen.get(1..).map(<[_]>::to_vec).unwrap_or_default();
-            (Arc::clone(active), next, ())
-        });
+    /// Retire one frozen memtable in one publication. Called only once
+    /// its contents are durable in an SSTable the published version
+    /// already references, or once they proved to be empty.
+    ///
+    /// By identity, not by position. The memtable named here is the one
+    /// this flush read, and between reading it and getting here the
+    /// list can have changed: a rotation appends, and another flush
+    /// could have retired ahead of this one. Dropping "index 0" would
+    /// then drop somebody else's memtable, whose contents are in no
+    /// published version. Retiring a memtable that is already gone is a
+    /// no-op, which is what makes this safe to call on every exit path.
+    fn retire_frozen(&self, flushed: &Arc<MemTable>) {
+        self.view.retire_memtable(flushed);
     }
 
     /// Snapshot the current write-stall inputs: L0 file count,
@@ -2159,6 +2179,12 @@ impl LarkEngine {
     }
 
     fn flush_frozen_memtable(&self, old_wal: Wal) -> std::io::Result<()> {
+        // Held for the whole flush, so the victim chosen below is still
+        // this flush's to retire when the SSTable naming it is
+        // published. See the `flushing` field for what happens without
+        // it.
+        let _flushing = self.flushing.lock();
+
         // Through the env: a target with no monotonic clock reports
         // nothing measured rather than a fabricated duration.
         let flush_start = self.env.now_micros();
@@ -2170,7 +2196,7 @@ impl LarkEngine {
         let range_tombstones = memtable.clone_range_tombstones();
 
         if memtable.is_empty() && range_tombstones.is_empty() {
-            self.retire_oldest_frozen();
+            self.retire_frozen(&memtable);
             let _ = Wal::remove_in(&*self.env, old_wal.path());
             return Ok(());
         }
@@ -2212,7 +2238,7 @@ impl LarkEngine {
         let summary = match writer.finish()? {
             Some(s) => s,
             None => {
-                self.retire_oldest_frozen();
+                self.retire_frozen(&memtable);
                 let _ = Wal::remove_in(&*self.env, old_wal.path());
                 let _ = std::fs::remove_file(&sst_path);
                 return Ok(());
@@ -2255,7 +2281,7 @@ impl LarkEngine {
 
         // Retired only now: until the `AddFile` above is published, the
         // flushed data lives in this memtable alone.
-        self.retire_oldest_frozen();
+        self.retire_frozen(&memtable);
         let _ = Wal::remove_in(&*self.env, old_wal.path());
         self.compaction.lock().notify();
 
