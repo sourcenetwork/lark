@@ -310,6 +310,16 @@ impl CacheShard {
     /// so a reader never waits on an insert that is freeing blocks.
     fn get(&self, key: &CacheKey) -> Option<CacheEntry> {
         let entry = self.map.get()?.get(key)?.upgrade()?;
+        // The entry has to agree that it is the one asked for. The map
+        // resolves a key by walking a bucket chain, and its own contract
+        // distinguishes removing one version of a key from evicting the
+        // key outright, so a chain can outlive what put it there. Two
+        // `u64` compares on the read path buy the guarantee that a hit
+        // is never another file's block, and a disagreement reads as a
+        // miss, which is always a safe answer for a cache.
+        if entry.key != *key {
+            return None;
+        }
         entry.referenced.store(true, Ordering::Relaxed);
         Some(entry.entry.clone_ref())
     }
@@ -321,7 +331,7 @@ impl CacheShard {
         let Some(map) = self.map.get() else {
             return;
         };
-        if let Some(entry) = map.remove(key).as_ref().and_then(Weak::upgrade) {
+        if let Some(entry) = map.force_remove(key).as_ref().and_then(Weak::upgrade) {
             ring.release(entry.slot as usize, entry.charge);
             ring.record_removal();
         }
@@ -357,7 +367,7 @@ impl CacheShard {
             ring.free.push(hand);
             ring.used = ring.used.saturating_sub(entry.charge);
             if let Some(map) = self.map.get() {
-                map.remove(&entry.key);
+                map.force_remove(&entry.key);
             }
             ring.record_removal();
             return true;
@@ -447,7 +457,7 @@ impl CacheShard {
                 continue;
             }
             let (key, charge) = (entry.key, entry.charge);
-            map.remove(&key);
+            map.force_remove(&key);
             ring.release(slot, charge);
             ring.record_removal();
         }

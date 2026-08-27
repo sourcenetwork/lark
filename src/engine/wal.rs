@@ -369,21 +369,43 @@ pub(crate) mod fault {
     static ARMED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
     /// Make every `sync_data` on a WAL under `dir` fail until disarmed.
+    ///
+    /// Both the path as given and its resolved form are armed. On macOS
+    /// the temporary directory sits under `/var/folders`, which is a
+    /// symlink to `/private/var/folders`, so a prefix test against only
+    /// one of the two never matches and the fault silently never fires:
+    /// the test then sees every write acknowledged and fails on its own
+    /// "the fault must produce a mix" assertion rather than on anything
+    /// the engine did.
     pub(crate) fn arm_sync_failure(dir: &Path) {
-        ARMED.lock().push(dir.to_path_buf());
+        let mut armed = ARMED.lock();
+        armed.push(dir.to_path_buf());
+        if let Ok(real) = dir.canonicalize()
+            && real != dir
+        {
+            armed.push(real);
+        }
     }
 
     /// Stop failing syncs under `dir`, leaving any other test's arming
     /// in place.
     pub(crate) fn disarm_sync_failure(dir: &Path) {
         let mut armed = ARMED.lock();
-        if let Some(at) = armed.iter().rposition(|d| d == dir) {
-            armed.remove(at);
-        }
+        let real = dir.canonicalize().ok();
+        armed.retain(|d| d != dir && Some(d) != real.as_ref());
     }
 
     pub(super) fn should_fail_sync(path: &Path) -> bool {
-        ARMED.lock().iter().any(|dir| path.starts_with(dir))
+        let armed = ARMED.lock();
+        if armed.iter().any(|dir| path.starts_with(dir)) {
+            return true;
+        }
+        // The log itself may not exist yet, so the resolved form is
+        // taken from its directory.
+        match path.parent().and_then(|p| p.canonicalize().ok()) {
+            Some(real) => armed.iter().any(|dir| real.starts_with(dir)),
+            None => false,
+        }
     }
 }
 
