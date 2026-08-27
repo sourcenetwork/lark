@@ -590,9 +590,14 @@ pub struct Frame {
     pub kind: u8,
 }
 
+/// Both the WAL and the MANIFEST open with a 12-byte format stamp, so
+/// records start there rather than at byte zero. Matches
+/// `WAL_STAMP_LEN` and `MANIFEST_STAMP_LEN`.
+pub const STAMP: usize = 12;
+
 fn frames(bytes: &[u8], header: usize) -> Vec<Frame> {
     let mut out = Vec::new();
-    let mut pos = 0usize;
+    let mut pos = STAMP;
     while pos + header < bytes.len() {
         let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().expect("4 bytes")) as usize;
         let end = match pos
@@ -653,9 +658,12 @@ fn footer_size(bytes: &[u8]) -> u64 {
             .try_into()
             .expect("the last 8 bytes"),
     );
+    // v5 and v6 are the stamped REGOSST flat and partitioned footers.
+    // They share the 72-byte layout v3 introduced, so the field
+    // offsets this harness uses hold for them too.
     match magic & 0xFF {
         1 | 2 => 64,
-        3 | 4 => 72,
+        3 | 4 | 5 | 6 => 72,
         other => panic!(
             "the SSTable fixture carries format version {other}, which this harness does not know"
         ),
