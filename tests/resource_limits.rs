@@ -39,7 +39,7 @@
 //!
 //! The default `cargo test` run only holds the fast boundary and
 //! degenerate-input tests. Everything that writes six figures of
-//! operations, a 64 MiB value, or fills a filesystem is `#[ignore]`d
+//! operations, a 64 MiB value, or fills a filesystem is sized
 //! with its measured runtime stated at the test.
 
 use std::collections::BTreeMap;

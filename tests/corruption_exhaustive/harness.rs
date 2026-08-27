@@ -28,7 +28,7 @@ use crate::common::fault::{ChildSpec, CrashRun, History, Phase, validate_prefix_
 pub const SEED: u64 = 0x_C0FF_EE12_3456_789A;
 
 /// Offsets sampled per file (truncation) and per region (bit flips) in
-/// the default run. The `#[ignore]`d twins visit every offset instead.
+/// the default run. The exhaustive twins visit every offset instead.
 pub const SAMPLE: usize = 24;
 
 /// How long a single trial may make no progress before the sweep is

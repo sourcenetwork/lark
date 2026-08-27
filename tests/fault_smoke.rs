@@ -6,7 +6,7 @@
 //! of these assert that the fault actually fired, not merely that nothing
 //! blew up.
 //!
-//! Runtime: the default set finishes in a few seconds. The two `#[ignore]`
+//! Runtime: the default set finishes in a few seconds. The two
 //! tests are called out individually below; run them with
 //! `just test-fault-slow`.
 

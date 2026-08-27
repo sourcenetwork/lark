@@ -38,7 +38,7 @@
 //! Every workload is generated from a fixed seed, so a failure
 //! reproduces byte for byte.
 //!
-//! The `#[ignore]`d tests are the full-scale versions of the same
+//! The full-scale tests are larger versions of the same
 //! properties; see each one's doc comment for its measured runtime.
 //! `just mvcc` runs the fast set, `just mvcc-slow` the full-scale set.
 
@@ -108,7 +108,7 @@ fn a_snapshots_view_is_byte_identical_for_its_whole_life() {
 /// shape the original probe ran at: 2000 keys, 6 writer threads and
 /// 120000 writes racing a snapshot that pins every version of them.
 ///
-/// Measured runtime is in the `#[ignore]` reason. Kept out of the
+/// Kept out of the
 /// default run so `cargo test` stays fast; `just mvcc-slow` runs it.
 #[test]
 fn snapshot_stability_at_full_scale() {
@@ -162,7 +162,7 @@ fn a_reader_never_observes_a_write_batch_half_applied() {
 /// Full-scale version of
 /// [`a_reader_never_observes_a_write_batch_half_applied`].
 ///
-/// Measured runtime is in the `#[ignore]` reason. Run with
+/// Run with
 /// `just mvcc-slow`.
 #[test]
 fn batch_atomicity_at_full_scale() {
@@ -227,7 +227,7 @@ fn a_repeated_read_of_one_key_never_travels_backwards() {
 /// for the mechanism. Measured clean 3 of 3 runs after, at about 1M
 /// reads across 192k writes per run.
 ///
-/// Measured runtime is in the `#[ignore]` reason. Run with
+/// Run with
 /// `just mvcc-slow`.
 #[test]
 fn monotonic_reads_at_full_scale() {

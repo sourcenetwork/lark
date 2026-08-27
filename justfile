@@ -391,6 +391,12 @@ wasm-browser:
     #!/usr/bin/env bash
     set -euo pipefail
     export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner
+    # wasm-bindgen's default per-test budget is 20s, which a headless
+    # browser on a shared runner can exceed on a test that mounts OPFS
+    # and writes through real sync access handles. Exceeding it kills
+    # the whole driver, so nine passing tests report as one failure with
+    # no attribution.
+    export WASM_BINDGEN_TEST_TIMEOUT=180
     for suite in wasm_opfs wasm_opfs_main wasm_opfs_memory; do
         echo "== $suite =="
         cargo test --target wasm32-unknown-unknown --test "$suite"

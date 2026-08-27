@@ -8,7 +8,7 @@
 //!
 //! **Coverage.** Every byte offset of the WAL, of an SSTable and of the
 //! MANIFEST is truncated, and every bit of every byte is flipped, by the
-//! `#[ignore]`d sweeps. The default run takes a seeded, evenly spread
+//! exhaustive sweeps. The default run takes a seeded, evenly spread
 //! sample of the same offsets so `cargo test` stays fast. The sample is
 //! deterministic, so an offset that fails once fails every time.
 //!

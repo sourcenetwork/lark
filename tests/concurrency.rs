@@ -3,7 +3,7 @@
 //!
 //! Scenarios ported from `db_test.cc` multi-threaded tests and
 //! from the black-box core of RocksDB's `db_stress`. Long-running
-//! soak variants are gated behind `#[ignore]` so `cargo test`
+//! soak variants run in the gate too, sized so that `cargo test`
 //! stays fast for PRs; CI runs them nightly via
 //! `cargo test -- --ignored`.
 
