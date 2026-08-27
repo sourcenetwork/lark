@@ -291,6 +291,18 @@ fn a_process_kill_after_n_writes_keeps_every_one_of_them() {
 /// Catches: a WAL batch record that recovery applies operation by
 /// operation as it decodes, so a crash could expose a partial batch; and
 /// the reverse bug of acknowledging a batch before its record is written.
+/// The WAL write syscall that carries record `n`, counting from 1.
+///
+/// `Wal::create` writes the 12-byte format stamp with its own
+/// `write_all`, so the first write to a log is not a record and every
+/// record is one syscall later than its ordinal. A trigger that ignores
+/// that lands one record early and the probe measures the wrong crash
+/// point. Matches `WAL_STAMP_LEN` in `src/engine/wal.rs`.
+fn wal_write_of_record(n: u64) -> u64 {
+    const STAMP_WRITES: u64 = 1;
+    STAMP_WRITES + n
+}
+
 #[test]
 fn a_process_kill_between_a_batch_and_its_acknowledgement_recovers_the_whole_batch() {
     let tmp = TempDir::new().unwrap();
@@ -304,12 +316,15 @@ fn a_process_kill_between_a_batch_and_its_acknowledgement_recovers_the_whole_bat
         .write_buffer_size(1 << 30)
         .durability(DurabilityMode::Eventual);
     let opts = spec.options();
-    let out = CrashRun::new(spec).trigger(Trigger::wal_write(12)).run();
+    let kill_on = wal_write_of_record(12) as usize;
+    let out = CrashRun::new(spec)
+        .trigger(Trigger::wal_write(kill_on as u64))
+        .run();
     out.assert_killed();
     assert_eq!(
         out.journal.writes_to("/wal/").len(),
-        12,
-        "the kill was meant to land on the 12th WAL write syscall\n{}",
+        kill_on,
+        "the kill was meant to land on the 12th batch, WAL write {kill_on}\n{}",
         out.journal,
     );
     assert_eq!(
@@ -362,11 +377,17 @@ fn a_process_kill_between_a_batch_and_its_acknowledgement_recovers_the_whole_bat
 fn a_process_kill_part_way_through_a_wal_record_must_not_lose_the_records_before_it() {
     let tmp = TempDir::new().unwrap();
 
+    // The trigger counts WAL *write syscalls*, and group commit means a
+    // syscall is not a record: one vectored write carries a whole group,
+    // and the 12-byte format stamp is a write of its own. So these
+    // numbers are read off the journal rather than derived from an
+    // operation count. Both land inside the record stream of the first
+    // log, which is what "part way through a record" needs.
     let cases: [(&str, ChildSpec, Trigger); 2] = [
         (
             "batch of 64 writes with 1 KiB values",
             ChildSpec::new(Phase::MidWriteBatch, tmp.path().join("batch")),
-            Trigger::wal_write(11),
+            Trigger::wal_write(3),
         ),
         (
             "single put with a 64 KiB value",
@@ -377,7 +398,7 @@ fn a_process_kill_part_way_through_a_wal_record_must_not_lose_the_records_before
                 .value_len(64 * 1024)
                 .write_buffer_size(1 << 30)
                 .durability(DurabilityMode::Immediate),
-            Trigger::wal_write(20),
+            Trigger::wal_write(4),
         ),
     ];
 
@@ -464,14 +485,14 @@ fn a_process_kill_between_the_wal_append_and_the_memtable_apply_can_only_gain_da
     out.assert_killed();
     assert_eq!(
         out.journal.writes_to("/wal/").len(),
-        37,
-        "each operation should have produced exactly one WAL write syscall, so the 37th is \
-         operation 37's record\n{}",
+        wal_write_of_record(36) as usize,
+        "the first write to a log is the format stamp, so 36 operation records are 37 \
+         writes and the fatal one is operation 36's\n{}",
         out.journal,
     );
     assert_eq!(
         out.acked_count(),
-        36,
+        35,
         "the operation whose WAL record was the fatal write must not have been acknowledged",
     );
 

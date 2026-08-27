@@ -760,15 +760,18 @@ fn an_sstable_from_an_unknown_format_version_is_rejected_with_a_clear_error() {
     let offset = sst_version_byte_offset(&sst);
     let known = read_byte(&sst, offset);
     assert!(
-        known == 3 || known == 4,
-        "expected a version lark writes today (3 = flat index, 4 = partitioned; \
-         1 and 2 are the legacy unchecksummed layouts, still read but never \
-         written), found {known} at offset {offset} of {} - this test targets \
-         the wrong byte",
+        known == 5 || known == 6,
+        "expected a version lark writes today (5 = flat index, 6 = partitioned, \
+         both under the REGOSST magic; 3 and 4 are the earlier checksummed \
+         LARKSST layouts and 1 and 2 the unchecksummed ones, all still read but \
+         never written), found {known} at offset {offset} of {} - this test \
+         targets the wrong byte",
         sst.display()
     );
 
-    for future_version in [0x05u8, 0x7F, 0xFF] {
+    // 0x05 and 0x06 are real versions now, so probing them here would
+    // assert that lark refuses a table it wrote itself.
+    for future_version in [0x07u8, 0x7F, 0xFF] {
         overwrite_range(&sst, offset, &[future_version]);
         match Db::open(dir.path(), opts()) {
             Ok(_) => panic!(

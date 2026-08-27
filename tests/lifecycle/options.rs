@@ -183,9 +183,12 @@ fn reopening_that_toggles_the_partitioned_index_reads_both_layouts() {
         o.metadata_block_size = 512;
     });
 
+    // 5 is the flat footer and 6 the partitioned one, both under the
+    // REGOSST magic. 3 and 4 were their LARKSST predecessors and are
+    // still read, but a table written today carries the new pair.
     for (label, from, to, new_version) in [
-        ("flat -> partitioned", &flat, &partitioned, 4u8),
-        ("partitioned -> flat", &partitioned, &flat, 3u8),
+        ("flat -> partitioned", &flat, &partitioned, 6u8),
+        ("partitioned -> flat", &partitioned, &flat, 5u8),
     ] {
         let stage = |s: &str| format!("{label}: {s}");
         let dir = seeded_dir(400, from);

@@ -115,9 +115,16 @@ fn wal_truncated_at_arbitrary_offset_replays_the_whole_records_before_the_cut() 
         let wal = first_wal(dir.path());
         let wal_count = count_wal_files(dir.path());
         let full = fs::read(&wal).unwrap();
-        // `[len: u32 LE][type: u8][payload][crc: u32 LE]`, so this is
-        // where the first record ends.
-        let first_end = 9 + u32::from_le_bytes(full[0..4].try_into().unwrap()) as u64;
+        // `[stamp: 12][len: u32 LE][type: u8][payload][crc: u32 LE]`,
+        // so this is where the first record ends. The length is read
+        // after the stamp, not at byte zero: reading it at zero takes
+        // four bytes of the REGO stamp as a length and lands the cut
+        // somewhere arbitrary. Matches `WAL_STAMP_LEN` in
+        // `src/engine/wal.rs`.
+        const STAMP: u64 = 12;
+        let len =
+            u32::from_le_bytes(full[STAMP as usize..STAMP as usize + 4].try_into().unwrap()) as u64;
+        let first_end = STAMP + 9 + len;
         let cut = full.len() as u64 - trim;
         assert!(
             cut > first_end && cut < full.len() as u64,

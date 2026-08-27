@@ -225,11 +225,20 @@ fn invalid_cf_id_io_error(cf_id: u32) -> std::io::Error {
 }
 
 fn map_point_read_error(err: std::io::Error, prefixed_key: &[u8]) -> Error {
+    let user_key = prefixed_key.get(4..).unwrap_or(prefixed_key);
+    map_point_read_error_for(err, user_key)
+}
+
+/// [`map_point_read_error`] for a caller that already holds the user
+/// key. Stripping the column-family prefix a second time would eat
+/// four bytes of the key itself and report a truncated one, so the
+/// strip lives in exactly one place and both entries share the
+/// decision below.
+fn map_point_read_error_for(err: std::io::Error, user_key: &[u8]) -> Error {
     if err.kind() == std::io::ErrorKind::InvalidData
         && err.to_string().starts_with("merge operator ")
     {
-        let user_key = prefixed_key.get(4..).unwrap_or(prefixed_key).to_vec();
-        Error::MergeFailed(user_key)
+        Error::MergeFailed(user_key.to_vec())
     } else {
         Error::from(err)
     }
@@ -422,12 +431,10 @@ impl Db {
         // disk. User-created CFs are the only thing that produces
         // on-disk metadata writes.
         let mut entries: Vec<(String, u32)> = Vec::new();
-        let seq = self.engine.snapshot_seq();
         let pairs = collect_range(
-            &self.engine,
+            self.engine.new_iter_latest(),
             Some(&meta::name_scan_prefix()),
             Some(&meta::name_scan_upper()),
-            seq,
         )?;
         for (key, value) in pairs {
             // A meta value that is not a 4-byte id is not one of ours.
@@ -475,15 +482,13 @@ impl Db {
     /// (`core`'s `PartialEq` for `Option` is homogeneous), so this
     /// method is additive and [`Db::get`] keeps its signature.
     pub fn get_slice(&self, key: &[u8]) -> Result<Option<DbSlice>> {
-        let seq = self.engine.snapshot_seq();
-        self.lookup_slice(&LookupKey::new(DEFAULT_CF_ID, key, seq))
+        self.lookup_slice_latest(DEFAULT_CF_ID, key)
     }
 
     /// [`Db::get_slice`] scoped to a column family.
     pub fn get_slice_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<Option<DbSlice>> {
         self.validate_cf_handle(cf)?;
-        let seq = self.engine.snapshot_seq();
-        self.lookup_slice(&LookupKey::new(cf.id(), key, seq))
+        self.lookup_slice_latest(cf.id(), key)
     }
 
     /// Whether a live value exists for `key` in the default column
@@ -516,21 +521,23 @@ impl Db {
     /// copy. See [`Db::has`] for what that does and does not save, and
     /// for the [`MergeOperator`] caveat.
     pub fn get_size(&self, key: &[u8]) -> Result<Option<usize>> {
-        let seq = self.engine.snapshot_seq();
-        self.lookup_size(&LookupKey::new(DEFAULT_CF_ID, key, seq))
+        self.lookup_size_latest(DEFAULT_CF_ID, key)
     }
 
     /// [`Db::get_size`] scoped to a column family.
     pub fn get_size_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<Option<usize>> {
         self.validate_cf_handle(cf)?;
-        let seq = self.engine.snapshot_seq();
-        self.lookup_size(&LookupKey::new(cf.id(), key, seq))
+        self.lookup_size_latest(cf.id(), key)
     }
 
-    /// The one point-read implementation every `get*` entry point
-    /// projects from, so statistics and perf counters are recorded
-    /// identically no matter which one the caller used.
-    fn lookup_slice(&self, lk: &LookupKey) -> Result<Option<DbSlice>> {
+    /// [`Db::lookup_slice`] for a read of the newest visible value.
+    ///
+    /// The engine samples the read horizon against the view it walks,
+    /// which a caller cannot do for it: building a `LookupKey` here
+    /// would fix the sequence before the engine loads its view, and a
+    /// compaction in between can drop the newest version at or below
+    /// it, so the read reports the key absent or an older value.
+    fn lookup_slice_latest(&self, cf_id: u32, key: &[u8]) -> Result<Option<DbSlice>> {
         let stats = self.stats();
         let _scope = statistics::TimeScope::new(stats, Histogram::DbGet);
         if let Some(s) = stats {
@@ -539,8 +546,8 @@ impl Db {
         perf_context::record_get_call();
         let result = self
             .engine
-            .get_slice(lk)
-            .map_err(|err| map_point_read_error(err, lk.prefixed_user_key()));
+            .get_slice_latest(cf_id, key)
+            .map_err(|err| map_point_read_error_for(err, key));
         if let (Some(s), Ok(Some(v))) = (stats, &result) {
             s.add(Ticker::BytesRead, v.len() as u64);
             s.record(Histogram::BytesPerRead, v.len() as u64);
@@ -548,10 +555,8 @@ impl Db {
         result
     }
 
-    /// The length-only twin of [`Db::lookup_slice`], sharing the
-    /// engine's single source walk. `Ticker::BytesRead` is deliberately
-    /// not recorded: no bytes were handed to the caller.
-    fn lookup_size(&self, lk: &LookupKey) -> Result<Option<usize>> {
+    /// The length-only twin of [`Db::lookup_slice_latest`].
+    fn lookup_size_latest(&self, cf_id: u32, key: &[u8]) -> Result<Option<usize>> {
         let stats = self.stats();
         let _scope = statistics::TimeScope::new(stats, Histogram::DbGet);
         if let Some(s) = stats {
@@ -559,8 +564,8 @@ impl Db {
         }
         perf_context::record_get_call();
         self.engine
-            .get_size(lk)
-            .map_err(|err| map_point_read_error(err, lk.prefixed_user_key()))
+            .get_size_latest(cf_id, key)
+            .map_err(|err| map_point_read_error_for(err, key))
     }
 
     /// Helper that exposes a borrowed reference to the engine's
@@ -1018,8 +1023,12 @@ impl Db {
             Some(e) => prefix_key(DEFAULT_CF_ID, e),
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
-        let seq = self.engine.snapshot_seq();
-        let raw = collect_range(&self.engine, Some(&lo), Some(&hi), seq)?;
+        // `new_iter_latest` loads the published view and *then* samples the
+        // horizon. Sampling first and building the iterator after leaves a
+        // window where a compaction no snapshot pins can drop the newest
+        // version at or below the sampled sequence, after which the scan
+        // finds only versions it must filter out and a key reads absent.
+        let raw = collect_range(self.engine.new_iter_latest(), Some(&lo), Some(&hi))?;
         strip_cf_prefix_entries(raw)
     }
 
@@ -1045,8 +1054,7 @@ impl Db {
             Some(e) => prefix_key(DEFAULT_CF_ID, e),
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
-        let seq = self.engine.snapshot_seq();
-        collect_page(&self.engine, &lo, &hi, seq, limit).and_then(strip_cf_prefix_page)
+        collect_page(self.engine.new_iter_latest(), &lo, &hi, limit).and_then(strip_cf_prefix_page)
     }
 
     /// Create a streaming iterator over the default column family.
@@ -1472,7 +1480,11 @@ impl Db {
             return Ok(existing);
         }
         self.validate_prefixed_key_size(&meta::name_key(name))?;
-        let (handle, next_id) = self.cfs.allocate(name);
+        let Some((handle, next_id)) = self.cfs.allocate(name) else {
+            return Err(Error::invalid_argument(
+                "the column-family id space is exhausted",
+            ));
+        };
         let mut batch = BTreeMap::new();
         batch.insert(
             meta::name_key(name),
@@ -1632,8 +1644,12 @@ impl Db {
             Some(e) => prefix_key(cf.id(), e),
             None => cf_upper_bound(cf.id()),
         };
-        let seq = self.engine.snapshot_seq();
-        let raw = collect_range(&self.engine, Some(&lo), Some(&hi), seq)?;
+        // `new_iter_latest` loads the published view and *then* samples the
+        // horizon. Sampling first and building the iterator after leaves a
+        // window where a compaction no snapshot pins can drop the newest
+        // version at or below the sampled sequence, after which the scan
+        // finds only versions it must filter out and a key reads absent.
+        let raw = collect_range(self.engine.new_iter_latest(), Some(&lo), Some(&hi))?;
         strip_cf_prefix_entries(raw)
     }
 
@@ -1658,8 +1674,7 @@ impl Db {
             Some(e) => prefix_key(cf.id(), e),
             None => cf_upper_bound(cf.id()),
         };
-        let seq = self.engine.snapshot_seq();
-        collect_page(&self.engine, &lo, &hi, seq, limit).and_then(strip_cf_prefix_page)
+        collect_page(self.engine.new_iter_latest(), &lo, &hi, limit).and_then(strip_cf_prefix_page)
     }
 
     /// Streaming iterator bounded to column family `cf`. The
@@ -2074,7 +2089,7 @@ impl Snapshot {
             Some(e) => prefix_key(DEFAULT_CF_ID, e),
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
-        let raw = collect_range(&self.engine, Some(&lo), Some(&hi), self.seq)?;
+        let raw = collect_range(self.engine.new_iter_at(self.seq), Some(&lo), Some(&hi))?;
         strip_cf_prefix_entries(raw)
     }
 
@@ -2097,7 +2112,8 @@ impl Snapshot {
             Some(e) => prefix_key(DEFAULT_CF_ID, e),
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
-        collect_page(&self.engine, &lo, &hi, self.seq, limit).and_then(strip_cf_prefix_page)
+        collect_page(self.engine.new_iter_at(self.seq), &lo, &hi, limit)
+            .and_then(strip_cf_prefix_page)
     }
 
     /// Create a streaming iterator anchored at this snapshot
@@ -2166,7 +2182,7 @@ impl Snapshot {
             Some(e) => prefix_key(cf.id(), e),
             None => cf_upper_bound(cf.id()),
         };
-        let raw = collect_range(&self.engine, Some(&lo), Some(&hi), self.seq)?;
+        let raw = collect_range(self.engine.new_iter_at(self.seq), Some(&lo), Some(&hi))?;
         strip_cf_prefix_entries(raw)
     }
 
@@ -2192,7 +2208,8 @@ impl Snapshot {
             Some(e) => prefix_key(cf.id(), e),
             None => cf_upper_bound(cf.id()),
         };
-        collect_page(&self.engine, &lo, &hi, self.seq, limit).and_then(strip_cf_prefix_page)
+        collect_page(self.engine.new_iter_at(self.seq), &lo, &hi, limit)
+            .and_then(strip_cf_prefix_page)
     }
 
     /// CF-scoped streaming iterator at this snapshot.
@@ -2211,12 +2228,10 @@ impl Snapshot {
 /// iterator. This is the engine of `Db::scan` / `Snapshot::scan`; the
 /// dedicated method exists so both callers share one merge implementation.
 fn collect_range(
-    engine: &LarkEngine,
+    mut iter: crate::engine::iterator::LarkIterator,
     start: Option<&[u8]>,
     end: Option<&[u8]>,
-    snapshot_seq: u64,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let mut iter = engine.new_iter_at(snapshot_seq);
     match start {
         Some(s) => iter.seek(s),
         None => iter.seek_to_first(),
@@ -2241,10 +2256,9 @@ fn collect_range(
 }
 
 fn collect_page(
-    engine: &LarkEngine,
+    mut iter: crate::engine::iterator::LarkIterator,
     start: &[u8],
     end: &[u8],
-    snapshot_seq: u64,
     limit: usize,
 ) -> Result<ScanPage> {
     if limit == 0 {
@@ -2253,7 +2267,6 @@ fn collect_page(
         ));
     }
 
-    let mut iter = engine.new_iter_at(snapshot_seq);
     iter.seek(start);
     iter.status().map_err(Error::from)?;
 

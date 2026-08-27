@@ -974,7 +974,24 @@ impl LarkEngine {
     /// that moment and every later view still exposes that memtable's
     /// data, as `active`, as `frozen`, or folded into the version.
     pub(crate) fn get_latest(&self, key: &[u8]) -> std::io::Result<Option<Vec<u8>>> {
-        self.get(key, self.visible_seq.visible())
+        self.ensure_open()?;
+        let view = self.view.load();
+        let lk = LookupKey::from_prefixed(key, self.visible_seq.visible());
+        if self.options.merge_operator.is_some() {
+            return Ok(self.get_with_merge(&lk)?.map(DbSlice::into_vec));
+        }
+        Ok(self
+            .lookup_in_view(
+                lk.prefixed_user_key(),
+                lk.snapshot_seq(),
+                &lk,
+                Materialize::Value,
+                &view,
+            )?
+            .and_then(|v| match v {
+                PointValue::Value(value) => Some(value.into_vec()),
+                PointValue::Length(_) => None,
+            }))
     }
 
     /// Point lookup at a caller-pinned snapshot sequence. The
@@ -1013,6 +1030,46 @@ impl LarkEngine {
     /// [`LarkEngine::get`] without copying the value. The returned
     /// [`DbSlice`] borrows the block or heap buffer the value already
     /// lives in and keeps that owner alive.
+    /// The sequence a "read the latest" caller must use, sampled with
+    /// the view it will read through already loaded.
+    ///
+    /// The order is load-bearing and it is the whole reason this is not
+    /// `visible_seq.visible()` at the call site. Sampling the horizon
+    /// first and loading the view afterwards leaves a window in
+    /// between: `snapshot_seq()` registers nothing in the
+    /// [`SnapshotRegistry`], so a compaction is free to drop the newest
+    /// version at or below the sampled sequence, and the read then
+    /// walks a view that no longer holds it and reports the key absent
+    /// or an older value. That is a read travelling backwards.
+    ///
+    /// Loading the view first pins the sources, so every version the
+    /// sampled horizon admits is still reachable through it.
+    ///
+    /// A caller reading at a *pinned* snapshot does not need this: the
+    /// registration is what holds the versions, so the order does not
+    /// matter there. See [`LarkEngine::get_at`].
+    /// Newest visible value for `key`, without copying it.
+    pub(crate) fn get_slice_latest(
+        &self,
+        cf_id: u32,
+        key: &[u8],
+    ) -> std::io::Result<Option<DbSlice>> {
+        match self.lookup_latest_cf(cf_id, key, Materialize::Value)? {
+            Some(PointValue::Value(value)) => Ok(Some(value)),
+            Some(PointValue::Length(_)) => Err(std::io::Error::other(
+                "point lookup produced a length where a value was requested",
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Length of the newest visible value for `key`, or `None`.
+    pub(crate) fn get_size_latest(&self, cf_id: u32, key: &[u8]) -> std::io::Result<Option<usize>> {
+        Ok(self
+            .lookup_latest_cf(cf_id, key, Materialize::LengthOnly)?
+            .map(|v| v.len()))
+    }
+
     pub(crate) fn get_slice(&self, lk: &LookupKey) -> std::io::Result<Option<DbSlice>> {
         match self.lookup(lk, Materialize::Value)? {
             Some(PointValue::Value(value)) => Ok(Some(value)),
@@ -1069,9 +1126,61 @@ impl LarkEngine {
             // collapse the chain exactly like a full read does.
             return Ok(self.get_with_merge(lk)?.map(PointValue::Value));
         }
-        let key = lk.prefixed_user_key();
-        let snapshot_seq = lk.snapshot_seq();
         let view = self.view.load();
+        self.lookup_in_view(
+            lk.prefixed_user_key(),
+            lk.snapshot_seq(),
+            lk,
+            materialize,
+            &view,
+        )
+    }
+
+    /// Read the newest visible value for `key`, sampling the horizon
+    /// against the very view the read then walks.
+    ///
+    /// One view load, one sample, in that order. Sampling first and
+    /// loading afterwards leaves a window where a compaction can drop
+    /// the newest version at or below the sampled sequence, and the
+    /// read reports the key absent or an older value: a read that
+    /// travels backwards. Sampling under a *different* view load than
+    /// the one the read walks has the same hole, only narrower, which
+    /// is why the two happen here together rather than in a helper the
+    /// caller composes.
+    fn lookup_latest_cf(
+        &self,
+        cf_id: u32,
+        key: &[u8],
+        materialize: Materialize,
+    ) -> std::io::Result<Option<PointValue>> {
+        self.ensure_open()?;
+        let view = self.view.load();
+        // `LookupKey::new` writes the prefix into its own inline buffer,
+        // so the read path stays allocation-free: prefixing into a
+        // `Vec` here would put a malloc on every point read.
+        let lk = LookupKey::new(cf_id, key, self.visible_seq.visible());
+        let snapshot_seq = lk.snapshot_seq();
+        if self.options.merge_operator.is_some() {
+            return Ok(self.get_with_merge(&lk)?.map(PointValue::Value));
+        }
+        self.lookup_in_view(
+            lk.prefixed_user_key(),
+            snapshot_seq,
+            &lk,
+            materialize,
+            &view,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lookup_in_view(
+        &self,
+        key: &[u8],
+        snapshot_seq: u64,
+        lk: &LookupKey,
+        materialize: Materialize,
+        view: &ReadView,
+    ) -> std::io::Result<Option<PointValue>> {
         let mut max_rt_seq: u64 = 0;
 
         // Memtable phase - timed via `PerfContext` at
