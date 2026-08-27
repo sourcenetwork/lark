@@ -49,19 +49,21 @@ mod harness;
 
 use common::fault::{
     builtin_workload, child_entrypoint, flip_bit, garbage, overwrite_range, truncate_at,
-    validate_prefix_of_state,
 };
+// Used only by the WAL sweeps, which are linux-only.
+#[cfg(target_os = "linux")]
+use common::fault::validate_prefix_of_state;
 use harness::{
     BLOOM, DATA, FOOTER, INDEX, Recovered, SAMPLE, SEED, TAG_ADD_FILE, Tally,
     assert_engine_never_panicked, every, exactly, manifest_frames, never_invents, read_state,
-    region, sample, sst_regions, table_fixture, trial, valid_prefix, wal_frames, watch,
+    region, sample, sst_regions, table_fixture, trial, watch,
 };
 // The WAL fixtures are built by killing a child process, so they exist
 // only where "was it killed" has an answer. The SSTable and MANIFEST
 // sweeps below use `table_fixture`, which spawns nothing, and run
 // everywhere.
 #[cfg(target_os = "linux")]
-use harness::{batch_fixture, wal_fixture};
+use harness::{batch_fixture, valid_prefix, wal_fixture, wal_frames};
 
 // ─── WAL: truncation ────────────────────────────────────────────────────
 

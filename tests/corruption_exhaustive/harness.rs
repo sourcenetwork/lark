@@ -18,10 +18,15 @@ use std::sync::{Arc, Mutex, Once, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lark_kv::{Db, DurabilityMode, Options};
+#[cfg(target_os = "linux")]
+use lark_kv::DurabilityMode;
+use lark_kv::{Db, Options};
 use tempfile::TempDir;
 
-use crate::common::fault::{ChildSpec, CrashRun, History, Phase, validate_prefix_of_state};
+use crate::common::fault::History;
+// Only the WAL fixtures spawn a child, and they exist only on linux.
+#[cfg(target_os = "linux")]
+use crate::common::fault::{ChildSpec, CrashRun, Phase, validate_prefix_of_state};
 
 /// Seed for every sampled sweep. Fixed, so a failing offset is reported
 /// once and reproduced on the next run without a `--seed` dance.
@@ -47,6 +52,10 @@ pub struct Fixture {
     /// process state rather than data and is left out.
     files: Vec<(String, Vec<u8>)>,
     /// The writes that produced it, in order.
+    /// The write history the fixture replayed. Read only by the WAL
+    /// sweeps, which are linux-only, but carried on every platform so
+    /// the fixture type does not change shape between them.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub history: History,
     /// What an uncorrupted open reads back.
     pub state: State,
@@ -408,6 +417,7 @@ pub fn never_invents(pristine: &State) -> impl Fn(&State) -> Result<(), String> 
 
 /// The recovered state must be the state after some whole number of the
 /// intended writes: no gap, no reordering, no half-applied `WriteBatch`.
+#[cfg(target_os = "linux")]
 pub fn valid_prefix(history: &History) -> impl Fn(&State) -> Result<(), String> + '_ {
     move |state| {
         validate_prefix_of_state(state, history)
@@ -623,6 +633,7 @@ fn frames(bytes: &[u8], header: usize) -> Vec<Frame> {
 }
 
 /// WAL frames, with a header of `[len: u32][type: u8]`.
+#[cfg(target_os = "linux")]
 pub fn wal_frames(bytes: &[u8]) -> Vec<Frame> {
     let f = frames(bytes, 5);
     assert!(!f.is_empty(), "the WAL fixture parsed as zero records");
