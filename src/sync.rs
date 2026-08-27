@@ -52,14 +52,14 @@ use std::sync as imp;
 
 pub(crate) use imp::{Condvar, MutexGuard, RwLockReadGuard, RwLockWriteGuard};
 
-use std::sync::PoisonError;
+use std::sync::{PoisonError, TryLockError};
 
 /// A mutex that hands back its guard rather than a `LockResult`.
 ///
 /// See the module docs for why poisoning is absorbed rather than
 /// propagated.
 #[derive(Default)]
-pub(crate) struct Mutex<T: ?Sized>(imp::Mutex<T>);
+pub(crate) struct Mutex<T>(imp::Mutex<T>);
 
 impl<T> Mutex<T> {
     /// A new mutex holding `value`.
@@ -83,7 +83,7 @@ impl<T> Mutex<T> {
     }
 }
 
-impl<T: ?Sized> Mutex<T> {
+impl<T> Mutex<T> {
     /// Lock, blocking until the mutex is available.
     pub(crate) fn lock(&self) -> MutexGuard<'_, T> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
@@ -93,8 +93,8 @@ impl<T: ?Sized> Mutex<T> {
     pub(crate) fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
         match self.0.try_lock() {
             Ok(guard) => Some(guard),
-            Err(imp::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
-            Err(imp::TryLockError::WouldBlock) => None,
+            Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
         }
     }
 
@@ -106,7 +106,7 @@ impl<T: ?Sized> Mutex<T> {
     }
 }
 
-impl<T: ?Sized + std::fmt::Debug> std::fmt::Debug for Mutex<T> {
+impl<T: std::fmt::Debug> std::fmt::Debug for Mutex<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
     }
@@ -118,7 +118,7 @@ impl<T: ?Sized + std::fmt::Debug> std::fmt::Debug for Mutex<T> {
 /// See the module docs for why poisoning is absorbed rather than
 /// propagated.
 #[derive(Default)]
-pub(crate) struct RwLock<T: ?Sized>(imp::RwLock<T>);
+pub(crate) struct RwLock<T>(imp::RwLock<T>);
 
 impl<T> RwLock<T> {
     /// A new lock holding `value`.
@@ -136,7 +136,7 @@ impl<T> RwLock<T> {
     }
 }
 
-impl<T: ?Sized> RwLock<T> {
+impl<T> RwLock<T> {
     /// Take shared access, blocking until no writer holds the lock.
     pub(crate) fn read(&self) -> RwLockReadGuard<'_, T> {
         self.0.read().unwrap_or_else(PoisonError::into_inner)
@@ -148,7 +148,7 @@ impl<T: ?Sized> RwLock<T> {
     }
 }
 
-impl<T: ?Sized + std::fmt::Debug> std::fmt::Debug for RwLock<T> {
+impl<T: std::fmt::Debug> std::fmt::Debug for RwLock<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
     }
@@ -210,10 +210,15 @@ impl Gate {
 
     /// Enter exclusive, returning a guard that keeps the gate alive
     /// itself and so may outlive this call.
-    pub(crate) fn write_owned(self: &Arc<Self>) -> OwnedGateWriteGuard {
-        self.acquire_write();
+    ///
+    /// An associated function taking `std::sync::Arc` rather than a
+    /// method: only `std::sync::Arc` is a legal `self` receiver, and the
+    /// gate is not model-checked, so it uses the real `Arc` in both
+    /// builds and agrees with the engine's.
+    pub(crate) fn write_owned(gate: &std::sync::Arc<Self>) -> OwnedGateWriteGuard {
+        gate.acquire_write();
         OwnedGateWriteGuard {
-            gate: Arc::clone(self),
+            gate: std::sync::Arc::clone(gate),
         }
     }
 
@@ -276,7 +281,7 @@ impl Drop for GateWriteGuard<'_> {
 /// Exclusive claim on a [`Gate`] that owns its share of the gate, so it
 /// can be returned from the call that took it.
 pub(crate) struct OwnedGateWriteGuard {
-    gate: Arc<Gate>,
+    gate: std::sync::Arc<Gate>,
 }
 
 impl Drop for OwnedGateWriteGuard {
@@ -392,7 +397,7 @@ mod tests {
     }
 
     fn held_by_a_returned_value(gate: &Arc<Gate>) -> OwnedGateWriteGuard {
-        gate.write_owned()
+        Gate::write_owned(gate)
     }
 
     #[test]

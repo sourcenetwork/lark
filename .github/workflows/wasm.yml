@@ -90,6 +90,7 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@wasm-bindgen
       - uses: jetli/wasm-pack-action@v0.4.0
       - name: OPFS round trip in headless Firefox
         run: just wasm-browser

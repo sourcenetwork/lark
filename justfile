@@ -33,8 +33,11 @@ msrv:
     cargo "+$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" check --workspace
 
 # The summary line CI annotates a build with.
+# Through nextest, like the gate: one process per test, so a wedged
+# test fails on the profile's slow-timeout instead of holding the whole
+# instrumented run open until the job's ceiling.
 cov-summary:
-    cargo llvm-cov --summary-only
+    cargo llvm-cov nextest --summary-only --workspace
 
 # The browsable HTML report, for reading locally.
 cov:
@@ -51,7 +54,7 @@ test-fault:
 # default run so `cargo test` stays quick.
 
 test-fault-slow:
-    cargo test --test fault_smoke -- --ignored --skip crash_child
+    cargo nextest run --test fault_smoke
 
 # The `#[ignore]`d resource-exhaustion and extremes tests: six-figure key
 # counts, a 64 MiB value, megabyte keys, a six-level cascade, and a real
@@ -76,7 +79,7 @@ test-power:
 # file on its own. Measured at 0.6s, spawning 41 child processes.
 
 test-corruption-slow:
-    cargo test --test corruption_exhaustive -- --ignored --skip crash_child
+    cargo nextest run --test corruption_exhaustive
 
 # The power-loss durability tests, with output shown so the measured cost of
 # the default DurabilityMode::Eventual is visible. Every test here spawns a
@@ -84,12 +87,12 @@ test-corruption-slow:
 # Measured at 0.6s in total, so it also runs in the default `cargo test`.
 
 test-durability-slow:
-    cargo test --test proptest_durability -- --ignored --skip crash_child
+    cargo nextest run --test proptest_durability
 
 # Every ignored test in the workspace, including the scheduled stress runs.
 
 test-extremes:
-    cargo test --test resource_limits -- --ignored --nocapture --test-threads 1 --skip crash_child
+    cargo nextest run --test resource_limits --no-capture --test-threads 1
 
 # The `#[ignore]`d durability property test: 128 randomized operation
 # sequences, each run in a child process that is killed part way through
@@ -106,7 +109,7 @@ test-lifecycle:
 # 0.5s, so every test in the fast set also runs in the default `cargo test`.
 
 test-slow:
-    cargo test --workspace --release -- --ignored --skip crash_child --nocapture
+    cargo nextest run --workspace --release --no-capture
 
 # Rebuild the LD_PRELOAD fault shim from scratch by dropping its cache.
 
@@ -131,7 +134,7 @@ mvcc:
 # `a_user_thread_compact_range_never_makes_a_read_travel_backwards`.
 
 mvcc-slow:
-    cargo test --test mvcc_invariants -- --ignored --nocapture --skip crash_child
+    cargo nextest run --test mvcc_invariants --no-capture
 
 set shell := ["bash", "-uc"]
 

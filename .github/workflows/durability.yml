@@ -36,6 +36,7 @@ jobs:
       - uses: extractions/setup-just@v2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
       - name: Crash recovery
         run: just test-crash
       - name: Power loss
@@ -63,6 +64,7 @@ jobs:
       - uses: extractions/setup-just@v2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
       - name: Exhaustive corruption sweep
         run: just test-corruption-slow
       - name: Model-based durability proptest

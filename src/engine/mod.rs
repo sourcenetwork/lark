@@ -2201,17 +2201,49 @@ impl LarkEngine {
         // memtable is what lets that flush unlink the right one.
         sealed.seal_wal(old_wal.path().to_path_buf());
         drop(old_wal);
-        self.flush_frozen_memtable()?;
+        self.flush_until_retired(&sealed)?;
         self.refresh_stall_level();
 
         Ok(())
     }
 
-    fn flush_frozen_memtable(&self) -> std::io::Result<()> {
-        // Held for the whole flush, so the victim chosen below is still
-        // this flush's to retire when the SSTable naming it is
-        // published. See the `flushing` field for what happens without
-        // it.
+    /// Flush frozen memtables, oldest first, until `target` is no
+    /// longer in the frozen list.
+    ///
+    /// The caller names the memtable it needs durable rather than a
+    /// count of passes, so a concurrent rotation cannot extend the work
+    /// and a concurrent flush that already retired the target ends it
+    /// early. Each pass takes the oldest frozen memtable, whoever asked:
+    /// L0 files carry no sequence of their own and readers take the
+    /// most recently added as the newest, so flushing out of order would
+    /// publish an older file over a newer one and make a read travel
+    /// backwards.
+    fn flush_until_retired(&self, target: &Arc<MemTable>) -> std::io::Result<()> {
+        while self
+            .view
+            .load()
+            .frozen
+            .iter()
+            .any(|mt| Arc::ptr_eq(mt, target))
+        {
+            if !self.flush_oldest_frozen()? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the oldest frozen memtable out to an L0 SSTable and retire
+    /// it. Returns `false` when there was nothing frozen to flush.
+    ///
+    /// Serialized against itself. The exclusion is not protecting shared
+    /// state, which the read view already publishes atomically: it is
+    /// what keeps L0 installs in the order the memtables were sealed,
+    /// because the format gives an L0 file no sequence of its own and
+    /// recency is install order. Two flushes racing would install a
+    /// newer file under an older one, and a read that had seen the newer
+    /// version would then see the older one.
+    fn flush_oldest_frozen(&self) -> std::io::Result<bool> {
         let _flushing = self.flushing.lock();
 
         // Through the env: a target with no monotonic clock reports
@@ -2219,7 +2251,7 @@ impl LarkEngine {
         let flush_start = self.env.now_micros();
         let memtable = match self.view.load().frozen.first() {
             Some(mt) => Arc::clone(mt),
-            None => return Ok(()),
+            None => return Ok(false),
         };
 
         let range_tombstones = memtable.clone_range_tombstones();
@@ -2227,7 +2259,7 @@ impl LarkEngine {
         if memtable.is_empty() && range_tombstones.is_empty() {
             self.retire_frozen(&memtable);
             self.remove_sealed_wal(&memtable);
-            return Ok(());
+            return Ok(true);
         }
 
         let file_id = {
@@ -2270,7 +2302,7 @@ impl LarkEngine {
                 self.retire_frozen(&memtable);
                 self.remove_sealed_wal(&memtable);
                 let _ = self.env.remove_file(&sst_path);
-                return Ok(());
+                return Ok(true);
             }
         };
 
@@ -2380,7 +2412,7 @@ impl LarkEngine {
             "Flushed memtable to L0 SSTable"
         );
 
-        Ok(())
+        Ok(true)
     }
 
     /// Synchronously compact SSTables overlapping the user-key range
@@ -2832,7 +2864,7 @@ impl LarkEngine {
         // because flushing needs it.
         self.drain_memtables(ActiveFlush::Always)?;
 
-        let compaction_guard = self.compaction_lock.write_owned();
+        let compaction_guard = Gate::write_owned(&self.compaction_lock);
         self.ensure_writable()?;
 
         let version;
@@ -3220,25 +3252,24 @@ impl LarkEngine {
                 !view.active.is_empty() || !view.active.clone_range_tombstones().is_empty()
             }
         };
-        loop {
-            let should_flush = {
-                let view = self.view.load();
-                active_pending(&view) || !view.frozen.is_empty()
-            };
-            if !should_flush {
+
+        // The set to drain is fixed here and never extended. A drain that
+        // re-read the view each pass would chase memtables that writers
+        // created after it started, and under a steady write load it
+        // would never finish: `Db::checkpoint` calls this with
+        // `ActiveFlush::Always`, so a checkpoint taken while anything is
+        // writing would hang rather than capture.
+        let targets: Vec<Arc<MemTable>> = {
+            let _write_guard = self.pipeline.lock();
+            let view = self.view.load();
+            let seal_active = active_pending(&view);
+            if !seal_active && view.frozen.is_empty() {
                 return Ok(());
             }
+            let mut targets = view.frozen.clone();
+            drop(view);
 
-            {
-                let _write_guard = self.pipeline.lock();
-                let view = self.view.load();
-                let active_needs_flush = active_pending(&view);
-                let has_frozen = !view.frozen.is_empty();
-                drop(view);
-                if !active_needs_flush && !has_frozen {
-                    continue;
-                }
-
+            if seal_active {
                 let new_wal_id = {
                     let mut versions = self.versions.lock();
                     let version = versions.current();
@@ -3249,20 +3280,16 @@ impl LarkEngine {
                 let wal_for_flush =
                     Wal::create_in(&self.env, &self.wal_dir.join(wal_filename(new_wal_id)))?;
 
-                let sealed = if active_needs_flush {
-                    // One publication for the seal and the enqueue: two
-                    // would leave a window where the sealed memtable is
-                    // in neither the active slot nor the frozen list.
-                    let fresh = Arc::new(MemTable::new(&self.memtable_config)?);
-                    Some(self.view.update_memtables(|active, frozen| {
-                        let sealed = Arc::clone(active);
-                        let mut next_frozen = frozen.to_vec();
-                        next_frozen.push(Arc::clone(&sealed));
-                        (fresh, next_frozen, sealed)
-                    }))
-                } else {
-                    None
-                };
+                // One publication for the seal and the enqueue: two
+                // would leave a window where the sealed memtable is in
+                // neither the active slot nor the frozen list.
+                let fresh = Arc::new(MemTable::new(&self.memtable_config)?);
+                let sealed = self.view.update_memtables(|active, frozen| {
+                    let sealed = Arc::clone(active);
+                    let mut next_frozen = frozen.to_vec();
+                    next_frozen.push(Arc::clone(&sealed));
+                    (fresh, next_frozen, sealed)
+                });
 
                 let old_wal = self
                     .active_wal
@@ -3270,13 +3297,19 @@ impl LarkEngine {
                     .replace(wal_for_flush)
                     .ok_or_else(Self::read_only_error)?;
                 self.wal_id.store(new_wal_id, Ordering::Release);
-                if let Some(sealed) = sealed {
-                    sealed.seal_wal(old_wal.path().to_path_buf());
-                }
-            };
+                sealed.seal_wal(old_wal.path().to_path_buf());
+                targets.push(sealed);
+            }
+            targets
+        };
 
-            self.flush_frozen_memtable()?;
+        // Oldest first, which is also the order `flush_until_retired`
+        // writes them in, so a target that an earlier pass already
+        // flushed costs one list scan and no work.
+        for target in &targets {
+            self.flush_until_retired(target)?;
         }
+        Ok(())
     }
 }
 

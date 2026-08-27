@@ -87,7 +87,7 @@ struct State {
 /// Default rate-limiter implementation: a single token bucket refilled
 /// at `bytes_per_second` bytes/sec with a burst capacity of `burst_bytes`.
 ///
-/// All waiters share one [`Mutex`] and one [`Condvar`]; on wakeup, each
+/// All waiters share one mutex and one condition variable; on wakeup, each
 /// waiter checks whether it is at the front of the FIFO queue (highest
 /// priority, lowest seq) and, if so, whether enough tokens have
 /// accumulated. Waiters that aren't at the front simply go back to
