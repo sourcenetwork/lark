@@ -1721,6 +1721,22 @@ impl LarkEngine {
         self.view.retire_memtable(flushed);
     }
 
+    /// Unlink the log that backed `flushed`, now that its records are in
+    /// an SSTable the published version references.
+    ///
+    /// Keyed off the memtable rather than off whatever log the caller
+    /// happened to seal. A flush and the seal that fed it are not
+    /// necessarily about the same memtable: the seal appends to the
+    /// frozen list while the flush takes the front of it, and the two
+    /// are separated by a whole SSTable write. Unlinking the caller's
+    /// log would delete the only durable copy of a memtable that has not
+    /// been flushed, and a crash would then lose every write in it.
+    fn remove_sealed_wal(&self, flushed: &MemTable) {
+        if let Some(path) = flushed.sealed_wal() {
+            let _ = Wal::remove_in(&*self.env, path);
+        }
+    }
+
     /// Snapshot the current write-stall inputs: L0 file count,
     /// in-memory memtable count (active + frozen), and total bytes
     /// across all L0 files (lark's approximation of pending
@@ -2149,10 +2165,11 @@ impl LarkEngine {
         // before the publication so the fallible allocation happens
         // once, outside it.
         let fresh = Arc::new(MemTable::new(&self.memtable_config)?);
-        self.view.update_memtables(|active, frozen| {
+        let sealed = self.view.update_memtables(|active, frozen| {
+            let sealed = Arc::clone(active);
             let mut next_frozen = frozen.to_vec();
-            next_frozen.push(Arc::clone(active));
-            (fresh, next_frozen, ())
+            next_frozen.push(Arc::clone(&sealed));
+            (fresh, next_frozen, sealed)
         });
 
         let new_wal_id = {
@@ -2172,13 +2189,19 @@ impl LarkEngine {
         };
 
         self.wal_id.store(new_wal_id, Ordering::Release);
-        self.flush_frozen_memtable(old_wal)?;
+        // The log that was active while `sealed` took writes is the one
+        // `sealed`'s records are in, and the only durable copy of them
+        // until a flush publishes an SSTable. Stamping it on the
+        // memtable is what lets that flush unlink the right one.
+        sealed.seal_wal(old_wal.path().to_path_buf());
+        drop(old_wal);
+        self.flush_frozen_memtable()?;
         self.refresh_stall_level();
 
         Ok(())
     }
 
-    fn flush_frozen_memtable(&self, old_wal: Wal) -> std::io::Result<()> {
+    fn flush_frozen_memtable(&self) -> std::io::Result<()> {
         // Held for the whole flush, so the victim chosen below is still
         // this flush's to retire when the SSTable naming it is
         // published. See the `flushing` field for what happens without
@@ -2197,7 +2220,7 @@ impl LarkEngine {
 
         if memtable.is_empty() && range_tombstones.is_empty() {
             self.retire_frozen(&memtable);
-            let _ = Wal::remove_in(&*self.env, old_wal.path());
+            self.remove_sealed_wal(&memtable);
             return Ok(());
         }
 
@@ -2239,8 +2262,8 @@ impl LarkEngine {
             Some(s) => s,
             None => {
                 self.retire_frozen(&memtable);
-                let _ = Wal::remove_in(&*self.env, old_wal.path());
-                let _ = std::fs::remove_file(&sst_path);
+                self.remove_sealed_wal(&memtable);
+                let _ = self.env.remove_file(&sst_path);
                 return Ok(());
             }
         };
@@ -2282,7 +2305,7 @@ impl LarkEngine {
         // Retired only now: until the `AddFile` above is published, the
         // flushed data lives in this memtable alone.
         self.retire_frozen(&memtable);
-        let _ = Wal::remove_in(&*self.env, old_wal.path());
+        self.remove_sealed_wal(&memtable);
         self.compaction.lock().notify();
 
         // Publish flush statistics before the listener dispatch
@@ -3200,7 +3223,7 @@ impl LarkEngine {
                 return Ok(());
             }
 
-            let old_wal = {
+            {
                 let _write_guard = self.pipeline.lock();
                 let view = self.view.load();
                 let active_needs_flush = active_pending(&view);
@@ -3220,18 +3243,20 @@ impl LarkEngine {
                 let wal_for_flush =
                     Wal::create_in(&self.env, &self.wal_dir.join(wal_filename(new_wal_id)))?;
 
-                if active_needs_flush {
+                let sealed = if active_needs_flush {
                     // One publication for the seal and the enqueue: two
                     // would leave a window where the sealed memtable is
                     // in neither the active slot nor the frozen list.
                     let fresh = Arc::new(MemTable::new(&self.memtable_config)?);
-                    self.view.update_memtables(|active, frozen| {
+                    Some(self.view.update_memtables(|active, frozen| {
                         let sealed = Arc::clone(active);
                         let mut next_frozen = frozen.to_vec();
-                        next_frozen.push(sealed);
-                        (fresh, next_frozen, ())
-                    });
-                }
+                        next_frozen.push(Arc::clone(&sealed));
+                        (fresh, next_frozen, sealed)
+                    }))
+                } else {
+                    None
+                };
 
                 let old_wal = self
                     .active_wal
@@ -3239,10 +3264,12 @@ impl LarkEngine {
                     .replace(wal_for_flush)
                     .ok_or_else(Self::read_only_error)?;
                 self.wal_id.store(new_wal_id, Ordering::Release);
-                old_wal
+                if let Some(sealed) = sealed {
+                    sealed.seal_wal(old_wal.path().to_path_buf());
+                }
             };
 
-            self.flush_frozen_memtable(old_wal)?;
+            self.flush_frozen_memtable()?;
         }
     }
 }

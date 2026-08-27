@@ -290,6 +290,58 @@ mod tests {
         );
     }
 
+    /// A sealed memtable carries the log its records are in, so the
+    /// flush that persists it can unlink that log and no other.
+    ///
+    /// The defect this guards: the flush was handed whatever log its
+    /// *caller* had just sealed, while it wrote whatever memtable was at
+    /// the front of the frozen list. Those are only the same memtable
+    /// when flushes and seals are perfectly interleaved. When they are
+    /// not, the flush unlinks the only durable copy of a memtable nobody
+    /// has flushed, and a crash loses every write in it.
+    #[test]
+    fn a_sealed_memtable_carries_the_log_its_records_are_in() {
+        let (_dir, _store, cell) = store_with_view();
+
+        let first = Arc::new(MemTable::new(&test_memtable_config()).unwrap());
+        first.put(b"a", b"1", 1);
+        first.seal_wal(std::path::PathBuf::from("/wal/000001.log"));
+
+        let second = Arc::new(MemTable::new(&test_memtable_config()).unwrap());
+        second.put(b"b", b"2", 2);
+        second.seal_wal(std::path::PathBuf::from("/wal/000002.log"));
+
+        cell.update_memtables(|active, _| {
+            (Arc::clone(active), vec![first.clone(), second.clone()], ())
+        });
+
+        let view = cell.load();
+        assert_eq!(
+            view.frozen[0].sealed_wal(),
+            Some(std::path::Path::new("/wal/000001.log")),
+            "the front of the frozen list must name its own log, not the newest one",
+        );
+        assert_eq!(
+            view.frozen[1].sealed_wal(),
+            Some(std::path::Path::new("/wal/000002.log")),
+        );
+        assert_eq!(
+            view.active.sealed_wal(),
+            None,
+            "the active memtable is still taking writes, so its log is not sealed",
+        );
+
+        // Retiring the front does not disturb the other's log identity:
+        // the flush that comes next still unlinks its own.
+        cell.retire_memtable(&first);
+        let after = cell.load();
+        assert_eq!(after.frozen.len(), 1);
+        assert_eq!(
+            after.frozen[0].sealed_wal(),
+            Some(std::path::Path::new("/wal/000002.log")),
+        );
+    }
+
     /// Every exit path of a flush retires, including the ones that
     /// found nothing to write, so retiring twice has to be harmless.
     #[test]
