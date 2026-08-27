@@ -154,9 +154,9 @@ Each worktree is isolated, no branch-switching overhead.
 
 ## Build Dependencies
 
-- **Rust** 1.82+ for the library build (see `rust-version` in `Cargo.toml`); CI runs tests and tools on stable Rust.
+- **Rust** 1.90+ (edition 2024) for the library build (see `rust-version` in `Cargo.toml`); CI runs tests and tools on stable Rust.
 
-That's it for the checked-in workspace. No `protoc`, no `cbindgen`, no C/C++ toolchain, no system libraries. Workspace tool dependencies must also parse and build on the MSRV toolchain because CI runs `cargo check --workspace` on Rust 1.82. Tools that need foreign libraries, bindgen-based comparison backends, or newer toolchains should live outside this workspace so the main CI path remains pure Rust.
+That's it for the checked-in workspace. No `protoc`, no `cbindgen`, no C/C++ toolchain, no system libraries. Workspace tool dependencies must also parse and build on the MSRV toolchain because CI runs `cargo check --workspace` on Rust 1.90. Tools that need foreign libraries, bindgen-based comparison backends, or newer toolchains should live outside this workspace so the main CI path remains pure Rust.
 
 ## Common Commands
 

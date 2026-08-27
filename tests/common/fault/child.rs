@@ -608,14 +608,34 @@ fn read_acks(path: &Path) -> Vec<usize> {
     }
 }
 
+/// Where each phase crashes, counted in write syscalls to the file the
+/// phase is about.
+///
+/// Two things make a syscall count different from an operation count,
+/// and a trigger that ignores either one silently never fires, which
+/// turns the probe into a false green rather than a failure:
+///
+/// - **The format stamp is a write.** A WAL and a MANIFEST each open
+///   with a 12-byte stamp written by itself, so a record is one write
+///   later than its ordinal.
+/// - **Group commit coalesces records.** One vectored write carries a
+///   whole group, so a batch phase produces a handful of writes rather
+///   than one per operation.
+///
+/// The numbers below are therefore read off the journal for each phase,
+/// not derived. `CrashOut::assert_killed` is what catches a stale one.
 fn default_trigger(spec: &ChildSpec) -> Trigger {
     match spec.phase {
         Phase::CleanExit => Trigger::None,
         Phase::AfterNPuts => Trigger::Workload,
-        Phase::MidWriteBatch => Trigger::wal_write(11),
+        // 64 writes of 1 KiB reach the log as a handful of grouped
+        // writes, so this lands inside the record stream.
+        Phase::MidWriteBatch => Trigger::wal_write(3),
         Phase::DuringFlush => Trigger::sst_write(3),
         Phase::DuringCompaction => Trigger::sst_write(40),
-        Phase::DuringManifestWrite => Trigger::manifest_write(2),
+        // Write 1 is the REGOMAN stamp; write 3 is the second append.
+        Phase::DuringManifestWrite => Trigger::manifest_write(3),
+        // Write 1 is the WAL stamp, so writes 2..=37 are records 1..=36.
         Phase::BetweenWalAndApply => Trigger::wal_write(37),
         Phase::Custom(_) => Trigger::None,
     }

@@ -193,10 +193,20 @@ fn batch_atomicity_at_full_scale() {
 /// block-cache entry served after its file was rewritten.
 ///
 /// This was red before the read view landed (measured 4 of 6 runs on
-/// the same box): a read sampled the horizon first and captured its
-/// sources second, so a compaction was free to drop the newest version
-/// at or below that horizon. It gates the ordering that replaced it -
-/// load the view, then sample the horizon - and stays a gate for it.
+/// the same box): a read took the active memtable, the frozen list and
+/// the version under three separate lock acquisitions, and sampled the
+/// read horizon before any of them. It gates the published, immutable
+/// view that replaced those three acquisitions.
+///
+/// It does **not** gate the other half of that fix, the rule that the
+/// view is loaded before the horizon is sampled. Inverting only that
+/// order and leaving the view in place left this test green 8 of 8
+/// runs, and left
+/// [`a_user_thread_compact_range_never_makes_a_read_travel_backwards`]
+/// green on 0 of 60 instances twice, over 2.2 billion reads each. The
+/// order is kept on the argument written on `LarkEngine::get_latest`,
+/// not on a red test, and no test here is known to catch its
+/// inversion.
 #[test]
 fn a_repeated_read_of_one_key_never_travels_backwards() {
     let outcome = run_monotonic_reads(&MonotonicScale {
@@ -270,6 +280,12 @@ fn monotonic_reads_at_full_scale() {
 ///
 /// Measured after: 0 of 60 instances on two consecutive runs, over
 /// about 24M reads each.
+///
+/// What it does not cover: inverting only the horizon-sample order
+/// while leaving the published view in place also measured 0 of 60
+/// instances twice here, over 2.2 billion reads each, so this test is
+/// a gate for the view and not for that order. See the note on
+/// [`a_repeated_read_of_one_key_never_travels_backwards`].
 #[test]
 #[ignore = "focused regression gate for the user-thread compact_range read race, measured at 14s; run with `just mvcc-slow`"]
 fn a_user_thread_compact_range_never_makes_a_read_travel_backwards() {

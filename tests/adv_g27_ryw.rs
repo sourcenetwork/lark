@@ -1,12 +1,13 @@
 //! Read-your-own-writes and lock-order probes for the published read
 //! view (G27).
 //!
-//! The view is published under a mutex that a version edit also takes
-//! while it still holds the version-set mutex. Any path that took those
-//! two in the other order would wedge, so this drives every publisher
-//! at once (rotation, foreground flush, background compaction,
-//! `compact_range`, `drop_all`) with a watchdog that fails instead of
-//! hanging.
+//! Publication is a compare-exchange, so there is no publish mutex for
+//! a version edit to nest under the version-set mutex and no lock order
+//! left to invert. This still drives every publisher at once (rotation,
+//! foreground flush, background compaction, `compact_range`,
+//! `drop_all`) with a watchdog that fails instead of hanging: the
+//! liveness question survives the mutex that prompted it, because a
+//! compare-exchange retry loop has its own way to make no progress.
 //!
 //! Read-your-own-writes is the other half: a thread that writes a key
 //! and immediately reads it back must see at least what it just wrote,
@@ -113,9 +114,10 @@ fn a_writer_always_reads_back_at_least_its_own_write() {
 
 /// Drive every publisher of the read view at once. The assertion is
 /// liveness: the run must finish, and every reader must keep making
-/// progress. A lock-order inversion between the version-set mutex and
-/// the read view's publish mutex would stall here rather than fail a
-/// value check, so a stalled run is the failure.
+/// progress. Publication is a compare-exchange retry loop, which is
+/// lock-free but not wait-free, so a publisher that could not converge
+/// under maximum contention would stall here rather than fail a value
+/// check; a stalled run is the failure.
 #[test]
 fn every_publisher_of_the_read_view_running_at_once_stays_live() {
     let secs = env("LARK_LIVE_SECS", 8);
