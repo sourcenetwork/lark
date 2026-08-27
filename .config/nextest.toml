@@ -24,3 +24,41 @@ inherits = "default"
 slow-timeout = { period = "120s", terminate-after = 5 }
 retries = 1
 final-status-level = "flaky"
+
+# Windows leg of the test matrix.
+#
+# Windows is in the matrix for the code only it runs: `src/env/std_env.rs`
+# takes different paths for positioned reads and directory sync, there is
+# no `rustix`, `src/env/db_lock.rs` has a whole separate implementation,
+# and the filesystem has semantics no unix has, notably that a file
+# unlinked while a handle is open stays delete-pending under its own name.
+# Those are worth a matrix leg.
+#
+# What is not worth one is re-running the long concurrency and corruption
+# soaks. Their subject is engine logic, which is identical on every
+# platform and already covered by the ubuntu and macos legs, and their
+# cost is dominated by durable operations that this runner serves about
+# two orders of magnitude slower than a Linux tmpfs. Together they were
+# most of a 45 minute job.
+#
+# Everything else still runs here, including every corruption, recovery,
+# lifecycle and public-API test.
+[profile.windows]
+inherits = "ci"
+default-filter = """
+    not (
+        binary(/^(adversarial_|adv_)/)
+        or binary(mvcc_invariants)
+        or binary(read_view_hammer)
+        or binary(read_view_chaos_workload)
+        or binary(scan_read_horizon_ordering)
+        or binary(group_commit_and_arena_memtable)
+        or binary(sstable_metadata_scan_get_agreement)
+        or binary(resource_limits)
+        or test(=concurrency::writer_compactor_contention_soak)
+        or test(=concurrency::snapshot_never_observes_a_torn_batch)
+        or test(/^engine::block_cache::adversarial::/)
+        or test(=rate_limiter::tests::ten_mb_through_one_mbps_takes_at_least_nine_seconds)
+        or test(=every_publisher_of_the_read_view_running_at_once_stays_live)
+    )
+"""
