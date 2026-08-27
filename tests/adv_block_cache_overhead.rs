@@ -273,8 +273,8 @@ charged_per_entry={:.1} over_capacity={} ratio={:.4}",
     // bytes, against 3.8x and rising if the reclamation is left
     // undrained, which is what the flatness check below guards.
     for (label, real, capacity, ceiling) in [
-        ("1 KiB blocks", tight_real, tight.capacity, 20),
-        ("256 B blocks", tiny_real, tiny.capacity, 40),
+        ("1 KiB blocks", tight_real, tight.capacity, 18),
+        ("256 B blocks", tiny_real, tiny.capacity, 24),
     ] {
         assert!(
             real <= capacity * ceiling / 10,
@@ -284,10 +284,12 @@ charged_per_entry={:.1} over_capacity={} ratio={:.4}",
     }
 
     // The margin has to be a constant, not a leak. Tripling the churn
-    // through the same budget must not move resident memory: if it does,
-    // something the cache evicted is never being freed, and the byte
-    // budget bounds only what the cache accounts rather than what it
-    // holds.
+    // through the same budget must not move resident memory much: if it
+    // does, the drain that reclaims evicted map nodes has stopped
+    // keeping up, and the byte budget bounds only what the cache
+    // accounts rather than what it holds. Undrained that measures 144
+    // bytes retained per insert: 7.9 MB after 40,000 inserts, 19.5 MB
+    // after 120,000 and 71.3 MB after 480,000, with no ceiling.
     let churned = run_rounds(small_dir.path(), 2 * 1024 * 1024, 6);
     let churned_real = churned.heap - tiny_off.heap;
     println!(
@@ -305,15 +307,16 @@ charged_per_entry={:.1} over_capacity={} ratio={:.4}",
     let extra = churned_real.saturating_sub(tiny_real);
     let per_add = extra as f64 / (churned.adds - tiny.adds).max(1) as f64;
     println!("ADVOVERHEAD retained_per_insert={per_add:.1} bytes");
+    // The rate, not exact flatness. How much the drain keeps up with
+    // depends on how much CPU the process gets: measured 0.2 bytes per
+    // insert on an idle machine and 14.1 with the rest of the suite
+    // running alongside. Undrained it is 144, so a ceiling of 40 keeps
+    // roughly three times the loaded figure in hand and still fails by a
+    // wide margin if the drain stops working.
     assert!(
-        per_add <= 200.0,
-        "the cache now retains {per_add:.1} bytes per insert, past the 144 measured when this \
-         bound was set: whatever it holds onto after an eviction got bigger"
-    );
-    assert!(
-        per_add >= 50.0,
-        "the cache retains only {per_add:.1} bytes per insert, well under the 144 this bound was \
-         written against. If reclamation was fixed, say so here and tighten or delete this gate \
-         rather than leaving it describing a defect that no longer exists"
+        per_add <= 40.0,
+        "the cache retains {per_add:.1} bytes per insert, so resident memory grows with churn \
+         rather than with the working set. Undrained this measures 144 bytes per insert, and a \
+         working drain measures under 15 even on a loaded machine"
     );
 }

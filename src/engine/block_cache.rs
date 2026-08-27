@@ -5,7 +5,7 @@ use std::sync::{Arc, OnceLock, Weak};
 // instruction gets the fallback implementation rather than failing to build.
 use crate::portability::{AtomicUsize, Ordering};
 
-use kovan_map::HashMap;
+use kovan_map::HopscotchMap;
 
 use crate::sync::Mutex;
 use xxhash_rust::xxh3::xxh3_64;
@@ -62,6 +62,24 @@ const MIN_MAP_BUCKETS: usize = 64;
 /// At 8 bytes a bucket this is 512 KiB per shard; past it the map grows
 /// on demand instead.
 const MAX_MAP_BUCKETS: usize = 64 * 1024;
+
+/// Map removals a shard performs between drains of the calling thread's
+/// retired entries.
+///
+/// The reclaimer does not free an evicted entry on its own here: with no
+/// drain at all the cache retains 144 bytes per insert forever, measured
+/// at 7.9 MB after 40,000 inserts through a 2 MiB budget and 71.3 MB
+/// after 480,000, growing with churn rather than with the working set.
+///
+/// Draining is only safe because this map probes a bounded neighbourhood
+/// of table slots. A drain advances the reclaimer's global epoch, and a
+/// reader is protected only for pointers it loaded from a location the
+/// retirer writes when it unlinks. Every pointer read here comes out of
+/// a slot that `remove` clears before it retires, so that holds. It does
+/// not hold for a chaining map, whose reader follows `next` links that
+/// an already-retired node froze, and driving the epoch under one of
+/// those is a use-after-free.
+const REMOVALS_PER_RECLAIM: u64 = 2048;
 
 /// Bytes one cached entry costs the cache.
 /// What a cache slot holds.
@@ -169,6 +187,9 @@ struct ClockRing {
     /// field rather than an atomic because every mutation happens under
     /// the ring mutex anyway.
     used: usize,
+    /// Removals since this shard last drained. See
+    /// [`REMOVALS_PER_RECLAIM`].
+    removals: u64,
 }
 
 impl ClockRing {
@@ -178,6 +199,7 @@ impl ClockRing {
             free: Vec::new(),
             hand: 0,
             used: 0,
+            removals: 0,
         }
     }
 
@@ -189,6 +211,15 @@ impl ClockRing {
         }
         self.slots.push(None);
         self.slots.len() - 1
+    }
+
+    /// Drain this thread's retired map entries, every
+    /// [`REMOVALS_PER_RECLAIM`] removals.
+    fn record_removal(&mut self) {
+        self.removals += 1;
+        if self.removals.is_multiple_of(REMOVALS_PER_RECLAIM) {
+            kovan::flush();
+        }
     }
 
     /// Release `slot` and the bytes the entry it held charged.
@@ -210,6 +241,7 @@ impl ClockRing {
         self.free = Vec::new();
         self.hand = 0;
         self.used = 0;
+        self.removals = 0;
     }
 }
 
@@ -226,7 +258,7 @@ struct CacheShard {
     /// costs the `OnceLock` and the ring instead. A reader on an
     /// uninitialized shard sees `None` and misses, which is correct: the
     /// shard holds nothing.
-    map: OnceLock<Box<HashMap<CacheKey, Weak<ClockEntry>>>>,
+    map: OnceLock<Box<HopscotchMap<CacheKey, Weak<ClockEntry>>>>,
     /// Byte budget for this shard: total capacity / num_shards.
     capacity: usize,
     ring: Mutex<ClockRing>,
@@ -250,11 +282,11 @@ impl CacheShard {
     /// below is entries at the default block size, so the table starts
     /// within one growth step of its steady state and the array stays
     /// proportional to the budget instead of to the shard count.
-    fn map(&self) -> &HashMap<CacheKey, Weak<ClockEntry>> {
+    fn map(&self) -> &HopscotchMap<CacheKey, Weak<ClockEntry>> {
         self.map.get_or_init(|| {
             let estimate =
                 (self.capacity / ESTIMATED_ENTRY_BYTES).clamp(MIN_MAP_BUCKETS, MAX_MAP_BUCKETS);
-            Box::new(HashMap::with_capacity(estimate))
+            Box::new(HopscotchMap::with_capacity(estimate))
         })
     }
 
@@ -329,6 +361,7 @@ impl CacheShard {
             if let Some(map) = self.map.get() {
                 map.force_remove(&entry.key);
             }
+            ring.record_removal();
             return true;
         }
         false

@@ -38,7 +38,14 @@ use crate::engine::{DurabilityMode, LarkEngine};
 pub(crate) const MAX_RANGE_DELETE_KEYS: usize = 1 << 20;
 
 /// Locks live here rather than on disk. See [`super::layout`].
-type LockTable = kovan_map::HashMap<Vec<u8>, LockInfo>;
+// Hopscotch rather than the chaining map: every pointer its `get`
+// dereferences is loaded from a table slot, which is the same location a
+// remover clears before retiring the entry. The chaining map instead
+// walks `next` links, and a link belonging to an already-retired node is
+// frozen, so nothing writes it again and reclamation does not protect a
+// pointer read out of it. That difference is a use-after-free under
+// concurrent get and remove, reproducible with no lark code involved.
+type LockTable = kovan_map::HopscotchMap<Vec<u8>, LockInfo>;
 
 pub(crate) struct LarkStorage {
     engine: Arc<LarkEngine>,

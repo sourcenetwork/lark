@@ -28,6 +28,9 @@ use tempfile::TempDir;
 const WRITERS: usize = 6;
 const READERS: usize = 6;
 const KEYS_PER_WRITER: usize = 24;
+/// Column-family create/drop cycles the churn thread performs. Bounded
+/// for the reason given at its spawn site.
+const CF_CHURN_PASSES: u64 = 256;
 
 fn env(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -206,8 +209,14 @@ fn overwritten_keys_never_vanish_and_never_travel_backwards() {
         );
         handles.push(thread::spawn(move || {
             gate.wait();
+            // Bounded like the compaction thread beside it. Each pass
+            // creates and drops a column family, which edits the
+            // manifest, so an unbounded spinner makes the run cost grow
+            // with how long the writers happen to take rather than with
+            // the work they do: this test timed out at 300s on a loaded
+            // machine while finishing in seconds on an idle one.
             let mut n = 0u64;
-            while live.load(Ordering::Acquire) > 0 {
+            while live.load(Ordering::Acquire) > 0 && n < CF_CHURN_PASSES {
                 let name = format!("chaos_cf_{n}");
                 if let Ok(cf) = db.create_column_family(&name) {
                     let _ = db.put_cf(&cf, b"x", b"y");
