@@ -84,7 +84,22 @@ impl Env for StdEnv {
                 .write(true)
                 .truncate(true)
                 .open(path)?,
-            WriteMode::Append => OpenOptions::new().create(true).append(true).open(path)?,
+            // `.write(true)` alongside `.append(true)` is not redundant.
+            // On Windows the two differ in the access mask Rust asks
+            // for: append alone requests `FILE_GENERIC_WRITE` with
+            // `FILE_WRITE_DATA` cleared, and `SetEndOfFile`, which
+            // backs [`WriteFile::set_len`], needs exactly that bit.
+            // Without it, truncating a torn manifest tail on reopen
+            // fails with "Access is denied", so a Windows database
+            // could not be reopened after the ordinary kind of crash.
+            // On Unix the pair is what the docs say it is, identical to
+            // append alone, because `ftruncate` only needs a writable
+            // descriptor and `O_APPEND` is one.
+            WriteMode::Append => OpenOptions::new()
+                .create(true)
+                .write(true)
+                .append(true)
+                .open(path)?,
         };
         Ok(Box::new(StdWriteFile { file }))
     }
