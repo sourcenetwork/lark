@@ -1,10 +1,15 @@
-//! Cross-fix probe: G28's "an orphan table that records no entry is a
-//! crash artifact" rule reads the footer's `num_entries` and
+//! Cross-fix regression gate: G28's "an orphan table that records no
+//! entry is a crash artifact" rule reads the footer's `num_entries` and
 //! `range_tombstone_size`. A V3/V4 footer is checksummed, so a damaged
 //! one is refused. A V1/V2 footer is not, which is G24's stated
-//! deliberate hole, and here that hole feeds the G28 guard: two zeroed
-//! `u64`s in a legacy footer make a table that holds 200 keys claim to
-//! hold none, and the guard then lets the open discard it.
+//! deliberate hole, and that hole used to feed the G28 guard: two zeroed
+//! `u64`s in a legacy footer made a table holding 200 keys claim to hold
+//! none, and the guard let the open discard it.
+//!
+//! `table_carries_data` no longer takes the footer's word for it. When
+//! the footer claims nothing, it decodes the index block and requires
+//! that to be empty too, so a legacy table with data blocks in it is
+//! counted whatever its `num_entries` says.
 //!
 //! Both halves are exercised so the difference is the format version and
 //! nothing else.
@@ -81,10 +86,18 @@ fn modern_table(entries: usize) -> Vec<u8> {
 #[test]
 fn a_modern_table_that_lies_about_its_entry_count_is_still_refused() {
     let mut bytes = modern_table(50);
-    assert_eq!(
-        &bytes[bytes.len() - 8..],
-        &[0x03, 0x54, 0x53, 0x53, 0x4b, 0x52, 0x41, 0x4c],
-        "this probe needs a V3 table",
+    // Any checksummed footer will do: V3 and V4 are LARKSST, V5 and V6
+    // the stamped REGOSST ones. They share a 72-byte layout, so the
+    // offsets below hold for all of them. What the probe needs is a
+    // footer the reader *can* verify, so that refusing the lie is the
+    // checksum doing its job and not the version byte.
+    let magic = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().expect("8"));
+    assert!(
+        matches!(
+            magic,
+            0x4C41524B_53535403 | 0x4C41524B_53535404 | 0x5245474F_53535405 | 0x5245474F_53535406
+        ),
+        "this probe needs a checksummed table, got {magic:#018x}",
     );
     lie_about_the_contents(&mut bytes, 72);
 

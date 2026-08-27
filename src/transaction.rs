@@ -561,7 +561,14 @@ impl<'db> Transaction<'db> {
     /// [`Transaction::delete`] and use [`Transaction::get_for_update`]
     /// when a read must also participate in conflict detection.
     ///
-    /// Calls with `start >= end` are treated as no-ops.
+    /// Calls with `start >= end` are treated as no-ops and return
+    /// `Ok(())`. That is deliberate and it is the one place where a
+    /// transactional write's acceptance depends on the arguments being
+    /// empty: `Db::write` rejects an empty batch on a read-only handle
+    /// because handle state is not an argument, while here the
+    /// rejection is a missing feature and an empty range asks for no
+    /// work from it. Callers that want the unsupported-feature error
+    /// unconditionally must check the range themselves.
     pub fn delete_range(&mut self, start: &[u8], end: &[u8]) -> TxResult<()> {
         if start >= end {
             return Ok(());

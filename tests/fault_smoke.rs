@@ -10,6 +10,17 @@
 //! tests are called out individually below; run them with
 //! `just test-fault-slow`.
 
+//! # Linux only
+//!
+//! Every test here drives a child process under the `LD_PRELOAD` fault
+//! shim, which is how unsynced bytes are discarded to model a power
+//! cut rather than a process kill. `LD_PRELOAD` interposition is a
+//! glibc mechanism, so on any other target the shim cannot be built.
+//! The file is compiled out there rather than failing at run time: a
+//! test that panics because the platform cannot host its mechanism
+//! reports a defect that does not exist.
+#![cfg(target_os = "linux")]
+
 mod common;
 
 use std::path::Path;
@@ -98,8 +109,15 @@ fn the_shim_records_larks_real_file_io() {
 fn a_kill_point_lands_on_the_requested_syscall() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("db");
+    // This probe checks that the harness dies *where it was asked to*,
+    // so it names the write rather than inheriting the phase default:
+    // a default that moves would otherwise look like the harness
+    // missing its mark.
+    const NTH_MANIFEST_WRITE: u64 = 2;
     let spec = ChildSpec::new(Phase::DuringManifestWrite, &db);
-    let out = CrashRun::new(spec).run();
+    let out = CrashRun::new(spec)
+        .trigger(Trigger::manifest_write(NTH_MANIFEST_WRITE))
+        .run();
 
     out.assert_killed();
     assert_eq!(out.signal, Some(9), "expected SIGKILL");
@@ -116,8 +134,8 @@ fn a_kill_point_lands_on_the_requested_syscall() {
     );
     assert_eq!(
         out.journal.writes_to("MANIFEST").len(),
-        2,
-        "expected to die on the 2nd MANIFEST write\n{}",
+        NTH_MANIFEST_WRITE as usize,
+        "expected to die on MANIFEST write {NTH_MANIFEST_WRITE}\n{}",
         out.journal,
     );
 }

@@ -165,8 +165,18 @@ fn every_truncation_offset_either_fails_or_recovers_a_clean_prefix() {
     }
     println!("truncation offsets: {full} tried, {opened} opened, {failed} failed loud");
     assert_eq!(opened + failed, full);
-    assert!(failed > 0, "no truncation offset was rejected");
     assert!(opened > 0, "no truncation offset recovered anything");
+    // Deliberately not `failed > 0`. A cut is a torn tail, and for the
+    // only log in the database every cut lands on a whole prefix of the
+    // write history, which is exactly the durability rule. A cut inside
+    // the format stamp is the same case: no record in that log can have
+    // been acknowledged, because the `fsync` that would have
+    // acknowledged one flushes the stamp written before it. Requiring
+    // some offset to be *refused* would be requiring recovery to fail
+    // on a state it can legitimately recover. Damage that is not a torn
+    // tail, whole records after a hole, is covered by
+    // `a_flip_in_the_middle_of_the_wal_never_silently_discards_the_records_after_it`
+    // and by the earlier-log rule in `adversarial_wal`.
 }
 
 /// Flip one byte at every offset in the log. The open must either fail
@@ -257,10 +267,14 @@ fn an_oversized_length_header_is_refused_not_allocated() {
     };
 
     let mut bytes = source.clone();
-    // The very first record header is at offset 0 for a headerless log,
-    // or right after the file header; find the first offset whose u32 LE
-    // matches a plausible small length and inflate it.
-    bytes[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+    // The first record header sits after the 12-byte format stamp, not
+    // at offset 0. Inflating bytes 0..4 would corrupt the stamp
+    // instead, which is a different failure with a different rule:
+    // a log with no valid stamp holds nothing that was ever
+    // acknowledged and is discarded, so the probe would pass on the
+    // wrong reason. Matches `WAL_STAMP_LEN` in `src/engine/wal.rs`.
+    const STAMP: usize = 12;
+    bytes[STAMP..STAMP + 4].copy_from_slice(&u32::MAX.to_le_bytes());
 
     let dir = TempDir::new().unwrap();
     {
@@ -273,8 +287,16 @@ fn an_oversized_length_header_is_refused_not_allocated() {
     fs::write(dir.path().join("wal").join("wal_000001.log"), &bytes).unwrap();
 
     let err = Db::open(dir.path(), opts()).expect_err("a 4 GiB length header must be refused");
+    // What matters is that the open was refused and the reason names
+    // the framing, not which of the three refusal paths reached it: a
+    // length that runs past the end of the file is caught as a
+    // truncation, as a checksum mismatch, or by the whole-record-follows
+    // rule, depending on what the inflated header lands on.
+    let text = format!("{err:?}");
     assert!(
-        format!("{err:?}").contains("truncated") || format!("{err:?}").contains("checksum"),
+        text.contains("truncated")
+            || text.contains("checksum")
+            || text.contains("runs past the end"),
         "unexpected error for an oversized length header: {err:?}"
     );
 }

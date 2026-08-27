@@ -128,6 +128,44 @@ fn a_zero_length_orphan_table_opens_and_keeps_every_acknowledged_write() {
     println!("zero-length orphan: opened, 61 acknowledged writes recovered");
 }
 
+/// Recovery deletes nothing, so repeating it converges.
+///
+/// The guard dismisses a zero-length orphan instead of removing it. That
+/// is what makes a crash part way through recovery re-entrant: every
+/// open sees the directory the previous one saw and reaches the same
+/// verdict, and there is no cleanup step for a second crash to land in
+/// the middle of. Removing it instead would race a second process that
+/// holds the same directory open and is flushing into that very id.
+///
+/// This is the "opened" half of the contract. The refusal tests already
+/// pin the other half with `orphan.exists()`; nothing pinned this one,
+/// so a later tidy-up that deleted dismissed orphans would have passed
+/// every test in this file.
+#[test]
+fn an_open_that_dismissed_a_zero_length_orphan_leaves_it_on_disk() {
+    let dir = wal_only_copy(61);
+    let orphan = dir.path().join("sst").join("000003.sst");
+    fs::write(&orphan, b"").expect("write orphan");
+
+    for attempt in 0..3 {
+        let db = Db::open(dir.path(), opts()).unwrap_or_else(|e| {
+            panic!("attempt {attempt}: a zero-length orphan must not block the open: {e}")
+        });
+        keys_readable(&db, 61);
+        db.close().expect("close");
+        drop(db);
+
+        let len = fs::metadata(&orphan)
+            .unwrap_or_else(|e| panic!("attempt {attempt}: recovery deleted the orphan: {e}"))
+            .len();
+        assert_eq!(
+            len, 0,
+            "attempt {attempt}: recovery must leave the dismissed orphan exactly as it found it",
+        );
+    }
+    println!("zero-length orphan: survived 3 open/close cycles at 0 bytes");
+}
+
 /// A table truncated to any non-zero prefix cannot be proved empty, so
 /// the guard must refuse at every one of those lengths. Sweeping the
 /// whole file catches a relaxation that dismisses anything whose footer
