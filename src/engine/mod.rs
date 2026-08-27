@@ -3117,10 +3117,15 @@ impl LarkEngine {
         self.latest_seq.store(0, Ordering::Release);
         self.visible_seq.reset();
 
-        self.versions.lock().compact_manifest()?;
+        self.versions.lock().compact_manifest().map_err(|e| {
+            std::io::Error::new(e.kind(), format!("drop_all rewriting manifest: {e}"))
+        })?;
 
-        remove_obsolete_sst_files(&*self.env, &self.sst_dir, &old_version)?;
-        remove_obsolete_wal_files(&*self.env, &self.wal_dir, &wal_path)?;
+        remove_obsolete_sst_files(&*self.env, &self.sst_dir, &old_version).map_err(|e| {
+            std::io::Error::new(e.kind(), format!("drop_all removing sstables: {e}"))
+        })?;
+        remove_obsolete_wal_files(&*self.env, &self.wal_dir, &wal_path)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("drop_all removing wals: {e}")))?;
 
         Ok(())
     }
@@ -3519,7 +3524,14 @@ fn remove_file_if_exists(env: &dyn Env, path: &Path) -> std::io::Result<bool> {
     match env.remove_file(path) {
         Ok(()) => Ok(true),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(err),
+        // Named, because a bare "Access is denied" from a filesystem
+        // call says nothing about which file the engine could not
+        // unlink, and the answer is usually that something still holds
+        // it open.
+        Err(err) => Err(std::io::Error::new(
+            err.kind(),
+            format!("removing {}: {err}", path.display()),
+        )),
     }
 }
 

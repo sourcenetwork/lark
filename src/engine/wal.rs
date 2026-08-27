@@ -173,7 +173,13 @@ pub(crate) enum WalEntry {
 impl Wal {
     /// Create a new WAL file at the given path.
     pub(crate) fn create_in(env: &Arc<dyn Env>, path: &Path) -> io::Result<Self> {
-        let mut file = env.open_write(path, WriteMode::Truncate)?;
+        // Named on failure: creating a log at a path a previous log was
+        // unlinked from is the interesting case, because on Windows an
+        // unlinked file whose handle is still open keeps its name until
+        // that handle closes, and creating over it is refused.
+        let mut file = env.open_write(path, WriteMode::Truncate).map_err(|e| {
+            io::Error::new(e.kind(), format!("creating wal {}: {e}", path.display()))
+        })?;
         // Every log this build creates is stamped. That is what makes the
         // format identifiable and versioned from here on, so a later
         // build can change the framing and still know what it is holding.

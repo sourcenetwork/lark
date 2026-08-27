@@ -505,7 +505,21 @@ fn closing_under_concurrent_writers_never_hangs_or_lies() {
             }
         }));
     }
-    thread::sleep(std::time::Duration::from_millis(20));
+    // Wait for evidence rather than for a duration. A fixed sleep is a
+    // bet that a writer thread has been scheduled, and on a loaded or
+    // slow host it loses: the close then happens before anything has
+    // been acknowledged and the assertion below fails for a reason that
+    // has nothing to do with closing.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut backoff = std::time::Duration::from_micros(50);
+    while acknowledged.lock().unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no writer acknowledged a write in 30s, so the close had nothing to race"
+        );
+        thread::sleep(backoff);
+        backoff = (backoff * 2).min(std::time::Duration::from_millis(5));
+    }
     db.close().unwrap();
     for h in handles {
         h.join().expect("a writer thread hung or panicked on close");
