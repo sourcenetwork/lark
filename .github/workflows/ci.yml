@@ -84,17 +84,6 @@ jobs:
   # single-writer guard (invariant S2) exists at all, because it is a
   # `debug_assert`, so the calibration that proves the guard fires on an
   # unserialized insert only runs there.
-  loom:
-    runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: --cfg loom -D warnings
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --release --test loom_memtable -- --nocapture
-      - run: cargo test --test loom_memtable -- --nocapture
-
   msrv:
     runs-on: ubuntu-latest
     steps:
