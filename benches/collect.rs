@@ -280,14 +280,21 @@ fn rss(bag: &mut Bag) -> Json {
         entries.push(s);
     }
 
+    let mut memory = bag.take_one(MEMORY);
+    if let Some(m) = &memory {
+        require_obj(m, "memory");
+    }
+
     let mut family = Json::obj(vec![("unit", Json::s("MiB"))]);
     if let Some(w) = workload {
         family.set("workload", Json::Str(w));
     }
-    family.set(
-        "trust",
-        Json::s(if entries.is_empty() { "absent" } else { trust }),
-    );
+    // Either contributor is a measurement. `soak` is not in the bench
+    // matrix, so deriving this from the soaks alone reported `absent`
+    // over a memory bench that had run, which is a gap rendered where
+    // there is data.
+    let measured = !entries.is_empty() || memory.is_some();
+    family.set("trust", Json::s(if measured { trust } else { "absent" }));
     family.set(
         "trust_note",
         Json::s(
@@ -297,10 +304,6 @@ fn rss(bag: &mut Bag) -> Json {
     );
     family.set("soaks", Json::Arr(entries));
 
-    let mut memory = bag.take_one(MEMORY);
-    if let Some(m) = &memory {
-        require_obj(m, "memory");
-    }
     for part in RSS_PARTS {
         match memory.as_mut().and_then(|m| m.remove(part)) {
             None => family.set(part, absent(&[])),
