@@ -67,13 +67,23 @@ impl OpfsStore for PoolStore {
     }
 
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
-        let (slot, generation, offset) =
-            self.0.open_write(path, matches!(mode, WriteMode::Append))?;
+        // Only `Truncate` discards. `Update` keeps the bytes and writes
+        // from the start, so it must not reach the pool's truncating
+        // branch: manifest recovery opens `Update` and then shortens,
+        // and a truncate here would zero the MANIFEST first and leave
+        // `set_len` to extend it back with zeros, losing every SSTable
+        // reference the database had.
+        let (slot, generation, end) = self
+            .0
+            .open_write(path, !matches!(mode, WriteMode::Truncate))?;
         Ok(Box::new(PoolWriter {
             pool: Arc::clone(&self.0),
             slot,
             generation,
-            offset,
+            offset: match mode {
+                WriteMode::Append => end,
+                WriteMode::Truncate | WriteMode::Update => 0,
+            },
         }))
     }
 

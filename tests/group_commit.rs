@@ -10,8 +10,8 @@
 //!    the whole point of the change and is the one thing here that is
 //!    deterministic enough to assert on.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -37,10 +37,19 @@ fn concurrent_durable_writers_cost_far_fewer_fsyncs_than_writes() {
     let stats = Arc::new(Statistics::new());
     let db = Arc::new(Db::open(dir.path(), durable_opts(Some(Arc::clone(&stats)))).unwrap());
 
+    // Released together. Group commit can only amortise fsyncs across
+    // writers that are actually in flight at the same time, so without a
+    // barrier this measures the scheduler: on a loaded machine the eight
+    // threads can run one after another, every write forms its own
+    // group, and the ratio the test is about never gets a chance to
+    // appear. The barrier makes the overlap a property of the test
+    // rather than of how busy the host happens to be.
+    let gate = Arc::new(Barrier::new(WRITERS));
     let mut handles = Vec::with_capacity(WRITERS);
     for w in 0..WRITERS {
-        let db = Arc::clone(&db);
+        let (db, gate) = (Arc::clone(&db), Arc::clone(&gate));
         handles.push(thread::spawn(move || {
+            gate.wait();
             for i in 0..PER_WRITER {
                 db.put(format!("w{w}k{i:05}").as_bytes(), b"value").unwrap();
             }

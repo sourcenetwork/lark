@@ -530,7 +530,9 @@ mod tests {
         let env = std_env();
         let path = dir.path().join("trunc");
         env.write(&path, b"0123456789").unwrap();
-        let mut w = env.open_write(&path, WriteMode::Append).unwrap();
+        // `Update`, not `Append`: shortening needs write access that an
+        // append handle does not carry on Windows.
+        let mut w = env.open_write(&path, WriteMode::Update).unwrap();
         w.set_len(3).unwrap();
         w.sync_all().unwrap();
         assert_eq!(w.len().unwrap(), 3);
