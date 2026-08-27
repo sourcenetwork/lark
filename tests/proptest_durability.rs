@@ -7,7 +7,7 @@
 //!
 //! 1. **Model-based equivalence over the full write API.** A random
 //!    sequence of puts, deletes, range deletes, merge operands and atomic
-//!    `WriteBatch`es is applied to lark and to a `BTreeMap` reference
+//!    `WriteBatch`es is applied to regolith and to a `BTreeMap` reference
 //!    model, and the two are compared after *every* operation. A single
 //!    disagreement anywhere in the sequence fails the case, so this is
 //!    the strongest single test in the file.
@@ -18,7 +18,7 @@
 //!    model after some prefix of the sequence.
 //! 3. **Byte transparency and ordering under adversarial keys.** Keys
 //!    and values that are empty, all zero, all `0xff`, or that end in
-//!    the nine-byte trailer lark appends to a user key internally, must
+//!    the nine-byte trailer regolith appends to a user key internally, must
 //!    round-trip exactly and must iterate in strict user-key order in
 //!    both directions.
 //!
@@ -95,13 +95,13 @@ mod model;
 use std::time::Duration;
 
 use common::fault::{self, ChildSpec, CrashRun, CutPoint, Phase, Trigger};
-use lark_kv::{Db, DurabilityMode};
 use model::{
     CRASH_PHASE, CRASH_VALUE_LEN, KEYS, Model, Op, SUFFIX_LOOKALIKE, Unit, WRITE_BUFFER,
     apply_to_db, apply_to_model, closest_prefix, first_difference, kill_after, matching_prefixes,
     model_state, ops_from_seed, opts, show,
 };
 use proptest::prelude::*;
+use regolith::{Db, DurabilityMode};
 use tempfile::TempDir;
 
 /// Child process entry point, re-executed by the crash harness. Returns
@@ -207,7 +207,7 @@ fn compare(db: &Db, model: &Model) -> Result<(), TestCaseError> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
-    /// Proves lark and a `BTreeMap` reference model agree after *every*
+    /// Proves regolith and a `BTreeMap` reference model agree after *every*
     /// operation of a random sequence of puts, deletes, range deletes,
     /// merge operands, atomic batches and compactions, through both the
     /// scan path and the point-lookup path.
@@ -221,7 +221,7 @@ proptest! {
     /// `scan` and `get`. The comparison runs after every operation, so
     /// the reported failure is the first one, not the last.
     #[test]
-    fn lark_agrees_with_the_model_after_every_operation(sequence in ops(1..=60)) {
+    fn regolith_agrees_with_the_model_after_every_operation(sequence in ops(1..=60)) {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts(WRITE_BUFFER, DurabilityMode::Eventual)).unwrap();
         let mut model = Model::new();
@@ -330,7 +330,7 @@ proptest! {
 
     /// Proves any key and any value round-trips byte for byte: empty,
     /// all zero, all `0xff`, and byte strings ending in the exact
-    /// nine-byte `!seq || value_type` trailer that lark appends to a
+    /// nine-byte `!seq || value_type` trailer that regolith appends to a
     /// user key internally. Verified in the memtable, after a WAL replay
     /// on reopen, and after compaction has rewritten every key through
     /// the block encoder.
@@ -551,7 +551,7 @@ fn check_order(
 /// *above* it: `seek_to_last` landed before the key and the reverse
 /// walk missed it entirely. No suffix of `0xff` bytes fixes that, since
 /// byte strings have no predecessor, so `seek_to_last` now takes the
-/// exclusive bound directly (`LarkIterator::seek_to_last_before`).
+/// exclusive bound directly (`RegolithIterator::seek_to_last_before`).
 ///
 /// Catches: exactly that. The key is written, `get` returns it and a
 /// forward scan returns it; only the backward walk dropped it, and the

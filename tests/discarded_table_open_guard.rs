@@ -40,7 +40,7 @@ use common::fault::{
     self, ChildOutcome, ChildSpec, CrashRun, CutPoint, Phase, PowerLossOptions, Recovery, TearMode,
     Trigger,
 };
-use lark_kv::{DurabilityMode, Options};
+use regolith::{DurabilityMode, Options};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -206,7 +206,7 @@ fn an_open_that_dismissed_a_zero_length_orphan_converges_over_repeated_reopens()
 
     let mut extra: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     for cycle in 0..6u32 {
-        let d = lark_kv::Db::open(&db, opts(8 * 1024)).unwrap_or_else(|e| {
+        let d = regolith::Db::open(&db, opts(8 * 1024)).unwrap_or_else(|e| {
             panic!("cycle {cycle}: reopen refused after the orphan was dismissed: {e}")
         });
         for (k, v) in &extra {

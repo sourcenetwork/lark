@@ -10,14 +10,14 @@
 //! The surfaces are split into one test each so a failure names the
 //! API that broke rather than "some read".
 //!
-//! Scale is read from `LARK_ADV_ROUNDS` (default 1) so the same gate
+//! Scale is read from `REGOLITH_ADV_ROUNDS` (default 1) so the same gate
 //! can be cranked up for a soak without editing it.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
-use lark_kv::{Db, Options, Statistics, Ticker};
+use regolith::{Db, Options, Statistics, Ticker};
 use tempfile::TempDir;
 
 /// Which public read surface a reader thread exercises.
@@ -314,11 +314,11 @@ fn env_usize(name: &str, default: usize) -> usize {
 fn default_scale() -> Scale {
     Scale {
         writers: 4,
-        keys_per_writer: env_usize("LARK_ADV_KEYS", 12),
+        keys_per_writer: env_usize("REGOLITH_ADV_KEYS", 12),
         readers: 3,
-        min_rounds: env_usize("LARK_ADV_MIN_ROUNDS", 50),
-        versions: env_usize("LARK_ADV_VERSIONS", 1_500) as u64,
-        compactor: env_usize("LARK_ADV_COMPACTOR", 1) != 0,
+        min_rounds: env_usize("REGOLITH_ADV_MIN_ROUNDS", 50),
+        versions: env_usize("REGOLITH_ADV_VERSIONS", 1_500) as u64,
+        compactor: env_usize("REGOLITH_ADV_COMPACTOR", 1) != 0,
     }
 }
 
@@ -327,8 +327,8 @@ fn default_scale() -> Scale {
 /// with a user-thread `compact_range` often enough to matter; one
 /// instance on a quiet box almost never reaches the window.
 fn drive(surface: Surface) {
-    let rounds = env_usize("LARK_ADV_ROUNDS", 1);
-    let instances = env_usize("LARK_ADV_INSTANCES", 4);
+    let rounds = env_usize("REGOLITH_ADV_ROUNDS", 1);
+    let instances = env_usize("REGOLITH_ADV_INSTANCES", 4);
     let mut reads = 0u64;
     let mut violations = Vec::new();
     let mut dirty = 0usize;
@@ -457,8 +457,8 @@ fn snapshot_scan_never_travels_backwards() {
 /// and closes the very window this is looking for.
 #[test]
 fn a_snapshot_taken_during_compaction_keeps_its_view() {
-    let rounds = env_usize("LARK_ADV_ROUNDS", 1);
-    let instances = env_usize("LARK_ADV_INSTANCES", 4);
+    let rounds = env_usize("REGOLITH_ADV_ROUNDS", 1);
+    let instances = env_usize("REGOLITH_ADV_INSTANCES", 4);
     let mut checks = 0u64;
     let mut violations: Vec<String> = Vec::new();
 

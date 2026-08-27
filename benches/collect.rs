@@ -3,7 +3,7 @@
 //! Usage:
 //!   cargo run --release --bench collect -- --out <run.json> --commit <sha> --label <label>
 //!
-//! Families are read from `$LARK_BENCH_OUT` (JSON Lines) when it is set, and
+//! Families are read from `$REGOLITH_BENCH_OUT` (JSON Lines) when it is set, and
 //! from `./bench-out/*.json` otherwise. Criterion's own `estimates.json` files
 //! are folded in as supporting per-iteration timings.
 //!
@@ -129,7 +129,7 @@ const USAGE: &str = "collect: assemble one schema v1 run file from every bench f
 
   cargo run --release --bench collect -- --out <run.json> --commit <sha> --label <label>
 
-Families are read from $LARK_BENCH_OUT (JSON Lines) when set, else ./bench-out/*.json.";
+Families are read from $REGOLITH_BENCH_OUT (JSON Lines) when set, else ./bench-out/*.json.";
 
 /// `None` means this invocation is not ours: `cargo bench` drives every bench
 /// target with criterion's flags, and collect has nothing to do then.

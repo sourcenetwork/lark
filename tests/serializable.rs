@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
-use lark_kv::{IsolationLevel, OptimisticTransactionDb, Options, TransactionError};
+use regolith::{IsolationLevel, OptimisticTransactionDb, Options, TransactionError};
 use tempfile::TempDir;
 
 /// Run the two-key write-skew schedule with both transactions

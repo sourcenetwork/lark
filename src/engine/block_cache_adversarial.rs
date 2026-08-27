@@ -1085,7 +1085,7 @@ fn an_emptied_cache_retains_only_budget_bounded_ring_capacity() {
     assert_shard_invariants(&cache, "cleared ring retention");
 }
 
-/// Probe: `lark.block-cache-add` counts only inserts that stored a
+/// Probe: `regolith.block-cache-add` counts only inserts that stored a
 /// block.
 ///
 /// The ticker documents itself as one per miss that populated the

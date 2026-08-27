@@ -84,7 +84,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo run --release --example stack_depth -- \
-            "$RUNNER_TEMP/lark-stack" | tee stack-depth.txt
+            "$RUNNER_TEMP/regolith-stack" | tee stack-depth.txt
       - name: Publish the embedded budget
         run: |
           {

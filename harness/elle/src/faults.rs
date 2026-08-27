@@ -1,6 +1,6 @@
 //! Write-ahead-log damage used to force recovery paths into the history.
 //!
-//! lark keeps its write-ahead log at `<db>/wal/wal_<id>.log`. Both
+//! regolith keeps its write-ahead log at `<db>/wal/wal_<id>.log`. Both
 //! faults here damage only bytes written after a recorded high-water
 //! mark, which is taken immediately before the doomed child process
 //! writes anything. Everything the history reports as committed lives
@@ -11,7 +11,7 @@
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-/// Newest write-ahead log file in a lark database directory.
+/// Newest write-ahead log file in a regolith database directory.
 pub fn newest_wal(db_dir: &Path) -> std::io::Result<Option<PathBuf>> {
     let wal_dir = db_dir.join("wal");
     let mut newest: Option<(String, PathBuf)> = None;

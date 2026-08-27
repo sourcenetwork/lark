@@ -11,7 +11,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicIsize, Ordering};
 
-use lark_kv::{Db, Options};
+use regolith::{Db, Options};
 use tempfile::TempDir;
 
 static LIVE: AtomicIsize = AtomicIsize::new(0);
@@ -66,7 +66,7 @@ static ALLOC: Counting = Counting;
 
 const BUDGET: usize = 8 * 1024 * 1024;
 const SHARD_BITS: [u32; 5] = [0, 2, 4, 6, 8];
-const CHILD_ENV: &str = "LARK_ADV_FOOTPRINT_BITS";
+const CHILD_ENV: &str = "REGOLITH_ADV_FOOTPRINT_BITS";
 
 fn vm_rss_kib() -> u64 {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
@@ -104,8 +104,10 @@ fn adv_footprint_child() {
     let heap_after = LIVE.load(Ordering::Relaxed);
     let rss_after = vm_rss_kib();
 
-    let capacity = db.get_int_property("lark.block-cache-capacity").unwrap();
-    let usage = db.get_int_property("lark.block-cache-usage").unwrap();
+    let capacity = db
+        .get_int_property("regolith.block-cache-capacity")
+        .unwrap();
+    let usage = db.get_int_property("regolith.block-cache-usage").unwrap();
     assert_eq!(usage, 0, "a freshly opened DB holds cached bytes");
     println!(
         "ADVRESULT bits={bits} heap={} rss_kib={} capacity={capacity} usage={usage}",

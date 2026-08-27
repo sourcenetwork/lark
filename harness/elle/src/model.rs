@@ -1,11 +1,11 @@
-//! Workload generation and execution against lark transactions.
+//! Workload generation and execution against regolith transactions.
 //!
 //! A transaction is planned before it runs and the plan is reused
 //! across retries, so the append values in the `invoke` record always
 //! match the ones in the completion record even when an optimistic
 //! transaction has to be replayed.
 
-use lark_kv::{IsolationLevel, 
+use regolith::{IsolationLevel, 
     Db, OptimisticTransactionDb, Options, Transaction, TransactionDb, TransactionError, TxResult,
 };
 use std::path::Path;
@@ -107,7 +107,7 @@ impl TxnPlan {
             .collect()
     }
 
-    /// Run every micro-operation inside one lark transaction and return
+    /// Run every micro-operation inside one regolith transaction and return
     /// the completion value, with observed results filled into reads.
     ///
     /// Appends are read-modify-write against `get_for_update`, which is
@@ -154,7 +154,7 @@ pub enum TxDb {
 }
 
 impl TxDb {
-    pub fn open(path: &Path, isolation: Isolation, opts: Options) -> lark_kv::Result<Self> {
+    pub fn open(path: &Path, isolation: Isolation, opts: Options) -> regolith::Result<Self> {
         match isolation {
             Isolation::ReadCommitted => Ok(TxDb::Pessimistic(TransactionDb::open(path, opts)?)),
             // Both run the optimistic engine; they differ in how much of

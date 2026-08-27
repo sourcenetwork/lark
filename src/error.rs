@@ -1,4 +1,4 @@
-/// Errors returned by lark operations.
+/// Errors returned by regolith operations.
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

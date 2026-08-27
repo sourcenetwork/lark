@@ -1,4 +1,4 @@
-//! Measure lark's memory high-water mark through a full database
+//! Measure regolith's memory high-water mark through a full database
 //! lifecycle, so the 1-4 MiB embedded budget is a number somebody ran
 //! rather than a number somebody hoped for.
 //!
@@ -21,12 +21,12 @@
 //! # Running it
 //!
 //! ```sh
-//! cargo run --release --example embedded_profile -- /tmp/lark-mem
-//! cargo run --release --example embedded_profile -- /tmp/lark-mem wasm
-//! cargo run --release --example embedded_profile -- /tmp/lark-mem default
+//! cargo run --release --example embedded_profile -- /tmp/regolith-mem
+//! cargo run --release --example embedded_profile -- /tmp/regolith-mem wasm
+//! cargo run --release --example embedded_profile -- /tmp/regolith-mem default
 //!
 //! cargo build --release --example embedded_profile --target wasm32-wasip1
-//! wasmtime run --dir=/tmp/lark-mem::/data \
+//! wasmtime run --dir=/tmp/regolith-mem::/data \
 //!     target/wasm32-wasip1/release/examples/embedded_profile.wasm /data
 //! ```
 //!
@@ -35,7 +35,7 @@
 
 use std::path::Path;
 
-use lark_kv::{Db, Options};
+use regolith::{Db, Options};
 
 /// Value size, in bytes, for every write this example makes. Matches
 /// the 128-byte payload the project's earlier embedded measurements
@@ -66,7 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    println!("lark memory profile");
+    println!("regolith memory profile");
     println!("  probe          {}", Probe::describe());
     println!("  profile        {profile}");
     println!("  writes         {puts} x {VALUE_SIZE} B values, 16 B keys");

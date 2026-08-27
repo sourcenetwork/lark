@@ -27,7 +27,7 @@
 //!   every event from every CF; callers that only care about a
 //!   subset should filter in the callback.
 //! - `on_wal_full` is declared so listener implementations can
-//!   target a common shape across storage backends, but lark
+//!   target a common shape across storage backends, but regolith
 //!   itself never fires it - the WAL is rotated alongside every
 //!   memtable, so there's no separate "WAL-full" condition.
 
@@ -145,7 +145,7 @@ pub struct ExternalFileIngestionInfo {
 
 /// Information about a full WAL. The struct is declared so that
 /// listener implementations can target a common shape across
-/// storage backends; lark itself never fires this callback,
+/// storage backends; regolith itself never fires this callback,
 /// because the engine rotates the WAL alongside every memtable
 /// and there is no separate "WAL-full" condition.
 #[derive(Debug, Clone)]
@@ -227,7 +227,7 @@ pub trait EventListener: Send + Sync + 'static {
     }
 
     /// Declared so listeners can target a common shape across
-    /// storage backends; lark itself never fires this callback.
+    /// storage backends; regolith itself never fires this callback.
     /// See the module-level docs.
     fn on_wal_full(&self, info: &WalFullInfo) {
         let _ = info;

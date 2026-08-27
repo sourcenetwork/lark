@@ -1,4 +1,4 @@
-//! Shared helpers for lark-kv integration tests.
+//! Shared helpers for regolith integration tests.
 //!
 //! Each file under `tests/` is compiled as its own integration-test
 //! crate, so Rust has no inherent way to share code between them. The
@@ -14,7 +14,7 @@
 use std::fs;
 use std::path::Path;
 
-use lark_kv::{Db, Options};
+use regolith::{Db, Options};
 use tempfile::TempDir;
 
 /// Options with a small write buffer (4 KiB) so memtable flushes
@@ -27,7 +27,7 @@ pub fn small_opts() -> Options {
     }
 }
 
-/// Open a fresh lark DB in `dir` using [`small_opts`].
+/// Open a fresh regolith DB in `dir` using [`small_opts`].
 pub fn open(dir: &TempDir) -> Db {
     Db::open(dir.path(), small_opts()).unwrap()
 }

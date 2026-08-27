@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use lark_kv::{
+use regolith::{
     Db, MergeOperator, OptimisticTransactionDb, Options, TransactionDb, TransactionError, TxResult,
 };
 use tempfile::TempDir;
@@ -121,7 +121,7 @@ fn a_write_batch_around_the_lock_manager_is_detected() {
 
     let mut tx = db.begin_transaction();
     assert_eq!(tx.get_for_update(b"k").unwrap(), Some(b"v0".to_vec()));
-    let mut batch = lark_kv::WriteBatch::new();
+    let mut batch = regolith::WriteBatch::new();
     batch.put(b"k", b"racer");
     db.db().write(batch).unwrap();
     tx.put(b"k", b"mine").unwrap();

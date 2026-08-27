@@ -1,6 +1,6 @@
 //! Resource exhaustion and extremes.
 //!
-//! Everything here pushes lark past a limit rather than through a
+//! Everything here pushes regolith past a limit rather than through a
 //! normal workload: a filesystem that runs out of space mid-write, keys
 //! and values sitting exactly on and one byte over the configured
 //! maxima, degenerate zero-length keys and values, six-figure operation
@@ -20,7 +20,7 @@
 //! **ENOSPC is produced, not simulated.** The out-of-space test mounts a
 //! real, small `tmpfs` inside an unprivileged user + mount namespace and
 //! re-executes this test binary inside it, so the engine meets a genuine
-//! `ENOSPC` from the kernel. Nothing about lark's I/O is mocked. If the
+//! `ENOSPC` from the kernel. Nothing about regolith's I/O is mocked. If the
 //! namespace cannot be created the test fails loudly and says why; it
 //! never passes without having filled a filesystem.
 //!
@@ -46,7 +46,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::time::{Duration, Instant};
 
-use lark_kv::{Db, Error, Options, WriteBatch};
+use regolith::{Db, Error, Options, WriteBatch};
 use tempfile::TempDir;
 
 mod common;
@@ -113,7 +113,7 @@ fn opts_with(write_buffer_size: usize) -> Options {
     }
 }
 
-fn expect_invalid_argument(result: lark_kv::Result<()>, what: &str) {
+fn expect_invalid_argument(result: regolith::Result<()>, what: &str) {
     match result {
         Err(Error::InvalidArgument(message)) => {
             assert!(
@@ -190,7 +190,7 @@ fn wait_until(deadline: Duration, mut check: impl FnMut() -> bool) -> bool {
 
 fn deepest_populated_level(db: &Db) -> Option<usize> {
     (0..7).rev().find(|level| {
-        db.get_int_property(&format!("lark.num-files-at-level{level}"))
+        db.get_int_property(&format!("regolith.num-files-at-level{level}"))
             .unwrap_or(0)
             > 0
     })
@@ -258,7 +258,7 @@ fn a_write_batch_with_zero_operations_is_a_successful_no_op() {
     db.put(b"k", b"v").unwrap();
 
     let before = scan_in_order(&db);
-    let memtable_before = db.get_int_property("lark.cur-size-all-mem-tables");
+    let memtable_before = db.get_int_property("regolith.cur-size-all-mem-tables");
     let snapshot = db.snapshot();
 
     let empty = WriteBatch::new();
@@ -268,7 +268,7 @@ fn a_write_batch_with_zero_operations_is_a_successful_no_op() {
 
     assert_eq!(scan_in_order(&db), before, "an empty batch changed state");
     assert_eq!(
-        db.get_int_property("lark.cur-size-all-mem-tables"),
+        db.get_int_property("regolith.cur-size-all-mem-tables"),
         memtable_before,
         "an empty batch put bytes into the memtable"
     );
@@ -378,7 +378,7 @@ fn the_value_size_limit_is_exact_on_the_point_and_batch_paths() {
 
     expect_invalid_argument(db.put(b"over", &over_limit), "max_value_size");
     expect_invalid_argument(
-        db.put_opt(&lark_kv::WriteOptions::sync(), b"over", &over_limit),
+        db.put_opt(&regolith::WriteOptions::sync(), b"over", &over_limit),
         "max_value_size",
     );
 
@@ -466,11 +466,11 @@ fn one_byte_over_the_default_limits_is_rejected() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), Options::default()).unwrap();
 
-    let over_value = vec![0u8; lark_kv::DEFAULT_MAX_VALUE_SIZE + 1];
+    let over_value = vec![0u8; regolith::DEFAULT_MAX_VALUE_SIZE + 1];
     expect_invalid_argument(db.put(b"k", &over_value), "max_value_size");
     drop(over_value);
 
-    let over_key = vec![b'k'; lark_kv::DEFAULT_MAX_KEY_SIZE + 1];
+    let over_key = vec![b'k'; regolith::DEFAULT_MAX_KEY_SIZE + 1];
     expect_invalid_argument(db.put(&over_key, b"v"), "max_key_size");
 }
 
@@ -488,9 +488,9 @@ fn one_byte_over_the_default_limits_is_rejected() {
 fn the_default_size_maxima_round_trip_at_exactly_the_limit() {
     measured("64 MiB value + 8 MiB key at the limit", || {
         let dir = TempDir::new().unwrap();
-        let value = seeded_bytes(0x0BAD_F00D, lark_kv::DEFAULT_MAX_VALUE_SIZE);
+        let value = seeded_bytes(0x0BAD_F00D, regolith::DEFAULT_MAX_VALUE_SIZE);
         let key = {
-            let mut k = seeded_bytes(0x00C0_FFEE, lark_kv::DEFAULT_MAX_KEY_SIZE);
+            let mut k = seeded_bytes(0x00C0_FFEE, regolith::DEFAULT_MAX_KEY_SIZE);
             k[0] = b'z';
             k
         };
@@ -544,8 +544,8 @@ fn one_key_overwritten_100_000_times_collapses_to_a_single_version() {
         assert_eq!(live.get(b"hot".as_slice()), Some(&last));
 
         let on_disk = db
-            .get_int_property("lark.total-sst-files-size")
-            .expect("lark.total-sst-files-size is a supported property");
+            .get_int_property("regolith.total-sst-files-size")
+            .expect("regolith.total-sst-files-size is a supported property");
         assert!(
             on_disk < 64 * 1024,
             "one live 11-byte value occupies {on_disk} bytes on disk; \
@@ -799,14 +799,14 @@ fn a_deep_level_structure_still_answers_every_read() {
         assert!(
             deep,
             "the tree never reached L6 within 120 s; levels now:\n{}",
-            db.get_property("lark.levelstats").unwrap_or_default()
+            db.get_property("regolith.levelstats").unwrap_or_default()
         );
 
         let levels: Vec<(usize, u64)> = (0..7)
             .map(|l| {
                 (
                     l,
-                    db.get_int_property(&format!("lark.num-files-at-level{l}"))
+                    db.get_int_property(&format!("regolith.num-files-at-level{l}"))
                         .unwrap_or(0),
                 )
             })

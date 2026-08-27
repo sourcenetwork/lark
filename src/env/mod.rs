@@ -4,7 +4,7 @@
 //! call of its own. Everything that touches the host goes through the
 //! [`Env`] installed on [`crate::Options::env`], which defaults to
 //! [`StdEnv`]: the same `std::fs` + `std::thread` + `std::time` calls
-//! lark made before this trait existed, in the same order, with the
+//! regolith made before this trait existed, in the same order, with the
 //! same error kinds.
 //!
 //! # Why a trait object
@@ -22,7 +22,7 @@
 //!
 //! Not every host has hard links, directory fsync, cross-process file
 //! locking, or threads. [`Capabilities`] is how a backend says so and
-//! how lark reports it back through [`crate::Db::capabilities`],
+//! how regolith reports it back through [`crate::Db::capabilities`],
 //! rather than claiming a guarantee it is not providing.
 //!
 //! # Internal naming convention
@@ -72,7 +72,7 @@ use std::time::Duration;
 /// are required on every target. `Debug` is required so a bug report
 /// can name which environment was installed.
 ///
-/// Paths are whatever the host understands. lark only ever joins
+/// Paths are whatever the host understands. regolith only ever joins
 /// names onto the database directory it was given, so a backend with
 /// a flat namespace is free to treat the whole path as an opaque key.
 pub trait Env: Send + Sync + std::fmt::Debug {
@@ -80,7 +80,7 @@ pub trait Env: Send + Sync + std::fmt::Debug {
     /// directory already exists.
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
 
-    /// The entries directly under `path`, in unspecified order. lark
+    /// The entries directly under `path`, in unspecified order. regolith
     /// sorts whatever it needs sorted.
     fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>>;
 
@@ -98,7 +98,7 @@ pub trait Env: Send + Sync + std::fmt::Debug {
 
     /// Rename `from` to `to`, replacing `to` if it exists.
     ///
-    /// lark uses this for its write-new-then-rename update of the
+    /// regolith uses this for its write-new-then-rename update of the
     /// MANIFEST and of backup metadata, so a backend whose rename is
     /// not crash-atomic must report that through
     /// [`Capabilities::atomic_rename`].
@@ -131,21 +131,21 @@ pub trait Env: Send + Sync + std::fmt::Debug {
     /// Monotonic microseconds from an arbitrary origin, for measuring
     /// durations.
     ///
-    /// `None` on a platform with no monotonic clock. lark then records
+    /// `None` on a platform with no monotonic clock. regolith then records
     /// no timing at all rather than recording a zero that reads like a
     /// measurement.
     fn now_micros(&self) -> Option<u64>;
 
     /// Seconds since the Unix epoch.
     ///
-    /// `None` on a platform with no wall clock. lark then reports the
+    /// `None` on a platform with no wall clock. regolith then reports the
     /// affected timestamps as absent rather than as the epoch.
     fn unix_secs(&self) -> Option<u64>;
 
     /// Run `body` on another thread.
     ///
     /// A single-threaded host reports
-    /// [`std::io::ErrorKind::Unsupported`] here, and lark's caller
+    /// [`std::io::ErrorKind::Unsupported`] here, and regolith's caller
     /// turns that into an open error rather than a panic.
     fn spawn(
         &self,
@@ -210,7 +210,7 @@ pub trait Env: Send + Sync + std::fmt::Debug {
 
     /// Hint that the host may evict any cache backing `path`.
     ///
-    /// Best effort by definition: lark is correct whether or not the
+    /// Best effort by definition: regolith is correct whether or not the
     /// hint is honored, so failures are swallowed. The default does
     /// nothing.
     fn drop_page_cache(&self, path: &Path) {
@@ -220,7 +220,7 @@ pub trait Env: Send + Sync + std::fmt::Debug {
 
 /// A file opened for reading.
 ///
-/// Positional only. lark never relies on a shared cursor, so an
+/// Positional only. regolith never relies on a shared cursor, so an
 /// implementation needs no seek state and no lock around one - which
 /// is why an `SsTableReader` can serve concurrent readers without
 /// serializing them.

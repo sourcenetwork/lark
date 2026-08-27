@@ -11,7 +11,7 @@
 
 #![no_main]
 
-use lark_kv::{Db, Options, WriteBatch};
+use regolith::{Db, Options, WriteBatch};
 use libfuzzer_sys::fuzz_target;
 use tempfile::TempDir;
 

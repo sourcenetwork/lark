@@ -1,7 +1,7 @@
 //! The block cache's byte budget is a hard bound.
 //!
 //! Every test drives the cache through the public API and checks the
-//! `lark.block-cache-usage` property against `lark.block-cache-capacity`.
+//! `regolith.block-cache-usage` property against `regolith.block-cache-capacity`.
 //! Each one reproduced an over-budget cache or a silently shrunken one
 //! before the accounting rework.
 
@@ -12,13 +12,14 @@
 
 use std::sync::Arc;
 
-use lark_kv::{Db, Options, Statistics, Ticker};
+use regolith::{Db, Options, Statistics, Ticker};
 use tempfile::TempDir;
 
 fn usage_and_capacity(db: &Db) -> (u64, u64) {
     (
-        db.get_int_property("lark.block-cache-usage").unwrap(),
-        db.get_int_property("lark.block-cache-capacity").unwrap(),
+        db.get_int_property("regolith.block-cache-usage").unwrap(),
+        db.get_int_property("regolith.block-cache-capacity")
+            .unwrap(),
     )
 }
 

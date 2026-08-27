@@ -1,4 +1,4 @@
-//! Fault-injection substrate for lark's durability, crash and corruption
+//! Fault-injection substrate for regolith's durability, crash and corruption
 //! tests.
 //!
 //! Four facilities, each in its own submodule and all re-exported here so
@@ -41,15 +41,15 @@
 //! byte ranges were never followed by a successful `fsync` on their file,
 //! then rewrites the directory as the filesystem would have left it.
 //!
-//! This is the ALICE model driven by what lark actually did, not by an
-//! assumption about what lark does. Interposition is sound here because
-//! lark performs all data I/O through `std::fs`, which calls the glibc
+//! This is the ALICE model driven by what regolith actually did, not by an
+//! assumption about what regolith does. Interposition is sound here because
+//! regolith performs all data I/O through `std::fs`, which calls the glibc
 //! symbols; it uses `rustix` raw syscalls only for `flock` and `fadvise`,
 //! which move no file data, and it has no `mmap` write path.
 //!
 //! The weaker option (c) exists as [`power::simulate_power_loss_modelled`]
 //! for platforms where the shim cannot run. **It is not used on this
-//! machine.** It encodes an assumption about lark's sync policy into the
+//! machine.** It encodes an assumption about regolith's sync policy into the
 //! test, so it prints a warning and is documented as weaker at its
 //! definition. [`shim::available`] reports which world a test is in;
 //! [`shim::require`] panics rather than degrading silently.

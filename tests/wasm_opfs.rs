@@ -21,9 +21,9 @@
 
 use std::path::Path;
 
-use lark_kv::env::opfs::{OpfsEnv, OpfsMode, OpfsOptions};
-use lark_kv::env::{Env, WriteMode};
-use lark_kv::{Db, Options, WriteBatch};
+use regolith::env::opfs::{OpfsEnv, OpfsMode, OpfsOptions};
+use regolith::env::{Env, WriteMode};
+use regolith::{Db, Options, WriteBatch};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
@@ -48,7 +48,7 @@ fn wasm_profile_options(env: &OpfsEnv) -> Options {
 
 #[wasm_bindgen_test]
 async fn a_worker_mount_selects_sync_access_handles() {
-    let env = OpfsEnv::mount("lark-test-probe", OpfsOptions::default())
+    let env = OpfsEnv::mount("regolith-test-probe", OpfsOptions::default())
         .await
         .expect("mount");
     assert_eq!(env.mode(), OpfsMode::Sah);
@@ -58,7 +58,7 @@ async fn a_worker_mount_selects_sync_access_handles() {
 
 #[wasm_bindgen_test]
 async fn sync_access_handles_report_real_durability() {
-    let env = OpfsEnv::mount("lark-test-caps", OpfsOptions::default())
+    let env = OpfsEnv::mount("regolith-test-caps", OpfsOptions::default())
         .await
         .expect("mount");
     let caps = env.capabilities();
@@ -72,7 +72,7 @@ async fn sync_access_handles_report_real_durability() {
 
 #[wasm_bindgen_test]
 async fn the_full_lifecycle_survives_a_remount() {
-    let name = "lark-test-lifecycle";
+    let name = "regolith-test-lifecycle";
     {
         let env = OpfsEnv::mount(name, OpfsOptions::default())
             .await
@@ -143,7 +143,7 @@ async fn the_full_lifecycle_survives_a_remount() {
 
 #[wasm_bindgen_test]
 async fn mirror_mode_needs_persist_to_survive() {
-    let name = "lark-test-mirror";
+    let name = "regolith-test-mirror";
     let options = OpfsOptions {
         force_mode: Some(OpfsMode::Mirror),
         ..OpfsOptions::default()
@@ -186,15 +186,15 @@ async fn an_exhausted_pool_is_reported_and_grow_pool_clears_it() {
         initial_slots: 3,
         ..OpfsOptions::default()
     };
-    let env = OpfsEnv::mount("lark-test-pool", options)
+    let env = OpfsEnv::mount("regolith-test-pool", options)
         .await
         .expect("mount");
-    env.create_dir_all(Path::new("lark-test-pool/d"))
+    env.create_dir_all(Path::new("regolith-test-pool/d"))
         .expect("mkdir");
 
     let mut opened = 0usize;
     loop {
-        let path = format!("lark-test-pool/d/f{opened}");
+        let path = format!("regolith-test-pool/d/f{opened}");
         match env.open_write(Path::new(&path), WriteMode::Truncate) {
             Ok(_) => opened += 1,
             Err(e) => {
@@ -212,13 +212,13 @@ async fn an_exhausted_pool_is_reported_and_grow_pool_clears_it() {
 
     env.grow_pool(2).await.expect("grow");
     assert_eq!(env.free_slots(), 2);
-    env.open_write(Path::new("lark-test-pool/d/after"), WriteMode::Truncate)
+    env.open_write(Path::new("regolith-test-pool/d/after"), WriteMode::Truncate)
         .expect("a grown pool must accept a new file");
 }
 
 #[wasm_bindgen_test]
 async fn a_rename_keeps_the_newer_slot_across_a_remount() {
-    let name = "lark-test-rename";
+    let name = "regolith-test-rename";
     let manifest = format!("{name}/MANIFEST");
     let staged = format!("{name}/MANIFEST.tmp");
     {
@@ -263,7 +263,7 @@ async fn a_rename_keeps_the_newer_slot_across_a_remount() {
 
 #[wasm_bindgen_test]
 async fn directories_list_their_entries_after_a_remount() {
-    let name = "lark-test-readdir";
+    let name = "regolith-test-readdir";
     {
         let env = OpfsEnv::mount(name, OpfsOptions::default())
             .await
@@ -302,7 +302,7 @@ async fn directories_list_their_entries_after_a_remount() {
 
 #[wasm_bindgen_test]
 async fn mounting_with_fewer_slots_never_orphans_a_file() {
-    let name = "lark-test-shrink";
+    let name = "regolith-test-shrink";
     {
         let env = OpfsEnv::mount(
             name,
@@ -347,7 +347,7 @@ async fn mounting_with_fewer_slots_never_orphans_a_file() {
 
 #[wasm_bindgen_test]
 async fn bytes_written_through_a_slot_survive_a_remount() {
-    let name = "lark-test-durable";
+    let name = "regolith-test-durable";
     let file = format!("{name}/wal/000001.wal");
     {
         let env = OpfsEnv::mount(name, OpfsOptions::default())
@@ -372,7 +372,7 @@ async fn bytes_written_through_a_slot_survive_a_remount() {
 
 #[wasm_bindgen_test]
 async fn append_reopens_at_the_end_and_truncate_starts_over() {
-    let name = "lark-test-modes";
+    let name = "regolith-test-modes";
     let file = format!("{name}/MANIFEST");
     let env = OpfsEnv::mount(name, OpfsOptions::default())
         .await
@@ -405,7 +405,7 @@ async fn append_reopens_at_the_end_and_truncate_starts_over() {
 
 #[wasm_bindgen_test]
 async fn positional_reads_and_set_len_behave() {
-    let name = "lark-test-positional";
+    let name = "regolith-test-positional";
     let file = format!("{name}/sst/000001.sst");
     let env = OpfsEnv::mount(name, OpfsOptions::default())
         .await
@@ -442,7 +442,7 @@ async fn positional_reads_and_set_len_behave() {
 
 #[wasm_bindgen_test]
 async fn removing_a_file_frees_its_slot_permanently() {
-    let name = "lark-test-remove";
+    let name = "regolith-test-remove";
     let file = format!("{name}/wal/000001.wal");
     {
         let env = OpfsEnv::mount(name, OpfsOptions::default())
@@ -472,7 +472,7 @@ async fn removing_a_file_frees_its_slot_permanently() {
 
 #[wasm_bindgen_test]
 async fn a_stale_handle_reports_instead_of_corrupting_another_file() {
-    let name = "lark-test-stale";
+    let name = "regolith-test-stale";
     let file = format!("{name}/victim");
     let env = OpfsEnv::mount(name, OpfsOptions::default())
         .await
@@ -493,7 +493,7 @@ async fn a_stale_handle_reports_instead_of_corrupting_another_file() {
 
 #[wasm_bindgen_test]
 async fn the_wasm_profile_survives_a_full_lifecycle_in_a_browser() {
-    let name = "lark-test-wasm-profile";
+    let name = "regolith-test-wasm-profile";
     {
         let env = OpfsEnv::mount(name, OpfsOptions::default())
             .await
@@ -546,7 +546,7 @@ async fn a_background_compaction_worker_is_rejected_at_the_option() {
     // This is the wasm-side half of the check; the library's own
     // `#[cfg(test)]` tests cannot cover it because they only ever run
     // on the host.
-    let env = OpfsEnv::mount("lark-test-wasm-workers", OpfsOptions::default())
+    let env = OpfsEnv::mount("regolith-test-wasm-workers", OpfsOptions::default())
         .await
         .expect("mount");
 

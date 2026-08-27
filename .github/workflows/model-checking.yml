@@ -76,7 +76,7 @@ jobs:
       # and `+cmpxchg16b` for its double-width CAS, which miri cannot
       # emulate in doctests - hence `--lib` only.
       #
-      # Measured on this tree: lark's own modules also pass under miri's
+      # Measured on this tree: regolith's own modules also pass under miri's
       # bare defaults, the arena tests that exercise `kovan-queue`'s ring
       # included. These flags are headroom against kovan's internals, not
       # cover for anything here, and a finding that originates inside

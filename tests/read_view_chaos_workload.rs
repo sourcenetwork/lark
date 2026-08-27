@@ -20,7 +20,7 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lark_kv::{Db, IngestOptions, Options, SstFileWriter};
+use regolith::{Db, IngestOptions, Options, SstFileWriter};
 use tempfile::TempDir;
 
 const WRITERS: usize = 4;
@@ -28,7 +28,7 @@ const KEYS_PER_WRITER: usize = 12;
 /// Reader threads per instance. Overridable so a wedge can be attributed
 /// to the read path or to the write path.
 fn readers() -> usize {
-    env("LARK_CHAOS_READERS", 4) as usize
+    env("REGOLITH_CHAOS_READERS", 4) as usize
 }
 /// External tables ingested per instance. Bounded so the key space the
 /// readers walk stays flat while the writers keep overwriting.
@@ -41,7 +41,7 @@ const CHECKPOINTS_PER_INSTANCE: u64 = 32;
 ///
 /// Each pass rewrites the whole database, and the database grows with
 /// the version count, so the product of this bound and
-/// `LARK_CHAOS_VERSIONS` is the run's dominant cost and it is quadratic.
+/// `REGOLITH_CHAOS_VERSIONS` is the run's dominant cost and it is quadratic.
 /// 64 rather than 256: the race this workload hunts is between one
 /// compaction and one read, so it is the number of *chances* that
 /// matters, and 64 passes against four reader threads sweeping
@@ -135,8 +135,8 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
             Options {
                 write_buffer_size: 8 * 1024,
                 block_cache_size: 4 * 1024,
-                max_write_buffer_number: env("LARK_CHAOS_MAX_MEMTABLES", 2) as usize,
-                level0_stop_writes_trigger: env("LARK_CHAOS_L0_STOP", 36) as usize,
+                max_write_buffer_number: env("REGOLITH_CHAOS_MAX_MEMTABLES", 2) as usize,
+                level0_stop_writes_trigger: env("REGOLITH_CHAOS_L0_STOP", 36) as usize,
                 ..Options::default()
             },
         )
@@ -156,7 +156,7 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
     let stop = Arc::new(AtomicBool::new(false));
     let progress = Arc::new(AtomicU64::new(0));
     let bad: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let mask = env("LARK_CHAOS_MASK", 0b1111);
+    let mask = env("REGOLITH_CHAOS_MASK", 0b1111);
     let enabled = |bit: u64| mask & bit != 0;
     // `1 +` is the stall probe below, which is spawned unconditionally.
     let chaos_threads = 1 + [1u64, 2, 4, 8].iter().filter(|b| enabled(**b)).count();
@@ -347,15 +347,15 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
                 if ticks.is_multiple_of(2) {
                     // `no_slowdown` turns any active stall condition into
                     // `Error::Busy(reason)`, which names the threshold.
-                    let mut probe_opts = lark_kv::WriteOptions::new();
+                    let mut probe_opts = regolith::WriteOptions::new();
                     probe_opts.no_slowdown = true;
                     let busy = db.put_opt(&probe_opts, b"__stall_probe", b"1");
                     eprintln!("stall reason: {busy:?}");
                     eprintln!(
                         "stall probe: L0={:?} imm_memtables={:?} all_memtable_bytes={:?} live_writers={}",
-                        db.get_property("lark.num-files-at-level0"),
-                        db.get_property("lark.num-entries-imm-mem-tables"),
-                        db.get_property("lark.cur-size-all-mem-tables"),
+                        db.get_property("regolith.num-files-at-level0"),
+                        db.get_property("regolith.num-entries-imm-mem-tables"),
+                        db.get_property("regolith.cur-size-all-mem-tables"),
                         live.load(Ordering::Acquire),
                     );
                 }
@@ -424,10 +424,10 @@ fn the_read_view_survives_compaction_cf_churn_ingest_and_checkpoint() {
     // minutes wall and 4h of CPU unoptimized, which is why it is not
     // what `cargo test` runs. Every value is overridable, so a wedge
     // can be reproduced at whatever size exposed it.
-    let instances = env("LARK_CHAOS_INSTANCES", 2) as usize;
-    let rounds = env("LARK_CHAOS_ROUNDS", 1);
-    let versions = env("LARK_CHAOS_VERSIONS", 50);
-    let min_rounds = env("LARK_CHAOS_MIN_ROUNDS", 10);
+    let instances = env("REGOLITH_CHAOS_INSTANCES", 2) as usize;
+    let rounds = env("REGOLITH_CHAOS_ROUNDS", 1);
+    let versions = env("REGOLITH_CHAOS_VERSIONS", 50);
+    let min_rounds = env("REGOLITH_CHAOS_MIN_ROUNDS", 10);
 
     let mut bad = Vec::new();
     for _ in 0..rounds {

@@ -323,7 +323,7 @@ jobs:
         continue-on-error: true
       - name: Run ${{ matrix.family }}
         env:
-          LARK_BENCH_OUT: ${{ github.workspace }}/bench-${{ matrix.family }}.jsonl
+          REGOLITH_BENCH_OUT: ${{ github.workspace }}/bench-${{ matrix.family }}.jsonl
         run: cargo bench --bench ${{ matrix.family }}
       - uses: actions/upload-artifact@v4
         with:
@@ -368,7 +368,7 @@ jobs:
         run: |
           set -euo pipefail
           cat bench-artifacts/*.jsonl > bench-out.jsonl
-          LARK_BENCH_OUT="$PWD/bench-out.jsonl" \
+          REGOLITH_BENCH_OUT="$PWD/bench-out.jsonl" \
             cargo run --release --bench collect -- \
               --out "run-${GITHUB_SHA::12}.json" \
               --commit "${GITHUB_SHA}" --label main

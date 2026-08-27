@@ -492,7 +492,7 @@ impl CacheShard {
 ///
 /// `Options::block_cache_size` is the total byte budget. It is a hard
 /// bound on [`BlockCache::usage`], the figure the cache accounts and
-/// the `lark.block-cache-usage` property publishes: that total never
+/// the `regolith.block-cache-usage` property publishes: that total never
 /// exceeds the budget, whatever the shard count, block size, or value
 /// size, and every shard enforces its share exactly under its own ring
 /// mutex. It is a close bound, not a hard one, on resident memory. See
@@ -573,7 +573,7 @@ impl CacheShard {
 /// while the same code at a single shard collapses from 30.9 to 2.1.
 /// Making the ring lock-free too would still have to publish the
 /// reference bit and the byte total somewhere, and on the two targets
-/// where lark cares most it would be a loss rather than a win:
+/// where regolith cares most it would be a loss rather than a win:
 /// single-threaded wasm never contends the lock at all, so every extra
 /// read-modify-write is pure overhead, and a target with no
 /// compare-and-swap emulates one with a critical section, which is a
@@ -873,7 +873,7 @@ impl BlockCache {
 
     /// Total bytes currently held across every shard, counting each
     /// entry's [`Block::charge`] plus [`ENTRY_OVERHEAD`]. Used by the
-    /// `lark.block-cache-usage` property and by unit tests to verify
+    /// `regolith.block-cache-usage` property and by unit tests to verify
     /// eviction. Lock-free, so it can lag an insert in flight on
     /// another thread by that insert's charge.
     pub(crate) fn usage(&self) -> usize {
@@ -1231,7 +1231,7 @@ mod tests {
     }
 
     /// Byte accounting is exact: `usage()` is the sum of every live
-    /// entry's charge, which backs the `lark.block-cache-usage`
+    /// entry's charge, which backs the `regolith.block-cache-usage`
     /// property.
     #[test]
     fn byte_accounting_is_exact() {

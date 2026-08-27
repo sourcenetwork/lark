@@ -12,8 +12,8 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::engine::LarkEngine;
-use crate::engine::iterator::LarkIterator;
+use crate::engine::RegolithEngine;
+use crate::engine::iterator::RegolithIterator;
 use crate::statistics::{Histogram, Statistics, Ticker, TimeScope};
 use crate::{DbSlice, Result};
 
@@ -34,9 +34,9 @@ use crate::{DbSlice, Result};
 /// # Example
 ///
 /// ```no_run
-/// use lark_kv::{Db, Options};
+/// use regolith::{Db, Options};
 ///
-/// let db = Db::open("/tmp/lark_iter", Options::default()).unwrap();
+/// let db = Db::open("/tmp/regolith_iter", Options::default()).unwrap();
 /// db.put(b"apple", b"red").unwrap();
 /// db.put(b"banana", b"yellow").unwrap();
 /// db.put(b"cherry", b"red").unwrap();
@@ -49,7 +49,7 @@ use crate::{DbSlice, Result};
 /// }
 /// ```
 pub struct Iter<'a> {
-    inner: LarkIterator,
+    inner: RegolithIterator,
     /// Optional statistics sink captured from the parent `Db`'s
     /// options at construction time. Seek / next / prev all fire
     /// ticker increments and timing histograms through this
@@ -58,11 +58,11 @@ pub struct Iter<'a> {
     // Ties the iterator's lifetime to its parent `Db` / `Snapshot` so the
     // borrow checker prevents the iterator from outliving the engine it
     // was built from.
-    _marker: PhantomData<&'a LarkEngine>,
+    _marker: PhantomData<&'a RegolithEngine>,
 }
 
 impl<'a> Iter<'a> {
-    pub(crate) fn from_internal(inner: LarkIterator) -> Self {
+    pub(crate) fn from_internal(inner: RegolithIterator) -> Self {
         Self {
             inner,
             stats: None,

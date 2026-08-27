@@ -1,5 +1,5 @@
 [package]
-name = "lark-kv-fuzz"
+name = "regolith-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -12,7 +12,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 tempfile = "3.8"
 
-[dependencies.lark-kv]
+[dependencies.regolith]
 path = ".."
 features = ["fuzzing"]
 

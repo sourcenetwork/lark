@@ -63,7 +63,7 @@ pub struct FileMeta {
 
 /// What a given [`Env`] can actually do.
 ///
-/// lark reads this at open and adapts: an environment without
+/// regolith reads this at open and adapts: an environment without
 /// `hard_link` copies bytes for a checkpoint, and one without
 /// `sync_dir` is warned about at open and reported through
 /// [`crate::Db::capabilities`] rather than being allowed to claim a
@@ -74,7 +74,7 @@ pub struct Capabilities {
     /// [`Env::hard_link`] creates a real link. `false` makes
     /// checkpoints copy bytes instead.
     pub hard_link: bool,
-    /// [`Env::sync_dir`] is real. `false` narrows lark's crash
+    /// [`Env::sync_dir`] is real. `false` narrows regolith's crash
     /// guarantee to file contents: a create, rename, or unlink may be
     /// lost even though the bytes survived.
     pub sync_dir: bool,
@@ -82,7 +82,7 @@ pub struct Capabilities {
     /// crash.
     pub atomic_rename: bool,
     /// [`Env::lock_file`] excludes other *processes*. `false` does not
-    /// mean no exclusion at all: every environment lark ships refuses
+    /// mean no exclusion at all: every environment regolith ships refuses
     /// a second [`crate::Db`] on one directory inside one process, and
     /// on a single-process target such as wasm that is the whole
     /// guarantee. What `false` says is that a second process is not

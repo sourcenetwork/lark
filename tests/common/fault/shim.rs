@@ -52,8 +52,8 @@ fn out_dir() -> PathBuf {
     // cached object out of a shared `/tmp` and lets `cargo clean` remove
     // it.
     match option_env!("CARGO_TARGET_TMPDIR") {
-        Some(d) => PathBuf::from(d).join("lark-fault"),
-        None => std::env::temp_dir().join("lark-fault"),
+        Some(d) => PathBuf::from(d).join("regolith-fault"),
+        None => std::env::temp_dir().join("regolith-fault"),
     }
 }
 
@@ -76,7 +76,7 @@ pub fn build() -> Result<PathBuf, ShimError> {
     let dir = out_dir();
     std::fs::create_dir_all(&dir).map_err(|e| ShimError::Io(e.to_string()))?;
     let hash = source_hash();
-    let lib = dir.join(format!("liblark_fault_shim_{hash:016x}.so"));
+    let lib = dir.join(format!("libregolith_fault_shim_{hash:016x}.so"));
     if lib.is_file() {
         return Ok(lib);
     }
@@ -96,7 +96,7 @@ pub fn build() -> Result<PathBuf, ShimError> {
     let out = Command::new(rustc)
         .args(["--edition", "2021"])
         .args(["--crate-type", "cdylib"])
-        .args(["--crate-name", "lark_fault_shim"])
+        .args(["--crate-name", "regolith_fault_shim"])
         .args(["-C", "opt-level=1"])
         .args(["-C", "panic=abort"])
         .arg("-o")

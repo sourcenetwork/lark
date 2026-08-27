@@ -23,7 +23,7 @@ use common::fault::{
     self, ChildOutcome, ChildSpec, CrashRun, CutPoint, Phase, PowerLossOptions, Recovery, TearMode,
     Trigger,
 };
-use lark_kv::{DurabilityMode, Options};
+use regolith::{DurabilityMode, Options};
 use std::time::Duration;
 use tempfile::TempDir;
 

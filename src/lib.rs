@@ -1,6 +1,6 @@
-//! Lark: A pure Rust LSM-tree key-value store.
+//! Regolith: A pure Rust LSM-tree key-value store.
 //!
-//! Lark provides a fast, embedded key-value store with:
+//! Regolith provides a fast, embedded key-value store with:
 //! - **Snapshot isolation** via MVCC sequence numbers
 //! - **Crash recovery** via write-ahead logging (WAL)
 //! - **LZ4 compression** for data blocks
@@ -11,7 +11,7 @@
 //! # Quick Start
 //!
 //! ```no_run
-//! use lark_kv::{Db, Options};
+//! use regolith::{Db, Options};
 //!
 //! let db = Db::open("/tmp/my_db", Options::default()).unwrap();
 //!
@@ -26,7 +26,7 @@
 //! db.delete(b"hello").unwrap();
 //!
 //! // Batch write
-//! let mut batch = lark_kv::WriteBatch::new();
+//! let mut batch = regolith::WriteBatch::new();
 //! batch.put(b"key1", b"val1");
 //! batch.put(b"key2", b"val2");
 //! batch.delete(b"key3");
@@ -187,7 +187,7 @@ pub mod fuzzing {
 
     fn temp_path(label: &str) -> PathBuf {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("lark-kv-fuzz-{label}-{}-{id}", std::process::id()))
+        std::env::temp_dir().join(format!("regolith-fuzz-{label}-{}-{id}", std::process::id()))
     }
 }
 
@@ -200,7 +200,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use engine::LarkEngine;
+use engine::RegolithEngine;
 
 fn invalid_cf_handle_error(cf: &ColumnFamilyHandle) -> Error {
     Error::invalid_column_family(format!(
@@ -287,8 +287,8 @@ fn prefixed_cf_id(prefixed_key: &[u8]) -> std::io::Result<u32> {
 }
 
 /// Minimal snapshot of the currently-configured options, returned
-/// by `Db::get_property("lark.options")`. Deliberately small -
-/// lark doesn't retain the full `Options` past `Db::open`, and
+/// by `Db::get_property("regolith.options")`. Deliberately small -
+/// regolith doesn't retain the full `Options` past `Db::open`, and
 /// the Debug impl of this struct is the property's string value.
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -301,7 +301,7 @@ struct OptionsSnapshot {
 }
 
 /// Format a raw engine key for inclusion in a property string.
-/// Internal keys in lark carry a 4-byte CF prefix; if the key
+/// Internal keys in regolith carry a 4-byte CF prefix; if the key
 /// is long enough we strip it and ASCII-escape the remainder.
 /// Anything non-printable (or keys too short to strip) falls
 /// back to a hex rendering so the output stays single-line.
@@ -347,12 +347,12 @@ pub struct MemTableStats {
     pub size: u64,
 }
 
-/// Result type for lark operations.
+/// Result type for regolith operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// A key-value database backed by an LSM-tree.
 pub struct Db {
-    engine: Arc<LarkEngine>,
+    engine: Arc<RegolithEngine>,
     durability: engine::DurabilityMode,
     cfs: Arc<CfRegistry>,
     read_only: bool,
@@ -393,9 +393,9 @@ impl Db {
         };
         let engine_opts = opts.to_engine_options();
         let engine = if read_only {
-            LarkEngine::open_read_only(path.as_ref(), engine_opts)?
+            RegolithEngine::open_read_only(path.as_ref(), engine_opts)?
         } else {
-            LarkEngine::open(path.as_ref(), engine_opts)?
+            RegolithEngine::open(path.as_ref(), engine_opts)?
         };
         let cfs = Arc::new(CfRegistry::new());
         let db = Self {
@@ -742,7 +742,7 @@ impl Db {
     /// The returned sequence is the engine's visibility horizon once the batch
     /// is durable and applied: a [`Snapshot`] taken afterwards reports at least
     /// this value from [`Snapshot::sequence`], and one taken before reports
-    /// less. An upper layer can therefore order its own versions against lark's
+    /// less. An upper layer can therefore order its own versions against regolith's
     /// without holding a lock across the write, because the horizon publishes
     /// atomically inside this call.
     ///
@@ -1152,7 +1152,7 @@ impl Db {
     /// thread currently holds the files that would be compacted. A
     /// loop of the form `while db.compact_step()? {}` therefore
     /// terminates, and terminates having compacted everything this
-    /// thread could reach. Every compaction style lark offers reduces
+    /// thread could reach. Every compaction style regolith offers reduces
     /// the file count it merges, so the loop cannot be fed forever by
     /// its own output.
     ///
@@ -1169,14 +1169,14 @@ impl Db {
     /// Return the string value of a named property, or `None` if
     /// `name` isn't recognized. See the module-level docs for the
     /// full list of supported properties; the most useful ones
-    /// are `"lark.stats"`, `"lark.sstables"`,
-    /// `"lark.levelstats"`, and `"lark.options"`.
+    /// are `"regolith.stats"`, `"regolith.sstables"`,
+    /// `"regolith.levelstats"`, and `"regolith.options"`.
     pub fn get_property(&self, name: &str) -> Option<String> {
         match name {
-            "lark.stats" => Some(self.format_stats_property()),
-            "lark.sstables" => Some(self.format_sstables_property()),
-            "lark.levelstats" => Some(self.format_levelstats_property()),
-            "lark.options" => Some(format!("{:#?}", self.options_snapshot())),
+            "regolith.stats" => Some(self.format_stats_property()),
+            "regolith.sstables" => Some(self.format_sstables_property()),
+            "regolith.levelstats" => Some(self.format_levelstats_property()),
+            "regolith.options" => Some(format!("{:#?}", self.options_snapshot())),
             _ => {
                 // Integer properties surfaced through the string
                 // API too - every int property's string form is
@@ -1190,7 +1190,7 @@ impl Db {
     /// actually do.
     ///
     /// Read this when a durability or isolation guarantee matters.
-    /// lark keeps working on a host without directory fsync, without
+    /// regolith keeps working on a host without directory fsync, without
     /// hard links, or without cross-process locking, but the
     /// guarantee is narrower there, and this is where it says so
     /// instead of the database quietly claiming more than it
@@ -1203,19 +1203,19 @@ impl Db {
     /// Return the integer value of a named property, or `None` if
     /// `name` isn't recognized or doesn't have an integer form.
     pub fn get_int_property(&self, name: &str) -> Option<u64> {
-        if let Some(level_str) = name.strip_prefix("lark.num-files-at-level") {
+        if let Some(level_str) = name.strip_prefix("regolith.num-files-at-level") {
             let level: usize = level_str.parse().ok()?;
             return Some(self.engine.num_files_at_level(level));
         }
         match name {
-            "lark.total-sst-files-size" => Some(self.engine.total_sst_size()),
-            "lark.cur-size-active-mem-table" => Some(self.engine.active_memtable_size()),
-            "lark.memtable-reserved-bytes" => Some(self.engine.memtables_reserved_size()),
-            "lark.arena-pool-bytes" => Some(self.engine.arena_pool_size()),
-            "lark.cur-size-all-mem-tables" => {
+            "regolith.total-sst-files-size" => Some(self.engine.total_sst_size()),
+            "regolith.cur-size-active-mem-table" => Some(self.engine.active_memtable_size()),
+            "regolith.memtable-reserved-bytes" => Some(self.engine.memtables_reserved_size()),
+            "regolith.arena-pool-bytes" => Some(self.engine.arena_pool_size()),
+            "regolith.cur-size-all-mem-tables" => {
                 Some(self.engine.active_memtable_size() + self.engine.frozen_memtables_size())
             }
-            "lark.num-entries-active-mem-table" => {
+            "regolith.num-entries-active-mem-table" => {
                 // Approximate: the memtable exposes `approximate_size`
                 // in bytes but no direct entry count. Estimate by
                 // assuming a 48-byte average entry (internal key +
@@ -1224,11 +1224,11 @@ impl Db {
                 let bytes = self.engine.active_memtable_size();
                 Some(bytes / 48)
             }
-            "lark.num-entries-imm-mem-tables" => {
+            "regolith.num-entries-imm-mem-tables" => {
                 let bytes = self.engine.frozen_memtables_size();
                 Some(bytes / 48)
             }
-            "lark.estimate-num-keys" => {
+            "regolith.estimate-num-keys" => {
                 // Lower-bound estimate: exact SST entry count plus
                 // a rough guess for the memtable contribution.
                 let sst = self.engine.total_sst_num_entries();
@@ -1236,28 +1236,28 @@ impl Db {
                     self.engine.active_memtable_size() + self.engine.frozen_memtables_size();
                 Some(sst + mem_bytes / 48)
             }
-            "lark.estimate-live-data-size" => Some(self.engine.total_sst_size()),
-            "lark.num-snapshots" => Some(self.engine.live_snapshot_count()),
-            "lark.oldest-snapshot-time" => self.engine.oldest_snapshot_time_unix(),
-            "lark.block-cache-usage" => Some(self.engine.block_cache_usage() as u64),
-            "lark.block-cache-capacity" => Some(self.engine.block_cache_capacity() as u64),
-            "lark.pinned-metadata-bytes" => Some(self.engine.pinned_metadata_bytes() as u64),
+            "regolith.estimate-live-data-size" => Some(self.engine.total_sst_size()),
+            "regolith.num-snapshots" => Some(self.engine.live_snapshot_count()),
+            "regolith.oldest-snapshot-time" => self.engine.oldest_snapshot_time_unix(),
+            "regolith.block-cache-usage" => Some(self.engine.block_cache_usage() as u64),
+            "regolith.block-cache-capacity" => Some(self.engine.block_cache_capacity() as u64),
+            "regolith.pinned-metadata-bytes" => Some(self.engine.pinned_metadata_bytes() as u64),
             // Background errors are surfaced through the
             // `EventListener::on_background_error` callback today,
             // with no dedicated counter yet. Report `0` so any
             // monitoring layer consuming this property gets a
             // stable numeric value instead of `None`.
-            "lark.background-errors" => Some(0),
+            "regolith.background-errors" => Some(0),
             _ => None,
         }
     }
 
-    /// Format the multi-line `lark.stats` property: counters +
+    /// Format the multi-line `regolith.stats` property: counters +
     /// histograms (when statistics are enabled) plus per-level
     /// file counts and compaction aggregates.
     fn format_stats_property(&self) -> String {
         let mut out = String::new();
-        out.push_str("== lark engine stats ==\n");
+        out.push_str("== regolith engine stats ==\n");
         out.push_str(&self.format_levelstats_property());
         if let Some(stats) = self.engine.statistics() {
             out.push('\n');
@@ -1268,7 +1268,7 @@ impl Db {
         out
     }
 
-    /// Format the `lark.levelstats` property: one row per
+    /// Format the `regolith.levelstats` property: one row per
     /// level with file count and total size in bytes.
     fn format_levelstats_property(&self) -> String {
         let version = self.engine.current_version();
@@ -1281,7 +1281,7 @@ impl Db {
         out
     }
 
-    /// Format the `lark.sstables` property: one row per live
+    /// Format the `regolith.sstables` property: one row per live
     /// SSTable with its level, file id, size, and key range.
     fn format_sstables_property(&self) -> String {
         let version = self.engine.current_version();
@@ -1445,8 +1445,8 @@ impl Db {
     ///
     /// ```
     /// # use std::time::Duration;
-    /// # use lark_kv::{Db, Options};
-    /// # fn main() -> lark_kv::Result<()> {
+    /// # use regolith::{Db, Options};
+    /// # fn main() -> regolith::Result<()> {
     /// # let dir = tempfile::tempdir().unwrap();
     /// let db = Db::open(dir.path(), Options::default())?;
     /// db.put(b"k", b"v")?;
@@ -1753,14 +1753,14 @@ impl Db {
         }
     }
 
-    pub(crate) fn engine(&self) -> &LarkEngine {
+    pub(crate) fn engine(&self) -> &RegolithEngine {
         &self.engine
     }
 
     /// Clone the engine `Arc` - used by transaction facade types
     /// that need to carry an engine reference around independent
     /// of the owning `Db`'s lifetime. Internal-only.
-    pub(crate) fn engine_arc(&self) -> Arc<LarkEngine> {
+    pub(crate) fn engine_arc(&self) -> Arc<RegolithEngine> {
         Arc::clone(&self.engine)
     }
 
@@ -1996,7 +1996,7 @@ impl OwnedSnapshotIter {
 
 /// A point-in-time snapshot for consistent reads.
 pub struct Snapshot {
-    engine: Arc<LarkEngine>,
+    engine: Arc<RegolithEngine>,
     cfs: Arc<CfRegistry>,
     seq: u64,
 }
@@ -2047,7 +2047,7 @@ impl Snapshot {
     /// Every write with a sequence at or below this value is visible here, and
     /// every later write is not. Pairs with [`Db::write_sequenced`], which
     /// returns the sequence a batch committed at, so an upper layer can order
-    /// its own versions against lark's without serializing commits behind a
+    /// its own versions against regolith's without serializing commits behind a
     /// lock of its own: the horizon publishes atomically inside the write, and
     /// a snapshot captures it atomically here.
     pub fn sequence(&self) -> u64 {
@@ -2273,7 +2273,7 @@ impl Snapshot {
 /// iterator. This is the engine of `Db::scan` / `Snapshot::scan`; the
 /// dedicated method exists so both callers share one merge implementation.
 fn collect_range(
-    mut iter: crate::engine::iterator::LarkIterator,
+    mut iter: crate::engine::iterator::RegolithIterator,
     start: Option<&[u8]>,
     end: Option<&[u8]>,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -2301,7 +2301,7 @@ fn collect_range(
 }
 
 fn collect_page(
-    mut iter: crate::engine::iterator::LarkIterator,
+    mut iter: crate::engine::iterator::RegolithIterator,
     start: &[u8],
     end: &[u8],
     limit: usize,
@@ -6832,11 +6832,11 @@ mod tests {
         db.put(b"k", b"v").unwrap();
         let dump = stats.dump();
         for ticker_name in [
-            "lark.bytes_written",
-            "lark.keys_written",
-            "lark.bloom_filter_useful",
-            "lark.compaction_count",
-            "lark.flush_count",
+            "regolith.bytes_written",
+            "regolith.keys_written",
+            "regolith.bloom_filter_useful",
+            "regolith.compaction_count",
+            "regolith.flush_count",
         ] {
             assert!(dump.contains(ticker_name), "dump missing {ticker_name}");
         }
@@ -6854,10 +6854,13 @@ mod tests {
     #[test]
     fn test_property_num_files_at_level() {
         let (db, _dir) = open_tmp();
-        assert_eq!(db.get_int_property("lark.num-files-at-level0"), Some(0));
-        assert_eq!(db.get_int_property("lark.num-files-at-level6"), Some(0));
+        assert_eq!(db.get_int_property("regolith.num-files-at-level0"), Some(0));
+        assert_eq!(db.get_int_property("regolith.num-files-at-level6"), Some(0));
         // Out-of-range level is a valid query that returns 0.
-        assert_eq!(db.get_int_property("lark.num-files-at-level99"), Some(0));
+        assert_eq!(
+            db.get_int_property("regolith.num-files-at-level99"),
+            Some(0)
+        );
     }
 
     #[test]
@@ -6869,13 +6872,13 @@ mod tests {
         }
         force_flush(&db, "props");
         // At this point we expect some L0 files.
-        let l0_before = db.get_int_property("lark.num-files-at-level0").unwrap();
-        assert!(l0_before > 0 || db.get_int_property("lark.num-files-at-level1").unwrap() > 0);
+        let l0_before = db.get_int_property("regolith.num-files-at-level0").unwrap();
+        assert!(l0_before > 0 || db.get_int_property("regolith.num-files-at-level1").unwrap() > 0);
 
         // Drain everything to the deepest level.
         db.compact_range(None, None).unwrap();
         assert_eq!(
-            db.get_int_property("lark.num-files-at-level0"),
+            db.get_int_property("regolith.num-files-at-level0"),
             Some(0),
             "L0 should be empty after compact_range"
         );
@@ -6885,12 +6888,17 @@ mod tests {
     fn test_property_total_sst_size_after_flush() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
-        assert_eq!(db.get_int_property("lark.total-sst-files-size"), Some(0));
+        assert_eq!(
+            db.get_int_property("regolith.total-sst-files-size"),
+            Some(0)
+        );
         for i in 0..100 {
             db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
         }
         force_flush(&db, "size");
-        let size = db.get_int_property("lark.total-sst-files-size").unwrap();
+        let size = db
+            .get_int_property("regolith.total-sst-files-size")
+            .unwrap();
         assert!(size > 0, "SST size should be > 0 after a flush");
     }
 
@@ -6898,14 +6906,14 @@ mod tests {
     fn test_property_cur_size_active_mem_table() {
         let (db, _dir) = open_tmp();
         assert_eq!(
-            db.get_int_property("lark.cur-size-active-mem-table"),
+            db.get_int_property("regolith.cur-size-active-mem-table"),
             Some(0)
         );
         for i in 0..50 {
             db.put(format!("k_{i:03}").as_bytes(), b"value").unwrap();
         }
         let size = db
-            .get_int_property("lark.cur-size-active-mem-table")
+            .get_int_property("regolith.cur-size-active-mem-table")
             .unwrap();
         assert!(size > 0, "active memtable should have non-zero size");
     }
@@ -6915,9 +6923,11 @@ mod tests {
         let (db, _dir) = open_tmp();
         db.put(b"k", b"v").unwrap();
         let active = db
-            .get_int_property("lark.cur-size-active-mem-table")
+            .get_int_property("regolith.cur-size-active-mem-table")
             .unwrap();
-        let all = db.get_int_property("lark.cur-size-all-mem-tables").unwrap();
+        let all = db
+            .get_int_property("regolith.cur-size-all-mem-tables")
+            .unwrap();
         assert!(all >= active, "all mem tables must be >= active");
     }
 
@@ -6930,7 +6940,7 @@ mod tests {
         }
         force_flush(&db, "estimate");
         db.compact_range(None, None).unwrap();
-        let estimate = db.get_int_property("lark.estimate-num-keys").unwrap();
+        let estimate = db.get_int_property("regolith.estimate-num-keys").unwrap();
         // Exact count per SST includes the flush filler + the 100
         // writes; the property is a lower bound, so > 50 is a
         // safe floor.
@@ -6940,22 +6950,26 @@ mod tests {
     #[test]
     fn test_property_num_snapshots_and_oldest_snapshot_time() {
         let (db, _dir) = open_tmp();
-        assert_eq!(db.get_int_property("lark.num-snapshots"), Some(0));
+        assert_eq!(db.get_int_property("regolith.num-snapshots"), Some(0));
         assert!(
-            db.get_int_property("lark.oldest-snapshot-time").is_none(),
+            db.get_int_property("regolith.oldest-snapshot-time")
+                .is_none(),
             "oldest-snapshot-time should be None when no snapshots are live"
         );
         let _snap_a = db.snapshot();
         let _snap_b = db.snapshot();
-        assert_eq!(db.get_int_property("lark.num-snapshots"), Some(2));
-        assert!(db.get_int_property("lark.oldest-snapshot-time").is_some());
+        assert_eq!(db.get_int_property("regolith.num-snapshots"), Some(2));
+        assert!(
+            db.get_int_property("regolith.oldest-snapshot-time")
+                .is_some()
+        );
     }
 
     #[test]
     fn test_property_background_errors_returns_zero() {
         let (db, _dir) = open_tmp();
         // No background errors on a fresh db.
-        assert_eq!(db.get_int_property("lark.background-errors"), Some(0));
+        assert_eq!(db.get_int_property("regolith.background-errors"), Some(0));
     }
 
     #[test]
@@ -6968,17 +6982,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         db.put(b"k", b"v").unwrap();
-        let text = db.get_property("lark.stats").unwrap();
-        assert!(text.contains("== lark engine stats =="));
+        let text = db.get_property("regolith.stats").unwrap();
+        assert!(text.contains("== regolith engine stats =="));
         assert!(text.contains("Level  Files     Size(B)"));
-        assert!(text.contains("lark.keys_written"));
+        assert!(text.contains("regolith.keys_written"));
     }
 
     #[test]
     fn test_property_stats_string_without_statistics_configured() {
         let (db, _dir) = open_tmp();
-        let text = db.get_property("lark.stats").unwrap();
-        assert!(text.contains("== lark engine stats =="));
+        let text = db.get_property("regolith.stats").unwrap();
+        assert!(text.contains("== regolith engine stats =="));
         assert!(text.contains("(no Statistics object configured"));
     }
 
@@ -6990,7 +7004,7 @@ mod tests {
             db.put(format!("k_{i:03}").as_bytes(), b"v").unwrap();
         }
         force_flush(&db, "ssts");
-        let text = db.get_property("lark.sstables").unwrap();
+        let text = db.get_property("regolith.sstables").unwrap();
         assert!(text.contains("Level    FileID"));
         // Should list at least one file with non-zero size.
         assert!(
@@ -7007,7 +7021,7 @@ mod tests {
             db.put(format!("k_{i:03}").as_bytes(), b"v").unwrap();
         }
         force_flush(&db, "lvl");
-        let text = db.get_property("lark.levelstats").unwrap();
+        let text = db.get_property("regolith.levelstats").unwrap();
         assert!(text.starts_with("Level  Files     Size(B)"));
         // Every level row is present, not just the populated ones.
         for lvl in 0..7 {
@@ -7021,7 +7035,7 @@ mod tests {
     #[test]
     fn test_property_options_debug_dump() {
         let (db, _dir) = open_tmp();
-        let text = db.get_property("lark.options").unwrap();
+        let text = db.get_property("regolith.options").unwrap();
         assert!(text.contains("OptionsSnapshot"));
         assert!(text.contains("default"));
     }
@@ -7032,10 +7046,13 @@ mod tests {
         // get_property, returning their decimal string form.
         let (db, _dir) = open_tmp();
         assert_eq!(
-            db.get_property("lark.num-files-at-level0").as_deref(),
+            db.get_property("regolith.num-files-at-level0").as_deref(),
             Some("0")
         );
-        assert_eq!(db.get_property("lark.num-snapshots").as_deref(), Some("0"));
+        assert_eq!(
+            db.get_property("regolith.num-snapshots").as_deref(),
+            Some("0")
+        );
     }
 
     #[test]
@@ -7479,9 +7496,9 @@ mod tests {
         db.compact_range(None, None).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let l1 = db.get_int_property("lark.num-files-at-level1").unwrap();
+        let l1 = db.get_int_property("regolith.num-files-at-level1").unwrap();
         assert_eq!(l1, 0, "Universal must not produce L1 files, saw {l1}");
-        let l0 = db.get_int_property("lark.num-files-at-level0").unwrap();
+        let l0 = db.get_int_property("regolith.num-files-at-level0").unwrap();
         assert!(
             l0 >= 1,
             "Universal compaction should leave at least one L0 file"
@@ -7510,7 +7527,7 @@ mod tests {
         db.compact_range(None, None).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let l0 = db.get_int_property("lark.num-files-at-level0").unwrap();
+        let l0 = db.get_int_property("regolith.num-files-at-level0").unwrap();
         assert_eq!(
             l0, 1,
             "full universal compact_range should fold everything into one L0 file, saw {l0}"
@@ -7553,7 +7570,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         let total = db
-            .get_int_property("lark.total-sst-files-size")
+            .get_int_property("regolith.total-sst-files-size")
             .unwrap_or(0);
         assert!(
             total <= 64 * 1024,
@@ -7591,7 +7608,7 @@ mod tests {
         db.compact_range(None, None).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let l0 = db.get_int_property("lark.num-files-at-level0").unwrap();
+        let l0 = db.get_int_property("regolith.num-files-at-level0").unwrap();
         assert!(
             l0 >= 1,
             "FIFO must keep at least one L0 file even when over the cap"
@@ -7620,7 +7637,7 @@ mod tests {
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        let l1 = db.get_int_property("lark.num-files-at-level1").unwrap();
+        let l1 = db.get_int_property("regolith.num-files-at-level1").unwrap();
         assert_eq!(l1, 0, "FIFO must not produce L1 files, saw {l1}");
     }
 
@@ -7776,7 +7793,7 @@ mod tests {
     fn test_block_cache_usage_property_reports_nonzero_after_reads() {
         // A cache with a small-but-nonzero budget fills with
         // decompressed data blocks as reads touch SSTables. The
-        // `lark.block-cache-usage` property must report a
+        // `regolith.block-cache-usage` property must report a
         // positive number once at least one read has happened
         // against a file that isn't entirely in the memtable.
         let opts = Options {
@@ -7802,14 +7819,14 @@ mod tests {
         }
 
         let usage = db
-            .get_int_property("lark.block-cache-usage")
+            .get_int_property("regolith.block-cache-usage")
             .expect("property must exist");
         assert!(
             usage > 0,
             "expected block-cache-usage > 0 after reads, got {usage}"
         );
         let cap = db
-            .get_int_property("lark.block-cache-capacity")
+            .get_int_property("regolith.block-cache-capacity")
             .expect("property must exist");
         assert!(
             cap >= 512 * 1024,
@@ -7976,11 +7993,17 @@ mod tests {
         for i in 0..32 {
             let k = format!("fill{i:04}");
             db.put(k.as_bytes(), &payload).unwrap();
-            if db.get_int_property("lark.num-files-at-level0").unwrap_or(0) >= 2 {
+            if db
+                .get_int_property("regolith.num-files-at-level0")
+                .unwrap_or(0)
+                >= 2
+            {
                 break;
             }
         }
-        let l0 = db.get_int_property("lark.num-files-at-level0").unwrap_or(0);
+        let l0 = db
+            .get_int_property("regolith.num-files-at-level0")
+            .unwrap_or(0);
         assert!(l0 >= 2, "precondition: need L0 >= 2, got {l0}");
 
         let db_writer = db.clone();

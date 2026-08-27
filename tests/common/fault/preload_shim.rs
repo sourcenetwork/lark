@@ -10,7 +10,7 @@
 //!
 //! # Why interposition works here
 //!
-//! lark performs every data read and write through `std::fs`, which on
+//! regolith performs every data read and write through `std::fs`, which on
 //! `*-linux-gnu` calls the glibc `write`/`pwrite64`/`writev`/`fsync`/
 //! `fdatasync`/`open64`/`openat` symbols through the PLT. It uses `rustix`
 //! (raw syscalls, NOT interposable) only for `flock` and `fadvise`, which
@@ -41,12 +41,12 @@
 //!
 //! # Environment
 //!
-//! * `LARK_FAULT_JOURNAL`   path of the journal. Unset = the shim is inert.
-//! * `LARK_FAULT_ROOT`      only paths containing this substring are tracked.
-//! * `LARK_FAULT_DIE_KIND`  `write` | `fsync` | `open` | `truncate`, unset = never die.
-//! * `LARK_FAULT_DIE_PATH`  substring the path must contain to count.
-//! * `LARK_FAULT_DIE_NTH`   1-based index of the matching operation to die on.
-//! * `LARK_FAULT_DIE_WHEN`  `after` (default) or `before` the real call.
+//! * `REGOLITH_FAULT_JOURNAL`   path of the journal. Unset = the shim is inert.
+//! * `REGOLITH_FAULT_ROOT`      only paths containing this substring are tracked.
+//! * `REGOLITH_FAULT_DIE_KIND`  `write` | `fsync` | `open` | `truncate`, unset = never die.
+//! * `REGOLITH_FAULT_DIE_PATH`  substring the path must contain to count.
+//! * `REGOLITH_FAULT_DIE_NTH`   1-based index of the matching operation to die on.
+//! * `REGOLITH_FAULT_DIE_WHEN`  `after` (default) or `before` the real call.
 
 #![allow(clippy::missing_safety_doc)]
 
@@ -106,7 +106,7 @@ macro_rules! real {
         if p == 0 {
             p = next_sym(concat!($name, "\0").as_bytes()) as u64;
             if p == 0 {
-                die_loudly(concat!("lark-fault-shim: missing symbol ", $name));
+                die_loudly(concat!("regolith-fault-shim: missing symbol ", $name));
             }
             CACHE.store(p, Ordering::Relaxed);
         }
@@ -175,19 +175,19 @@ struct Config {
 fn config() -> &'static Config {
     static CELL: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
     CELL.get_or_init(|| Config {
-        root: env("LARK_FAULT_ROOT").unwrap_or_default(),
-        die_kind: match env("LARK_FAULT_DIE_KIND").as_deref() {
+        root: env("REGOLITH_FAULT_ROOT").unwrap_or_default(),
+        die_kind: match env("REGOLITH_FAULT_DIE_KIND").as_deref() {
             Some("write") => DIE_WRITE,
             Some("fsync") => DIE_FSYNC,
             Some("open") => DIE_OPEN,
             Some("truncate") => DIE_TRUNCATE,
             _ => DIE_NONE,
         },
-        die_path: env("LARK_FAULT_DIE_PATH").unwrap_or_default(),
-        die_nth: env("LARK_FAULT_DIE_NTH")
+        die_path: env("REGOLITH_FAULT_DIE_PATH").unwrap_or_default(),
+        die_nth: env("REGOLITH_FAULT_DIE_NTH")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0),
-        die_before: matches!(env("LARK_FAULT_DIE_WHEN").as_deref(), Some("before")),
+        die_before: matches!(env("REGOLITH_FAULT_DIE_WHEN").as_deref(), Some("before")),
     })
 }
 
@@ -197,7 +197,7 @@ unsafe fn journal_fd() -> c_int {
     if cur != -2 {
         return cur;
     }
-    let fd = match env("LARK_FAULT_JOURNAL") {
+    let fd = match env("REGOLITH_FAULT_JOURNAL") {
         None => -1,
         Some(path) => {
             let mut c = path.into_bytes();
@@ -588,6 +588,6 @@ pub unsafe extern "C" fn unlink(path: *const c_char) -> c_int {
 /// Exported so a harness can assert the shim is actually loaded rather
 /// than silently running an un-instrumented child.
 #[no_mangle]
-pub extern "C" fn lark_fault_shim_present() -> c_long {
+pub extern "C" fn regolith_fault_shim_present() -> c_long {
     1
 }

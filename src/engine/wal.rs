@@ -12,19 +12,19 @@
 //! ...
 //! ```
 //!
-//! # Reading a log written before the stamp existed
+//! # A log with no stamp
 //!
-//! Logs written before the stamp begin directly with a record, and they
-//! still open: a file whose first four bytes are not `REGO` is replayed
-//! as a bare record sequence, exactly as it was written. Nothing is
-//! rewritten to migrate one. The next log the engine creates carries the
-//! stamp, so a database moves forward one WAL at a time simply by being
-//! used, and a mixed directory is normal rather than an error state.
+//! The stamp is written when the log is created, before any record, so a
+//! file whose first four bytes are not `REGO` is one a crash caught
+//! during creation: no write from it was ever acknowledged, and it holds
+//! no record to lose. Such a file is discarded rather than parsed, and
+//! the discard is recorded so an open still fails when a *later* log
+//! yielded records, which would make the missing bytes a hole in the
+//! history rather than its end.
 //!
-//! The two shapes cannot be confused. `REGO` read as the little-endian
-//! `len` of a legacy record is 0x4F47_4552, about 1.3 GiB, and
-//! [`MAX_RECORD_LEN`] caps a record far below that, so no legacy record
-//! can begin with those bytes.
+//! A stamp can never be read as a record header. `REGO` as a
+//! little-endian `len` is 0x4F47_4552, about 1.3 GiB, and
+//! [`MAX_RECORD_LEN`] caps a record far below that.
 //!
 //! The checksum covers the length, the type byte and the payload, so the
 //! length field is both what finds the next record and part of what the
@@ -113,8 +113,7 @@ const WAL_FORMAT_V1: u16 = 1;
 
 /// Largest record payload the writer will emit, and the largest a reader
 /// will believe. Well under `REGO` read as a little-endian length
-/// (0x4F47_4552), which is what keeps a stamped file from ever being
-/// mistaken for a legacy record and the reverse.
+/// (0x4F47_4552), so the stamp can never be parsed as a record header.
 pub(crate) const MAX_RECORD_LEN: u32 = 1 << 30;
 
 const WAL_HEADER_LEN: usize = 5;
@@ -689,12 +688,9 @@ struct Frame<'a> {
 
 impl Frame<'_> {
     /// Whether the stored checksum matches the bytes of this record.
-    /// Logs written before the header joined the checksum's coverage
-    /// stored a payload-only checksum, which is still accepted.
     fn checksum_matches(&self) -> bool {
         let len = self.data.len() as u32;
         self.stored_checksum == checksum::wal_record(len, self.record_type, self.data)
-            || self.stored_checksum == checksum::legacy_payload_u32(self.data)
     }
 }
 
@@ -950,7 +946,7 @@ pub(super) fn validate_wal_stamp(bytes: &[u8]) -> io::Result<Option<usize>> {
     // newer one wrote, instead of misreading its framing.
     if format > WAL_FORMAT_V1 {
         return Err(invalid_wal(format!(
-            "WAL format {format} was written by a newer lark than this build, \
+            "WAL format {format} was written by a newer regolith than this build, \
              which understands up to {WAL_FORMAT_V1}"
         )));
     }
@@ -1680,8 +1676,8 @@ mod tests {
     #[test]
     fn the_stamp_cannot_be_confused_with_a_record_length() {
         // `REGO` read as a little-endian record length is far above the
-        // largest record the writer will emit, so no legacy-shaped record
-        // can begin with the magic and no stamp can be read as a record.
+        // largest record the writer will emit, so no stamp can be read
+        // as a record header.
         let as_len = u32::from_le_bytes(WAL_MAGIC);
         assert!(
             as_len > MAX_RECORD_LEN,
@@ -1700,7 +1696,7 @@ mod tests {
         let err = validate_wal_stamp(&stamp).expect_err("a newer format must not be parsed");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(
-            err.to_string().contains("newer lark"),
+            err.to_string().contains("newer regolith"),
             "the error must say why: {err}"
         );
     }
@@ -1995,31 +1991,6 @@ mod tests {
             Ok(v) => panic!("expected checksum error, got {} entries", v.len()),
         };
         assert_eq!(kind, io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn replay_accepts_legacy_payload_only_checksum() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("legacy.wal");
-        let data = put_data(b"k", b"v", 1);
-        let mut f = File::create(&path).unwrap();
-        f.write_all(&encode_wal_stamp()).unwrap();
-        append_raw_record(
-            &mut f,
-            RECORD_PUT,
-            &data,
-            Some(checksum::legacy_payload_u32(&data)),
-        );
-        f.sync_all().unwrap();
-
-        assert_eq!(
-            Wal::replay(&path).unwrap(),
-            vec![WalEntry::Put {
-                key: b"k".to_vec(),
-                value: b"v".to_vec(),
-                seq: 1
-            }]
-        );
     }
 
     #[test]

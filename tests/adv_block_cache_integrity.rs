@@ -10,7 +10,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 
-use lark_kv::{Db, Options, Statistics, Ticker};
+use regolith::{Db, Options, Statistics, Ticker};
 use tempfile::TempDir;
 
 const KEYS: u32 = 40_000;
@@ -94,8 +94,10 @@ fn readers_never_see_a_wrong_block_while_compaction_evicts_files() {
         assert_eq!(db.get(&key(i)).unwrap(), Some(value(i)), "key {i} diverged");
     }
 
-    let usage = db.get_int_property("lark.block-cache-usage").unwrap();
-    let capacity = db.get_int_property("lark.block-cache-capacity").unwrap();
+    let usage = db.get_int_property("regolith.block-cache-usage").unwrap();
+    let capacity = db
+        .get_int_property("regolith.block-cache-capacity")
+        .unwrap();
     let hits = stats.get_ticker(Ticker::BlockCacheHit);
     let misses = stats.get_ticker(Ticker::BlockCacheMiss);
     println!(
@@ -158,8 +160,9 @@ fn a_disabled_cache_serves_the_same_storm() {
     }
     assert_eq!(
         (
-            db.get_int_property("lark.block-cache-usage").unwrap(),
-            db.get_int_property("lark.block-cache-capacity").unwrap()
+            db.get_int_property("regolith.block-cache-usage").unwrap(),
+            db.get_int_property("regolith.block-cache-capacity")
+                .unwrap()
         ),
         (0, 0)
     );

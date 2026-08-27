@@ -19,8 +19,8 @@
 //! cargo invocation, which builds every test target in the package, and
 //! the rest of `tests/` is native-only.
 
-use lark_kv::env::opfs::{OpfsEnv, OpfsOptions};
-use lark_kv::{Db, Options};
+use regolith::env::opfs::{OpfsEnv, OpfsOptions};
+use regolith::{Db, Options};
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
@@ -43,7 +43,7 @@ fn linear_memory_kib() -> usize {
 async fn the_whole_lifecycle_fits_the_embedded_budget() {
     let baseline = linear_memory_kib();
 
-    let env = OpfsEnv::mount("lark-test-memory", OpfsOptions::default())
+    let env = OpfsEnv::mount("regolith-test-memory", OpfsOptions::default())
         .await
         .expect("mount");
     let mut options = Options::embedded();

@@ -1,6 +1,6 @@
 //! Point-read throughput at 1, 2, 4 and 8 threads.
 //!
-//! The read path is the one place where the [`lark_kv::Env`] indirection
+//! The read path is the one place where the [`regolith::Env`] indirection
 //! could plausibly cost something, so it gets a harness rather than an
 //! assurance. Cached blocks never reach `Env` at all (the block cache
 //! answers first), and an uncached block now takes a positional
@@ -8,7 +8,7 @@
 //! result is "no measurable change".
 //!
 //! ```sh
-//! cargo run --release --example read_scaling -- /tmp/lark-scale 200000 3
+//! cargo run --release --example read_scaling -- /tmp/regolith-scale 200000 3
 //! ```
 //!
 //! Arguments: database directory, key count, repeat count. Each thread
@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Instant;
 
-use lark_kv::{Db, Options};
+use regolith::{Db, Options};
 
 const THREAD_COUNTS: [usize; 4] = [1, 2, 4, 8];
 const READS_PER_THREAD: u64 = 200_000;
@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = args
         .first()
         .cloned()
-        .unwrap_or_else(|| "/tmp/lark-read-scaling".to_string());
+        .unwrap_or_else(|| "/tmp/regolith-read-scaling".to_string());
     let num: u64 = args.get(1).map_or(Ok(200_000), |s| s.parse())?;
     let repeats: usize = args.get(2).map_or(Ok(3), |s| s.parse())?;
 
@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert!(db.get(k)?.is_some(), "seed key missing");
     }
 
-    println!("lark point-read scaling");
+    println!("regolith point-read scaling");
     println!("  keys           {num}");
     println!("  reads/thread   {READS_PER_THREAD}");
     println!("  repeats        {repeats} (best reported)");

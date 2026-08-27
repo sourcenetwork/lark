@@ -2,7 +2,7 @@
 //!
 //! The test in this module mounts a small `tmpfs` inside an unprivileged
 //! user and mount namespace, re-executes the test binary inside it, and
-//! lets lark meet the kernel's own out-of-space error on its own
+//! lets regolith meet the kernel's own out-of-space error on its own
 //! `std::fs` writes. Nothing about the engine's I/O is mocked, and when
 //! the namespace cannot be created the test fails loudly instead of
 //! passing without having filled anything.
@@ -12,16 +12,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-use lark_kv::{BackgroundErrorReason, Db, Error, EventListener, Options};
+use regolith::{BackgroundErrorReason, Db, Error, EventListener, Options};
 use tempfile::TempDir;
 
 use super::{measured, seeded_bytes};
 
 /// Environment variable carrying the mount point into the re-executed
 /// child. Its presence is also what stops the child from recursing.
-const ENOSPC_MOUNT_ENV: &str = "LARK_ENOSPC_MOUNT";
+const ENOSPC_MOUNT_ENV: &str = "REGOLITH_ENOSPC_MOUNT";
 
-/// Size of the tmpfs the child fills, in bytes. Large enough for lark to
+/// Size of the tmpfs the child fills, in bytes. Large enough for regolith to
 /// open a database and small enough to fill in well under a second.
 const ENOSPC_FS_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -36,7 +36,7 @@ const ENOSPC_HEADROOM: u64 = 192 * 1024;
 ///
 /// The filesystem is real. The test mounts an 8 MiB tmpfs inside an
 /// unprivileged user and mount namespace and re-executes this binary
-/// inside it, so lark meets the kernel's own `ENOSPC` on its own
+/// inside it, so regolith meets the kernel's own `ENOSPC` on its own
 /// `std::fs` writes. Catches an engine that reports a disk-full write as
 /// data corruption, that leaves its WAL writer wedged after the first
 /// failure, or that cannot reopen a database whose WAL has a partial
@@ -177,7 +177,7 @@ fn enospc_child_body(mount: &Path) {
             filled > ENOSPC_HEADROOM,
             "the tmpfs is too small to leave usable headroom"
         );
-        // Hand a little space back so lark, not the ballast, is the one
+        // Hand a little space back so regolith, not the ballast, is the one
         // that runs out.
         fs::OpenOptions::new()
             .write(true)

@@ -9,7 +9,7 @@
 //! [`TokenBucketRateLimiter`] is the stock implementation: a single
 //! token bucket with a configurable refill rate and burst capacity,
 //! served by a FIFO queue that always drains [`Priority::High`] waiters
-//! before [`Priority::Low`]. It is the only implementation lark ships;
+//! before [`Priority::Low`]. It is the only implementation regolith ships;
 //! the trait is public so callers can drop in their own (e.g. for test
 //! harnesses or a shared limiter across multiple databases).
 

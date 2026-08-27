@@ -3,7 +3,7 @@
 //!
 //! # Design
 //!
-//! Column families in lark are implemented as **key-prefix
+//! Column families in regolith are implemented as **key-prefix
 //! namespaces** on top of the single underlying LSM engine. Every
 //! logical operation on a CF wraps the caller's user key in a
 //! 4-byte big-endian `cf_id` prefix before handing it to the
@@ -28,7 +28,7 @@
 //! ## Atomic flush across column families
 //!
 //! Because every CF shares one memtable, one WAL, and one
-//! manifest, multi-CF writes are atomic in lark by construction.
+//! manifest, multi-CF writes are atomic in regolith by construction.
 //! A flush produces one SSTable that either contains every key in
 //! a batch or none of them; the WAL is the source of truth until
 //! the manifest edit lands, so a crash mid-flush replays the
@@ -36,7 +36,7 @@
 //!
 //! [`crate::Options::atomic_flush`] is accepted for parity with
 //! storage engines that require an explicit opt-in to get this
-//! guarantee - under lark's design its value is irrelevant, the
+//! guarantee - under regolith's design its value is irrelevant, the
 //! guarantee is always on.
 //!
 //! ## Metadata storage

@@ -11,7 +11,7 @@
 //!     -- --dir /data --mode verify
 //! ```
 
-use lark_kv::{Db, Error, Options, WriteBatch};
+use regolith::{Db, Error, Options, WriteBatch};
 
 const N: usize = 4_000;
 

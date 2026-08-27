@@ -1,4 +1,4 @@
-//! Shared harness for the lark benchmark suite.
+//! Shared harness for the regolith benchmark suite.
 //!
 //! Every bench target links this module and reports through it, so sampling,
 //! key shapes, process accounting, and the on-disk metric format stay in one
@@ -134,7 +134,7 @@ impl TempDb {
             .unwrap_or(0);
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = root.join(format!(
-            "lark-bench-{tag}-{}-{nanos}-{seq}",
+            "regolith-bench-{tag}-{}-{nanos}-{seq}",
             std::process::id()
         ));
         fs::create_dir_all(&dir)
@@ -150,29 +150,29 @@ impl TempDb {
 impl Drop for TempDb {
     fn drop(&mut self) {
         if let Err(e) = fs::remove_dir_all(&self.dir) {
-            eprintln!("lark-bench: leaked {}: {e}", self.dir.display());
+            eprintln!("regolith-bench: leaked {}: {e}", self.dir.display());
         }
     }
 }
 
-pub fn open(tag: &str, opts: lark_kv::Options) -> (TempDb, lark_kv::Db) {
+pub fn open(tag: &str, opts: regolith::Options) -> (TempDb, regolith::Db) {
     let tmp = TempDb::new(tag);
-    let db = lark_kv::Db::open(tmp.path(), opts)
+    let db = regolith::Db::open(tmp.path(), opts)
         .unwrap_or_else(|e| panic!("open db at {}: {e}", tmp.dir.display()));
     (tmp, db)
 }
 
-pub fn default_opts() -> lark_kv::Options {
-    lark_kv::Options::default()
+pub fn default_opts() -> regolith::Options {
+    regolith::Options::default()
 }
 
 /// Small enough to force flushes and compaction inside a bench run.
-pub fn small_opts() -> lark_kv::Options {
-    lark_kv::Options {
+pub fn small_opts() -> regolith::Options {
+    regolith::Options {
         write_buffer_size: 4 * 1024 * 1024,
         block_cache_size: 8 * 1024 * 1024,
         block_cache_num_shard_bits: 0,
-        ..lark_kv::Options::default()
+        ..regolith::Options::default()
     }
 }
 
@@ -205,13 +205,13 @@ pub fn min_max(v: &[f64]) -> (f64, f64) {
 
 /// Emit one metric family as JSON into the run file assembled by collect.rs.
 ///
-/// With LARK_BENCH_OUT set, one `{"family":..,"data":..}` record is appended
+/// With REGOLITH_BENCH_OUT set, one `{"family":..,"data":..}` record is appended
 /// per call (JSON Lines). Without it, the family lands in `./bench-out/<name>.json`
 /// so a single bench can be run standalone. `json` is written verbatim and must
 /// already be valid JSON.
 pub fn write_family(name: &str, json: &str) {
     let record = format!("{{\"family\":\"{name}\",\"data\":{json}}}\n");
-    match std::env::var_os("LARK_BENCH_OUT") {
+    match std::env::var_os("REGOLITH_BENCH_OUT") {
         Some(p) if !p.is_empty() => {
             let path = PathBuf::from(p);
             let mut f = OpenOptions::new()

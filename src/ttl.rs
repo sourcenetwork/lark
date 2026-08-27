@@ -24,14 +24,8 @@ use std::sync::Arc;
 use crate::options::{CompactionDecision, CompactionFilter};
 use crate::{Db, DbSlice, Options, Result, WriteBatch, WriteBatchOp};
 
-const LEGACY_TS_LEN: usize = 4;
-/// Identifier stamped into a TTL-carrying value. Values written by an
-/// earlier build carry `LTTL` and are still read, so a TTL database
-/// opens and migrates as its values are rewritten.
+/// Identifier stamped into a TTL-carrying value.
 const TTL_MAGIC: [u8; 4] = *b"RTTL";
-
-/// The identifier earlier builds wrote. Read, never written.
-const TTL_MAGIC_LEGACY: [u8; 4] = *b"LTTL";
 const TTL_MAGIC_LEN: usize = 4;
 const TTL_FORMAT_VERSION: u8 = 1;
 const TTL_TS_LEN: usize = 8;
@@ -286,32 +280,19 @@ struct DecodedTtlSuffix {
 }
 
 fn decode_ttl_suffix(stamped: &[u8]) -> Option<DecodedTtlSuffix> {
-    if stamped.len() >= TTL_SUFFIX_LEN {
-        let suffix_start = stamped.len() - TTL_SUFFIX_LEN;
-        let suffix = &stamped[suffix_start..];
-        let magic: [u8; TTL_MAGIC_LEN] = suffix[..TTL_MAGIC_LEN].try_into().unwrap();
-        if magic == TTL_MAGIC || magic == TTL_MAGIC_LEGACY {
-            if suffix[TTL_MAGIC_LEN] != TTL_FORMAT_VERSION {
-                return None;
-            }
-            let ts_start = TTL_MAGIC_LEN + 1;
-            let timestamp =
-                u64::from_be_bytes(suffix[ts_start..ts_start + TTL_TS_LEN].try_into().unwrap());
-            return Some(DecodedTtlSuffix {
-                value_len: suffix_start,
-                timestamp,
-            });
-        }
-    }
-
-    if stamped.len() < LEGACY_TS_LEN {
+    if stamped.len() < TTL_SUFFIX_LEN {
         return None;
     }
-
-    let start = stamped.len() - LEGACY_TS_LEN;
-    let timestamp = u32::from_be_bytes(stamped[start..].try_into().unwrap()) as u64;
+    let suffix_start = stamped.len() - TTL_SUFFIX_LEN;
+    let suffix = &stamped[suffix_start..];
+    let magic: [u8; TTL_MAGIC_LEN] = suffix[..TTL_MAGIC_LEN].try_into().unwrap();
+    if magic != TTL_MAGIC || suffix[TTL_MAGIC_LEN] != TTL_FORMAT_VERSION {
+        return None;
+    }
+    let ts_start = TTL_MAGIC_LEN + 1;
+    let timestamp = u64::from_be_bytes(suffix[ts_start..ts_start + TTL_TS_LEN].try_into().unwrap());
     Some(DecodedTtlSuffix {
-        value_len: start,
+        value_len: suffix_start,
         timestamp,
     })
 }
@@ -372,7 +353,7 @@ impl CompactionFilter for TtlCompactionFilter {
     }
 
     fn name(&self) -> &'static str {
-        "lark_ttl_filter"
+        "regolith_ttl_filter"
     }
 }
 
@@ -407,12 +388,6 @@ mod tests {
             let key = format!("__flush_{}_{:04}", tag, i);
             db.put(key.as_bytes(), &payload).unwrap();
         }
-    }
-
-    fn legacy_stamp(value: &[u8], ts: u32) -> Vec<u8> {
-        let mut out = Vec::from(value);
-        out.extend_from_slice(&ts.to_be_bytes());
-        out
     }
 
     #[test]
@@ -552,29 +527,6 @@ mod tests {
         let stamped = stamp(b"future", far_future);
         assert_eq!(timestamp_of(&stamped), Some(far_future));
         assert_eq!(strip_timestamp(&stamped), Some(b"future".as_slice()));
-    }
-
-    #[test]
-    fn test_ttl_strip_timestamp_accepts_legacy_u32_suffix() {
-        let legacy = legacy_stamp(b"hello", 42);
-        assert_eq!(timestamp_of(&legacy), Some(42));
-        assert_eq!(strip_timestamp(&legacy), Some(b"hello".as_slice()));
-    }
-
-    #[test]
-    fn test_ttl_legacy_u32_suffix_still_expires() {
-        let dir = TempDir::new().unwrap();
-        let db = DbWithTtl::open(dir.path(), Options::default(), 10).unwrap();
-        db.inner()
-            .put(b"old_legacy", &legacy_stamp(b"stale", 1))
-            .unwrap();
-        assert_eq!(db.get(b"old_legacy").unwrap(), None);
-
-        let filter = TtlCompactionFilter::new(10);
-        assert_eq!(
-            filter.filter(0, b"k", &legacy_stamp(b"stale", 1)),
-            CompactionDecision::Remove
-        );
     }
 
     #[test]

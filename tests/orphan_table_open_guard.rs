@@ -2,24 +2,15 @@
 //! recording no entry is a crash artifact.
 //!
 //! The rule reads the footer's `num_entries` and `range_tombstone_size`.
-//! A checksummed footer (v3 and v4 under LARKSST, v5 and v6 under
-//! REGOSST) refuses a damaged one. A v1 or v2 footer carries no
-//! checksum, which is the deliberate hole the metadata-checksum work
-//! left, and that hole feeds this guard: two zeroed `u64`s in a legacy
-//! footer make a table holding 200 keys claim to hold none, and the
-//! guard would then let the open discard it.
-//!
-//! Both halves are exercised so the difference is the format version and
-//! nothing else.
+//! Every format regolith reads carries a footer checksum, so a damaged
+//! footer is refused before the guard ever sees it, and a forged entry
+//! count cannot talk the open into discarding a table that holds data.
 
 use std::fs;
 use std::path::Path;
 
-use lark_kv::{Db, DurabilityMode, Options, SstFileWriter};
+use regolith::{Db, DurabilityMode, Options, SstFileWriter};
 use tempfile::TempDir;
-
-/// A real V1 table written by the pre-change tree.
-const LEGACY_V1: &[u8] = include_bytes!("fixtures/legacy_v1v2/legacy_flat.sst");
 
 fn opts() -> Options {
     Options {
@@ -84,11 +75,11 @@ fn modern_table(entries: usize) -> Vec<u8> {
 #[test]
 fn a_modern_table_that_lies_about_its_entry_count_is_still_refused() {
     let mut bytes = modern_table(50);
-    // Any checksummed footer will do: v3 and v4 are LARKSST, v5 and v6
-    // the stamped REGOSST ones, and all four share the 72-byte layout
-    // the offsets below assume. What the probe needs is a footer the
-    // reader *can* verify, so that refusing the forgery is the checksum
-    // doing its job rather than the version byte.
+    // Either footer will do: v5 is the flat REGOSST magic and v6 the
+    // partitioned one, and both share the 72-byte layout the offsets
+    // below assume. What the probe needs is a footer the reader *can*
+    // verify, so that refusing the forgery is the checksum doing its job
+    // rather than the version byte.
     let magic = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().expect("8"));
     assert!(
         matches!(
@@ -109,34 +100,4 @@ fn a_modern_table_that_lies_about_its_entry_count_is_still_refused() {
     };
     assert!(err.contains("000042.sst"), "got: {err}");
     println!("checksummed lying footer: refused ({err})");
-}
-
-/// The same forgery on a legacy table. A failure here is not a new
-/// defect on its own: it is the un-checksummed legacy footer reaching
-/// the open guard, and the consequence is that the open succeeds while
-/// a table holding 200 keys is discarded.
-#[test]
-fn a_legacy_table_that_lies_about_its_entry_count_is_still_refused() {
-    let mut bytes = LEGACY_V1.to_vec();
-    assert_eq!(
-        &bytes[bytes.len() - 8..],
-        &[0x01, 0x54, 0x53, 0x53, 0x4b, 0x52, 0x41, 0x4c],
-        "this probe needs the real V1 fixture",
-    );
-    lie_about_the_contents(&mut bytes, 64);
-
-    let dir = wal_only_copy(10);
-    let orphan = dir.path().join("sst").join("000042.sst");
-    fs::write(&orphan, &bytes).expect("write orphan");
-    match Db::open(dir.path(), opts()) {
-        Err(e) => println!("V1 lying footer: refused ({e})"),
-        Ok(db) => {
-            let served = db.scan(None, None).expect("scan").len();
-            panic!(
-                "a legacy table holding 200 keys claimed to hold none and the open went \
-                 through, serving {served} entries and leaving the table unreferenced. The \
-                 legacy footer carries no checksum, and the open guard trusts it."
-            );
-        }
-    }
 }

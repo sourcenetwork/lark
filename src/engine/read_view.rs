@@ -7,7 +7,7 @@
 //!   memtable set or of the current version publishes a **new** view;
 //!   nothing ever mutates a view a reader may be holding.
 //! * The view is the single source of truth for the active memtable and
-//!   the frozen memtable list. `LarkEngine` owns no separate copy.
+//!   the frozen memtable list. `RegolithEngine` owns no separate copy.
 //! * Successive published views only ever move data in the "older"
 //!   direction (active -> frozen -> version) and never lose it, so a
 //!   reader holding an older view sees a subset of the data a newer

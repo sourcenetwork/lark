@@ -2,13 +2,13 @@
 //!
 //! `createSyncAccessHandle()` is itself asynchronous even inside a worker;
 //! only `read`, `write`, `flush`, `getSize`, `truncate` and `close` on the
-//! resulting handle are synchronous. lark creates WAL and SSTable files
+//! resulting handle are synchronous. regolith creates WAL and SSTable files
 //! from inside synchronous engine calls, and recovery lists directories
 //! from inside a synchronous `Db::open`, so there is nowhere to `await`.
 //!
 //! The pool resolves that the way SQLite's `opfs-sahpool` VFS does: a fixed
 //! set of physical OPFS files is opened with sync access handles up front,
-//! and lark's logical paths are assigned to those slots at runtime. Every
+//! and regolith's logical paths are assigned to those slots at runtime. Every
 //! filesystem operation the engine performs is then a map lookup plus a
 //! synchronous handle call.
 //!
@@ -35,7 +35,7 @@
 //!
 //! Contents are written before the header, and the header is rewritten
 //! only on `sync_all` or `sync_dir`. A crash between the two loses the
-//! tail of the file, which is the case lark already handles: a torn WAL
+//! tail of the file, which is the case regolith already handles: a torn WAL
 //! tail fails its per-record checksum during replay, and an SSTable only
 //! enters a version after the manifest edit that references it, so a torn
 //! SSTable is an unreferenced orphan.
@@ -60,21 +60,21 @@ use crate::engine::checksum;
 pub(super) const SLOT_HEADER_LEN: u64 = 512;
 /// Fixed-width part of the header, before the logical path.
 const HEADER_FIXED_LEN: usize = 32;
-/// "LARK" little-endian.
-const SLOT_MAGIC: u32 = 0x4B52_414C;
+/// "REGO" little-endian.
+const SLOT_MAGIC: u32 = 0x4F47_4552;
 const FLAG_IN_USE: u32 = 1 << 0;
 const MAX_PATH_LEN: usize = (SLOT_HEADER_LEN as usize) - HEADER_FIXED_LEN;
 /// Physical name prefix. Files in the OPFS directory that do not start
 /// with this are left alone, so a mirror-mode database and a pool can
 /// share one directory without either eating the other's files.
-const SLOT_PREFIX: &str = ".lark-sah-";
+const SLOT_PREFIX: &str = ".regolith-sah-";
 
 /// Identifies one mounted pool inside the per-thread handle registry.
 pub(super) type MountId = u64;
 
 /// The JS handles for one mount.
 ///
-/// `FileSystemSyncAccessHandle` is neither `Send` nor `Sync`, and lark's
+/// `FileSystemSyncAccessHandle` is neither `Send` nor `Sync`, and regolith's
 /// [`crate::env::Env`] must be both. Rather than assert thread-safety with
 /// `unsafe` (the crate forbids it), the handles live in a thread-local
 /// registry and the pool itself holds only plain Rust data plus an integer

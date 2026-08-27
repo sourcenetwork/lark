@@ -15,7 +15,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lark_kv::{Db, DurabilityMode, Options, Statistics, Ticker, WriteBatch, WriteOptions};
+use regolith::{Db, DurabilityMode, Options, Statistics, Ticker, WriteBatch, WriteOptions};
 use tempfile::TempDir;
 
 fn durable_opts(stats: Option<Arc<Statistics>>) -> Options {

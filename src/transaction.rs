@@ -87,7 +87,7 @@ use std::time::Duration;
 use crate::sync::{Condvar, Mutex};
 
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
-use crate::engine::{CommitOutcome, LarkEngine};
+use crate::engine::{CommitOutcome, RegolithEngine};
 use crate::{Db, Error, Options, Result};
 
 /// Default lock-acquisition timeout for [`TransactionDb`] when the
@@ -371,7 +371,7 @@ pub enum IsolationLevel {
     /// Validate nothing beyond what the transaction wrote.
     ReadCommitted,
     /// Validate writes and keys read through
-    /// [`Transaction::get_for_update`]. lark's default.
+    /// [`Transaction::get_for_update`]. regolith's default.
     #[default]
     SnapshotIsolation,
     /// Validate the entire read set.
@@ -397,7 +397,7 @@ enum TxMode {
 /// calling [`Transaction::rollback`]: buffered writes are
 /// discarded and any held locks are released.
 pub struct Transaction<'db> {
-    engine: Arc<LarkEngine>,
+    engine: Arc<RegolithEngine>,
     /// What the commit-time validation covers. See [`IsolationLevel`].
     isolation: IsolationLevel,
     snapshot_seq: u64,
@@ -458,7 +458,7 @@ struct KeyState {
 impl<'db> Transaction<'db> {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        engine: Arc<LarkEngine>,
+        engine: Arc<RegolithEngine>,
         snapshot_seq: u64,
         durability: crate::engine::DurabilityMode,
         mode: TxMode,
@@ -600,7 +600,7 @@ impl<'db> Transaction<'db> {
 
     /// Roll back to the most recent savepoint. Discards every
     /// buffered write made after the savepoint. Locks acquired
-    /// after the savepoint stay held: lark's pessimistic lock
+    /// after the savepoint stay held: regolith's pessimistic lock
     /// manager does not release mid-transaction locks.
     ///
     /// Reads are not rolled back. A key this transaction has already
@@ -851,7 +851,7 @@ impl Drop for Transaction<'_> {
 /// The hash map maps user keys to the tx id that currently holds
 /// the lock. Acquires block on the condvar until the lock is free
 /// or the deadline expires. Sharding the map for higher
-/// concurrency is a future optimization: lark transactions today
+/// concurrency is a future optimization: regolith transactions today
 /// expect low-to-moderate concurrency, so a single mutex is fine.
 struct LockManager {
     locks: Mutex<HashMap<Vec<u8>, u64>>,
@@ -981,13 +981,13 @@ mod tests {
         let (db, _dir) = opt_db();
         let tx1 = db.begin_transaction();
         let tx2 = db.begin_transaction();
-        assert_eq!(db.db().get_int_property("lark.num-snapshots"), Some(2));
+        assert_eq!(db.db().get_int_property("regolith.num-snapshots"), Some(2));
 
         tx1.rollback();
-        assert_eq!(db.db().get_int_property("lark.num-snapshots"), Some(1));
+        assert_eq!(db.db().get_int_property("regolith.num-snapshots"), Some(1));
 
         drop(tx2);
-        assert_eq!(db.db().get_int_property("lark.num-snapshots"), Some(0));
+        assert_eq!(db.db().get_int_property("regolith.num-snapshots"), Some(0));
     }
 
     #[test]
@@ -1218,13 +1218,13 @@ mod tests {
         let (db, _dir) = pes_db();
         let tx1 = db.begin_transaction();
         let tx2 = db.begin_transaction();
-        assert_eq!(db.db().get_int_property("lark.num-snapshots"), Some(2));
+        assert_eq!(db.db().get_int_property("regolith.num-snapshots"), Some(2));
 
         tx1.rollback();
-        assert_eq!(db.db().get_int_property("lark.num-snapshots"), Some(1));
+        assert_eq!(db.db().get_int_property("regolith.num-snapshots"), Some(1));
 
         drop(tx2);
-        assert_eq!(db.db().get_int_property("lark.num-snapshots"), Some(0));
+        assert_eq!(db.db().get_int_property("regolith.num-snapshots"), Some(0));
     }
 
     #[test]

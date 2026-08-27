@@ -14,7 +14,7 @@ mod common;
 use std::hint::black_box;
 use std::time::Instant;
 
-use lark_kv::{Options, Snapshot};
+use regolith::{Options, Snapshot};
 
 const KEYSPACE: u64 = 400_000;
 const VALUE_BYTES: usize = 4096;
@@ -218,7 +218,7 @@ fn main() {
             samples.len()
         );
     }
-    println!("  family 'soak' written (LARK_BENCH_OUT, else bench-out/soak.json)");
+    println!("  family 'soak' written (REGOLITH_BENCH_OUT, else bench-out/soak.json)");
 }
 
 fn samples_json(samples: &[(f64, f64, u64)]) -> String {

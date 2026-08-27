@@ -9,7 +9,7 @@
 //! everything again. An upgrade that is readable in only one direction
 //! is still a trap, so the round trip is part of every case.
 
-use lark_kv::{
+use regolith::{
     CompactionStyle, CompressionType, Db, DurabilityMode, FifoCompactionOptions, Options,
 };
 use tempfile::TempDir;
@@ -148,7 +148,7 @@ fn reopening_under_a_different_compaction_style_keeps_every_key() {
     let db = Db::open(probe.path(), leveled.clone()).unwrap();
     let below_l0: u64 = (1..=6)
         .map(|level| {
-            db.get_int_property(&format!("lark.num-files-at-level{level}"))
+            db.get_int_property(&format!("regolith.num-files-at-level{level}"))
                 .unwrap()
         })
         .sum();
@@ -184,8 +184,7 @@ fn reopening_that_toggles_the_partitioned_index_reads_both_layouts() {
     });
 
     // 5 is the flat footer and 6 the partitioned one, both under the
-    // REGOSST magic. 3 and 4 were their LARKSST predecessors and are
-    // still read, but a table written today carries the new pair.
+    // REGOSST magic.
     for (label, from, to, new_version) in [
         ("flat -> partitioned", &flat, &partitioned, 6u8),
         ("partitioned -> flat", &partitioned, &flat, 5u8),

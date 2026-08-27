@@ -38,7 +38,7 @@ use std::time::Duration;
 use kovan_queue::array_queue::ArrayQueue;
 
 use super::wal::Wal;
-use super::{CommitOutcome, DurabilityMode, LarkEngine, grouped_batch_ops};
+use super::{CommitOutcome, DurabilityMode, RegolithEngine, grouped_batch_ops};
 use crate::WriteBatchOp;
 use crate::perf_context::{PerfTimer, PerfTimerField};
 use crate::statistics::{Histogram, Ticker};
@@ -130,7 +130,7 @@ fn release_stranded(group: &mut Vec<GroupTicket>) {
     }
 }
 
-impl LarkEngine {
+impl RegolithEngine {
     /// Build the commit ring. Sized once at open.
     pub(crate) fn new_commit_ring() -> ArrayQueue<Arc<WriteSlot>> {
         ArrayQueue::new(commit_ring_capacity())
@@ -398,7 +398,7 @@ impl LarkEngine {
         let result = self.run_group(stage, group);
         // Each ticket learns the sequence *its own* operations were
         // assigned, not the group's maximum. An upper layer ordering its
-        // versions against lark's needs the sequence of the write it
+        // versions against regolith's needs the sequence of the write it
         // made, and a group can carry many writers' batches.
         let mut seq = result.as_ref().ok().copied().unwrap_or(0);
         for ticket in group.drain(..) {
@@ -549,8 +549,8 @@ mod tests {
     use crate::sync::Mutex;
     use tempfile::TempDir;
 
-    fn open_engine(dir: &TempDir) -> Arc<LarkEngine> {
-        LarkEngine::open(dir.path(), EngineOptions::default()).expect("engine open")
+    fn open_engine(dir: &TempDir) -> Arc<RegolithEngine> {
+        RegolithEngine::open(dir.path(), EngineOptions::default()).expect("engine open")
     }
 
     /// Default-column-family prefix, the shape every engine key carries.
@@ -748,7 +748,7 @@ mod tests {
     fn one_group_costs_one_sync_no_matter_how_many_members() {
         let dir = TempDir::new().unwrap();
         let stats = Arc::new(crate::statistics::Statistics::new());
-        let engine = LarkEngine::open(
+        let engine = RegolithEngine::open(
             dir.path(),
             EngineOptions {
                 statistics: Some(Arc::clone(&stats)),
@@ -894,7 +894,7 @@ mod tests {
     fn a_wal_disabled_member_rides_along_without_forcing_a_sync() {
         let dir = TempDir::new().unwrap();
         let stats = Arc::new(crate::statistics::Statistics::new());
-        let engine = LarkEngine::open(
+        let engine = RegolithEngine::open(
             dir.path(),
             EngineOptions {
                 statistics: Some(Arc::clone(&stats)),
@@ -944,7 +944,7 @@ mod tests {
     fn concurrent_writers_share_far_fewer_fsyncs_than_writes() {
         let dir = TempDir::new().unwrap();
         let stats = Arc::new(crate::statistics::Statistics::new());
-        let engine = LarkEngine::open(
+        let engine = RegolithEngine::open(
             dir.path(),
             EngineOptions {
                 statistics: Some(Arc::clone(&stats)),

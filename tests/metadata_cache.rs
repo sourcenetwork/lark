@@ -9,7 +9,7 @@
 mod common;
 
 use common::force_compaction;
-use lark_kv::{Db, Options};
+use regolith::{Db, Options};
 use tempfile::TempDir;
 
 /// Small files and small blocks, so a modest fill produces several
@@ -50,8 +50,8 @@ fn verify(db: &Db) {
 }
 
 fn pinned_metadata(db: &Db) -> u64 {
-    db.get_int_property("lark.pinned-metadata-bytes")
-        .expect("lark.pinned-metadata-bytes is a known property")
+    db.get_int_property("regolith.pinned-metadata-bytes")
+        .expect("regolith.pinned-metadata-bytes is a known property")
 }
 
 /// Build a database on disk, then reopen it under `cache_metadata` and
@@ -120,15 +120,16 @@ fn a_partitioned_file_still_pins_only_its_top_level_index() {
 #[test]
 fn cached_metadata_is_charged_to_the_block_cache() {
     with_reopened(false, true, |db| {
-        let before = db.get_int_property("lark.block-cache-usage").unwrap();
+        let before = db.get_int_property("regolith.block-cache-usage").unwrap();
         verify(db);
-        let after = db.get_int_property("lark.block-cache-usage").unwrap();
+        let after = db.get_int_property("regolith.block-cache-usage").unwrap();
         assert!(
             after > before,
             "index and filter bytes must land in the cache ({before} -> {after})"
         );
         assert_eq!(
-            db.get_int_property("lark.pinned-metadata-bytes").unwrap(),
+            db.get_int_property("regolith.pinned-metadata-bytes")
+                .unwrap(),
             0,
             "and must not also be pinned"
         );

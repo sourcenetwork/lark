@@ -13,8 +13,8 @@
 //! shim, works out which byte ranges were written but never followed by a
 //! successful `fsync`/`fdatasync` on that file, and rewrites the directory
 //! as the filesystem would have left it. This is the ALICE model, driven
-//! by the syscalls lark actually issued rather than by an assumption about
-//! what lark issues.
+//! by the syscalls regolith actually issued rather than by an assumption about
+//! what regolith issues.
 //!
 //! # What is modelled
 //!
@@ -219,7 +219,7 @@ pub fn simulate_power_loss(dir: &Path, cut: CutPoint) -> PowerLossReport {
         "no I/O journal at {}.\n\
          simulate_power_loss needs the LD_PRELOAD shim's recording to know which bytes were \
          never fsynced. Run the workload through fault::run_child (or CrashRun), which sets \
-         LARK_FAULT_JOURNAL to that path.",
+         REGOLITH_FAULT_JOURNAL to that path.",
         jp.display(),
     );
     simulate_power_loss_with(dir, &journal, cut, &PowerLossOptions::default())
@@ -489,11 +489,11 @@ fn apply(
 /// # This is WEAKER than [`simulate_power_loss`] and downstream tests must
 /// say so
 ///
-/// It does not observe what lark actually synced. It encodes an assumption
-/// about lark's behaviour into the test: that under
+/// It does not observe what regolith actually synced. It encodes an assumption
+/// about regolith's behaviour into the test: that under
 /// `DurabilityMode::Eventual` the WAL is only made durable on rotation and
 /// on close, so the tail of the newest WAL past `synced_len` is unsynced.
-/// If lark's sync policy changes, this model silently keeps passing while
+/// If regolith's sync policy changes, this model silently keeps passing while
 /// testing the wrong thing. Use it only when
 /// [`super::shim::available`] is false, and print the warning it returns.
 pub fn simulate_power_loss_modelled(dir: &Path, unsynced_tail_bytes: u64) -> PowerLossReport {

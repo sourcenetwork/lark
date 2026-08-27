@@ -16,7 +16,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use lark_kv::{Db, DurabilityMode, Options, RateLimiter};
+use regolith::{Db, DurabilityMode, Options, RateLimiter};
 use tempfile::TempDir;
 
 fn opts() -> Options {
@@ -464,8 +464,8 @@ fn a_truncated_sstable_does_not_panic() {
 
 #[test]
 fn a_zero_refill_period_rate_limiter_does_not_panic() {
-    let limiter = lark_kv::TokenBucketRateLimiter::new(1024, Duration::ZERO, 4096);
-    limiter.request(128, lark_kv::Priority::High);
+    let limiter = regolith::TokenBucketRateLimiter::new(1024, Duration::ZERO, 4096);
+    limiter.request(128, regolith::Priority::High);
 }
 
 #[test]

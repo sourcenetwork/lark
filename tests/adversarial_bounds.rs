@@ -11,27 +11,27 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 
-use lark_kv::{Db, OptimisticTransactionDb, Options, WriteBatch};
+use regolith::{Db, OptimisticTransactionDb, Options, WriteBatch};
 use tempfile::TempDir;
 
 fn active_bytes(db: &Db) -> u64 {
-    db.get_int_property("lark.cur-size-active-mem-table")
-        .expect("lark.cur-size-active-mem-table is a known property")
+    db.get_int_property("regolith.cur-size-active-mem-table")
+        .expect("regolith.cur-size-active-mem-table is a known property")
 }
 
 fn all_memtable_bytes(db: &Db) -> u64 {
-    db.get_int_property("lark.cur-size-all-mem-tables")
-        .expect("lark.cur-size-all-mem-tables is a known property")
+    db.get_int_property("regolith.cur-size-all-mem-tables")
+        .expect("regolith.cur-size-all-mem-tables is a known property")
 }
 
 fn reserved_bytes(db: &Db) -> u64 {
-    db.get_int_property("lark.memtable-reserved-bytes")
-        .expect("lark.memtable-reserved-bytes is a known property")
+    db.get_int_property("regolith.memtable-reserved-bytes")
+        .expect("regolith.memtable-reserved-bytes is a known property")
 }
 
 fn pool_bytes(db: &Db) -> u64 {
-    db.get_int_property("lark.arena-pool-bytes")
-        .expect("lark.arena-pool-bytes is a known property")
+    db.get_int_property("regolith.arena-pool-bytes")
+        .expect("regolith.arena-pool-bytes is a known property")
 }
 
 /// The memtable-attributable high-water mark [`Options::embedded`]

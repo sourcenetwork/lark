@@ -15,7 +15,7 @@
 //! [`crate::Db::capabilities`] hands back to the caller.
 //!
 //! The registry is a complete guarantee exactly where it is used. wasm
-//! is one process with one linear memory holding one copy of lark's
+//! is one process with one linear memory holding one copy of regolith's
 //! state, so a second writer can only come from a second [`crate::Db`]
 //! in that same process, which the registry sees. A [`super::MemEnv`]
 //! and an OPFS mount are likewise scoped to one process, so each keeps
@@ -23,7 +23,7 @@
 //! `MemEnv`s are two different filesystems and must not collide on a
 //! shared path.
 //!
-//! The alternative lark used to ship was a `create_new(true)` proxy:
+//! The alternative regolith used to ship was a `create_new(true)` proxy:
 //! opening failed when a `LOCK` file already existed. That has the
 //! severe failure mode a registry does not - a crash or an unclean
 //! unload leaves the file behind, and every later open fails
@@ -32,10 +32,10 @@
 //! crash can never leave a stale lock.
 //!
 //! Two `Db` handles opened on one path inside a single process are
-//! rejected on every target: `flock` rejects them because lark opens a
+//! rejected on every target: `flock` rejects them because regolith opens a
 //! separate descriptor per handle, and the registry rejects them
 //! because it records the path. What neither prevents is a second
-//! *process* on a target with no file locking, and there lark says so
+//! *process* on a target with no file locking, and there regolith says so
 //! through `Capabilities::file_lock` instead of pretending.
 
 use std::collections::HashMap;
@@ -184,8 +184,8 @@ mod real {
     ///
     /// The lock itself is advisory and needs no bytes, but an unmarked
     /// zero-length `LOCK` is indistinguishable from any other tool's,
-    /// and from a stray file in a directory someone pointed lark at by
-    /// mistake. The stamp is checked on the exclusive path, so lark
+    /// and from a stray file in a directory someone pointed regolith at by
+    /// mistake. The stamp is checked on the exclusive path, so regolith
     /// refuses to write a database into a directory that is not its own
     /// rather than taking it over.
     const LOCK_STAMP: &[u8; 8] = b"REGOLOCK";
@@ -234,7 +234,7 @@ mod real {
     /// when it does not.
     ///
     /// An empty file is what a build older than the stamp left behind,
-    /// so it is adopted rather than refused: the directory is lark's, it
+    /// so it is adopted rather than refused: the directory is regolith's, it
     /// simply predates the stamp. Content that is neither empty nor the
     /// stamp belongs to something else.
     fn stamp_lock_file(file: &File) -> io::Result<()> {
@@ -247,7 +247,7 @@ mod real {
         if !existing.is_empty() && existing.as_slice() != LOCK_STAMP {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "LOCK exists but was not written by lark: refusing to open a database here",
+                "LOCK exists but was not written by regolith: refusing to open a database here",
             ));
         }
         if existing.is_empty() {

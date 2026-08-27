@@ -12,7 +12,7 @@
 //!
 //! **a process kill must lose nothing that reached the kernel.**
 //!
-//! lark hands every WAL record to the kernel before the write is
+//! regolith hands every WAL record to the kernel before the write is
 //! acknowledged, in both durability modes: `Immediate` calls `Wal::sync`
 //! and `Eventual` calls `Wal::flush`, which empties the `BufWriter` with a
 //! real `write` syscall (`src/engine/mod.rs:1389`). So under a process
@@ -58,7 +58,7 @@ use std::io::Write;
 use std::path::Path;
 
 use common::fault::{self, ChildSpec, CrashRun, DieKind, History, Phase, Trigger};
-use lark_kv::{Db, DurabilityMode, Options, WriteBatch};
+use regolith::{Db, DurabilityMode, Options, WriteBatch};
 use tempfile::TempDir;
 
 /// Child process entry point. Returns immediately unless this process was
@@ -98,8 +98,8 @@ fn reopen(db_dir: &Path, opts: Options) -> Db {
 /// engine rather than guessed from the directory listing.
 fn live_file_ids(db: &Db) -> BTreeSet<u64> {
     let prop = db
-        .get_property("lark.sstables")
-        .expect("lark.sstables is a supported property");
+        .get_property("regolith.sstables")
+        .expect("regolith.sstables is a supported property");
     prop.lines()
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
@@ -516,7 +516,7 @@ fn a_process_kill_between_the_wal_append_and_the_memtable_apply_can_only_gain_da
 /// in the recovered version.
 ///
 /// The crash lands on the 3rd `.sst` write syscall, so the file exists on
-/// disk with a partial data block and no footer. lark flushes on the
+/// disk with a partial data block and no footer. regolith flushes on the
 /// writing thread (`rotate_memtable` calls `flush_frozen_memtable`,
 /// `src/engine/mod.rs:1658`), and three L0 files is below the default
 /// compaction trigger, so exactly one thread has written SSTables at that
@@ -630,14 +630,14 @@ fn a_process_kill_during_a_compaction_keeps_the_inputs_and_discards_the_output()
 
     let promoted = (1..7).any(|level| {
         recovered
-            .get_int_property(&format!("lark.num-files-at-level{level}"))
+            .get_int_property(&format!("regolith.num-files-at-level{level}"))
             .unwrap_or(0)
             > 0
     });
     assert!(
         promoted,
         "no file above L0 survived, so this run exercised flushes and not a compaction:\n{}",
-        recovered.get_property("lark.sstables").unwrap(),
+        recovered.get_property("regolith.sstables").unwrap(),
     );
 
     assert_functional(&recovered, "compaction");

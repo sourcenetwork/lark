@@ -10,12 +10,12 @@
 //! `format!("key{:08}", i)` per operation, matching the shape of the
 //! recorded baseline (so the harness's own 1 allocation per op is
 //! included in both); `prebuilt` keys are hoisted out of the loop, so
-//! that column is lark's own cost with nothing added.
+//! that column is regolith's own cost with nothing added.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use lark_kv::{Db, Options};
+use regolith::{Db, Options};
 use tempfile::TempDir;
 
 thread_local! {

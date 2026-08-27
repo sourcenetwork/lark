@@ -19,8 +19,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
-use lark_kv::DurabilityMode;
-use lark_kv::{Db, Options};
+use regolith::DurabilityMode;
+use regolith::{Db, Options};
 use tempfile::TempDir;
 
 use crate::common::fault::History;
@@ -48,7 +48,7 @@ pub type State = Vec<(Vec<u8>, Vec<u8>)>;
 /// A pristine database directory captured as bytes, plus everything a
 /// test needs to say what the engine should have returned.
 pub struct Fixture {
-    /// `(relative path, contents)` for every file lark wrote. `LOCK` is
+    /// `(relative path, contents)` for every file regolith wrote. `LOCK` is
     /// process state rather than data and is left out.
     files: Vec<(String, Vec<u8>)>,
     /// The writes that produced it, in order.

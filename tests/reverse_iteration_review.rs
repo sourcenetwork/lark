@@ -13,7 +13,7 @@
 
 use std::collections::BTreeSet;
 
-use lark_kv::{Db, DurabilityMode, Options};
+use regolith::{Db, DurabilityMode, Options};
 use tempfile::TempDir;
 
 fn opts() -> Options {

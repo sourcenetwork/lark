@@ -7,7 +7,7 @@
 //! opens a reader, neither of which loom can run, so the file is stood
 //! in for by a vector while the lock discipline and the order of the two
 //! publishing steps are reproduced exactly as
-//! `LarkEngine::flush_frozen_memtable` and `LarkEngine::lookup` have
+//! `RegolithEngine::flush_frozen_memtable` and `RegolithEngine::lookup` have
 //! them - install into the version first, drop the frozen memtable
 //! second, and read active, then frozen, then the version.
 
@@ -64,7 +64,7 @@ enum Source {
 }
 
 /// The reader's walk: active memtable, then frozen memtables newest
-/// first, then the installed version. Mirrors `LarkEngine::lookup`.
+/// first, then the installed version. Mirrors `RegolithEngine::lookup`.
 fn read(
     active: &MemTable,
     frozen: &RwLock<Vec<Arc<MemTable>>>,
@@ -194,7 +194,7 @@ fn frozen_flush_fixture() -> (
 /// Invariants H1 and H2: a snapshot that observes sequence `s` observes
 /// every memtable insert the publisher of `s` had already made.
 ///
-/// This is the ordering `LarkEngine::snapshot_seq` and the commit
+/// This is the ordering `RegolithEngine::snapshot_seq` and the commit
 /// pipeline's publish depend on. Break it and a write that returned `Ok`
 /// reads back as absent.
 pub fn the_read_horizon_never_outruns_the_memtable() {

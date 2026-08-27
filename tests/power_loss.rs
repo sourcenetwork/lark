@@ -19,10 +19,10 @@
 //! and thread ids. The reconstruction replays that stream, computes the byte
 //! ranges never followed by a successful `fsync` on their file, and rewrites
 //! the directory the way the filesystem would have left it. It is the ALICE
-//! model driven by what lark actually did, not by an assumption about what
-//! lark does.
+//! model driven by what regolith actually did, not by an assumption about what
+//! regolith does.
 //!
-//! Interposition is sound for this engine because lark performs all data
+//! Interposition is sound for this engine because regolith performs all data
 //! I/O through `std::fs` (glibc symbols); it uses `rustix` raw syscalls only
 //! for `flock` and `fadvise`, which move no file data, and it has no `mmap`
 //! write path.
@@ -31,7 +31,7 @@
 //!
 //! * That a write acknowledged under `DurabilityMode::Immediate` was really
 //!   on stable storage, not merely in the page cache.
-//! * That the state lark recovers is a valid prefix of the write history:
+//! * That the state regolith recovers is a valid prefix of the write history:
 //!   some `k` writes applied in order, no gap, no half-applied `WriteBatch`,
 //!   no key the workload never wrote, and an intact iteration order.
 //! * That the above still holds when the cut lands inside a memtable flush,
@@ -97,7 +97,7 @@ use common::fault::{
     self, ChildOutcome, ChildSpec, CrashRun, CutPoint, History, Phase, PowerLossOptions,
     PowerLossReport, Recovery, TearMode, Trigger,
 };
-use lark_kv::{Db, DurabilityMode, Options};
+use regolith::{Db, DurabilityMode, Options};
 use tempfile::TempDir;
 
 /// Child process entry point. Returns immediately unless this process was
@@ -371,7 +371,7 @@ fn eventual_durability_recovers_to_a_valid_prefix_and_the_loss_is_measured() {
 /// The proof: the whole run wrote to exactly `nth` SSTable files, which is
 /// fewer than `l0_compaction_trigger` (4 by default), so no level compaction
 /// can have started and every SSTable write in the run belongs to a flush;
-/// and the fatal record is a write to the newest of those files. lark
+/// and the fatal record is a write to the newest of those files. regolith
 /// flushes synchronously on the thread that filled the memtable
 /// (`rotate_memtable` calls `flush_frozen_memtable` in `src/engine/mod.rs`),
 /// so the cut lands with the SSTable written but not yet `fsync`ed and its
@@ -618,7 +618,7 @@ fn a_power_cut_during_a_compaction_keeps_every_write_it_was_merging() {
 /// acknowledged write.
 ///
 /// The crash is placed on the second `VersionEdit` write, which is the
-/// record that publishes the first flushed SSTable. lark writes and flushes
+/// record that publishes the first flushed SSTable. regolith writes and flushes
 /// `VersionEdit`s but only fsyncs the MANIFEST when the edit requires it
 /// (`src/engine/manifest.rs`), so the reconstruction genuinely discards a
 /// MANIFEST tail here; the test asserts that it did, rather than assuming
@@ -695,7 +695,7 @@ fn a_power_cut_during_a_manifest_append_keeps_every_acknowledged_write() {
 /// earlier power cut may not lose anything the first recovery would have
 /// kept.
 ///
-/// lark's open path replays the surviving WALs into a memtable, creates a
+/// regolith's open path replays the surviving WALs into a memtable, creates a
 /// new WAL, rewrites the recovered memtable into it, fsyncs it and only then
 /// removes the old WALs (`src/engine/mod.rs`). The second cut is placed on
 /// the first write of that rewrite, which is the window in which two copies

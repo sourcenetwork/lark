@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use lark_kv::{OptimisticTransactionDb, Options, TransactionDb, TransactionError, TxResult};
+use regolith::{OptimisticTransactionDb, Options, TransactionDb, TransactionError, TxResult};
 use tempfile::TempDir;
 
 const THREADS: u64 = 8;

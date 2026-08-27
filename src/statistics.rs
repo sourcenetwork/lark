@@ -138,31 +138,31 @@ impl Ticker {
     /// Stable string name for exporting to monitoring systems.
     pub fn name(&self) -> &'static str {
         match self {
-            Ticker::BytesWritten => "lark.bytes_written",
-            Ticker::BytesRead => "lark.bytes_read",
-            Ticker::KeysWritten => "lark.keys_written",
-            Ticker::KeysRead => "lark.keys_read",
-            Ticker::KeysDeleted => "lark.keys_deleted",
-            Ticker::RangeDeletesWritten => "lark.range_deletes_written",
-            Ticker::MergesWritten => "lark.merges_written",
-            Ticker::BlockCacheHit => "lark.block_cache_hit",
-            Ticker::BlockCacheMiss => "lark.block_cache_miss",
-            Ticker::BlockCacheAdd => "lark.block_cache_add",
-            Ticker::BloomFilterUseful => "lark.bloom_filter_useful",
-            Ticker::BloomFilterFullPositive => "lark.bloom_filter_full_positive",
-            Ticker::CompactionBytesRead => "lark.compaction_bytes_read",
-            Ticker::CompactionBytesWritten => "lark.compaction_bytes_written",
-            Ticker::CompactionCount => "lark.compaction_count",
-            Ticker::FlushBytesWritten => "lark.flush_bytes_written",
-            Ticker::FlushCount => "lark.flush_count",
-            Ticker::WalBytesWritten => "lark.wal_bytes_written",
-            Ticker::WalSyncCount => "lark.wal_sync_count",
-            Ticker::IterSeekCount => "lark.iter_seek_count",
-            Ticker::IterNextCount => "lark.iter_next_count",
-            Ticker::WriteStallMicros => "lark.write_stall_micros",
-            Ticker::SnapshotsRegistered => "lark.snapshots_registered",
-            Ticker::SnapshotsReleased => "lark.snapshots_released",
-            Ticker::WalTailDiscarded => "lark.wal_tail_discarded",
+            Ticker::BytesWritten => "regolith.bytes_written",
+            Ticker::BytesRead => "regolith.bytes_read",
+            Ticker::KeysWritten => "regolith.keys_written",
+            Ticker::KeysRead => "regolith.keys_read",
+            Ticker::KeysDeleted => "regolith.keys_deleted",
+            Ticker::RangeDeletesWritten => "regolith.range_deletes_written",
+            Ticker::MergesWritten => "regolith.merges_written",
+            Ticker::BlockCacheHit => "regolith.block_cache_hit",
+            Ticker::BlockCacheMiss => "regolith.block_cache_miss",
+            Ticker::BlockCacheAdd => "regolith.block_cache_add",
+            Ticker::BloomFilterUseful => "regolith.bloom_filter_useful",
+            Ticker::BloomFilterFullPositive => "regolith.bloom_filter_full_positive",
+            Ticker::CompactionBytesRead => "regolith.compaction_bytes_read",
+            Ticker::CompactionBytesWritten => "regolith.compaction_bytes_written",
+            Ticker::CompactionCount => "regolith.compaction_count",
+            Ticker::FlushBytesWritten => "regolith.flush_bytes_written",
+            Ticker::FlushCount => "regolith.flush_count",
+            Ticker::WalBytesWritten => "regolith.wal_bytes_written",
+            Ticker::WalSyncCount => "regolith.wal_sync_count",
+            Ticker::IterSeekCount => "regolith.iter_seek_count",
+            Ticker::IterNextCount => "regolith.iter_next_count",
+            Ticker::WriteStallMicros => "regolith.write_stall_micros",
+            Ticker::SnapshotsRegistered => "regolith.snapshots_registered",
+            Ticker::SnapshotsReleased => "regolith.snapshots_released",
+            Ticker::WalTailDiscarded => "regolith.wal_tail_discarded",
         }
     }
 }
@@ -222,16 +222,16 @@ impl Histogram {
     /// Stable string name for exporting to monitoring systems.
     pub fn name(&self) -> &'static str {
         match self {
-            Histogram::DbGet => "lark.db_get",
-            Histogram::DbWrite => "lark.db_write",
-            Histogram::DbIterSeek => "lark.db_iter_seek",
-            Histogram::DbIterNext => "lark.db_iter_next",
-            Histogram::CompactionTime => "lark.compaction_time",
-            Histogram::FlushTime => "lark.flush_time",
-            Histogram::BlockReadTime => "lark.block_read_time",
-            Histogram::BytesPerRead => "lark.bytes_per_read",
-            Histogram::BytesPerWrite => "lark.bytes_per_write",
-            Histogram::WalWriteTime => "lark.wal_write_time",
+            Histogram::DbGet => "regolith.db_get",
+            Histogram::DbWrite => "regolith.db_write",
+            Histogram::DbIterSeek => "regolith.db_iter_seek",
+            Histogram::DbIterNext => "regolith.db_iter_next",
+            Histogram::CompactionTime => "regolith.compaction_time",
+            Histogram::FlushTime => "regolith.flush_time",
+            Histogram::BlockReadTime => "regolith.block_read_time",
+            Histogram::BytesPerRead => "regolith.bytes_per_read",
+            Histogram::BytesPerWrite => "regolith.bytes_per_write",
+            Histogram::WalWriteTime => "regolith.wal_write_time",
         }
     }
 }
@@ -473,10 +473,10 @@ mod tests {
     fn dump_contains_every_ticker_and_histogram_name() {
         let s = Statistics::new();
         let out = s.dump();
-        assert!(out.contains("lark.bytes_written"));
-        assert!(out.contains("lark.block_cache_hit"));
-        assert!(out.contains("lark.db_get"));
-        assert!(out.contains("lark.flush_time"));
+        assert!(out.contains("regolith.bytes_written"));
+        assert!(out.contains("regolith.block_cache_hit"));
+        assert!(out.contains("regolith.db_get"));
+        assert!(out.contains("regolith.flush_time"));
     }
 
     #[test]

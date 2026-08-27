@@ -23,7 +23,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 
-use lark_kv::{
+use regolith::{
     Db, DurabilityMode, Error, IngestOptions, Options, Range, SstFileWriter, WriteBatch,
     WriteOptions,
 };
@@ -82,14 +82,14 @@ fn assert_range_present(db: &Db, from: usize, to: usize, ctx: &str) {
     );
 }
 
-fn assert_closed<T: std::fmt::Debug>(what: &str, result: lark_kv::Result<T>) {
+fn assert_closed<T: std::fmt::Debug>(what: &str, result: regolith::Result<T>) {
     match result {
         Err(Error::Closed) => {}
         other => panic!("{what}: expected Error::Closed after close, got {other:?}"),
     }
 }
 
-fn assert_read_only<T: std::fmt::Debug>(what: &str, result: lark_kv::Result<T>) {
+fn assert_read_only<T: std::fmt::Debug>(what: &str, result: regolith::Result<T>) {
     match result {
         Err(Error::ReadOnly) => {}
         other => panic!("{what}: expected Error::ReadOnly, got {other:?}"),
@@ -99,7 +99,7 @@ fn assert_read_only<T: std::fmt::Debug>(what: &str, result: lark_kv::Result<T>) 
 /// Call every mutating entry point on `db` and hand each result to
 /// `expect`. One list, so the read-only sweep and the closed sweep
 /// cannot drift apart as the write surface grows.
-fn sweep_every_mutation(db: &Db, scratch: &Path, expect: fn(&str, lark_kv::Result<()>)) {
+fn sweep_every_mutation(db: &Db, scratch: &Path, expect: fn(&str, regolith::Result<()>)) {
     let cf = db.default_cf();
     let wo = WriteOptions::new();
     // Every batch here carries an op: an *empty* batch takes a
@@ -322,7 +322,7 @@ fn a_read_only_handle_refuses_every_mutation_and_still_reads() {
 /// Property: a write that happens to carry no work is still a write, so
 /// a read-only handle must refuse it with `Error::ReadOnly` exactly as
 /// it refuses a loaded one. `Db::open_read_only` documents "Mutating
-/// APIs return [`Error::ReadOnly`]" without an exemption, and lark
+/// APIs return [`Error::ReadOnly`]" without an exemption, and regolith
 /// already takes the strict line for the sibling case: on a *closed*
 /// handle these same three calls return `Error::Closed` rather than
 /// `Ok`. Catches a guard-ordering slip that lets a caller probe a
@@ -414,11 +414,11 @@ fn every_fallible_method_returns_closed_after_close() {
 
     // Infallible accessors have no error channel; the contract is that
     // they answer rather than panic.
-    let _ = db.get_property("lark.stats");
-    let _ = db.get_property("lark.sstables");
-    let _ = db.get_property("lark.levelstats");
-    let _ = db.get_property("lark.options");
-    let _ = db.get_int_property("lark.estimate-num-keys");
+    let _ = db.get_property("regolith.stats");
+    let _ = db.get_property("regolith.sstables");
+    let _ = db.get_property("regolith.levelstats");
+    let _ = db.get_property("regolith.options");
+    let _ = db.get_int_property("regolith.estimate-num-keys");
     let _ = db.get_approximate_sizes(&[Range::new(&key(0), &key(50))]);
     let _ = db.get_approximate_memtable_stats(Range::new(&key(0), &key(50)));
     let _ = db.list_column_families();
@@ -668,7 +668,7 @@ fn a_symlink_that_is_not_a_directory_is_refused_and_creates_nothing() {
     );
 }
 
-/// Property: lark owns the files it creates and nothing else. Unrelated
+/// Property: regolith owns the files it creates and nothing else. Unrelated
 /// files in the database directory, in `sst/`, and in `wal/` survive an
 /// open, a compaction, a `drop_all`, and a reopen with their contents
 /// unchanged. Catches an obsolete-file sweep that unlinks by directory
@@ -705,20 +705,20 @@ fn opening_a_directory_with_unrelated_files_leaves_them_untouched() {
         assert_eq!(
             fs::read_to_string(path).unwrap_or_default(),
             *body,
-            "lark disturbed an unrelated file at {}",
+            "regolith disturbed an unrelated file at {}",
             path.display()
         );
     }
     assert!(
         dir.path().join("subdir").is_dir(),
-        "lark removed an unrelated subdirectory"
+        "regolith removed an unrelated subdirectory"
     );
 }
 
 // ---- an unknown on-disk format version ----
 
 /// Offset of the SSTable footer's version byte. The trailing 8-byte
-/// little-endian magic is `"LARKSST" << 8 | version`, so the version is
+/// little-endian magic is `"REGOSST" << 8 | version`, so the version is
 /// the first byte of the last eight.
 fn sst_version_byte_offset(path: &Path) -> u64 {
     file_len(path) - 8
@@ -741,7 +741,7 @@ fn sst_format_versions(db_dir: &Path) -> Vec<u8> {
     versions
 }
 
-/// Property: the footer carries a format version, and one lark does not
+/// Property: the footer carries a format version, and one regolith does not
 /// know is rejected with a corruption error naming the magic - never
 /// parsed as if it were a known version. Catches the forward-compat
 /// failure where a newer writer's file is silently misread and serves
@@ -760,21 +760,19 @@ fn an_sstable_from_an_unknown_format_version_is_rejected_with_a_clear_error() {
     let known = read_byte(&sst, offset);
     assert!(
         known == 5 || known == 6,
-        "expected a version lark writes today (5 = flat index, 6 = partitioned, \
-         both under the REGOSST magic; 3 and 4 are the earlier checksummed \
-         LARKSST layouts and 1 and 2 the unchecksummed ones, all still read but \
-         never written), found {known} at offset {offset} of {} - this test \
-         targets the wrong byte",
+        "expected a version regolith writes today (5 = flat index, 6 = partitioned, \
+         both under the REGOSST magic), found {known} at offset {offset} of {} - \
+         this test targets the wrong byte",
         sst.display()
     );
 
     // 0x05 and 0x06 are real versions now, so probing them here would
-    // assert that lark refuses a table it wrote itself.
+    // assert that regolith refuses a table it wrote itself.
     for future_version in [0x07u8, 0x7F, 0xFF] {
         overwrite_range(&sst, offset, &[future_version]);
         match Db::open(dir.path(), opts()) {
             Ok(_) => panic!(
-                "lark opened a database whose SSTable claims format version \
+                "regolith opened a database whose SSTable claims format version \
                  {future_version}, which it does not implement"
             ),
             Err(Error::Corruption(source)) => {

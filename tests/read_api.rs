@@ -1,8 +1,8 @@
 //! Public-API coverage for the reads that answer without handing back
 //! a copy: `has`, `get_size`, and the iterator's `value_slice`.
 
-use lark_kv::{Db, MergeOperator, Options, WriteBatch};
 use proptest::prelude::*;
+use regolith::{Db, MergeOperator, Options, WriteBatch};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;

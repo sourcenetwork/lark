@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
-use lark_kv::{Db, Options, Statistics, Ticker, WriteBatch};
+use regolith::{Db, Options, Statistics, Ticker, WriteBatch};
 use tempfile::TempDir;
 
 // ── shared scaffolding ─────────────────────────────────────────────

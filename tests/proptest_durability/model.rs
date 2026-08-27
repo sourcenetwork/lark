@@ -4,7 +4,7 @@
 //! Two things live here rather than in the test file. The first is the
 //! `BTreeMap` model every assertion in that file is measured against,
 //! together with the one function that applies an [`Op`] to a real
-//! database, so lark and the model can never be driven by two different
+//! database, so regolith and the model can never be driven by two different
 //! readings of the same generated sequence. The second is the seeded
 //! generator: the crash test regenerates its operation sequence inside a
 //! child process from the seed alone, which `proptest`'s RNG cannot
@@ -18,11 +18,11 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use lark_kv::{Db, DurabilityMode, MergeOperator, Options, WriteBatch};
+use regolith::{Db, DurabilityMode, MergeOperator, Options, WriteBatch};
 
 // ── the model ──────────────────────────────────────────────────
 
-/// One write. Every variant maps to exactly one lark call, or to one
+/// One write. Every variant maps to exactly one regolith call, or to one
 /// operation inside a [`WriteBatch`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Unit {
@@ -44,7 +44,7 @@ pub(crate) enum Op {
 
 pub(crate) type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
-pub(crate) fn apply_to_db(db: &Db, op: &Op) -> lark_kv::Result<()> {
+pub(crate) fn apply_to_db(db: &Db, op: &Op) -> regolith::Result<()> {
     match op {
         Op::Single(Unit::Put(k, v)) => db.put(k, v),
         Op::Single(Unit::Delete(k)) => db.delete(k),
@@ -111,7 +111,7 @@ pub(crate) fn model_state(model: &Model) -> Vec<(Vec<u8>, Vec<u8>)> {
 
 /// The merge operator used everywhere in this file: append the operand
 /// to the base. It is associative, so folding operands one at a time
-/// (what the model does) and folding a whole chain at once (what lark
+/// (what the model does) and folding a whole chain at once (what regolith
 /// does at read time) must give the same bytes. `partial_merge` is
 /// implemented too, so compaction-time operand collapsing is exercised
 /// rather than skipped.
@@ -201,14 +201,14 @@ pub(crate) fn first_difference(
     for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
         if g.0 != w.0 {
             return Some(format!(
-                "entry {i}: lark has key {}, model has key {}",
+                "entry {i}: regolith has key {}, model has key {}",
                 show(&g.0),
                 show(&w.0),
             ));
         }
         if g.1 != w.1 {
             return Some(format!(
-                "key {}: lark has value {}, model has value {}",
+                "key {}: regolith has value {}, model has value {}",
                 show(&g.0),
                 show(&g.1),
                 show(&w.1),
@@ -217,12 +217,12 @@ pub(crate) fn first_difference(
     }
     match got.len().cmp(&want.len()) {
         std::cmp::Ordering::Greater => Some(format!(
-            "lark has {} extra entrie(s), first is key {}",
+            "regolith has {} extra entrie(s), first is key {}",
             got.len() - want.len(),
             show(&got[want.len()].0),
         )),
         std::cmp::Ordering::Less => Some(format!(
-            "lark is missing {} entrie(s), first is key {}",
+            "regolith is missing {} entrie(s), first is key {}",
             want.len() - got.len(),
             show(&want[got.len()].0),
         )),

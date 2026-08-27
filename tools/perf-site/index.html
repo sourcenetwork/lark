@@ -213,10 +213,10 @@ function sizeSection(cur,base,threshold){
   const cs=cur?.metrics?.binary_size||{}, rows=cs.rows||[];
   if(!rows.length)return "";
   const bmap={};
-  for(const r of (base?.metrics?.binary_size?.rows)||[]) bmap[r.artifact]=r.lark_cost_kib;
+  for(const r of (base?.metrics?.binary_size?.rows)||[]) bmap[r.artifact]=r.regolith_cost_kib;
   return `<h2>Binary size</h2><div class="grid">${card("regolith's own contribution",
     cs.note||"Lower is better.",
-    bars(rows.map(r=>({name:r.artifact,cur:r.lark_cost_kib,base:bmap[r.artifact]})),"KiB",threshold),
+    bars(rows.map(r=>({name:r.artifact,cur:r.regolith_cost_kib,base:bmap[r.artifact]})),"KiB",threshold),
     cs.trust)}</div>`;
 }
 
@@ -279,8 +279,8 @@ function overview(cur,base,threshold){
       base:((base?.metrics?.rss?.soaks)||[]).find(b=>(b.label||b.variant)===(s.label||s.variant))?.rss_peak_mib});
   }
   for(const r of (cur?.metrics?.binary_size?.rows)||[]){
-    rows.push({name:r.artifact+" KiB",cur:r.lark_cost_kib,
-      base:((base?.metrics?.binary_size?.rows)||[]).find(b=>b.artifact===r.artifact)?.lark_cost_kib});
+    rows.push({name:r.artifact+" KiB",cur:r.regolith_cost_kib,
+      base:((base?.metrics?.binary_size?.rows)||[]).find(b=>b.artifact===r.artifact)?.regolith_cost_kib});
   }
   const bIso={};
   for(const c of (base?.metrics?.isolation?.matrix)||[]) bIso[c.flavor+"/"+c.isolation]=c;

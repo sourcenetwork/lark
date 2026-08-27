@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
-use lark_kv::{Db, IngestOptions, Options, SstFileWriter, WriteBatch};
+use regolith::{Db, IngestOptions, Options, SstFileWriter, WriteBatch};
 use tempfile::TempDir;
 
 fn build_sst(path: &std::path::Path, batch: usize, opts: &Options) {
@@ -173,9 +173,9 @@ fn wal_disabled_writers_in_a_group_do_not_break_recovery() {
     for w in 0..8usize {
         let db = Arc::clone(&db);
         handles.push(thread::spawn(move || {
-            let wo = lark_kv::WriteOptions {
+            let wo = regolith::WriteOptions {
                 disable_wal: w % 2 == 0,
-                ..lark_kv::WriteOptions::default()
+                ..regolith::WriteOptions::default()
             };
             for i in 0..500usize {
                 db.put_opt(&wo, format!("d{w}_{i:04}").as_bytes(), b"v")

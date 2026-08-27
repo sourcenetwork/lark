@@ -1,4 +1,4 @@
-use lark_kv::{Db, IngestOptions, Options, SstFileWriter};
+use regolith::{Db, IngestOptions, Options, SstFileWriter};
 use tempfile::TempDir;
 
 fn build(path: &std::path::Path, batch: usize, opts: &Options) {
@@ -46,7 +46,7 @@ fn no_writers_at_all() {
             "after ingest {batch}: missing_via_get={} scanned={scanned} horizon_props ok",
             missing.len()
         );
-        println!("{}", db.get_property("lark.sstables").unwrap());
+        println!("{}", db.get_property("regolith.sstables").unwrap());
     }
     // And every earlier batch is still there.
     for batch in 0..5usize {
@@ -93,7 +93,7 @@ fn one_plain_write_between_ingests() {
             );
         }
     }
-    println!("{}", db.get_property("lark.sstables").unwrap());
+    println!("{}", db.get_property("regolith.sstables").unwrap());
 }
 
 /// Same five ingests, but each one through a freshly opened `Db` so the

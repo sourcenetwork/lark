@@ -5,7 +5,7 @@
 //! was measured working here rather than assumed: create, open, read,
 //! write, append after reopen, `set_len`, seek from the end, rename
 //! over an existing entry, hard link, and `read_dir` all behave as
-//! they do on Linux, and so does `File::sync_all`. lark therefore runs
+//! they do on Linux, and so does `File::sync_all`. regolith therefore runs
 //! on real files on this target, not on an in-memory mirror.
 //!
 //! So `WasiEnv` delegates every filesystem call to [`StdEnv`] rather
@@ -23,7 +23,7 @@
 //!   explanation is the main reason this type exists.
 //! - **No directory fsync.** Opening a preopened directory and calling
 //!   `sync_all` on it reports `EBADF`. [`Capabilities::sync_dir`] is
-//!   `false` and lark reports the narrower crash guarantee through
+//!   `false` and regolith reports the narrower crash guarantee through
 //!   [`crate::Db::capabilities`] instead of claiming one it does not
 //!   provide. [`StdEnv`] already gets this right, because it derives
 //!   the flag and the behavior from one expression rather than from

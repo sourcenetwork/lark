@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use lark_kv::{Db, MergeOperator, Options};
+use regolith::{Db, MergeOperator, Options};
 use tempfile::TempDir;
 
 struct Concat;

@@ -5,7 +5,7 @@
 //! Two fresh child processes run the identical workload over the
 //! identical data directory, one with a real block cache and one with
 //! `block_cache_size = 0`. The difference in live heap is what the
-//! block cache costs; `lark.block-cache-usage` is what it claims to
+//! block cache costs; `regolith.block-cache-usage` is what it claims to
 //! cost. If the claim is under the cost, the budget stops bounding
 //! memory and the over-allocation defect is back in a new costume.
 
@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 
 use std::sync::Arc;
 
-use lark_kv::{Db, Options, Statistics, Ticker};
+use regolith::{Db, Options, Statistics, Ticker};
 
 static LIVE: AtomicIsize = AtomicIsize::new(0);
 
@@ -66,10 +66,10 @@ unsafe impl GlobalAlloc for Counting {
 static ALLOC: Counting = Counting;
 
 const KEYS: u32 = 60_000;
-const DIR_ENV: &str = "LARK_ADV_OVERHEAD_DIR";
-const CACHE_ENV: &str = "LARK_ADV_OVERHEAD_CACHE";
-const BS_ENV: &str = "LARK_ADV_OVERHEAD_BS";
-const ROUNDS_ENV: &str = "LARK_ADV_OVERHEAD_ROUNDS";
+const DIR_ENV: &str = "REGOLITH_ADV_OVERHEAD_DIR";
+const CACHE_ENV: &str = "REGOLITH_ADV_OVERHEAD_CACHE";
+const BS_ENV: &str = "REGOLITH_ADV_OVERHEAD_BS";
+const ROUNDS_ENV: &str = "REGOLITH_ADV_OVERHEAD_ROUNDS";
 
 fn key(i: u32) -> Vec<u8> {
     format!("k{i:07}").into_bytes()
@@ -111,8 +111,10 @@ fn adv_overhead_child() {
         }
     }
     let heap_warm = LIVE.load(Ordering::Relaxed);
-    let usage = db.get_int_property("lark.block-cache-usage").unwrap();
-    let capacity = db.get_int_property("lark.block-cache-capacity").unwrap();
+    let usage = db.get_int_property("regolith.block-cache-usage").unwrap();
+    let capacity = db
+        .get_int_property("regolith.block-cache-capacity")
+        .unwrap();
     let adds = stats.get_ticker(Ticker::BlockCacheAdd);
     let hits = stats.get_ticker(Ticker::BlockCacheHit);
     let misses = stats.get_ticker(Ticker::BlockCacheMiss);

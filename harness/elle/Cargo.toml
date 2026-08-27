@@ -4,9 +4,9 @@ version = "0.1.0"
 publish = false
 edition = "2024"
 rust-version = "1.90"
-description = "Jepsen/Elle consistency harness for the lark storage engine"
+description = "Jepsen/Elle consistency harness for the regolith storage engine"
 
-# Detaches this crate from the lark-kv workspace so `cargo check --workspace`
+# Detaches this crate from the regolith workspace so `cargo check --workspace`
 # at the repository root never builds it, exactly like fuzz/ does.
 [workspace]
 members = ["."]
@@ -15,7 +15,7 @@ members = ["."]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-[dependencies.lark-kv]
+[dependencies.regolith]
 path = "../.."
 
 [[bin]]

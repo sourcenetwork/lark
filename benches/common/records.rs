@@ -55,10 +55,10 @@ impl Bag {
     }
 }
 
-/// `$LARK_BENCH_OUT` when the run was collected into one JSON Lines file,
+/// `$REGOLITH_BENCH_OUT` when the run was collected into one JSON Lines file,
 /// otherwise whatever a standalone bench left in `./bench-out/`.
 pub fn record_files() -> Vec<PathBuf> {
-    match std::env::var_os("LARK_BENCH_OUT") {
+    match std::env::var_os("REGOLITH_BENCH_OUT") {
         Some(p) if !p.is_empty() => vec![PathBuf::from(p)],
         _ => {
             let mut files: Vec<PathBuf> = match fs::read_dir("bench-out") {
@@ -76,7 +76,7 @@ pub fn record_files() -> Vec<PathBuf> {
 
 pub fn describe(files: &[PathBuf]) -> String {
     if files.is_empty() {
-        "$LARK_BENCH_OUT (unset) and ./bench-out/*.json (empty or missing)".to_string()
+        "$REGOLITH_BENCH_OUT (unset) and ./bench-out/*.json (empty or missing)".to_string()
     } else {
         files
             .iter()

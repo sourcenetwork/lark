@@ -15,7 +15,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use lark_kv::{Options, WriteBatch};
+use regolith::{Options, WriteBatch};
 
 const BATCH_SIZES: [usize; 4] = [1, 8, 32, 256];
 const VALUE_BYTES: usize = 100;
@@ -180,17 +180,17 @@ fn main() {
     let reps = if smoke {
         2
     } else {
-        env_u64("LARK_BENCH_REPS", 7)
+        env_u64("REGOLITH_BENCH_REPS", 7)
     } as usize;
     let rep_ms = if smoke {
         60
     } else {
-        env_u64("LARK_BENCH_REP_MS", 400)
+        env_u64("REGOLITH_BENCH_REP_MS", 400)
     };
     let bulk_mib = if smoke {
         2
     } else {
-        env_u64("LARK_BENCH_BULK_MIB", 32)
+        env_u64("REGOLITH_BENCH_BULK_MIB", 32)
     };
     let dur = Duration::from_millis(rep_ms);
 

@@ -1,4 +1,4 @@
-//! Generator for Jepsen-format histories of concurrent lark transactions.
+//! Generator for Jepsen-format histories of concurrent regolith transactions.
 //!
 //! See README.md for how to check a generated history with elle-cli.
 
@@ -48,9 +48,9 @@ fn dispatch(cfg: &Config) -> Result<(), String> {
     report_verification(&verify::verify(&cfg.out, cfg.model)?)
 }
 
-/// lark provides snapshot isolation only. Say so before generating a
+/// regolith provides snapshot isolation only. Say so before generating a
 /// history at a level the engine cannot reach, so nobody reads the
-/// checker verdict as a lark bug when it is legal snapshot-isolated
+/// checker verdict as a regolith bug when it is legal snapshot-isolated
 /// behavior.
 fn warn_unreachable_isolation(isolation: Isolation) {
     let gap = match isolation {
@@ -65,11 +65,11 @@ fn warn_unreachable_isolation(isolation: Isolation) {
         }
     };
     eprintln!(
-        "warning: {} isolation is NOT reachable on this tree. lark exposes snapshot \
+        "warning: {} isolation is NOT reachable on this tree. regolith exposes snapshot \
          isolation only, through TransactionDb and OptimisticTransactionDb, and {}. \
          The generated history is a snapshot-isolated history; check it with \
          `--consistency-models snapshot-isolation` for a verdict that means something \
-         about lark. A failure at {} may be legal behavior, not a bug.",
+         about regolith. A failure at {} may be legal behavior, not a bug.",
         isolation.as_str(),
         gap,
         isolation.as_str()

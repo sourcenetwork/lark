@@ -8,7 +8,7 @@
 // suite lives in tests/wasm_opfs*.rs.
 #![cfg(not(target_arch = "wasm32"))]
 
-use lark_kv::{CompactionStyle, Db, Env, Error, FifoCompactionOptions, Options};
+use regolith::{CompactionStyle, Db, Env, Error, FifoCompactionOptions, Options};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -426,7 +426,7 @@ fn universal_compact_step_converges() {
 /// keep, and it must be refused rather than silently downgraded.
 #[test]
 fn immediate_durability_on_a_non_durable_env_is_refused() {
-    let env = std::sync::Arc::new(lark_kv::MemEnv::new());
+    let env = std::sync::Arc::new(regolith::MemEnv::new());
     let caps = env.capabilities();
     assert!(
         !caps.durable_sync,
@@ -434,7 +434,7 @@ fn immediate_durability_on_a_non_durable_env_is_refused() {
     );
     let opts = Options {
         env: env.clone(),
-        durability: lark_kv::DurabilityMode::Immediate,
+        durability: regolith::DurabilityMode::Immediate,
         max_background_compactions: 0,
         ..Options::default()
     };
@@ -536,7 +536,7 @@ fn compact_step_racing_workers_and_compact_range_loses_nothing() {
 /// a second *process* is not excluded; a second handle here is.
 #[test]
 fn a_second_handle_is_refused_even_without_a_cross_process_lock() {
-    let env = std::sync::Arc::new(lark_kv::MemEnv::new());
+    let env = std::sync::Arc::new(regolith::MemEnv::new());
     assert!(
         !env.capabilities().file_lock,
         "precondition: MemEnv reports no cross-process file lock"

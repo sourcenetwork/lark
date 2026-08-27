@@ -6,7 +6,7 @@
 //! fails loudly instead, because there is no filesystem behind it at
 //! all.
 //!
-//! It is also the honest way to test the paths lark takes when the
+//! It is also the honest way to test the paths regolith takes when the
 //! host is missing a capability: `MemEnv` has no hard links, no
 //! directory fsync, and no threads, and it says so through
 //! [`super::Capabilities`].
@@ -104,7 +104,7 @@ impl MemEnv {
     }
 
     /// Remove the monotonic clock, the wall clock, or both, to
-    /// exercise what lark does on a platform that has none.
+    /// exercise what regolith does on a platform that has none.
     pub fn set_clocks(&self, micros: Option<u64>, unix_secs: Option<u64>) {
         let mut clock = self.clock.lock();
         clock.micros = micros;
@@ -258,7 +258,7 @@ impl Env for MemEnv {
     fn capabilities(&self) -> Capabilities {
         // Nothing here survives the process, so `durable_sync` is
         // false: a `sync_all` on a MemEnv file is a no-op and saying
-        // otherwise would be a durability claim lark cannot keep.
+        // otherwise would be a durability claim regolith cannot keep.
         Capabilities::none().with_atomic_rename(true)
     }
 

@@ -1,4 +1,4 @@
-//! Allocation budgets for lark's hot paths, enforced as a gate.
+//! Allocation budgets for regolith's hot paths, enforced as a gate.
 //!
 //! Run with `cargo bench --bench allocs`. The process exits non-zero as
 //! soon as any path allocates more per operation than its budget, so
@@ -32,7 +32,7 @@ use std::hint::black_box;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use lark_kv::{Db, Options, WriteBatch};
+use regolith::{Db, Options, WriteBatch};
 use tempfile::TempDir;
 
 /// Process-wide counting gate. Setup and teardown run with this off.
@@ -257,10 +257,10 @@ fn filled(to_sstables: bool) -> Fixture {
     // same path: one reads an SSTable only if the memtable is actually
     // empty, and the other reads the memtable only if no SSTable exists.
     let sst =
-        f.db.get_int_property("lark.total-sst-files-size")
+        f.db.get_int_property("regolith.total-sst-files-size")
             .unwrap_or_default();
     let mem =
-        f.db.get_int_property("lark.cur-size-all-mem-tables")
+        f.db.get_int_property("regolith.cur-size-all-mem-tables")
             .unwrap_or_default();
     if to_sstables {
         assert!(sst > 0 && mem == 0, "not SSTable-resident: {sst} / {mem}");
@@ -547,7 +547,7 @@ fn iterator_disclosure() {
         let (cold_steps, cold) = measure(|| drain_iter(&f.db));
         let (warm_steps, warm) = measure(|| drain_iter(&f.db));
         let cache =
-            f.db.get_int_property("lark.block-cache-usage")
+            f.db.get_int_property("regolith.block-cache-usage")
                 .unwrap_or_default();
         println!(
             "  {name}: cold {} allocs over {cold_steps} steps ({:.5}/step), \
@@ -587,7 +587,7 @@ fn rotation_disclosure() {
     });
     let (allocs, bytes) = counts.per_op(OPS as u64);
     let sst_bytes = db
-        .get_int_property("lark.total-sst-files-size")
+        .get_int_property("regolith.total-sst-files-size")
         .unwrap_or_default();
     assert!(
         sst_bytes > 0,

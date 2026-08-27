@@ -8,16 +8,21 @@
 
 use std::io::{self, Read};
 
-use xxhash_rust::xxh3::{Xxh3Default, xxh3_64};
+use xxhash_rust::xxh3::Xxh3Default;
 
-const WAL_RECORD_DOMAIN: &[u8] = b"lark/wal-record/v2";
-const WAL_STAMP_DOMAIN: &[u8] = b"lark/wal-stamp/v1";
-const MANIFEST_RECORD_DOMAIN: &[u8] = b"lark/manifest-record/v2";
-const SST_BLOCK_DOMAIN: &[u8] = b"lark/sst-block/v2";
-const SST_META_DOMAIN: &[u8] = b"lark/sst-meta/v1";
-const BACKUP_MANIFEST_DOMAIN: &[u8] = b"lark/backup-manifest/v2";
-const BACKUP_SHARED_FILE_DOMAIN: &[u8] = b"lark/backup-shared-file/v2";
-const OPFS_SLOT_HEADER_DOMAIN: &[u8] = b"lark/opfs-slot-header/v1";
+// Hash domain separators: never displayed, never compared against a
+// name, and present only to keep one checksum family from colliding with
+// another. The bytes are part of the on-disk format, so they are frozen
+// from regolith's first release onward and a change to any of them is a
+// format break that needs a new version byte alongside it.
+const WAL_RECORD_DOMAIN: &[u8] = b"regolith/wal-record/v2";
+const WAL_STAMP_DOMAIN: &[u8] = b"regolith/wal-stamp/v1";
+const MANIFEST_RECORD_DOMAIN: &[u8] = b"regolith/manifest-record/v2";
+const SST_BLOCK_DOMAIN: &[u8] = b"regolith/sst-block/v2";
+const SST_META_DOMAIN: &[u8] = b"regolith/sst-meta/v1";
+const BACKUP_MANIFEST_DOMAIN: &[u8] = b"regolith/backup-manifest/v2";
+const BACKUP_SHARED_FILE_DOMAIN: &[u8] = b"regolith/backup-shared-file/v2";
+const OPFS_SLOT_HEADER_DOMAIN: &[u8] = b"regolith/opfs-slot-header/v1";
 
 pub(crate) fn wal_record(len: u32, record_type: u8, data: &[u8]) -> u32 {
     let len = len.to_le_bytes();
@@ -94,14 +99,6 @@ pub(crate) fn backup_shared_file(reader: &mut impl Read) -> io::Result<u128> {
         hasher.update(&buf[..n]);
     }
     Ok(hasher.digest128())
-}
-
-pub(crate) fn legacy_payload_u32(data: &[u8]) -> u32 {
-    xxh3_64(data) as u32
-}
-
-pub(crate) fn legacy_payload_u64(data: &[u8]) -> u64 {
-    xxh3_64(data)
 }
 
 fn u32_parts(domain: &[u8], parts: &[&[u8]]) -> u32 {

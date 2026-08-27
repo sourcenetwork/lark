@@ -1,7 +1,7 @@
 # Configuration for cargo-deny. See https://embarkstudios.github.io/cargo-deny/
 # for the full schema.
 #
-# Lark ships under `Apache-2.0 OR MIT` so any dependency that uses a
+# Regolith ships under `Apache-2.0 OR MIT` so any dependency that uses a
 # weakly-copyleft or proprietary license would force consumers of
 # the crate into a compatibility headache. The allow-list below is
 # the conventional FOSS set plus `Unicode-*` variants that unicode-ident

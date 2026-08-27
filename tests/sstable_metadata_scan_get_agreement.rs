@@ -16,7 +16,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use lark_kv::{Db, Options};
+use regolith::{Db, Options};
 use tempfile::TempDir;
 
 const KEYS: usize = 400;
@@ -307,11 +307,9 @@ fn relabelling_a_tables_format_version_is_never_served_as_data() {
         let version_byte = original.len() - 8;
         let current = original[version_byte];
         assert!(
-            (1..=6).contains(&current),
+            (5..=6).contains(&current),
             "the fixture's version byte is {current:#04x}, not a known version. \
-             v1 and v2 are the unchecksummed LARKSST footers, v3 and v4 the \
-             checksummed ones, v5 and v6 the stamped REGOSST flat and \
-             partitioned ones.",
+             v5 and v6 are the REGOSST flat and partitioned footers.",
         );
 
         let root = TempDir::new().expect("tempdir");

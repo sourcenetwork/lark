@@ -97,13 +97,8 @@ struct BackupManifest {
 /// Identifier at the head of a backup manifest: `REGOMBKP`.
 const BACKUP_MANIFEST_MAGIC: [u8; 8] = *b"REGOMBKP";
 
-/// The 4-byte identifier earlier builds wrote (`LKBP`). Read, never
-/// written, so an existing backup repository still restores.
-const BACKUP_MANIFEST_MAGIC_LEGACY: u32 = 0x4C4B_4250;
-
-/// Bumped with the identifier: a manifest carrying `REGOMBKP` is v2.
+/// On-disk backup manifest version.
 const BACKUP_MANIFEST_VERSION: u32 = 2;
-const BACKUP_MANIFEST_VERSION_LEGACY: u32 = 1;
 
 impl BackupEngine {
     /// Open or create a backup repository at `backup_dir` on the
@@ -478,33 +473,23 @@ fn decode_manifest(data: &[u8]) -> io::Result<BackupManifest> {
     let body_len = data.len() - 8;
     let body = &data[..body_len];
     let stored_cksum = u64::from_le_bytes(data[body_len..].try_into().unwrap());
-    if checksum::backup_manifest(body) != stored_cksum
-        && checksum::legacy_payload_u64(body) != stored_cksum
-    {
+    if checksum::backup_manifest(body) != stored_cksum {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "backup manifest checksum mismatch",
         ));
     }
-    let mut p = 0usize;
-    // `REGOMBKP` is eight bytes; the identifier earlier builds wrote is
-    // four. Reading eight and falling back keeps an existing repository
-    // restorable instead of stranding it.
-    let expected_version = if body.len() >= BACKUP_MANIFEST_MAGIC.len()
-        && body[..BACKUP_MANIFEST_MAGIC.len()] == BACKUP_MANIFEST_MAGIC
+    if body.len() < BACKUP_MANIFEST_MAGIC.len()
+        || body[..BACKUP_MANIFEST_MAGIC.len()] != BACKUP_MANIFEST_MAGIC
     {
-        p = BACKUP_MANIFEST_MAGIC.len();
-        BACKUP_MANIFEST_VERSION
-    } else if read_u32(body, &mut p)? == BACKUP_MANIFEST_MAGIC_LEGACY {
-        BACKUP_MANIFEST_VERSION_LEGACY
-    } else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "backup manifest bad magic",
         ));
-    };
+    }
+    let mut p = BACKUP_MANIFEST_MAGIC.len();
     let version = read_u32(body, &mut p)?;
-    if version != expected_version {
+    if version != BACKUP_MANIFEST_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported backup manifest version {version}"),
@@ -580,10 +565,12 @@ fn read_var_bytes(data: &[u8], p: &mut usize) -> io::Result<Vec<u8>> {
 
 /// Encode a restored backup as an engine-compatible MANIFEST stream.
 ///
-/// Mirrors the record layout produced by
-/// `VersionSet::encode_records` / `ManifestRecord::encode` in
-/// [`crate::engine::manifest`]. Each record is `[len u32][body][cksum u32]`
-/// with the same accidental-corruption checksum used by the engine manifest.
+/// The stamp comes from [`VersionSet::encode_stamp`] so a restored
+/// manifest cannot drift from the one the engine writes. The records
+/// mirror the layout produced by `VersionSet::encode_records` /
+/// `ManifestRecord::encode` in [`crate::engine::manifest`]: each is
+/// `[len u32][body][cksum u32]` with the same accidental-corruption
+/// checksum the engine manifest uses.
 fn encode_engine_manifest(m: &BackupManifest) -> Vec<u8> {
     const TAG_ADD_FILE: u8 = 1;
     const TAG_LAST_SEQ: u8 = 3;
@@ -616,7 +603,7 @@ fn encode_engine_manifest(m: &BackupManifest) -> Vec<u8> {
         records.push(r);
     }
 
-    let mut out = Vec::new();
+    let mut out = crate::engine::manifest::VersionSet::encode_stamp().to_vec();
     for record_buf in &records {
         let len = record_buf.len() as u32;
         let checksum = checksum::manifest_record(len, record_buf);

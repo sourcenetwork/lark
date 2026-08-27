@@ -18,7 +18,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use lark_kv::{Db, Options, WriteBatch, WriteOptions};
+use regolith::{Db, Options, WriteBatch, WriteOptions};
 use tempfile::TempDir;
 
 /// One write the fixture performed, in order.
@@ -566,7 +566,7 @@ fn plant_split(fx: &Fixture, db: &Path, split_at: usize, cut_first_to: Option<us
 /// `Wal::replay` used to judge each file on its own bytes, applying the
 /// torn-tail rule, which is only sound for the newest WAL file, to
 /// every one of them. Replay now takes a `WalPosition`, and
-/// `LarkEngine::open` passes it from the id order it already walks, so
+/// `RegolithEngine::open` passes it from the id order it already walks, so
 /// damage in a file a rotation already closed is refused instead of
 /// being discarded as a tail.
 ///

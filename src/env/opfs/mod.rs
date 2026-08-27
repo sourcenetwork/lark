@@ -3,7 +3,7 @@
 //! An [`Env`] backed by the browser's Origin Private File System.
 //!
 //! `wasm32-unknown-unknown` has no `std::fs` at all: every filesystem call
-//! there returns `Unsupported`, so lark cannot open a database without a
+//! there returns `Unsupported`, so regolith cannot open a database without a
 //! storage backend written for the platform. OPFS is that backend.
 //!
 //! # Two strategies, chosen at mount
@@ -14,8 +14,8 @@
 //! probe rather than a `cfg`:
 //!
 //! - [`OpfsMode::Sah`] pre-opens a pool of sync access handles and serves
-//!   lark's synchronous filesystem calls straight from storage. Nothing
-//!   beyond lark's own memtables and block cache is resident, and
+//!   regolith's synchronous filesystem calls straight from storage. Nothing
+//!   beyond regolith's own memtables and block cache is resident, and
 //!   `sync_all` is real durability.
 //! - [`OpfsMode::Mirror`] holds the whole database in linear memory and
 //!   writes it back through `FileSystemWritableFileStream`, which is what
@@ -31,8 +31,8 @@
 //! # Host contract
 //!
 //! ```ignore
-//! use lark_kv::env::opfs::{OpfsEnv, OpfsOptions};
-//! use lark_kv::{Db, Options};
+//! use regolith::env::opfs::{OpfsEnv, OpfsOptions};
+//! use regolith::{Db, Options};
 //!
 //! let env = OpfsEnv::mount("my-db", OpfsOptions::default()).await?;
 //! let mut options = Options::embedded();
@@ -46,7 +46,7 @@
 //! env.persist().await?;
 //! ```
 //!
-//! Open the database at [`OpfsEnv::db_path`]. lark records the logical
+//! Open the database at [`OpfsEnv::db_path`]. regolith records the logical
 //! paths it is given, so a database written under one path is not visible
 //! under another. Compaction has to run on the calling thread here, which
 //! is what [`crate::Options::embedded`] already sets; a browser wasm
@@ -160,7 +160,7 @@ pub enum OpfsMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpfsOptions {
     /// Handle-pool slots pre-opened at mount in [`OpfsMode::Sah`]. Each
-    /// slot is one OPFS file that lark can assign to a new WAL or SSTable
+    /// slot is one OPFS file that regolith can assign to a new WAL or SSTable
     /// without an `await`. Running out is reported, not fatal: see
     /// [`OpfsEnv::grow_pool`].
     pub initial_slots: usize,
@@ -429,13 +429,13 @@ impl Env for OpfsEnv {
     fn hard_link(&self, _src: &Path, _dst: &Path) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "OPFS has no hard links; Capabilities::hard_link is false, so lark copies instead",
+            "OPFS has no hard links; Capabilities::hard_link is false, so regolith copies instead",
         ))
     }
 
     fn lock_file(&self, path: &Path, exclusive: bool) -> io::Result<Box<dyn FileLock>> {
         // A wasm module is one process with one linear memory holding one
-        // copy of lark's state, so an in-process registry excludes every
+        // copy of regolith's state, so an in-process registry excludes every
         // writer that can exist. No LOCK file is created: an unclean
         // unload would leave a stale one behind and turn a crash into an
         // unopenable database, while registry state dies with the module.
@@ -524,7 +524,7 @@ mod tests {
 
     // The unit tests of this module and its children are pure logic, but
     // they only exist on a target whose test harness is a browser. One
-    // configuration line for the whole `lark-kv` lib test target.
+    // configuration line for the whole `regolith` lib test target.
     wasm_bindgen_test_configure!(run_in_browser);
 
     #[wasm_bindgen_test]

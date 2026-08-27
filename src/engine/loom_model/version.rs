@@ -48,7 +48,7 @@ struct Version {
 
 impl Version {
     /// The newest table holding `key`, searched exactly as
-    /// `LarkEngine::lookup` searches: L0 newest first, then L1.
+    /// `RegolithEngine::lookup` searches: L0 newest first, then L1.
     fn find(&self, key: u8) -> Option<Table> {
         self.levels[0]
             .iter()
@@ -116,7 +116,7 @@ fn apply_locked(pipeline: &Mutex<()>, versions: &VersionSet, edits: &[Edit]) {
     versions.apply(edits);
 }
 
-/// `self.versions.lock().current()`, the shape `LarkEngine::lookup` has
+/// `self.versions.lock().current()`, the shape `RegolithEngine::lookup` has
 /// when it pins the version it will walk.
 fn current_locked(pipeline: &Mutex<()>, versions: &VersionSet) -> Arc<Version> {
     let _lock = pipeline.lock().expect("pipeline");
@@ -141,7 +141,7 @@ fn before_compaction() -> Arc<VersionSet> {
 /// compaction, because the removals and the addition are one `apply`.
 ///
 /// The reader takes the pipeline mutex to pin its version, exactly as
-/// `LarkEngine::lookup` does, and then walks the pinned snapshot with no
+/// `RegolithEngine::lookup` does, and then walks the pinned snapshot with no
 /// lock held at all - which is why the snapshot has to be whole.
 pub fn a_reader_pins_one_version_across_a_compaction() {
     explore(

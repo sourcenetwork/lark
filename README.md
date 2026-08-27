@@ -1,5 +1,5 @@
 <h1 align="center">
-    <img src="https://github.com/sourcenetwork/regolith/raw/master/art/regolith_banner_2048x512.png"/>
+    <img src="https://github.com/sourcenetwork/regolith/raw/main/art/regolith_banner_2048x512.png"/>
 </h1>
 <div align="center">
  <strong>
