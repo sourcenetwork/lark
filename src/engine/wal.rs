@@ -380,18 +380,38 @@ pub(crate) mod fault {
     pub(crate) fn arm_sync_failure(dir: &Path) {
         let mut armed = ARMED.lock();
         armed.push(dir.to_path_buf());
-        if let Ok(real) = dir.canonicalize()
+        if let Some(real) = resolved(dir)
             && real != dir
         {
             armed.push(real);
         }
     }
 
+    /// `dir` with symlinks resolved, and without Windows' verbatim
+    /// prefix.
+    ///
+    /// Two platforms need this and neither is optional. On macOS the
+    /// temporary directory sits under `/var/folders`, a symlink to
+    /// `/private/var/folders`. On Windows `canonicalize` hands back a
+    /// `\\?\C:\...` verbatim path, which no path built by joining
+    /// ever matches. Either way a prefix test against one form alone
+    /// silently never matches, the fault never fires, and the test fails
+    /// on its own "the fault must produce a mix" assertion rather than
+    /// on anything the engine did.
+    fn resolved(dir: &Path) -> Option<PathBuf> {
+        let real = dir.canonicalize().ok()?;
+        let text = real.to_str()?;
+        Some(match text.strip_prefix(r"\\?\") {
+            Some(plain) => PathBuf::from(plain),
+            None => real,
+        })
+    }
+
     /// Stop failing syncs under `dir`, leaving any other test's arming
     /// in place.
     pub(crate) fn disarm_sync_failure(dir: &Path) {
         let mut armed = ARMED.lock();
-        let real = dir.canonicalize().ok();
+        let real = resolved(dir);
         armed.retain(|d| d != dir && Some(d) != real.as_ref());
     }
 
@@ -402,7 +422,7 @@ pub(crate) mod fault {
         }
         // The log itself may not exist yet, so the resolved form is
         // taken from its directory.
-        match path.parent().and_then(|p| p.canonicalize().ok()) {
+        match path.parent().and_then(resolved) {
             Some(real) => armed.iter().any(|dir| real.starts_with(dir)),
             None => false,
         }
