@@ -272,12 +272,21 @@ mod real {
     fn open_lock_file(path: &Path) -> io::Result<File> {
         use std::os::windows::fs::OpenOptionsExt;
 
+        // Deny read and write, but not delete. The share mode is the
+        // whole exclusion here, because `lock_exclusive` is a no-op on
+        // Windows, and a second opener asking for read or write still
+        // gets a sharing violation. Denying delete as well would also
+        // make removing the database directory fail while a handle is
+        // open, which no other platform does and which `flock` on unix
+        // never did either.
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+
         OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .share_mode(0)
+            .share_mode(FILE_SHARE_DELETE)
             .open(path)
     }
 

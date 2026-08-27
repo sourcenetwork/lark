@@ -60,6 +60,10 @@ use harness::{
 
 // ─── WAL: truncation ────────────────────────────────────────────────────
 
+// The fixture this uses is built by killing a child process, and
+// "was it killed" is a POSIX signal question that Windows cannot
+// answer, so the assertion would be vacuous there.
+#[cfg(target_os = "linux")]
 /// Truncating the WAL must leave the database holding the state after
 /// some whole number of the intended writes. A cut leaves every record
 /// before it byte-for-byte as the process wrote it and only the record it
@@ -110,6 +114,10 @@ fn wal_truncation_sweep(cuts: &[u64], what: &str, progress: &AtomicU64) {
     tally.finish(what);
 }
 
+// The fixture this uses is built by killing a child process, and
+// "was it killed" is a POSIX signal question that Windows cannot
+// answer, so the assertion would be vacuous there.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_wal_truncated_at_a_sampled_offset_replays_whole_records_or_refuses() {
     watch("wal truncation sample", |progress| {
@@ -123,6 +131,10 @@ fn a_wal_truncated_at_a_sampled_offset_replays_whole_records_or_refuses() {
     });
 }
 
+// The fixture this uses is built by killing a child process, and
+// "was it killed" is a POSIX signal question that Windows cannot
+// answer, so the assertion would be vacuous there.
+#[cfg(target_os = "linux")]
 /// The exhaustive twin of the sampled sweep: every byte offset of the
 /// WAL, with no sampling to hide behind.
 #[test]
@@ -134,6 +146,10 @@ fn a_wal_truncated_at_every_offset_replays_whole_records_or_refuses() {
     });
 }
 
+// The fixture this uses is built by killing a child process, and
+// "was it killed" is a POSIX signal question that Windows cannot
+// answer, so the assertion would be vacuous there.
+#[cfg(target_os = "linux")]
 /// A `WriteBatch` is atomic, so a WAL cut inside the record that carries
 /// one must leave none of it applied, in every durability mode. Cutting
 /// at every offset inside the final batch record catches a replay that
@@ -164,6 +180,10 @@ fn a_write_batch_record_cut_in_half_is_never_half_applied() {
 
 // ─── WAL: bit rot ───────────────────────────────────────────────────────
 
+// The fixture this uses is built by killing a child process, and
+// "was it killed" is a POSIX signal question that Windows cannot
+// answer, so the assertion would be vacuous there.
+#[cfg(target_os = "linux")]
 /// Every byte of a WAL record is covered by its checksum: the length, the
 /// type byte and the payload all feed `checksum::wal_record`, and the
 /// stored checksum is the last four bytes. So every single-bit flip must
@@ -223,6 +243,10 @@ fn wal_flip_sweep(positions: &[u64], what: &str, progress: &AtomicU64) {
     tally.finish(what);
 }
 
+// The fixture this uses is built by killing a child process, and
+// "was it killed" is a POSIX signal question that Windows cannot
+// answer, so the assertion would be vacuous there.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_sampled_bit_flip_anywhere_in_the_wal_is_caught_by_the_record_checksum() {
     watch("wal bit flips sample", |progress| {
@@ -236,6 +260,10 @@ fn a_sampled_bit_flip_anywhere_in_the_wal_is_caught_by_the_record_checksum() {
     });
 }
 
+// The fixture this uses is built by killing a child process, and
+// "was it killed" is a POSIX signal question that Windows cannot
+// answer, so the assertion would be vacuous there.
+#[cfg(target_os = "linux")]
 /// The exhaustive twin: every bit of every byte of the WAL.
 #[test]
 fn every_bit_flip_in_the_wal_is_caught_by_the_record_checksum() {
@@ -248,6 +276,10 @@ fn every_bit_flip_in_the_wal_is_caught_by_the_record_checksum() {
 
 // ─── WAL: torn and trailing bytes ───────────────────────────────────────
 
+// The fixture this uses is built by killing a child process, and
+// "was it killed" is a POSIX signal question that Windows cannot
+// answer, so the assertion would be vacuous there.
+#[cfg(target_os = "linux")]
 /// A record header that promises more payload than the file holds is the
 /// signature of a write torn by a crash, and what replay owes depends on
 /// where it sits.
@@ -331,6 +363,10 @@ fn a_wal_record_header_promising_more_bytes_than_exist_is_refused_unless_it_is_t
     });
 }
 
+// The fixture this uses is built by killing a child process, and
+// "was it killed" is a POSIX signal question that Windows cannot
+// answer, so the assertion would be vacuous there.
+#[cfg(target_os = "linux")]
 /// Garbage appended after the last valid record is what a crash mid-write
 /// plus a filesystem that pads with whatever was in the block leaves
 /// behind. It must never be replayed as data. Catches a replay loop that
@@ -357,6 +393,10 @@ fn garbage_appended_after_a_valid_wal_is_never_replayed_as_data() {
     });
 }
 
+// The fixture this uses is built by killing a child process, and
+// "was it killed" is a POSIX signal question that Windows cannot
+// answer, so the assertion would be vacuous there.
+#[cfg(target_os = "linux")]
 /// A WAL truncated to nothing is a legal state: the writes it held are
 /// lost, but the database must open, serve whatever the tables hold and
 /// keep working. Catches an open path that treats a zero-length WAL as

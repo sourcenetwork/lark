@@ -146,6 +146,7 @@ pub fn measure_pristine(files: &[(String, Vec<u8>)], write_buffer: usize) -> Sta
 /// A database killed mid-life with every write still in the WAL: a clean
 /// close would flush the memtable to an SSTable and leave nothing to
 /// corrupt, so the writer is a real child process that is killed.
+#[cfg(target_os = "linux")]
 pub fn build_wal_fixture(batch_size: usize, delete_every: usize) -> Fixture {
     const OPS: usize = 8;
     const WRITE_BUFFER: usize = 1 << 20;
@@ -176,11 +177,13 @@ pub fn build_wal_fixture(batch_size: usize, delete_every: usize) -> Fixture {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub fn wal_fixture() -> &'static Fixture {
     static F: OnceLock<Fixture> = OnceLock::new();
     F.get_or_init(|| build_wal_fixture(1, 3))
 }
 
+#[cfg(target_os = "linux")]
 pub fn batch_fixture() -> &'static Fixture {
     static F: OnceLock<Fixture> = OnceLock::new();
     F.get_or_init(|| build_wal_fixture(4, 0))
