@@ -6,7 +6,7 @@
 //! into one run file and told apart by the `options` each entry carries.
 //!
 //! Usage:
-//!   cargo run --release --bench soak -- <seconds> <write_buffer_mib> <cache_mib> <shard_bits> <tag>
+//!   cargo bench --bench soak -- <seconds> <write_buffer_mib> <cache_mib> <shard_bits> <tag>
 //! Defaults: 360 64 64 6 default
 
 mod common;
@@ -39,13 +39,13 @@ hold-and-release over a 400k keyspace with 4 KiB values.";
 const RSS_AVAILABLE: bool = cfg!(target_os = "linux");
 
 fn main() {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let argv = common::args();
     if argv.iter().any(|a| a.starts_with('-')) {
         eprintln!(
             "soak: skipped. It is a custom long-running harness, not a criterion bench, so `cargo bench` does not drive it."
         );
         eprintln!(
-            "  cargo run --release --bench soak -- <seconds> <write_buffer_mib> <cache_mib> <shard_bits> <tag>"
+            "  cargo bench --bench soak -- <seconds> <write_buffer_mib> <cache_mib> <shard_bits> <tag>"
         );
         return;
     }

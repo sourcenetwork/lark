@@ -339,15 +339,6 @@ jobs:
   # regenerated per run shows one run and loses the comparison the
   # moment it is replaced; keeping the documents is what lets the
   # dashboard plot a metric across every run ever recorded.
-
-
-  # Assemble every family into one run document, file it alongside every
-  # earlier run, and publish the dashboard that reads the whole set.
-  #
-  # The run documents are the artifact, not a rendered page. A page
-  # regenerated per run shows one run and loses the comparison the
-  # moment it is replaced; keeping the documents is what lets the
-  # dashboard plot a metric across every run ever recorded.
   perf-site:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [bench]
@@ -369,7 +360,7 @@ jobs:
           set -euo pipefail
           cat bench-artifacts/*.jsonl > bench-out.jsonl
           REGOLITH_BENCH_OUT="$PWD/bench-out.jsonl" \
-            cargo run --release --bench collect -- \
+            cargo bench --bench collect -- \
               --out "run-${GITHUB_SHA::12}.json" \
               --commit "${GITHUB_SHA}" --label main
       - name: Fetch the runs already published

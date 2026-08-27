@@ -13,6 +13,23 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// This process's arguments, without the `--bench` marker cargo appends.
+///
+/// `cargo bench --bench <name> -- <args>` passes `<args>` through and then
+/// adds `--bench` of its own, which libtest reads and a `harness = false`
+/// target has no reason to. Stripping it here is what lets a bench target
+/// take real arguments: `collect` refuses an argument it does not know, and
+/// `soak` treats any flag as a sign it was not meant to run at all, so
+/// leaving the marker in place turns a real invocation into an error or a
+/// silent skip.
+pub fn args() -> Vec<String> {
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(i) = argv.iter().rposition(|a| a == "--bench") {
+        argv.remove(i);
+    }
+    argv
+}
+
 /// Deterministic splitmix64 generator: reproducible across runs and machines,
 /// and well distributed from any seed including zero.
 pub struct Rng(pub u64);

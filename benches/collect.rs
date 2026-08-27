@@ -1,7 +1,7 @@
 //! Assemble one schema v1 run file from every metric family the benches wrote.
 //!
 //! Usage:
-//!   cargo run --release --bench collect -- --out <run.json> --commit <sha> --label <label>
+//!   cargo bench --bench collect -- --out <run.json> --commit <sha> --label <label>
 //!
 //! Families are read from `$REGOLITH_BENCH_OUT` (JSON Lines) when it is set, and
 //! from `./bench-out/*.json` otherwise. Criterion's own `estimates.json` files
@@ -127,14 +127,14 @@ struct Args {
 
 const USAGE: &str = "collect: assemble one schema v1 run file from every bench family.
 
-  cargo run --release --bench collect -- --out <run.json> --commit <sha> --label <label>
+  cargo bench --bench collect -- --out <run.json> --commit <sha> --label <label>
 
 Families are read from $REGOLITH_BENCH_OUT (JSON Lines) when set, else ./bench-out/*.json.";
 
 /// `None` means this invocation is not ours: `cargo bench` drives every bench
 /// target with criterion's flags, and collect has nothing to do then.
 fn parse_args() -> Option<Args> {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let argv = common::args();
     let mut out: Option<PathBuf> = None;
     let mut commit: Option<String> = None;
     let mut label: Option<String> = None;
@@ -172,7 +172,7 @@ fn parse_args() -> Option<Args> {
             foreign.join(" ")
         );
         eprintln!(
-            "  cargo run --release --bench collect -- --out <run.json> --commit <sha> --label \
+            "  cargo bench --bench collect -- --out <run.json> --commit <sha> --label \
              <label>"
         );
         return None;

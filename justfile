@@ -190,7 +190,7 @@ bench-one name: loadguard
 # RSS soak. Default 360s; pass seconds and an Options variant tag.
 
 soak secs="360" wb="64" cache="64" shard_bits="6" tag="default": loadguard
-    cargo run --release --bench soak -- {{secs}} {{wb}} {{cache}} {{shard_bits}} {{tag}}
+    cargo bench --bench soak -- {{secs}} {{wb}} {{cache}} {{shard_bits}} {{tag}}
 
 # The two soak variants compared. Deterministic: no loadguard needed.
 
@@ -201,7 +201,7 @@ soak-pair:
 # Binary size, native and both wasm targets, against the budget.
 
 size:
-    cargo run --release --bench size
+    cargo bench --bench size
 
 # The memory table in the README: every profile, on both hosts, one
 # workload. The wasm column is the reproducible one because linear
@@ -227,7 +227,7 @@ wasm-budget puts="20000":
 # Point memory probes.
 
 mem:
-    cargo run --release --bench memory
+    cargo bench --bench memory
 
 # The MVCC regression probes. Must stay at zero violations.
 
@@ -406,7 +406,7 @@ wasm-browser:
     done
 
 embedded:
-    cargo run --release --bench memory -- --profile embedded
+    cargo bench --bench memory -- --profile embedded
 
 # ---------- the gains figures ----------
 
@@ -417,7 +417,7 @@ gains: loadguard
     set -euo pipefail
     sha=$(git rev-parse --short HEAD)
     cargo bench -- --baseline pre --save-baseline "$sha"
-    cargo run --release --bench collect -- \
+    cargo bench --bench collect -- \
         --out {{gains_dir}}/runs/"$sha"-{{label}}.json \
         --commit "$sha" --label {{label}}
     just gains-render
