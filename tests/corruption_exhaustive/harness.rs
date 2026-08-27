@@ -272,14 +272,14 @@ pub fn read_state(db: &Db) -> Result<State, ReadError> {
             Some(v) => v.to_vec(),
             None => return Err(ReadError::Broken("valid iterator with no value".into())),
         };
-        if let Some((prev, _)) = forward.last() {
-            if prev >= &k {
-                return Err(ReadError::Broken(format!(
-                    "forward scan returned {} after {}",
-                    show(&k),
-                    show(prev)
-                )));
-            }
+        if let Some((prev, _)) = forward.last()
+            && prev >= &k
+        {
+            return Err(ReadError::Broken(format!(
+                "forward scan returned {} after {}",
+                show(&k),
+                show(prev)
+            )));
         }
         forward.push((k, v));
         it.next();

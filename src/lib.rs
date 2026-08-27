@@ -1362,7 +1362,11 @@ impl Db {
             return Ok(existing);
         }
         self.validate_prefixed_key_size(&meta::name_key(name))?;
-        let (handle, next_id) = self.cfs.allocate(name);
+        let Some((handle, next_id)) = self.cfs.allocate(name) else {
+            return Err(Error::invalid_argument(
+                "the column-family id space is exhausted",
+            ));
+        };
         let mut batch = BTreeMap::new();
         batch.insert(
             meta::name_key(name),

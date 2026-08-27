@@ -24,6 +24,7 @@ struct CacheKey {
     offset: u64,
 }
 
+
 /// Hard upper bound on the number of shards the cache will ever
 /// create. A 32-bit shard-bit config of 8 → 256 shards is plenty
 /// for a single-process embedded store.

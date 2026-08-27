@@ -21,6 +21,11 @@ crates/ffi/defra.h
 
 # Documentation
 /book/
+# Local planning docs: the repo rule in CLAUDE.md forbids a docs/ tree in-tree
+/docs/
+
+# Bench output: a bench run without LARK_BENCH_OUT writes families here
+/bench-out/
 
 # Environment
 .env

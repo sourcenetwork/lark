@@ -256,16 +256,16 @@ pub fn recovered_state(db: &Db) -> Result<KeyValues, PrefixViolation> {
     while it.valid() {
         let k = it.key().expect("valid iterator has a key").to_vec();
         let v = it.value().expect("valid iterator has a value").to_vec();
-        if let Some((prev, _)) = forward.last() {
-            if prev >= &k {
-                return Err(PrefixViolation::OrderBroken {
-                    detail: format!(
-                        "forward scan returned {:?} after {:?}",
-                        String::from_utf8_lossy(&k),
-                        String::from_utf8_lossy(prev),
-                    ),
-                });
-            }
+        if let Some((prev, _)) = forward.last()
+            && prev >= &k
+        {
+            return Err(PrefixViolation::OrderBroken {
+                detail: format!(
+                    "forward scan returned {:?} after {:?}",
+                    String::from_utf8_lossy(&k),
+                    String::from_utf8_lossy(prev),
+                ),
+            });
         }
         forward.push((k, v));
         it.next();
