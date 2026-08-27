@@ -33,6 +33,7 @@ thiserror = "1.0"
 rustix = { version = "1.1", features = ["fs"] }
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
 tempfile = "3.8"
 
@@ -53,9 +54,53 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [profile.release]
 opt-level = 3
-lto = true
+lto = "fat"
 codegen-units = 1
 strip = true
 
 [profile.bench]
 opt-level = 3
+
+[[bench]]
+name = "point_read"
+harness = false
+
+[[bench]]
+name = "write_durable"
+harness = false
+
+[[bench]]
+name = "write_buffered"
+harness = false
+
+[[bench]]
+name = "scan"
+harness = false
+
+[[bench]]
+name = "batch"
+harness = false
+
+[[bench]]
+name = "transaction"
+harness = false
+
+[[bench]]
+name = "large_value"
+harness = false
+
+[[bench]]
+name = "memory"
+harness = false
+
+[[bench]]
+name = "soak"
+harness = false
+
+[[bench]]
+name = "size"
+harness = false
+
+[[bench]]
+name = "collect"
+harness = false

@@ -1,0 +1,16 @@
+# Build output
+target/
+
+# elle-cli distribution (downloaded, never checked in)
+*.jar
+elle-cli-bin*.zip
+
+# Generated histories and their checker output
+*.json
+*.jsonl
+*.edn
+histories/
+out/
+
+# Scratch databases the harness writes
+db/
