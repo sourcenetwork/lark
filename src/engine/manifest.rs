@@ -548,6 +548,14 @@ impl VersionSet {
             file.write_all(&encoded)?;
             file.sync_all()?;
         }
+        // Close the log before replacing it. Windows refuses to replace
+        // a file that still has an open handle, so a rewrite performed
+        // while this writer was live failed with "Access is denied" and
+        // took every manifest rewrite on that platform with it. On unix
+        // the rename would have worked either way: the old inode simply
+        // outlives its name. Dropping the writer first is correct on
+        // both, and the reopen below is where the new log is picked up.
+        self.manifest_writer = None;
         self.env.rename(&tmp_path, &self.manifest_path)?;
         crate::env::sync_parent_dir(&*self.env, &self.manifest_path)?;
         self.manifest_bytes = (MANIFEST_STAMP_LEN + encoded.len()) as u64;
