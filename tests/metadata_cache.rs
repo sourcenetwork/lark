@@ -1,4 +1,4 @@
-//! G5: SSTable index and filter blocks under the block-cache budget.
+//! SSTable index and filter blocks under the block-cache budget.
 //!
 //! These are the public-API checks that the bound is real: with
 //! `cache_index_and_filter_blocks` on, what the open files hold outside

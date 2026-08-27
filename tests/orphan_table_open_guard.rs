@@ -1,10 +1,13 @@
-//! Cross-fix probe: the discarded-table open guard's "an orphan table that records no entry is a
-//! crash artifact" rule reads the footer's `num_entries` and
-//! `range_tombstone_size`. A V3/V4 footer is checksummed, so a damaged
-//! one is refused. A V1/V2 footer is not, which is the metadata checksum fix's stated
-//! deliberate hole, and here that hole feeds the discarded-table open guard: two zeroed
-//! `u64`s in a legacy footer make a table that holds 200 keys claim to
-//! hold none, and the guard then lets the open discard it.
+//! Cross-fix probe over the open guard's rule that an orphan table
+//! recording no entry is a crash artifact.
+//!
+//! The rule reads the footer's `num_entries` and `range_tombstone_size`.
+//! A checksummed footer (v3 and v4 under LARKSST, v5 and v6 under
+//! REGOSST) refuses a damaged one. A v1 or v2 footer carries no
+//! checksum, which is the deliberate hole the metadata-checksum work
+//! left, and that hole feeds this guard: two zeroed `u64`s in a legacy
+//! footer make a table holding 200 keys claim to hold none, and the
+//! guard would then let the open discard it.
 //!
 //! Both halves are exercised so the difference is the format version and
 //! nothing else.
@@ -81,10 +84,18 @@ fn modern_table(entries: usize) -> Vec<u8> {
 #[test]
 fn a_modern_table_that_lies_about_its_entry_count_is_still_refused() {
     let mut bytes = modern_table(50);
-    assert_eq!(
-        &bytes[bytes.len() - 8..],
-        &[0x03, 0x54, 0x53, 0x53, 0x4b, 0x52, 0x41, 0x4c],
-        "this probe needs a V3 table",
+    // Any checksummed footer will do: v3 and v4 are LARKSST, v5 and v6
+    // the stamped REGOSST ones, and all four share the 72-byte layout
+    // the offsets below assume. What the probe needs is a footer the
+    // reader *can* verify, so that refusing the forgery is the checksum
+    // doing its job rather than the version byte.
+    let magic = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().expect("8"));
+    assert!(
+        matches!(
+            magic,
+            0x4C41524B_53535403 | 0x4C41524B_53535404 | 0x5245474F_53535405 | 0x5245474F_53535406
+        ),
+        "this probe needs a checksummed table, got {magic:#018x}",
     );
     lie_about_the_contents(&mut bytes, 72);
 
@@ -92,16 +103,18 @@ fn a_modern_table_that_lies_about_its_entry_count_is_still_refused() {
     fs::write(dir.path().join("sst").join("000042.sst"), &bytes).expect("write orphan");
     let err = match Db::open(dir.path(), opts()) {
         Err(e) => e.to_string(),
-        Ok(_) => panic!("a V3 footer with a forged entry count must not pass the guard"),
+        Ok(_) => {
+            panic!("a checksummed footer with a forged entry count must not pass the guard")
+        }
     };
     assert!(err.contains("000042.sst"), "got: {err}");
-    println!("V3 lying footer: refused ({err})");
+    println!("checksummed lying footer: refused ({err})");
 }
 
 /// The same forgery on a legacy table. A failure here is not a new
-/// defect on its own: it is the metadata checksum fix's un-checksummed legacy footer reaching
-/// the discarded-table open guard's guard, and the consequence is that the open succeeds while a
-/// table holding 200 keys is discarded.
+/// defect on its own: it is the un-checksummed legacy footer reaching
+/// the open guard, and the consequence is that the open succeeds while
+/// a table holding 200 keys is discarded.
 #[test]
 fn a_legacy_table_that_lies_about_its_entry_count_is_still_refused() {
     let mut bytes = LEGACY_V1.to_vec();
@@ -122,8 +135,7 @@ fn a_legacy_table_that_lies_about_its_entry_count_is_still_refused() {
             panic!(
                 "a legacy table holding 200 keys claimed to hold none and the open went \
                  through, serving {served} entries and leaving the table unreferenced. The \
-                 legacy footer carries no checksum (the metadata checksum fix's stated hole), and the discarded-table open guard's guard \
-                 trusts it."
+                 legacy footer carries no checksum, and the open guard trusts it."
             );
         }
     }

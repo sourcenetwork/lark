@@ -1,0 +1,66 @@
+name: Durability
+
+# Split into its own workflow so it carries its own status badge. A
+# badge is per workflow, not per job, so a suite whose result the README
+# advertises has to be a workflow of its own.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+
+  # Durability, split out from `test` because it fails for different
+  # reasons and is worth reading on its own: crash recovery, power loss,
+  # the fault shim, the lifecycle sweep and the MVCC invariants.
+  durability:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Crash recovery
+        run: just test-crash
+      - name: Power loss
+        run: just test-power
+      - name: Fault injection smoke
+        run: just test-fault
+      - name: Lifecycle
+        run: just test-lifecycle
+      - name: MVCC invariants
+        run: just mvcc
+
+  # The exhaustive halves of the same families. Every truncation offset
+  # and every bit flip is a large cross product, so these run nightly
+  # rather than on every PR.
+
+
+  # The exhaustive halves of the same families. Every truncation offset
+  # and every bit flip is a large cross product, so these run nightly
+  # rather than on every PR.
+  durability-exhaustive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Exhaustive corruption sweep
+        run: just test-corruption-slow
+      - name: Model-based durability proptest
+        run: just test-durability-slow
+      - name: Resource limits
+        run: just test-extremes
+
+  # Browser wasm. `wasm-wasip1` above covers the wasi target, which has a
+  # real `std::fs`; this covers `wasm32-unknown-unknown`, which has no
+  # filesystem at all and reaches storage through OPFS. OPFS's
+  # `createSyncAccessHandle` only exists inside a Web Worker, so there is
+  # no way to exercise it without a real browser.

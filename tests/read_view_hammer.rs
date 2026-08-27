@@ -1,6 +1,6 @@
-//! Scaled-up G27 hammer against the kovan-backed read view.
+//! Scaled-up hammer against the kovan-backed read view.
 //!
-//! Two invariants, driven far harder than the existing G27 regressions
+//! Two invariants, driven far harder than the existing read-view regressions
 //! and with every publisher of the view running at once:
 //!
 //! * **Monotonic reads.** A key that is only ever overwritten must
@@ -234,7 +234,7 @@ fn overwritten_keys_never_vanish_and_never_travel_backwards() {
     );
     assert!(
         bad.is_empty(),
-        "{} G27 violations, first 10: {:#?}",
+        "{} read-view violations, first 10: {:#?}",
         bad.len(),
         &bad[..bad.len().min(10)]
     );

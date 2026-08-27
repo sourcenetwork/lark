@@ -78,7 +78,6 @@
 //! the stamp's `format` field is what lets that arrive without breaking
 //! the logs written before it.
 
-use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -330,7 +329,7 @@ impl Wal {
     #[cfg(test)]
     pub(crate) fn replay(path: &Path) -> io::Result<Vec<WalEntry>> {
         let mut iter = super::wal_replay::WalReplayIter::open(
-            &*crate::env::std_env(),
+            &crate::env::std_env(),
             path,
             super::wal_replay::WalPosition::Newest,
         )?;
@@ -648,10 +647,15 @@ fn frame_at(bytes: &[u8], offset: usize) -> Option<Frame<'_>> {
 /// records follow the damage, so the tail is loss rather than a torn
 /// write, and the open is refused.
 pub(super) fn classify_incomplete_record(
+    env: &dyn crate::env::Env,
     path: &Path,
     record_start: u64,
 ) -> io::Result<TailVerdict> {
-    let bytes = fs::read(path)?;
+    // Through `Env`, like every other read on the recovery path. A
+    // `std::fs::read` here would look on the real filesystem, so a
+    // database on any other backend could not reopen the moment its
+    // newest log had a partial tail: the ordinary shape of a crash.
+    let bytes = env.read(path)?;
     let pos = usize::try_from(record_start)
         .unwrap_or(usize::MAX)
         .min(bytes.len());
@@ -667,8 +671,12 @@ pub(super) fn classify_incomplete_record(
 /// is the end of the log, not damage: there is nothing after it to lose.
 /// A bad record with anything non-zero behind it is real corruption and
 /// refuses the open.
-pub(super) fn classify_unusable_record(path: &Path, record_start: u64) -> io::Result<TailVerdict> {
-    let bytes = fs::read(path)?;
+pub(super) fn classify_unusable_record(
+    env: &dyn crate::env::Env,
+    path: &Path,
+    record_start: u64,
+) -> io::Result<TailVerdict> {
+    let bytes = env.read(path)?;
     let pos = usize::try_from(record_start)
         .unwrap_or(usize::MAX)
         .min(bytes.len());

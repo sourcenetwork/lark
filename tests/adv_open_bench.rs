@@ -1,4 +1,4 @@
-//! Measures what the metadata checksum fix's format change costs at open: the footer probe is
+//! Measures what the checksummed footer costs at open: the footer probe is
 //! now two reads instead of one, and every metadata region is hashed
 //! once. Run in both trees and compare.
 

@@ -1,0 +1,31 @@
+name: Chaos
+
+# Split into its own workflow so it carries its own status badge. A
+# badge is per workflow, not per job, so a suite whose result the README
+# advertises has to be a workflow of its own.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+
+  # The read-view chaos workload at full size. `cargo test` runs a smaller
+  # default so the ordinary gate stays fast; this job is what covers
+  # the full one.
+  chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v2
+      - name: Chaos workload, full size
+        run: just chaos

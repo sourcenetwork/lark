@@ -1,0 +1,26 @@
+# Test-runner settings shared by local runs and CI.
+#
+# nextest runs each test in its own process. That matters here for two
+# reasons: a test that wedges cannot take the rest of the binary with
+# it, and a test that assumes it owns its process (the crash harness
+# re-executes itself) behaves the same way locally and in CI.
+
+[profile.default]
+# A test that stops making progress must fail, not hang. `cargo test`
+# has no such bound: a deadlocked test holds the job until the whole
+# workflow times out, which reports a scheduling problem instead of the
+# defect. Terminating after two periods turns that into a named failure.
+slow-timeout = { period = "60s", terminate-after = 5 }
+# A test that fails because a sibling saturated the machine is noise;
+# one that fails twice in a row is not.
+retries = 0
+failure-output = "immediate-final"
+status-level = "fail"
+
+[profile.ci]
+inherits = "default"
+# CI runners are slower and noisier than a workstation, so the bound is
+# looser, but it is still a bound.
+slow-timeout = { period = "120s", terminate-after = 5 }
+retries = 1
+final-status-level = "flaky"

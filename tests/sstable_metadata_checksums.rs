@@ -1,4 +1,4 @@
-//! Independent adversarial review of the G24 SSTable metadata checksums.
+//! Independent adversarial review of the SSTable metadata checksums.
 //!
 //! Two questions, and the second matters as much as the first.
 //!
@@ -6,7 +6,7 @@
 //!    region either caught or harmless? The oracle is not "an error was
 //!    returned": it is that `get` and a full scan agree with each other
 //!    and with the truth. A flip that makes the two surfaces disagree is
-//!    silently wrong data, which is the defect G24 names.
+//!    silently wrong data, which is the defect this file names.
 //! 2. Do tables written by the *previous* format still read? A
 //!    compatibility break is itself a data-loss bug. The fixtures for
 //!    that question are produced by building the pre-change tree and

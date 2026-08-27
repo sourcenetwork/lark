@@ -1,0 +1,84 @@
+name: Concurrency Model Checking
+
+# Split into its own workflow so it carries its own status badge. A
+# badge is per workflow, not per job, so a suite whose result the README
+# advertises has to be a workflow of its own.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+
+  # Loom model checking. Exhaustive over the C11 interleavings the
+  # memtable's publication protocol and the read horizon permit, which
+  # no amount of stress testing covers. Both profiles run: the skip
+  # list's single-writer guard is a `debug_assert`, so its calibration
+  # only exists in a debug build.
+  loom:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v2
+      - name: Loom models, release and debug
+        run: just loom-all
+
+  # The read-view chaos workload at full size. `cargo test` runs a smaller
+  # default so the ordinary gate stays fast; this job is what covers
+  # the full one.
+
+
+  # Miri over the modules that carry the crate's `unsafe`: the arena's
+  # chunk layout and bump arithmetic, the skip list's node layout and
+  # publication, the memtable's arena-backed slices, and the block
+  # decoder. Interpreted execution is orders of magnitude slower than
+  # native, so this runs on the nightly schedule rather than per pull
+  # request. Two things are scaled down under `cfg(miri)` in the tests
+  # themselves, with every assertion left intact: the two spinning-reader
+  # stress tests are `#[ignore]`d in favour of an interpreter-sized
+  # equivalent, and the arena's multi-megabyte fills use a smaller
+  # budget.
+  miri:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      # Kovan's flag set, run the way kovan's own CI runs it, because
+      # `kovan-queue` backs the arena's chunk pool. Each flag is there
+      # for something miri cannot model rather than for a defect:
+      # `tree-borrows` because miri's default Stacked Borrows model
+      # rejects the pointer provenance a deferred-reclamation scheme
+      # uses, `ignore-leaks` because such a scheme defers frees by
+      # design and may legitimately still hold retired entries at exit,
+      # `permissive-provenance` for its int-to-pointer tagged pointers,
+      # and `+cmpxchg16b` for its double-width CAS, which miri cannot
+      # emulate in doctests - hence `--lib` only.
+      #
+      # Measured on this tree: lark's own modules also pass under miri's
+      # bare defaults, the arena tests that exercise `kovan-queue`'s ring
+      # included. These flags are headroom against kovan's internals, not
+      # cover for anything here, and a finding that originates inside
+      # kovan does not block this crate.
+      MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-ignore-leaks -Zmiri-tree-borrows
+      RUSTFLAGS: -C target-feature=+cmpxchg16b -D warnings
+      PROPTEST_CASES: '4'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - run: "cargo miri test --lib -- --test-threads=1 engine::arena:: engine::skiplist:: engine::memtable:: engine::block:: slice::tests::"
+
+  # Long-running stress, soak, and fault-injection tests. Gated behind
+  # `#[ignore]` in the main crate so `cargo test` stays fast for PRs;
+  # this job unlocks them via `--ignored`. Runs on the nightly schedule,
+  # manual dispatch, or direct pushes to `main`, never on PRs.

@@ -1,4 +1,4 @@
-//! G2 in a fresh process: the block cache's own footprint must be
+//! The block cache's own footprint, measured in a fresh process: it must be
 //! driven by the byte budget, never by the shard count.
 //!
 //! The defect this guards cost 254,656 KiB for an 8 MiB configured

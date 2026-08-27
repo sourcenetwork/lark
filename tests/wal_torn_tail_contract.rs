@@ -1,4 +1,4 @@
-//! Independent adversarial review of the G25 torn-WAL-tail contract.
+//! Independent adversarial review of the torn-WAL-tail contract.
 //!
 //! Written against the public API only, with its own fixture, its own
 //! record-framing oracle and its own prefix check, so it shares no helper

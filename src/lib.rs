@@ -140,7 +140,7 @@ pub mod fuzzing {
     pub fn replay_wal(data: &[u8]) {
         with_temp_file("wal", "log", data, |path| {
             let Ok(mut iter) = crate::engine::wal_replay::WalReplayIter::open(
-                &*crate::env::std_env(),
+                &crate::env::std_env(),
                 path,
                 crate::engine::wal_replay::WalPosition::Newest,
             ) else {

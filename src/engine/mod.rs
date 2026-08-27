@@ -473,7 +473,7 @@ impl LarkEngine {
             } else {
                 WalPosition::Earlier
             };
-            let mut replay = WalReplayIter::open(&*env, wal_path, position)?;
+            let mut replay = WalReplayIter::open(&env, wal_path, position)?;
             let mut entries = 0usize;
             while let Some(entry) = replay.next_entry()? {
                 entries += 1;
@@ -645,7 +645,7 @@ impl LarkEngine {
             } else {
                 WalPosition::Earlier
             };
-            let mut replay = WalReplayIter::open(&*env, wal_path, position)?;
+            let mut replay = WalReplayIter::open(&env, wal_path, position)?;
             let mut entries = 0usize;
             while let Some(entry) = replay.next_entry()? {
                 entries += 1;

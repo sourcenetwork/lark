@@ -18,8 +18,13 @@ lint:
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
+# nextest, not `cargo test`: each test gets its own process, so a
+# wedged test fails on the profile's slow-timeout instead of holding the
+# whole binary. See `.config/nextest.toml`.
+
 test:
-    cargo test --workspace
+    cargo nextest run --workspace
+    cargo test --workspace --doc
 
 deny:
     cargo deny check

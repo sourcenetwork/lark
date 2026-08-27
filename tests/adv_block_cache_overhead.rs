@@ -7,7 +7,7 @@
 //! `block_cache_size = 0`. The difference in live heap is what the
 //! block cache costs; `lark.block-cache-usage` is what it claims to
 //! cost. If the claim is under the cost, the budget stops bounding
-//! memory and G2 is back in a new costume.
+//! memory and the over-allocation defect is back in a new costume.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicIsize, Ordering};

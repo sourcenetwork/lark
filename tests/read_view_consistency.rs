@@ -1,4 +1,4 @@
-//! Independent adversarial review of the G27 read-view fix.
+//! Independent adversarial review of the published read view.
 //!
 //! The fix publishes the active memtable, the frozen memtables and the
 //! version as one immutable object, so a read resolves every source at

@@ -1,4 +1,4 @@
-//! Independent adversarial review of the G28 open guard.
+//! Independent adversarial review of the discarded-table open guard.
 //!
 //! The guard was relaxed so a crash inside the very first flush no longer
 //! costs the WAL's acknowledged writes. A relaxation of a data-loss guard

@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use lark_kv::env::{Env, WriteMode};
 use lark_kv::{Db, MemEnv, Options, WriteBatch};
 
 fn opts(env: &Arc<MemEnv>) -> Options {
@@ -90,4 +91,74 @@ fn a_memory_env_database_replays_its_wal_after_an_unclean_close() {
         );
     }
     db.close().expect("close");
+}
+
+/// A partial tail on the newest log is the ordinary shape of a crash,
+/// and recovering from it re-reads the log to decide whether the tail is
+/// torn or is damage with whole records behind it.
+///
+/// That second read is the one the reviewer caught: it used
+/// `std::fs::read` while the first went through the `Env`, so a database
+/// on any other backend reopened fine until its newest log was partial,
+/// and then could not open at all. The default backend cannot show it,
+/// because there `Env` *is* the real filesystem.
+#[test]
+fn a_memory_env_database_reopens_when_its_newest_wal_ends_mid_record() {
+    let env = Arc::new(MemEnv::new());
+
+    {
+        let db = Db::open("/torn", opts(&env)).expect("first open");
+        for i in 0..40u32 {
+            db.put(format!("t{i:04}").as_bytes(), b"value")
+                .expect("put");
+        }
+        drop(db);
+    }
+
+    // Cut the newest log a few bytes short so its last record is
+    // incomplete, which is what a crash mid-append leaves behind.
+    let wal = newest_wal(&env, "/torn");
+    let full = Env::read(&*env, &wal).expect("read wal");
+    assert!(full.len() > 24, "the log needs records to cut into");
+    let cut = full.len() - 7;
+    write_all(&env, &wal, &full[..cut]);
+
+    let db = Db::open("/torn", opts(&env)).expect(
+        "a torn tail on the newest log is a crash artifact, not an unopenable database; a \
+         failure here means the torn-tail classifier read the real filesystem instead of \
+         the Env",
+    );
+
+    // Everything before the cut must still be there. The last record may
+    // or may not survive: it is the one that was torn.
+    let survived = (0..40u32)
+        .filter(|i| {
+            db.get(format!("t{i:04}").as_bytes())
+                .expect("get")
+                .is_some()
+        })
+        .count();
+    assert!(
+        survived >= 39,
+        "a cut inside the last record must not lose the records before it, {survived}/40 survived",
+    );
+    db.close().expect("close");
+}
+
+/// The newest log in `dir`, by filename order.
+fn newest_wal(env: &Arc<MemEnv>, dir: &str) -> std::path::PathBuf {
+    let mut logs: Vec<_> = Env::read_dir(&**env, std::path::Path::new(&format!("{dir}/wal")))
+        .expect("read_dir wal")
+        .into_iter()
+        .map(|e| e.path)
+        .filter(|p| p.extension().is_some_and(|x| x == "log"))
+        .collect();
+    logs.sort();
+    logs.pop().expect("at least one wal file")
+}
+
+fn write_all(env: &Arc<MemEnv>, path: &std::path::Path, bytes: &[u8]) {
+    let mut f = Env::open_write(&**env, path, WriteMode::Truncate).expect("open_write");
+    f.write_all(bytes).expect("write");
+    f.sync_all().expect("sync");
 }
