@@ -1,0 +1,1128 @@
+{
+  "schema_version": 1,
+  "run": {
+    "commit": "96b62313dedef442c832121e394e8d5d5b36e8f6",
+    "label": "main",
+    "timestamp": "2026-08-27T22:58:27Z",
+    "toolchain": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "host": {
+      "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+      "cores": 4,
+      "ram_gib": 16,
+      "store": "unrecorded (set REGOLITH_BENCH_STORE to name the filesystem the benches ran on)"
+    },
+    "loadguard": {
+      "passed": false,
+      "loadavg_1m": 1.79,
+      "loadavg_5m": 0.6,
+      "loadavg_15m": 0.22,
+      "note": "loadguard.py not found at loadguard.py (set REGOLITH_LOADGUARD to point at it). Not run, so the host is not certified quiet: throughput is marked contaminated rather than presumed clean."
+    }
+  },
+  "metrics": {
+    "throughput": {
+      "unit": "ops/s",
+      "reps": "varies by workload",
+      "workloads": {
+        "read": {
+          "keys": 200000,
+          "value_bytes": 200,
+          "cpu_accounting_available": true,
+          "hot_cache_ops_per_s": 783782.079,
+          "cold_cache_ops_per_s": 110701.309,
+          "threads": [
+            {
+              "threads": 1,
+              "ops": 8850000,
+              "wall_s": 11.758,
+              "cpu_s": 11.76,
+              "ops_per_s": 752679.811,
+              "cpu_s_per_mop": 1.329
+            },
+            {
+              "threads": 2,
+              "ops": 17700000,
+              "wall_s": 11.984,
+              "cpu_s": 23.86,
+              "ops_per_s": 1476972.835,
+              "cpu_s_per_mop": 1.348
+            },
+            {
+              "threads": 4,
+              "ops": 30280000,
+              "wall_s": 13.441,
+              "cpu_s": 53.18,
+              "ops_per_s": 2252728.495,
+              "cpu_s_per_mop": 1.756
+            },
+            {
+              "threads": 8,
+              "ops": 38640000,
+              "wall_s": 17.485,
+              "cpu_s": 67.92,
+              "ops_per_s": 2209945.719,
+              "cpu_s_per_mop": 1.758
+            }
+          ],
+          "scaling_1_to_8": 2.936,
+          "trust": "contaminated"
+        },
+        "buffered_write": {
+          "metric": "buffered_write_throughput",
+          "sync": false,
+          "value_bytes": 100,
+          "rep_ms": 500,
+          "unstable_spread_threshold": 0.5,
+          "cpu_metric_available": true,
+          "storage_root": "/tmp",
+          "stability": "stable",
+          "by_threads": [
+            {
+              "threads": 1,
+              "ops_per_sec_median": 798475.626,
+              "ops_per_sec_min": 723641.279,
+              "ops_per_sec_max": 856820.161,
+              "spread_ratio": 0.167,
+              "stability": "stable",
+              "cpu_s_per_mop_median": 1.131,
+              "cpu_s_per_mop_min": 1.108,
+              "cpu_s_per_mop_max": 1.177
+            },
+            {
+              "threads": 2,
+              "ops_per_sec_median": 664104.533,
+              "ops_per_sec_min": 611564.107,
+              "ops_per_sec_max": 675483.556,
+              "spread_ratio": 0.096,
+              "stability": "stable",
+              "cpu_s_per_mop_median": 2.188,
+              "cpu_s_per_mop_min": 2.129,
+              "cpu_s_per_mop_max": 2.518
+            },
+            {
+              "threads": 4,
+              "ops_per_sec_median": 268974.978,
+              "ops_per_sec_min": 265771.98,
+              "ops_per_sec_max": 274831.475,
+              "spread_ratio": 0.034,
+              "stability": "stable",
+              "cpu_s_per_mop_median": 7.942,
+              "cpu_s_per_mop_min": 7.78,
+              "cpu_s_per_mop_max": 8.046
+            },
+            {
+              "threads": 8,
+              "ops_per_sec_median": 273922.98,
+              "ops_per_sec_min": 266268.744,
+              "ops_per_sec_max": 288659.493,
+              "spread_ratio": 0.082,
+              "stability": "stable",
+              "cpu_s_per_mop_median": 7.93,
+              "cpu_s_per_mop_min": 7.671,
+              "cpu_s_per_mop_max": 8.09
+            }
+          ],
+          "trust": "contaminated"
+        },
+        "durable_write": {
+          "metric": "durable_write_throughput",
+          "sync": true,
+          "value_bytes": 100,
+          "rep_ms": 500,
+          "unstable_spread_threshold": 0.5,
+          "cpu_metric_available": true,
+          "storage_root": "/tmp",
+          "stability": "stable",
+          "by_threads": [
+            {
+              "threads": 1,
+              "ops_per_sec_median": 3397.315,
+              "ops_per_sec_min": 3026.822,
+              "ops_per_sec_max": 3532.378,
+              "spread_ratio": 0.149,
+              "stability": "stable",
+              "cpu_s_per_mop_median": 41.249
+            },
+            {
+              "threads": 2,
+              "ops_per_sec_median": 3468.631,
+              "ops_per_sec_min": 3247.065,
+              "ops_per_sec_max": 3539.933,
+              "spread_ratio": 0.084,
+              "stability": "stable",
+              "cpu_s_per_mop_median": 69.444
+            },
+            {
+              "threads": 4,
+              "ops_per_sec_median": 5234.219,
+              "ops_per_sec_min": 5099.852,
+              "ops_per_sec_max": 5413.188,
+              "spread_ratio": 0.06,
+              "stability": "stable",
+              "cpu_s_per_mop_median": 73.672
+            },
+            {
+              "threads": 8,
+              "ops_per_sec_median": 12184.232,
+              "ops_per_sec_min": 11687.394,
+              "ops_per_sec_max": 12338.91,
+              "spread_ratio": 0.053,
+              "stability": "stable",
+              "cpu_s_per_mop_median": 46.971
+            }
+          ],
+          "trust": "contaminated"
+        },
+        "scan": {
+          "keys": 262144,
+          "value_bytes": 1024,
+          "working_set_bytes": 272367616,
+          "scanned_bytes": 46847229952,
+          "wall_s": 27.705,
+          "stream_mib_per_s": 1612.626,
+          "trust": "contaminated"
+        },
+        "batch": {
+          "metric": "write_batch",
+          "value_bytes": 100,
+          "rep_ms": 400,
+          "unstable_spread_threshold": 0.5,
+          "storage_root": "/tmp",
+          "by_batch_size": [
+            {
+              "batch_ops": 1,
+              "unit": "ops_per_sec",
+              "median": 970359.226,
+              "min": 928174.441,
+              "max": 980712.752,
+              "spread_ratio": 0.054,
+              "stability": "stable"
+            },
+            {
+              "batch_ops": 8,
+              "unit": "ops_per_sec",
+              "median": 1825329.518,
+              "min": 1588053.306,
+              "max": 1872086.689,
+              "spread_ratio": 0.156,
+              "stability": "stable"
+            },
+            {
+              "batch_ops": 32,
+              "unit": "ops_per_sec",
+              "median": 2098927.913,
+              "min": 1806449.603,
+              "max": 2120694.345,
+              "spread_ratio": 0.15,
+              "stability": "stable"
+            },
+            {
+              "batch_ops": 256,
+              "unit": "ops_per_sec",
+              "median": 1857934.538,
+              "min": 1807934.023,
+              "max": 1865331.343,
+              "spread_ratio": 0.031,
+              "stability": "stable"
+            }
+          ],
+          "bulk_load": {
+            "payload_mib": 32,
+            "unit": "mib_per_sec",
+            "reps": 5,
+            "value_bytes": 1024,
+            "batch_ops": 256,
+            "includes_close_flush": true,
+            "median": 729.026,
+            "min": 271.527,
+            "max": 827.655,
+            "spread_ratio": 0.763,
+            "stability": "unstable"
+          },
+          "trust": "contaminated"
+        },
+        "large_value": {
+          "quick": false,
+          "process_metrics_available": true,
+          "compression": "Lz4",
+          "default_max_value_mib": 64,
+          "sizes": [
+            {
+              "value_mib": 1,
+              "reps": 3,
+              "put_secs_median": 0.0007,
+              "put_mib_per_s": 1445.4,
+              "get_secs_median": 0,
+              "get_mib_per_s": 44397.1,
+              "rss_before_kib": 3976,
+              "rss_after_kib": 9104,
+              "peak_rss_after_kib": 9108
+            },
+            {
+              "value_mib": 16,
+              "reps": 3,
+              "put_secs_median": 0.0081,
+              "put_mib_per_s": 1973.2,
+              "get_secs_median": 0.0008,
+              "get_mib_per_s": 20914.5,
+              "rss_before_kib": 19624,
+              "rss_after_kib": 86064,
+              "peak_rss_after_kib": 101304
+            },
+            {
+              "value_mib": 64,
+              "reps": 3,
+              "put_secs_median": 0.3938,
+              "put_mib_per_s": 162.5,
+              "get_secs_median": 0.0068,
+              "get_mib_per_s": 9434.9,
+              "rss_before_kib": 68776,
+              "rss_after_kib": 135344,
+              "peak_rss_after_kib": 332384
+            }
+          ],
+          "gib_case": null,
+          "gib_note": "the 1024 MiB case raises max_value_size and runs only with REGOLITH_BENCH_HUGE=1",
+          "trust": "contaminated"
+        }
+      },
+      "criterion": {
+        "unit": "ns/iter",
+        "trust": "absent",
+        "source": "target/criterion/**/new/estimates.json",
+        "benchmarks": []
+      }
+    },
+    "rss": {
+      "unit": "MiB",
+      "trust": "clean",
+      "trust_note": "RSS for a given configuration is deterministic and independent of host CPU load, so it stays comparable across runs whatever the load guard said.",
+      "soaks": [],
+      "shard_sweep": [
+        {
+          "shard_bits": 0,
+          "requested_shards": 1,
+          "cache_bytes": 8388608,
+          "rss_kib": 3124,
+          "peak_kib": 3128,
+          "over_baseline_kib": 812
+        },
+        {
+          "shard_bits": 1,
+          "requested_shards": 2,
+          "cache_bytes": 8388608,
+          "rss_kib": 3036,
+          "peak_kib": 3056,
+          "over_baseline_kib": 724
+        },
+        {
+          "shard_bits": 2,
+          "requested_shards": 4,
+          "cache_bytes": 8388608,
+          "rss_kib": 3124,
+          "peak_kib": 3128,
+          "over_baseline_kib": 812
+        },
+        {
+          "shard_bits": 3,
+          "requested_shards": 8,
+          "cache_bytes": 8388608,
+          "rss_kib": 3080,
+          "peak_kib": 3084,
+          "over_baseline_kib": 768
+        },
+        {
+          "shard_bits": 4,
+          "requested_shards": 16,
+          "cache_bytes": 8388608,
+          "rss_kib": 3076,
+          "peak_kib": 3092,
+          "over_baseline_kib": 764
+        },
+        {
+          "shard_bits": 5,
+          "requested_shards": 32,
+          "cache_bytes": 8388608,
+          "rss_kib": 3028,
+          "peak_kib": 3056,
+          "over_baseline_kib": 716
+        },
+        {
+          "shard_bits": 6,
+          "requested_shards": 64,
+          "cache_bytes": 8388608,
+          "rss_kib": 3092,
+          "peak_kib": 3132,
+          "over_baseline_kib": 780
+        },
+        {
+          "shard_bits": 7,
+          "requested_shards": 128,
+          "cache_bytes": 8388608,
+          "rss_kib": 3092,
+          "peak_kib": 3112,
+          "over_baseline_kib": 780
+        },
+        {
+          "shard_bits": 8,
+          "requested_shards": 256,
+          "cache_bytes": 8388608,
+          "rss_kib": 3100,
+          "peak_kib": 3104,
+          "over_baseline_kib": 788
+        }
+      ],
+      "block_sweep": {
+        "trust": "absent"
+      },
+      "point": {
+        "trust": "absent"
+      },
+      "process_metrics_available": true,
+      "sections_run": ["baseline", "shard_sweep", "write_sweep", "wal_replay", "open_floor", "embedded"],
+      "baseline_rss_kib": 2312,
+      "pinned_cache_bytes": 8388608,
+      "write_sweep": [
+        {
+          "written_mib": 1024,
+          "shard_bits": 6,
+          "nominal_mib": 192,
+          "rss_kib": 159772,
+          "peak_kib": 159772,
+          "seconds": 12.88,
+          "cpu_s": 4.39
+        },
+        {
+          "written_mib": 1024,
+          "shard_bits": 0,
+          "nominal_mib": 192,
+          "rss_kib": 155372,
+          "peak_kib": 155372,
+          "seconds": 11.013,
+          "cpu_s": 4.19
+        },
+        {
+          "written_mib": 2048,
+          "shard_bits": 6,
+          "nominal_mib": 192,
+          "rss_kib": 183576,
+          "peak_kib": 183576,
+          "seconds": 24.561,
+          "cpu_s": 9.58
+        },
+        {
+          "written_mib": 2048,
+          "shard_bits": 0,
+          "nominal_mib": 192,
+          "rss_kib": 163336,
+          "peak_kib": 163336,
+          "seconds": 24.501,
+          "cpu_s": 9.46
+        },
+        {
+          "written_mib": 4096,
+          "shard_bits": 6,
+          "nominal_mib": 192,
+          "rss_kib": 200400,
+          "peak_kib": 200400,
+          "seconds": 53.199,
+          "cpu_s": 19.99
+        },
+        {
+          "written_mib": 4096,
+          "shard_bits": 0,
+          "nominal_mib": 192,
+          "rss_kib": 173752,
+          "peak_kib": 173752,
+          "seconds": 51.693,
+          "cpu_s": 19.17
+        }
+      ],
+      "wal_replay": {
+        "written_mib": 256,
+        "crashed_with_9": true,
+        "log_bytes": 278934540,
+        "replay_rss_kib": 280716,
+        "replay_peak_kib": 280716,
+        "open_s": 1.898,
+        "first_key_present": true,
+        "peak_over_log": 1.03
+      },
+      "open_floor": [
+        {
+          "scale_bytes": 1,
+          "opened": true,
+          "usable": true,
+          "rss_kib": 3024,
+          "error": null
+        },
+        {
+          "scale_bytes": 16,
+          "opened": true,
+          "usable": true,
+          "rss_kib": 3028,
+          "error": null
+        },
+        {
+          "scale_bytes": 256,
+          "opened": true,
+          "usable": true,
+          "rss_kib": 3020,
+          "error": null
+        },
+        {
+          "scale_bytes": 4096,
+          "opened": true,
+          "usable": true,
+          "rss_kib": 3064,
+          "error": null
+        },
+        {
+          "scale_bytes": 65536,
+          "opened": true,
+          "usable": true,
+          "rss_kib": 3032,
+          "error": null
+        },
+        {
+          "scale_bytes": 1048576,
+          "opened": true,
+          "usable": true,
+          "rss_kib": 3104,
+          "error": null
+        }
+      ],
+      "embedded": {
+        "nominal_kib": 3072,
+        "empty_rss_kib": 3076,
+        "written_mib": 64,
+        "rss_kib": 8832,
+        "peak_kib": 8832
+      }
+    },
+    "binary_size": {
+      "host": "x86_64-unknown-linux-gnu",
+      "profile": "opt-level=3,lto=fat,codegen-units=1,strip=true,panic=abort",
+      "surface": "open,put,get,iter",
+      "wasm_opt": null,
+      "families": [
+        {
+          "name": "native",
+          "available": true,
+          "baseline_bytes": 307432,
+          "linked_bytes": 780672,
+          "regolith_bytes": 473240,
+          "regolith_kib": 462.1,
+          "reason": null
+        },
+        {
+          "name": "wasm32-wasip1",
+          "available": false,
+          "baseline_bytes": null,
+          "linked_bytes": null,
+          "regolith_bytes": null,
+          "regolith_kib": null,
+          "reason": "std_for_wasm32-wasip1_is_not_installed_(no_/home/runner/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/wasm32-wasip1/lib);_rustup_target_add_wasm32-wasip1"
+        },
+        {
+          "name": "wasm32-wasip1+wasm-opt-Oz",
+          "available": false,
+          "baseline_bytes": null,
+          "linked_bytes": null,
+          "regolith_bytes": null,
+          "regolith_kib": null,
+          "reason": "std_for_wasm32-wasip1_is_not_installed_(no_/home/runner/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/wasm32-wasip1/lib);_rustup_target_add_wasm32-wasip1"
+        }
+      ],
+      "trust": "clean"
+    },
+    "correctness": {
+      "quick": false,
+      "matrix": [
+        {
+          "flavor": "pessimistic",
+          "isolation": "read-committed",
+          "correctness": {
+            "threads": 8,
+            "increments_per_thread": 50,
+            "expected": 400,
+            "runs": [
+              {
+                "survived": 400,
+                "survival_pct": 100,
+                "attempts": {
+                  "commits": 400,
+                  "conflicts": 0,
+                  "busy": 0,
+                  "io_errors": 0,
+                  "other_errors": 0,
+                  "abandoned": 0
+                }
+              },
+              {
+                "survived": 400,
+                "survival_pct": 100,
+                "attempts": {
+                  "commits": 400,
+                  "conflicts": 0,
+                  "busy": 0,
+                  "io_errors": 0,
+                  "other_errors": 0,
+                  "abandoned": 0
+                }
+              },
+              {
+                "survived": 400,
+                "survival_pct": 100,
+                "attempts": {
+                  "commits": 400,
+                  "conflicts": 0,
+                  "busy": 0,
+                  "io_errors": 0,
+                  "other_errors": 0,
+                  "abandoned": 0
+                }
+              }
+            ],
+            "survival_pct_median": 100,
+            "survival_pct_min": 100,
+            "survival_pct_max": 100
+          },
+          "throughput": {
+            "uncontended_commits_per_s": {
+              "median": 302017,
+              "min": 296780.2,
+              "max": 313521.5
+            },
+            "contended_threads": 8,
+            "hot_keys": 8,
+            "contended_commits_per_s": {
+              "median": 130444.4,
+              "min": 125712.8,
+              "max": 134853.8
+            },
+            "contended_attempts": {
+              "commits": 16000,
+              "conflicts": 0,
+              "busy": 0,
+              "io_errors": 0,
+              "other_errors": 0,
+              "abandoned": 0
+            }
+          }
+        },
+        {
+          "flavor": "pessimistic",
+          "isolation": "snapshot",
+          "correctness": {
+            "threads": 8,
+            "increments_per_thread": 50,
+            "expected": 400,
+            "runs": [
+              {
+                "survived": 400,
+                "survival_pct": 100,
+                "attempts": {
+                  "commits": 400,
+                  "conflicts": 0,
+                  "busy": 0,
+                  "io_errors": 0,
+                  "other_errors": 0,
+                  "abandoned": 0
+                }
+              },
+              {
+                "survived": 400,
+                "survival_pct": 100,
+                "attempts": {
+                  "commits": 400,
+                  "conflicts": 0,
+                  "busy": 0,
+                  "io_errors": 0,
+                  "other_errors": 0,
+                  "abandoned": 0
+                }
+              },
+              {
+                "survived": 400,
+                "survival_pct": 100,
+                "attempts": {
+                  "commits": 400,
+                  "conflicts": 0,
+                  "busy": 0,
+                  "io_errors": 0,
+                  "other_errors": 0,
+                  "abandoned": 0
+                }
+              }
+            ],
+            "survival_pct_median": 100,
+            "survival_pct_min": 100,
+            "survival_pct_max": 100
+          },
+          "throughput": {
+            "uncontended_commits_per_s": {
+              "median": 304018.7,
+              "min": 279882.3,
+              "max": 306150.2
+            },
+            "contended_threads": 8,
+            "hot_keys": 8,
+            "contended_commits_per_s": {
+              "median": 126947.3,
+              "min": 115914.2,
+              "max": 141264.6
+            },
+            "contended_attempts": {
+              "commits": 16000,
+              "conflicts": 0,
+              "busy": 0,
+              "io_errors": 0,
+              "other_errors": 0,
+              "abandoned": 0
+            }
+          }
+        },
+        {
+          "flavor": "pessimistic",
+          "isolation": "serializable",
+          "correctness": {
+            "threads": 8,
+            "increments_per_thread": 50,
+            "expected": 400,
+            "runs": [
+              {
+                "survived": 400,
+                "survival_pct": 100,
+                "attempts": {
+                  "commits": 400,
+                  "conflicts": 0,
+                  "busy": 0,
+                  "io_errors": 0,
+                  "other_errors": 0,
+                  "abandoned": 0
+                }
+              },
+              {
+                "survived": 400,
+                "survival_pct": 100,
+                "attempts": {
+                  "commits": 400,
+                  "conflicts": 0,
+                  "busy": 0,
+                  "io_errors": 0,
+                  "other_errors": 0,
+                  "abandoned": 0
+                }
+              },
+              {
+                "survived": 400,
+                "survival_pct": 100,
+                "attempts": {
+                  "commits": 400,
+                  "conflicts": 0,
+                  "busy": 0,
+                  "io_errors": 0,
+                  "other_errors": 0,
+                  "abandoned": 0
+                }
+              }
+            ],
+            "survival_pct_median": 100,
+            "survival_pct_min": 100,
+            "survival_pct_max": 100
+          },
+          "throughput": {
+            "uncontended_commits_per_s": {
+              "median": 298527.6,
+              "min": 295711.8,
+              "max": 313456.4
+            },
+            "contended_threads": 8,
+            "hot_keys": 8,
+            "contended_commits_per_s": {
+              "median": 127344.4,
+              "min": 123036.4,
+              "max": 129489.4
+            },
+            "contended_attempts": {
+              "commits": 16000,
+              "conflicts": 0,
+              "busy": 0,
+              "io_errors": 0,
+              "other_errors": 0,
+              "abandoned": 0
+            }
+          }
+        },
+        {
+          "flavor": "optimistic",
+          "isolation": "read-committed",
+          "correctness": {
+            "threads": 8,
+            "increments_per_thread": 50,
+            "expected": 400,
+            "runs": [
+              {
+                "survived": 400,
+                "survival_pct": 100,
+                "attempts": {
+                  "commits": 400,
+                  "conflicts": 414,
+                  "busy": 0,
+                  "io_errors": 0,
+                  "other_errors": 0,
+                  "abandoned": 0
+                }
+              },
+              {
+                "survived": 400,
+                "survival_pct": 100,
+                "attempts": {
+                  "commits": 400,
+                  "conflicts": 374,
+                  "busy": 0,
+                  "io_errors": 0,
+                  "other_errors": 0,
+                  "abandoned": 0
+                }
+              },
+              {
+                "survived": 400,
+                "survival_pct": 100,
+                "attempts": {
+                  "commits": 400,
+                  "conflicts": 400,
+                  "busy": 0,
+                  "io_errors": 0,
+                  "other_errors": 0,
+                  "abandoned": 0
+                }
+              }
+            ],
+            "survival_pct_median": 100,
+            "survival_pct_min": 100,
+            "survival_pct_max": 100
+          },
+          "throughput": {
+            "uncontended_commits_per_s": {
+              "median": 330023.4,
+              "min": 320474.3,
+              "max": 336790.2
+            },
+            "contended_threads": 8,
+            "hot_keys": 8,
+            "contended_commits_per_s": {
+              "median": 248655.6,
+              "min": 223019.3,
+              "max": 270399.1
+            },
+            "contended_attempts": {
+              "commits": 16000,
+              "conflicts": 2790,
+              "busy": 0,
+              "io_errors": 0,
+              "other_errors": 0,
+              "abandoned": 0
+            }
+          }
+        },
+        {
+          "flavor": "optimistic",
+          "isolation": "snapshot",
+          "correctness": {
+            "threads": 8,
+            "increments_per_thread": 50,
+            "expected": 400,
+            "runs": [
+              {
+                "survived": 400,
+                "survival_pct": 100,
+                "attempts": {
+                  "commits": 400,
+                  "conflicts": 380,
+                  "busy": 0,
+                  "io_errors": 0,
+                  "other_errors": 0,
+                  "abandoned": 0
+                }
+              },
+              {
+                "survived": 400,
+                "survival_pct": 100,
+                "attempts": {
+                  "commits": 400,
+                  "conflicts": 407,
+                  "busy": 0,
+                  "io_errors": 0,
+                  "other_errors": 0,
+                  "abandoned": 0
+                }
+              },
+              {
+                "survived": 400,
+                "survival_pct": 100,
+                "attempts": {
+                  "commits": 400,
+                  "conflicts": 350,
+                  "busy": 0,
+                  "io_errors": 0,
+                  "other_errors": 0,
+                  "abandoned": 0
+                }
+              }
+            ],
+            "survival_pct_median": 100,
+            "survival_pct_min": 100,
+            "survival_pct_max": 100
+          },
+          "throughput": {
+            "uncontended_commits_per_s": {
+              "median": 335849,
+              "min": 331434.2,
+              "max": 361669.8
+            },
+            "contended_threads": 8,
+            "hot_keys": 8,
+            "contended_commits_per_s": {
+              "median": 242237.5,
+              "min": 223708.2,
+              "max": 255743.7
+            },
+            "contended_attempts": {
+              "commits": 16000,
+              "conflicts": 3390,
+              "busy": 0,
+              "io_errors": 0,
+              "other_errors": 0,
+              "abandoned": 0
+            }
+          }
+        },
+        {
+          "flavor": "optimistic",
+          "isolation": "serializable",
+          "correctness": {
+            "threads": 8,
+            "increments_per_thread": 50,
+            "expected": 400,
+            "runs": [
+              {
+                "survived": 400,
+                "survival_pct": 100,
+                "attempts": {
+                  "commits": 400,
+                  "conflicts": 337,
+                  "busy": 0,
+                  "io_errors": 0,
+                  "other_errors": 0,
+                  "abandoned": 0
+                }
+              },
+              {
+                "survived": 400,
+                "survival_pct": 100,
+                "attempts": {
+                  "commits": 400,
+                  "conflicts": 375,
+                  "busy": 0,
+                  "io_errors": 0,
+                  "other_errors": 0,
+                  "abandoned": 0
+                }
+              },
+              {
+                "survived": 400,
+                "survival_pct": 100,
+                "attempts": {
+                  "commits": 400,
+                  "conflicts": 352,
+                  "busy": 0,
+                  "io_errors": 0,
+                  "other_errors": 0,
+                  "abandoned": 0
+                }
+              }
+            ],
+            "survival_pct_median": 100,
+            "survival_pct_min": 100,
+            "survival_pct_max": 100
+          },
+          "throughput": {
+            "uncontended_commits_per_s": {
+              "median": 333430.8,
+              "min": 330901.9,
+              "max": 338727
+            },
+            "contended_threads": 8,
+            "hot_keys": 8,
+            "contended_commits_per_s": {
+              "median": 251259.4,
+              "min": 230976.1,
+              "max": 259759.7
+            },
+            "contended_attempts": {
+              "commits": 16000,
+              "conflicts": 2929,
+              "busy": 0,
+              "io_errors": 0,
+              "other_errors": 0,
+              "abandoned": 0
+            }
+          }
+        }
+      ],
+      "trust": "clean"
+    },
+    "isolation": {
+      "unit": "commits/s",
+      "quick": false,
+      "note": "Every transaction flavor against every isolation level. The level decides how much of a transaction's footprint is validated at commit, so a stricter level refuses more and commits fewer; that refusal is the work it is doing.",
+      "matrix": [
+        {
+          "flavor": "pessimistic",
+          "isolation": "read-committed",
+          "uncontended_commits_per_s": 302017,
+          "contended_commits_per_s": 130444.4,
+          "conflict_rate_pct": 0
+        },
+        {
+          "flavor": "pessimistic",
+          "isolation": "snapshot",
+          "uncontended_commits_per_s": 304018.7,
+          "contended_commits_per_s": 126947.3,
+          "conflict_rate_pct": 0
+        },
+        {
+          "flavor": "pessimistic",
+          "isolation": "serializable",
+          "uncontended_commits_per_s": 298527.6,
+          "contended_commits_per_s": 127344.4,
+          "conflict_rate_pct": 0
+        },
+        {
+          "flavor": "optimistic",
+          "isolation": "read-committed",
+          "uncontended_commits_per_s": 330023.4,
+          "contended_commits_per_s": 248655.6,
+          "conflict_rate_pct": 14.85
+        },
+        {
+          "flavor": "optimistic",
+          "isolation": "snapshot",
+          "uncontended_commits_per_s": 335849,
+          "contended_commits_per_s": 242237.5,
+          "conflict_rate_pct": 17.48
+        },
+        {
+          "flavor": "optimistic",
+          "isolation": "serializable",
+          "uncontended_commits_per_s": 333430.8,
+          "contended_commits_per_s": 251259.4,
+          "conflict_rate_pct": 15.47
+        }
+      ],
+      "trust": "clean"
+    },
+    "allocs": {
+      "ops": 20000,
+      "paths": [
+        {
+          "path": "get, SSTable, cache warm",
+          "budget": 3,
+          "achieved": 1,
+          "bytes_per_op": 256,
+          "met": true
+        },
+        {
+          "path": "get, memtable resident",
+          "budget": 3,
+          "achieved": 1,
+          "bytes_per_op": 256,
+          "met": true
+        },
+        {
+          "path": "get, miss",
+          "budget": 2,
+          "achieved": 0,
+          "bytes_per_op": 0,
+          "met": true
+        },
+        {
+          "path": "get_slice, SSTable, cache warm",
+          "budget": 1,
+          "achieved": 0,
+          "bytes_per_op": 0,
+          "met": true
+        },
+        {
+          "path": "get_slice, memtable resident",
+          "budget": 1,
+          "achieved": 0,
+          "bytes_per_op": 0,
+          "met": true
+        },
+        {
+          "path": "put, single",
+          "budget": 3,
+          "achieved": 2.0009,
+          "bytes_per_op": 582.3766,
+          "met": true
+        },
+        {
+          "path": "put, WriteBatch of 64",
+          "budget": 3,
+          "achieved": 2.0793,
+          "bytes_per_op": 692.1974,
+          "met": true
+        },
+        {
+          "path": "iterator step, SSTable",
+          "budget": 1,
+          "achieved": 0.0004,
+          "bytes_per_op": 0.0469,
+          "met": true
+        },
+        {
+          "path": "iterator step, memtable",
+          "budget": 1,
+          "achieved": 0.0003,
+          "bytes_per_op": 0.044,
+          "met": true
+        }
+      ],
+      "trust": "clean"
+    },
+    "viability": {
+      "trust": "absent",
+      "rows": []
+    }
+  },
+  "plan_targets": {
+    "note": "From docs/plans/regolith-production.md success criteria. NOT measurements.",
+    "rss_point": {
+      "Empty DB, 8 MiB cache budget": 12,
+      "RSS at 4 GiB data, 192 MiB budget": 250,
+      "WAL replay peak, 533 MiB log": 70,
+      "Open floor, smallest config": 1.7,
+      "1 GiB value put, peak": 3719
+    },
+    "correctness": {
+      "Pessimistic txn": 100,
+      "Optimistic txn": 100
+    },
+    "viability": {
+      "WASM (browser / wasmtime)": "works, under 4 MiB",
+      "Embedded, 1-4 MiB budget": "reachable",
+      "Serializable isolation": "available",
+      "Elle-verified history": "passes at serializable"
+    },
+    "binary_size_kib": {
+      "native": 359.4,
+      "wasm32-wasip1": 349.6,
+      "wasm32-wasip1+opt-Oz": 308.9,
+      "policy": "budget: no regression; net of kovan +147.4 published by PR 3"
+    }
+  },
+  "retractions": []
+}
