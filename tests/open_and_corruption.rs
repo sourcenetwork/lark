@@ -62,6 +62,7 @@ fn seeded_db(keys: usize) -> TempDir {
 
 /// Permission-based cases are meaningless for a process that ignores
 /// permissions, so they are skipped rather than falsely passing.
+#[cfg(unix)]
 fn permissions_are_enforced(dir: &Path) -> bool {
     let probe = dir.join("write-probe");
     let enforced = fs::File::create(&probe).is_err();

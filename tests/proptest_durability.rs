@@ -77,6 +77,13 @@
 //! PROPTEST_CASES=512 cargo test --test proptest_durability
 //! ```
 
+// The whole file drives the `LD_PRELOAD` syscall shim, which exists only
+// on Linux: macOS blocks the loader equivalent under system integrity
+// protection and Windows has none. Gated at the file level, like the
+// other shim-backed suites, so the tests are absent where the substrate
+// cannot run rather than failing there.
+#![cfg(target_os = "linux")]
+
 mod common;
 // A test crate's submodules resolve against `tests/`, and every
 // `tests/*.rs` is its own test binary, so the model cannot simply live
