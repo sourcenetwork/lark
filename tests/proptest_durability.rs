@@ -100,7 +100,6 @@ use tempfile::TempDir;
 /// Child process entry point, re-executed by the crash harness. Returns
 /// immediately in a normal `cargo test` run.
 #[test]
-#[ignore = "child process entry point, re-executed by the crash harness"]
 fn crash_child() {
     fault::child_entrypoint(workload);
 }

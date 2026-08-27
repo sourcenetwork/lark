@@ -1420,6 +1420,50 @@ impl Db {
         self.engine.close().map_err(Error::from)
     }
 
+    /// Block until no [`Snapshot`] and no snapshot-backed iterator is
+    /// live, returning how many pins were still outstanding when
+    /// `timeout` elapsed. `0` means the wait succeeded.
+    ///
+    /// A snapshot pins the SSTables it can see, so closing a database
+    /// while one is outstanding leaves those files on disk and their
+    /// readers open. An embedder that wants a clean shutdown has to wait
+    /// for its readers to finish, and this is that wait: it blocks on
+    /// the release itself rather than polling a counter, so it costs
+    /// nothing while it waits and adds no latency once the last reader
+    /// is done.
+    ///
+    /// Counts pins, not handles. An iterator taken from a snapshot pins
+    /// it again for as long as the iterator lives, so a `Snapshot` that
+    /// has already been dropped can still be counted here, which is
+    /// exactly the case an embedder tracking its own transaction objects
+    /// would miss.
+    ///
+    /// Returns a count rather than an error because whether outstanding
+    /// readers are a failure is the caller's decision: [`Db::close`]
+    /// does not require this wait, and a database closed with snapshots
+    /// live is consistent, just not tidy.
+    ///
+    /// ```
+    /// # use std::time::Duration;
+    /// # use lark_kv::{Db, Options};
+    /// # fn main() -> lark_kv::Result<()> {
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// let db = Db::open(dir.path(), Options::default())?;
+    /// db.put(b"k", b"v")?;
+    ///
+    /// let snapshot = db.snapshot();
+    /// assert_eq!(db.wait_for_snapshots(Duration::from_millis(50)), 1);
+    ///
+    /// drop(snapshot);
+    /// assert_eq!(db.wait_for_snapshots(Duration::from_secs(5)), 0);
+    /// db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn wait_for_snapshots(&self, timeout: std::time::Duration) -> u64 {
+        self.engine.wait_for_snapshots(timeout)
+    }
+
     /// Test-only: number of SSTable files at `level`.
     #[cfg(test)]
     pub(crate) fn level_file_count(&self, level: usize) -> usize {

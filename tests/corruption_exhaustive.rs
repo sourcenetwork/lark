@@ -832,7 +832,6 @@ fn a_manifest_that_names_the_same_table_twice_never_serves_an_inconsistent_view(
 // ─── child entry point ──────────────────────────────────────────────────
 
 #[test]
-#[ignore = "child process entry point, re-executed by the crash harness"]
 fn crash_child() {
     child_entrypoint(builtin_workload);
 }

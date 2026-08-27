@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::sync::Mutex;
+use crate::sync::{Condvar, Mutex};
 
 use crate::env::Env;
 
@@ -33,6 +33,10 @@ pub(crate) struct SnapshotRegistry {
     /// `lark.oldest-snapshot-time` is stable across refcount
     /// changes.
     active: Mutex<BTreeMap<u64, SlotState>>,
+    /// Signalled whenever the last pin is released, so a caller
+    /// shutting the database down can wait for readers to finish
+    /// instead of polling a counter.
+    drained: Condvar,
     env: Arc<dyn Env>,
 }
 
@@ -50,6 +54,7 @@ impl SnapshotRegistry {
     pub(crate) fn with_env(env: Arc<dyn Env>) -> Self {
         Self {
             active: Mutex::new(BTreeMap::new()),
+            drained: Condvar::new(),
             env,
         }
     }
@@ -110,6 +115,38 @@ impl SnapshotRegistry {
                 active.remove(&seq);
             }
         }
+        let empty = active.is_empty();
+        drop(active);
+        if empty {
+            self.drained.notify_all();
+        }
+    }
+
+    /// Block until no snapshot is pinned, or until `timeout` elapses.
+    ///
+    /// Returns the number of pins still live, so `0` means the wait
+    /// succeeded and anything else is what was still outstanding when
+    /// the deadline passed. The caller decides whether that is an error.
+    ///
+    /// A condition variable rather than a counter the caller polls: a
+    /// poll picks an interval, and every interval is wrong somewhere.
+    /// Too short burns a core during a shutdown that is waiting on a
+    /// long scan; too long adds its own latency to every clean
+    /// shutdown. Waiting on the release itself has neither cost.
+    pub(crate) fn wait_until_drained(&self, timeout: std::time::Duration) -> u64 {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut active = self.active.lock();
+        while !active.is_empty() {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break;
+            };
+            let (next, _) = self
+                .drained
+                .wait_timeout(active, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            active = next;
+        }
+        active.values().map(|slot| slot.refcount as u64).sum()
     }
 
     /// Return the smallest currently registered seq, or `u64::MAX`

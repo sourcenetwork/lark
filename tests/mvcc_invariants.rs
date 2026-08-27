@@ -73,7 +73,6 @@ use harness::{
 /// entry point is never re-executed; it exists so the crate satisfies
 /// the harness contract uniformly with its siblings.
 #[test]
-#[ignore = "child process entry point, re-executed by the crash harness"]
 fn crash_child() {
     fault::child_entrypoint(fault::builtin_workload);
 }

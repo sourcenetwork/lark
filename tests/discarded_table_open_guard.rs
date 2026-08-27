@@ -38,7 +38,6 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 #[test]
-#[ignore = "child process entry point, re-executed by the crash harness"]
 fn crash_child() {
     fault::child_entrypoint(fault::builtin_workload);
 }

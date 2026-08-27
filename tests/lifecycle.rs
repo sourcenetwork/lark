@@ -38,7 +38,6 @@ use common::fault::{file_len, find_ssts, first_sst, overwrite_range};
 mod options;
 
 #[test]
-#[ignore = "child process entry point, re-executed by the crash harness"]
 fn crash_child() {
     common::fault::child_entrypoint(common::fault::builtin_workload);
 }

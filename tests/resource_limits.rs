@@ -52,7 +52,6 @@ use tempfile::TempDir;
 mod common;
 
 #[test]
-#[ignore = "child process entry point, re-executed by the crash harness"]
 fn crash_child() {
     common::fault::child_entrypoint(common::fault::builtin_workload);
 }

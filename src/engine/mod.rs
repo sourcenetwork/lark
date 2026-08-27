@@ -926,6 +926,12 @@ impl LarkEngine {
         self.snapshot_registry.oldest_live_seq()
     }
 
+    /// Wait for every snapshot pin to be released, returning how many
+    /// were still outstanding when `timeout` elapsed.
+    pub(crate) fn wait_for_snapshots(&self, timeout: std::time::Duration) -> u64 {
+        self.snapshot_registry.wait_until_drained(timeout)
+    }
+
     /// Construct a streaming iterator over the latest published read
     /// horizon. The view is loaded before the horizon is sampled, for
     /// the reason spelled out on [`Self::get_latest`].

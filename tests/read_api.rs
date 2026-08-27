@@ -3,6 +3,8 @@
 
 use lark_kv::{Db, MergeOperator, Options, WriteBatch};
 use proptest::prelude::*;
+use std::sync::Arc;
+use std::time::Duration;
 use tempfile::TempDir;
 
 mod common;
@@ -292,4 +294,78 @@ proptest! {
             prop_assert_eq!(db.get_size(&key).unwrap(), got.as_ref().map(|v| v.len()));
         }
     }
+}
+
+/// Waiting for readers to finish has to see what the embedder cannot:
+/// an iterator taken from a snapshot pins the snapshot again, so a
+/// database is still busy after the `Snapshot` handle itself is gone.
+#[test]
+fn waiting_for_snapshots_counts_iterator_pins_not_just_snapshot_handles() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = Db::open(dir.path(), Options::default()).expect("open");
+    for i in 0..32u32 {
+        db.put(format!("k{i:04}").as_bytes(), b"v").expect("put");
+    }
+
+    assert_eq!(
+        db.wait_for_snapshots(Duration::from_secs(5)),
+        0,
+        "a database with no readers must not wait at all",
+    );
+
+    let snapshot = db.snapshot();
+    assert_eq!(
+        db.wait_for_snapshots(Duration::from_millis(50)),
+        1,
+        "a live snapshot must be counted",
+    );
+
+    // The iterator pins the snapshot independently, so dropping the
+    // handle is not enough.
+    let iter = snapshot.into_owned_iter();
+    assert_eq!(
+        db.wait_for_snapshots(Duration::from_millis(50)),
+        1,
+        "an iterator outliving its snapshot handle must keep the pin",
+    );
+
+    drop(iter);
+    assert_eq!(
+        db.wait_for_snapshots(Duration::from_secs(5)),
+        0,
+        "every pin was released, so the wait must return immediately",
+    );
+    db.close().expect("close");
+}
+
+/// The wait must return as soon as the last reader finishes rather than
+/// after a fixed poll interval, so a generous timeout costs nothing.
+#[test]
+fn waiting_for_snapshots_returns_as_soon_as_the_last_reader_finishes() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = Arc::new(Db::open(dir.path(), Options::default()).expect("open"));
+    db.put(b"k", b"v").expect("put");
+
+    let snapshot = db.snapshot();
+    let holder = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            assert_eq!(snapshot.get(b"k").expect("get").as_deref(), Some(&b"v"[..]));
+            std::thread::sleep(Duration::from_millis(120));
+            drop(snapshot);
+            drop(db);
+        })
+    };
+
+    let started = std::time::Instant::now();
+    let outstanding = db.wait_for_snapshots(Duration::from_secs(30));
+    let waited = started.elapsed();
+    holder.join().expect("holder");
+
+    assert_eq!(outstanding, 0, "the wait timed out with the reader gone");
+    assert!(
+        waited < Duration::from_secs(5),
+        "the wait took {waited:?} against a 30s timeout, so it is sleeping out an interval rather \
+         than waking on the release",
+    );
 }
