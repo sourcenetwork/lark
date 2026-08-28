@@ -9,7 +9,7 @@ mod model;
 mod runner;
 mod verify;
 
-use cli::{Config, Isolation};
+use cli::Config;
 
 fn main() {
     let cfg = match cli::parse(std::env::args().skip(1)) {
@@ -31,7 +31,6 @@ fn dispatch(cfg: &Config) -> Result<(), String> {
         return report_verification(&verify::verify(path, cfg.model)?);
     }
 
-    warn_unreachable_isolation(cfg.isolation);
 
     if cfg.worker.is_some() {
         return runner::run_worker(cfg);
@@ -46,34 +45,6 @@ fn dispatch(cfg: &Config) -> Result<(), String> {
         cfg.isolation.as_str()
     );
     report_verification(&verify::verify(&cfg.out, cfg.model)?)
-}
-
-/// regolith provides snapshot isolation only. Say so before generating a
-/// history at a level the engine cannot reach, so nobody reads the
-/// checker verdict as a regolith bug when it is legal snapshot-isolated
-/// behavior.
-fn warn_unreachable_isolation(isolation: Isolation) {
-    let gap = match isolation {
-        Isolation::ReadCommitted => return,
-        Isolation::RepeatableRead => {
-            "snapshot isolation is incomparable with repeatable-read: it permits write \
-             skew (G2-item), which repeatable-read forbids"
-        }
-        Isolation::Serializable => {
-            "snapshot isolation is strictly weaker than serializable: it permits write \
-             skew (G2-item), which serializable forbids"
-        }
-    };
-    eprintln!(
-        "warning: {} isolation is NOT reachable on this tree. regolith exposes snapshot \
-         isolation only, through TransactionDb and OptimisticTransactionDb, and {}. \
-         The generated history is a snapshot-isolated history; check it with \
-         `--consistency-models snapshot-isolation` for a verdict that means something \
-         about regolith. A failure at {} may be legal behavior, not a bug.",
-        isolation.as_str(),
-        gap,
-        isolation.as_str()
-    );
 }
 
 fn report_verification(report: &verify::Report) -> Result<(), String> {

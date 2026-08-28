@@ -40,25 +40,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
-name = "crossbeam-epoch"
-version = "0.9.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
-name = "crossbeam-skiplist"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df29de440c58ca2cc6e587ec3d22347551a32435fbde9d2bff64e78a9ffa151b"
-dependencies = [
- "crossbeam-epoch",
- "crossbeam-utils",
-]
-
-[[package]]
 name = "crossbeam-utils"
 version = "0.8.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -88,6 +69,12 @@ name = "find-msvc-tools"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
+
+[[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "futures-core"
@@ -129,6 +116,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "getrandom"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "r-efi",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -147,9 +145,9 @@ dependencies = [
 
 [[package]]
 name = "kovan"
-version = "0.1.19"
+version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c140456f1fc2406f9218629ba654ae2f036a3e203eede77ef7ecd5342faecdc"
+checksum = "069314825b47e60f2882bf6fc90ab66e3eb37ee5e4407de6357a124842fc3b26"
 dependencies = [
  "once_cell",
  "portable-atomic",
@@ -157,45 +155,45 @@ dependencies = [
 
 [[package]]
 name = "kovan-channel"
-version = "0.1.19"
+version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7680bd3185bff7523acb534cd228db7072025510e56fc8917b453da00c0fd083"
+checksum = "0d105d382f56b3e8ece40ef1de7246205a419513333ac71e42832766240d8a47"
 dependencies = [
  "crossbeam-utils",
  "kovan",
  "kovan-queue",
+]
+
+[[package]]
+name = "kovan-map"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aaba93d80fa57cdb3525198c0b61abeeb689ec0ac346b6d8da6a7c108bf608d4"
+dependencies = [
+ "foldhash",
+ "kovan",
+]
+
+[[package]]
+name = "kovan-mvcc"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43bda37cfe1a4e6a1cf6737aaab3f601b0a245098beaa2c278630beadb8eec5b"
+dependencies = [
+ "kovan",
+ "kovan-map",
+ "parking_lot",
+ "uuid",
 ]
 
 [[package]]
 name = "kovan-queue"
-version = "0.1.19"
+version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f65d628b7fbb4bc0b6b82f3915c21f586f87bd4cbde9960fe69e21f07a52b089"
+checksum = "f1f72e2bdab247e2f7d53e41bcd2abd6a53daac69727511d1223abf41f0c9b7f"
 dependencies = [
  "crossbeam-utils",
  "kovan",
-]
-
-[[package]]
-name = "regolith"
-version = "0.1.0"
-dependencies = [
- "crossbeam-epoch",
- "crossbeam-skiplist",
- "js-sys",
- "kovan-channel",
- "kovan-queue",
- "loom",
- "lz4_flex",
- "parking_lot",
- "portable-atomic",
- "rustix",
- "snap",
- "thiserror",
- "tracing",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -337,6 +335,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "r-efi"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -361,6 +365,28 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "regolith"
+version = "0.1.1"
+dependencies = [
+ "js-sys",
+ "kovan",
+ "kovan-channel",
+ "kovan-map",
+ "kovan-mvcc",
+ "kovan-queue",
+ "loom",
+ "lz4_flex",
+ "portable-atomic",
+ "rustix",
+ "snap",
+ "thiserror",
+ "tracing",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "xxhash-rust",
+]
 
 [[package]]
 name = "rustix"
@@ -592,6 +618,17 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "uuid"
+version = "1.26.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5772d71c9be8a8a6ac2117d949c5b224c1b72241bb611d9a3012edcf8af7812"
+dependencies = [
+ "getrandom",
+ "js-sys",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "valuable"
