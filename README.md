@@ -72,6 +72,58 @@ database handed back and bytes you assembled yourself travel as one type:
 let assembled: DbSlice = b"built elsewhere".to_vec().into();
 ```
 
+## Streaming
+
+A cursor is lazy and iterates as an ordinary Rust iterator, so a scan holds one
+entry rather than the whole range. Values come back as `DbSlice`, so iterating
+copies keys but never value bytes:
+
+```rust
+let snap = db.snapshot();
+for (key, value) in snap.owned_iter() {
+    // `value` borrows the bytes the database already holds.
+    println!("{} = {} bytes", String::from_utf8_lossy(&key), value.len());
+}
+
+// Positioned scans, reverse scans, and early exit all work:
+let mut cursor = snap.owned_iter();
+cursor.seek(b"user:");
+let first_ten: Vec<_> = cursor.entries().take(10).collect();
+```
+
+`Db::scan` returns a `Vec` and reads the whole range up front. Prefer a cursor,
+or `scan_page` for explicit page-sized reads.
+
+regolith stays synchronous and needs no async runtime, so it does not implement
+`Stream`. Building one is a one-liner where the async context already is:
+
+```rust
+let stream = futures::stream::iter(db.snapshot().owned_iter());
+```
+
+Writes stream too. A `WriteBatch` costs memory proportional to its input, which
+is wrong for a stream whose length the caller does not control. A
+`StreamingWriter` costs a fixed budget instead:
+
+```rust
+use regolith::StreamOptions;
+
+let mut writer = db.streaming_writer(StreamOptions {
+    max_buffered_bytes: 1 << 20,
+    ..Default::default()
+});
+for (key, value) in huge_source {
+    writer.put_owned(&key, value)?;  // takes the buffer, does not copy it
+}
+let sequence = writer.finish()?;
+```
+
+Peak footprint is the budget plus one operation, whatever the stream's length.
+The tradeoff is explicit: each flush is atomic, the stream as a whole is not.
+A crash partway through leaves a valid prefix of the stream, never a
+half-applied flush. Work that must land all-or-nothing wants a single
+`WriteBatch` and has to pay the memory for it.
+
 ## Transactions
 
 Pick the isolation a unit of work actually needs. The level decides how much of the
