@@ -104,8 +104,8 @@ pub use statistics::{Histogram, HistogramSnapshot, Statistics, Ticker};
 pub use stream_writer::{StreamOptions, StreamingWriter};
 pub use tailing::TailingIter;
 pub use transaction::{
-    IsolationLevel, OptimisticTransactionDb, OwnedTransaction, Transaction, TransactionDb,
-    TransactionError, TxResult, TxnScanStream,
+    IsolationLevel, OptimisticTransactionDb, OwnedTransaction, ScanDirection, Transaction,
+    TransactionDb, TransactionError, TxResult, TxnScanStream,
 };
 pub use ttl::{DbWithTtl, TtlCompactionFilter, strip_timestamp};
 
