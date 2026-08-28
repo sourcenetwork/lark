@@ -79,7 +79,7 @@
 //!   commit then iterate, or use point lookups).
 
 use crate::portability::{AtomicBool, AtomicU64, Ordering};
-use kovan_map::HashMap as ConcurrentMap;
+use kovan_map::HopscotchMap as ConcurrentMap;
 use kovan_queue::seg_queue::SegQueue;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
