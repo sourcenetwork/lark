@@ -476,12 +476,14 @@ struct Savepoint {
 
 /// What one transaction knows about one key it has read.
 ///
-/// Every field is atomic and every update is monotonic, so two threads
+/// Shared, never copied: `tracked` holds an `Arc` of this cell and every
+/// observation of the key folds into that one instance. The mutable
+/// fields are atomic and every update is monotonic, so two threads
 /// reading the same key through the same transaction cannot lose an
-/// observation between them: `first_read_seq` only falls, `read_seq`
-/// only rises, and `for_update` only latches on. A non-atomic
-/// read-modify-write here would let one thread's observation overwrite
-/// another's and silently shrink the commit-time validation set.
+/// observation between them: `read_seq` only rises and `for_update` only
+/// latches on. Copying the cell, or a non-atomic read-modify-write on
+/// it, would let one thread's observation overwrite another's and
+/// silently shrink the commit-time validation set.
 struct KeyState {
     /// Sequence this transaction first observed the key at.
     /// Validation uses this one, because it is the read a later
