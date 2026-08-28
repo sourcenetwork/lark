@@ -306,6 +306,7 @@ jobs:
           - write_buffered
           - write_durable
           - scan
+          - scan_stream
           - batch
           - large_value
           - transaction

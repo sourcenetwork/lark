@@ -46,6 +46,9 @@ const RETRACTION: &[&str] = &["retraction"];
 /// Per-operation allocation budgets. Deterministic: a count, not a rate,
 /// so a busy runner cannot move it.
 const ALLOCS: &[&str] = &["allocs"];
+/// Peak live bytes a streaming scan holds against a materializing one.
+/// Deterministic for the same reason as `ALLOCS`: bytes held, not a rate.
+const SCAN_STREAM: &[&str] = &["scan_stream"];
 
 /// Sub-metrics of the rss family that the memory bench contributes.
 const RSS_PARTS: &[&str] = &["shard_sweep", "block_sweep", "point"];
@@ -85,6 +88,7 @@ fn main() {
         ),
         ("isolation", deterministic(&mut bag, ISOLATION, "commits/s")),
         ("allocs", deterministic(&mut bag, ALLOCS, "allocations/op")),
+        ("scan_stream", deterministic(&mut bag, SCAN_STREAM, "B")),
         ("viability", deterministic(&mut bag, VIABILITY, "")),
     ]);
     let retractions = Json::Arr(bag.take_all(RETRACTION));
@@ -202,6 +206,7 @@ fn accepted_names() -> Vec<&'static str> {
         VIABILITY,
         RETRACTION,
         ALLOCS,
+        SCAN_STREAM,
     ] {
         v.extend(group.iter().copied());
     }

@@ -153,6 +153,10 @@ name = "scan"
 harness = false
 
 [[bench]]
+name = "scan_stream"
+harness = false
+
+[[bench]]
 name = "batch"
 harness = false
 
