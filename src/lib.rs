@@ -1,12 +1,20 @@
-//! Regolith: A pure Rust LSM-tree key-value store.
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/sourcenetwork/regolith/main/art/regolith_banner_2048x512.png"
+)]
+//! Regolith: ACID, performance oriented, embedded key-value database engine for edge systems.
 //!
 //! Regolith provides a fast, embedded key-value store with:
-//! - **Snapshot isolation** via MVCC sequence numbers
+//! - **Read committed, snapshot isolation, or serializable** per
+//!   transaction, via MVCC sequence numbers
+//! - **Lock-free transactions** whose reads and writes take `&self`, so
+//!   one transaction can be shared across threads without a lock
 //! - **Crash recovery** via write-ahead logging (WAL)
 //! - **LZ4 compression** for data blocks
 //! - **Bloom filters** for fast negative lookups
 //! - **Level-based compaction** on a dedicated OS thread
 //! - **Lock-free reads** via an arena-backed skip list memtable
+//! - **Zero-copy reads** via [`DbSlice`], which borrows the bytes the
+//!   database already holds
 //!
 //! # Quick Start
 //!
