@@ -69,6 +69,7 @@ mod rate_limiter;
 mod slice;
 mod sst_file_writer;
 mod statistics;
+mod stream_writer;
 mod sync;
 mod tailing;
 mod transaction;
@@ -99,6 +100,7 @@ pub use rate_limiter::{Priority, RateLimiter, TokenBucketRateLimiter};
 pub use slice::DbSlice;
 pub use sst_file_writer::{IngestOptions, SstFileMeta, SstFileWriter};
 pub use statistics::{Histogram, HistogramSnapshot, Statistics, Ticker};
+pub use stream_writer::{StreamOptions, StreamingWriter};
 pub use tailing::TailingIter;
 pub use transaction::{
     IsolationLevel, OptimisticTransactionDb, OwnedTransaction, Transaction, TransactionDb,
@@ -735,6 +737,18 @@ impl Db {
             )
             .map(|_| ())
             .map_err(Error::from)
+    }
+
+    /// Open a write stream that bounds its own memory.
+    ///
+    /// [`WriteBatch`] costs memory proportional to its input, which a
+    /// caller feeding an unbounded stream cannot afford. A
+    /// [`StreamingWriter`] costs the configured budget instead, at the
+    /// price of atomicity across the whole stream. Read
+    /// [`StreamingWriter`]'s own documentation before choosing it: that
+    /// tradeoff is the entire reason the type exists.
+    pub fn streaming_writer(&self, opts: StreamOptions) -> StreamingWriter<'_> {
+        StreamingWriter::new(self, opts)
     }
 
     /// Apply a batch of writes atomically using the database-global
@@ -2003,6 +2017,112 @@ impl OwnedSnapshotIter {
     }
 }
 
+/// Ordered entries drained from a cursor, from its current position on.
+///
+/// Returned by the `IntoIterator` impls on the cursors and by
+/// [`OwnedSnapshotIter::entries`] / [`OwnedSnapshotIter::entries_rev`].
+/// The value is a [`DbSlice`], so iterating copies keys but never value
+/// bytes: a key is reassembled from its prefix-compressed form into a
+/// buffer the cursor owns and has to be copied out, while a value is
+/// stored whole and can be handed over by reference.
+///
+/// This is the seam to build a `Stream` on. regolith's IO is synchronous
+/// and it requires no async runtime, so wrapping a ready iterator with
+/// `futures::stream::iter` belongs where the async context is rather than
+/// here, where it would add a dependency and never yield.
+pub struct Entries<C> {
+    cursor: C,
+    started: bool,
+    reverse: bool,
+}
+
+impl<C> Entries<C> {
+    fn new(cursor: C, reverse: bool) -> Self {
+        Self {
+            cursor,
+            started: false,
+            reverse,
+        }
+    }
+
+    /// Give the cursor back, positioned wherever iteration stopped.
+    pub fn into_cursor(self) -> C {
+        self.cursor
+    }
+}
+
+/// A cursor already positioned by `seek` is left where it is on the first
+/// step, so seeking and then iterating resumes from the seek instead of
+/// restarting at the end of the range.
+macro_rules! impl_entries {
+    ($cursor:ty $(, $lt:lifetime)?) => {
+        impl$(<$lt>)? Iterator for Entries<$cursor> {
+            type Item = (Vec<u8>, DbSlice);
+
+            fn next(&mut self) -> Option<Self::Item> {
+                if self.started {
+                    if self.reverse {
+                        self.cursor.prev();
+                    } else {
+                        self.cursor.next();
+                    }
+                } else {
+                    self.started = true;
+                    if !self.cursor.valid() {
+                        if self.reverse {
+                            self.cursor.seek_to_last();
+                        } else {
+                            self.cursor.seek_to_first();
+                        }
+                    }
+                }
+                if !self.cursor.valid() {
+                    return None;
+                }
+                let key = self.cursor.key()?.to_vec();
+                let value = self.cursor.value_slice()?;
+                Some((key, value))
+            }
+        }
+
+        impl$(<$lt>)? IntoIterator for $cursor {
+            type Item = (Vec<u8>, DbSlice);
+            type IntoIter = Entries<$cursor>;
+
+            fn into_iter(self) -> Self::IntoIter {
+                Entries::new(self, false)
+            }
+        }
+    };
+}
+
+impl_entries!(OwnedSnapshotIter);
+impl_entries!(CfIter<'a>, 'a);
+
+impl OwnedSnapshotIter {
+    /// Iterate forward from the cursor's current position.
+    pub fn entries(self) -> Entries<Self> {
+        Entries::new(self, false)
+    }
+
+    /// Iterate backward from the cursor's current position.
+    pub fn entries_rev(self) -> Entries<Self> {
+        Entries::new(self, true)
+    }
+}
+
+impl<'a> CfIter<'a> {
+    /// Iterate forward from the cursor's current position.
+    pub fn entries(self) -> Entries<CfIter<'a>> {
+        Entries::new(self, false)
+    }
+
+    /// Iterate backward from the cursor's current position.
+    pub fn entries_rev(self) -> Entries<CfIter<'a>> {
+        Entries::new(self, true)
+    }
+}
+
 /// A point-in-time snapshot for consistent reads.
 pub struct Snapshot {
     engine: Arc<RegolithEngine>,
@@ -2372,6 +2492,20 @@ pub(crate) enum WriteBatchOp {
     Merge { key: Vec<u8>, operand: Vec<u8> },
 }
 
+impl WriteBatchOp {
+    /// Heap bytes this op holds. Drives the streaming writer's flush
+    /// budget, so it counts what is buffered now, not what the op will
+    /// encode to later.
+    pub(crate) fn buffered_bytes(&self) -> usize {
+        match self {
+            Self::Put { key, value } => key.len() + value.len(),
+            Self::Delete { key } => key.len(),
+            Self::DeleteRange { start, end } => start.len() + end.len(),
+            Self::Merge { key, operand } => key.len() + operand.len(),
+        }
+    }
+}
+
 /// A batch of write operations to apply atomically.
 #[derive(Debug, Default)]
 pub struct WriteBatch {
@@ -2386,10 +2520,26 @@ impl WriteBatch {
 
     /// Add a put operation to the batch (default column family).
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
+        self.put_owned(key, value.to_vec());
+    }
+
+    /// [`WriteBatch::put`] for a value the caller already owns.
+    ///
+    /// Takes the buffer instead of copying it, which is what a producer
+    /// that just built the bytes wants. The key is still copied because
+    /// it is rewritten with a column-family prefix, so there is nothing
+    /// to hand over.
+    pub fn put_owned(&mut self, key: &[u8], value: Vec<u8>) {
         self.ops.push(WriteBatchOp::Put {
             key: prefix_key(DEFAULT_CF_ID, key),
-            value: value.to_vec(),
+            value,
         });
+    }
+
+    /// Bytes this batch is holding: the key and value of every buffered
+    /// operation. What a caller bounds when it decides to flush.
+    pub fn buffered_bytes(&self) -> usize {
+        self.ops.iter().map(WriteBatchOp::buffered_bytes).sum()
     }
 
     /// Add a delete operation to the batch (default column family).
