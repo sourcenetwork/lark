@@ -173,7 +173,7 @@ fn decode_counter(raw: Option<Vec<u8>>) -> u64 {
 fn bump(db: &dyn TxnDb, key: &[u8]) -> Attempts {
     let mut acc = Attempts::default();
     for attempt in 0..MAX_ATTEMPTS {
-        let mut tx = db.begin();
+        let tx = db.begin();
         let current = match tx.get_for_update(key) {
             Ok(v) => decode_counter(v),
             Err(e) => {
@@ -312,7 +312,7 @@ fn uncontended_rate(db: &dyn TxnDb, ops: u64, offset: u64) -> f64 {
     let start = Instant::now();
     for i in 0..ops {
         let key = common::key(offset + i);
-        let mut tx = db.begin();
+        let tx = db.begin();
         tx.put(&key, &value)
             .unwrap_or_else(|e| panic!("uncontended put: {e}"));
         tx.commit()

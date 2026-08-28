@@ -375,7 +375,7 @@ fn optimistic_transactions_do_not_lose_conflicts_under_group_commit() {
         let conflicts = Arc::clone(&conflicts);
         handles.push(thread::spawn(move || {
             for _ in 0..200 {
-                let mut txn = tdb.begin_transaction();
+                let txn = tdb.begin_transaction();
                 let current: u64 = txn
                     .get_for_update(b"counter")
                     .unwrap()

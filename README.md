@@ -65,6 +65,13 @@ if let Some(slice) = db.get_slice(b"a")? {
 }
 ```
 
+A `DbSlice` also adopts a buffer you already own, without copying it, so bytes the
+database handed back and bytes you assembled yourself travel as one type:
+
+```rust
+let assembled: DbSlice = b"built elsewhere".to_vec().into();
+```
+
 ## Transactions
 
 Pick the isolation a unit of work actually needs. The level decides how much of the
@@ -90,6 +97,34 @@ txn.commit()?;
 
 `TransactionDb` is the pessimistic flavour: it takes key locks, so contention waits
 instead of retrying. `OptimisticTransactionDb` validates at commit and retries.
+
+Buffering a read or a write takes `&self`, so one transaction can be shared across
+threads without a lock around it. The write buffer and the read set are lock-free, and
+every read is folded into the commit-time validation set no matter which thread recorded
+it. Only `commit`, `rollback`, and the savepoint calls need exclusive access, because
+those are the points where the buffer stops changing.
+
+```rust
+use std::sync::Arc;
+use regolith::{IsolationLevel, OptimisticTransactionDb, Options};
+
+let db = Arc::new(OptimisticTransactionDb::open("/tmp/shared_db", Options::default())?);
+
+// `begin_transaction` borrows the database, so the transaction cannot outlive it or be
+// stored in a `'static` container. `begin_transaction_owned` returns an
+// `OwnedTransaction`, which carries an `Arc` on the database instead and can be boxed,
+// shared, and moved freely.
+let txn = Arc::new(db.begin_transaction_owned(IsolationLevel::Serializable));
+
+std::thread::scope(|scope| {
+    for thread in 0..4 {
+        let txn = txn.clone();
+        scope.spawn(move || txn.put(format!("k{thread}").as_bytes(), b"v"));
+    }
+});
+
+txn.into_inner().expect("threads joined").commit()?;
+```
 
 Commits report the sequence they landed at, so an upper layer can order its own versions
 against the store without a lock of its own:

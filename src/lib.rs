@@ -93,7 +93,8 @@ pub use sst_file_writer::{IngestOptions, SstFileMeta, SstFileWriter};
 pub use statistics::{Histogram, HistogramSnapshot, Statistics, Ticker};
 pub use tailing::TailingIter;
 pub use transaction::{
-    IsolationLevel, OptimisticTransactionDb, Transaction, TransactionDb, TransactionError, TxResult,
+    IsolationLevel, OptimisticTransactionDb, OwnedTransaction, Transaction, TransactionDb,
+    TransactionError, TxResult,
 };
 pub use ttl::{DbWithTtl, TtlCompactionFilter, strip_timestamp};
 
