@@ -352,6 +352,17 @@ impl core::hash::Hash for DbSlice {
     }
 }
 
+/// Adopt an owned buffer as a slice, without copying it.
+///
+/// Lets a caller funnel bytes the database produced and bytes it
+/// assembled itself (a decrypted value, a reassembled chunk) through one
+/// value type instead of an enum that means the same thing.
+impl From<Vec<u8>> for DbSlice {
+    fn from(bytes: Vec<u8>) -> Self {
+        DbSlice::from_vec(bytes)
+    }
+}
+
 impl From<DbSlice> for Vec<u8> {
     fn from(slice: DbSlice) -> Vec<u8> {
         slice.into_vec()
