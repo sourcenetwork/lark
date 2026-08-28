@@ -923,6 +923,13 @@ pub(crate) struct RegolithIterator {
     /// a visible entry. key()/value() delegate through to the inner
     /// iterator in this state.
     valid_entry: bool,
+    /// True once any seek has run, whether or not it landed on a key.
+    ///
+    /// Distinct from `valid_entry`, which is also false for a cursor that was
+    /// seeked past the end of the range. Anything that seeks on a caller's
+    /// behalf has to tell those two apart, or it undoes a deliberate seek.
+    /// Sits next to the other one-byte state so it costs no extra bytes.
+    positioned: bool,
     /// Reusable buffer holding the user key of the current entry.
     /// Used by consume_curr_user_key_forward and covering_rt_seq
     /// during materialization. NOT used by key()/value().
@@ -1078,6 +1085,7 @@ impl RegolithIterator {
             snapshot_seq,
             direction: Direction::Forward,
             valid_entry: false,
+            positioned: false,
             curr_user_key: Vec::new(),
             reverse_curr: None,
             merge_result: None,
@@ -1103,7 +1111,13 @@ impl RegolithIterator {
             .max_covering_seq(user_key, self.snapshot_seq)
     }
 
+    /// Whether any seek has run on this cursor. See the field.
+    pub(crate) fn positioned(&self) -> bool {
+        self.positioned
+    }
+
     pub(crate) fn seek_to_first(&mut self) {
+        self.positioned = true;
         if self.terminal_error {
             return;
         }
@@ -1123,6 +1137,7 @@ impl RegolithIterator {
     }
 
     pub(crate) fn seek_to_last(&mut self) {
+        self.positioned = true;
         if self.terminal_error {
             return;
         }
@@ -1142,6 +1157,7 @@ impl RegolithIterator {
     }
 
     pub(crate) fn seek(&mut self, target: &[u8]) {
+        self.positioned = true;
         if self.terminal_error {
             return;
         }
@@ -1165,6 +1181,7 @@ impl RegolithIterator {
     }
 
     pub(crate) fn seek_for_prev(&mut self, target: &[u8]) {
+        self.positioned = true;
         if self.terminal_error {
             return;
         }
@@ -1206,6 +1223,7 @@ impl RegolithIterator {
     /// from it: byte strings have no predecessor, so no suffix of
     /// `0xff` bytes is an upper bound for user keys of every length.
     pub(crate) fn seek_to_last_before(&mut self, exclusive_upper: &[u8]) {
+        self.positioned = true;
         if self.terminal_error {
             return;
         }
@@ -1244,6 +1262,7 @@ impl RegolithIterator {
     }
 
     pub(crate) fn seek_prefix(&mut self, prefix: &[u8]) {
+        self.positioned = true;
         if self.terminal_error {
             return;
         }
