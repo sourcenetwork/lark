@@ -176,6 +176,9 @@ jobs:
     # Instrumented builds run several times slower than the gate, so the
     # job carries its own ceiling rather than inheriting the workflow's.
     timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: extractions/setup-just@v2
@@ -187,6 +190,17 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - name: Run coverage
         run: just cov-summary | tee coverage-summary.txt
+      - name: Export coverage report
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex '(^|/)tools/'
+      - name: Upload coverage report
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          disable_search: true
+          fail_ci_if_error: true
+          files: lcov.info
+          use_oidc: true
       - name: Publish coverage summary
         run: |
           {

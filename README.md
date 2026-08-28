@@ -11,6 +11,7 @@
 [![Documentation](https://docs.rs/regolith/badge.svg)](https://docs.rs/regolith)
 
 [![CI](https://github.com/sourcenetwork/regolith/actions/workflows/ci.yml/badge.svg)](https://github.com/sourcenetwork/regolith/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/sourcenetwork/regolith/branch/main/graph/badge.svg)](https://codecov.io/gh/sourcenetwork/regolith)
 [![Transactional Verification](https://github.com/sourcenetwork/regolith/actions/workflows/transactional-verification.yml/badge.svg)](https://github.com/sourcenetwork/regolith/actions/workflows/transactional-verification.yml)
 [![Durability](https://github.com/sourcenetwork/regolith/actions/workflows/durability.yml/badge.svg)](https://github.com/sourcenetwork/regolith/actions/workflows/durability.yml)
 [![Concurrency Model Checking](https://github.com/sourcenetwork/regolith/actions/workflows/model-checking.yml/badge.svg)](https://github.com/sourcenetwork/regolith/actions/workflows/model-checking.yml)
