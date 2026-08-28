@@ -157,32 +157,42 @@ fn a_stale_read_still_conflicts_even_when_the_write_matches() {
     );
 }
 
-/// A plain read is only honoured under serializable. At the weaker levels it
-/// is already unprotected, so a key present for that reason alone is a blind
-/// write as far as this commit is concerned, and an identical write elides.
+/// **The counterexample that defines the rule.** A read-modify-write produces
+/// byte-identical writes from a stale read, and eliding one loses an update.
 ///
-/// This is the counterpart to the serializable case above: the same schedule,
-/// the opposite verdict, decided by what the level actually promises.
+/// Two transactions read a counter at 5 and both write 6. The writes are equal
+/// to the byte, so a rule that looked only at the bytes would let both commit
+/// and the counter would advance once. No serial order produces that: run
+/// second, a transaction reads 6 and writes 7. This is why the elision is
+/// refused for any key the transaction read, at every level, rather than only
+/// where the level would validate a plain read.
 #[test]
-fn a_plain_read_does_not_block_elision_below_serializable() {
-    for level in [
-        IsolationLevel::ReadCommitted,
-        IsolationLevel::SnapshotIsolation,
-    ] {
+fn a_read_modify_write_still_conflicts_at_every_level() {
+    for level in levels() {
         let dir = tempfile::tempdir().unwrap();
         let db = db(dir.path());
+        db.db().put(b"counter", &5u64.to_le_bytes()).unwrap();
 
         let first = db.begin_transaction_with(level);
         let second = db.begin_transaction_with(level);
 
-        assert_eq!(second.get(b"key").unwrap(), None);
-        second.put(b"key", b"same").unwrap();
-        first.put(b"key", b"same").unwrap();
+        // Both read 5 and both intend to store 6.
+        for txn in [&first, &second] {
+            let current =
+                u64::from_le_bytes(txn.get(b"counter").unwrap().unwrap().try_into().unwrap());
+            assert_eq!(current, 5);
+            txn.put(b"counter", &(current + 1).to_le_bytes()).unwrap();
+        }
 
         first.commit().unwrap();
-        second
-            .commit()
-            .unwrap_or_else(|error| panic!("{level:?}: {error:?}"));
+        assert!(
+            second.commit().is_err(),
+            "{level:?}: eliding this write would lose an increment"
+        );
+        assert_eq!(
+            db.db().get(b"counter").unwrap().as_deref(),
+            Some(6u64.to_le_bytes().as_slice())
+        );
     }
 }
 

@@ -937,24 +937,29 @@ impl<'db> Transaction<'db> {
         for (key, state) in tracked {
             let written =
                 writes.contains_key(&key) || merges.iter().any(|(merged, _)| *merged == key);
-            let for_update = state.for_update.load(Ordering::Acquire);
             let validate = if serializable {
                 // Every read, whether or not the transaction wrote it.
                 true
             } else if read_committed {
                 written
             } else {
-                for_update || written
+                state.for_update.load(Ordering::Acquire) || written
             };
             if validate {
-                // The read is only *honoured* where the level says it is:
-                // everywhere under serializable, and through `get_for_update`
-                // otherwise. A plain read at a weaker level is already
-                // unprotected, so a key here for that reason alone is a blind
-                // write as far as an idempotent commit is concerned, and
-                // marking it read would refuse an elision the level permits.
-                let honoured_read = serializable || for_update;
-                checks.insert(key, (state.first_read_seq, honoured_read));
+                // Any read at all, whatever the level. This flag exists to
+                // stop an idempotent-write elision at commit, and the
+                // equivalence that elision rests on holds only for a write
+                // nobody derived from a read.
+                //
+                // A read-modify-write is the counterexample: two transactions
+                // read a counter at 5 and both write 6. The writes are
+                // byte-identical, so eliding the second lets both commit and
+                // the counter advances once, losing an increment. No serial
+                // order produces that: run second, the transaction reads 6 and
+                // writes 7. `first_read_seq` anchors the check at the read for
+                // exactly this reason, and honouring the anchor is what makes
+                // the abort correct.
+                checks.insert(key, (state.first_read_seq, true));
             }
         }
         if optimistic {
