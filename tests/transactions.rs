@@ -54,14 +54,14 @@ where
 }
 
 fn pessimistic_increment(db: &TransactionDb, key: &[u8]) -> TxResult<()> {
-    let mut tx = db.begin_transaction();
+    let tx = db.begin_transaction();
     let current = decode(tx.get_for_update(key)?);
     tx.put(key, &(current + 1).to_le_bytes())?;
     tx.commit()
 }
 
 fn optimistic_increment(db: &OptimisticTransactionDb, key: &[u8]) -> TxResult<()> {
-    let mut tx = db.begin_transaction();
+    let tx = db.begin_transaction();
     let current = decode(tx.get_for_update(key)?);
     tx.put(key, &(current + 1).to_le_bytes())?;
     tx.commit()

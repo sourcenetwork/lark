@@ -5,6 +5,13 @@ use crate::engine::internal_key::INTERNAL_KEY_SUFFIX_LEN;
 /// Default maximum user-key length accepted by write APIs: 8 MiB.
 pub const DEFAULT_MAX_KEY_SIZE: usize = 8 * 1024 * 1024;
 
+/// Default [`Options::transaction_keys_inline`].
+///
+/// A transaction that touches more keys than this indexes its buffer.
+/// Chosen so an ordinary transaction, which touches a handful of keys,
+/// never builds a table it will not use.
+pub const DEFAULT_TRANSACTION_KEYS_INLINE: usize = 32;
+
 /// Default maximum value / merge-operand length accepted by write APIs: 64 MiB.
 pub const DEFAULT_MAX_VALUE_SIZE: usize = 64 * 1024 * 1024;
 
@@ -663,6 +670,23 @@ pub struct Options {
     /// Maximum value and merge-operand length accepted by write APIs.
     /// Default: 64 MiB.
     pub max_value_size: usize,
+    /// Keys one transaction buffers before it builds a hash index over
+    /// them.
+    ///
+    /// A transaction keeps its own writes and reads in a linear buffer,
+    /// which costs no table and answers a lookup by walking a handful of
+    /// entries. Past this many keys the walk stops being the cheap option
+    /// and the buffer indexes itself, which costs one table and one entry
+    /// per key on top of the buffer itself.
+    ///
+    /// Set it to the number of keys the workload's transactions actually
+    /// touch. Too low and a transaction pays for an index it did not need;
+    /// too high and a large transaction walks further than it should. A
+    /// value of `0` never indexes, which suits a workload of uniformly
+    /// tiny transactions and is a poor choice for any other.
+    ///
+    /// Default: 32.
+    pub transaction_keys_inline: usize,
     /// The host platform this database runs on: its filesystem, its
     /// clock, and its threads.
     ///
@@ -719,6 +743,7 @@ impl Default for Options {
             read_only: false,
             max_key_size: DEFAULT_MAX_KEY_SIZE,
             max_value_size: DEFAULT_MAX_VALUE_SIZE,
+            transaction_keys_inline: DEFAULT_TRANSACTION_KEYS_INLINE,
             env: crate::env::std_env(),
         }
     }
@@ -962,6 +987,11 @@ impl Options {
             metadata_block_size: 1024,
             max_key_size: 16 * 1024,
             max_value_size: 256 * 1024,
+            // An index over the buffer is a table plus an entry per key,
+            // which is real memory on a budget this size. A transaction
+            // here is expected to be small, so walk further before
+            // spending it.
+            transaction_keys_inline: 16,
             ..Self::default()
         }
     }
@@ -1094,6 +1124,9 @@ impl Options {
             metadata_block_size: 1024,
             max_key_size: 16 * 1024,
             max_value_size: 1024 * 1024,
+            // A browser tab's heap is not the server's, and a transaction
+            // here is a page interaction rather than a bulk job.
+            transaction_keys_inline: 16,
             ..Self::default()
         }
     }

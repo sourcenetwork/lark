@@ -65,6 +65,65 @@ if let Some(slice) = db.get_slice(b"a")? {
 }
 ```
 
+A `DbSlice` also adopts a buffer you already own, without copying it, so bytes the
+database handed back and bytes you assembled yourself travel as one type:
+
+```rust
+let assembled: DbSlice = b"built elsewhere".to_vec().into();
+```
+
+## Streaming
+
+A cursor is lazy and iterates as an ordinary Rust iterator, so a scan holds one
+entry rather than the whole range. Values come back as `DbSlice`, so iterating
+copies keys but never value bytes:
+
+```rust
+let snap = db.snapshot();
+for (key, value) in snap.owned_iter() {
+    // `value` borrows the bytes the database already holds.
+    println!("{} = {} bytes", String::from_utf8_lossy(&key), value.len());
+}
+
+// Positioned scans, reverse scans, and early exit all work:
+let mut cursor = snap.owned_iter();
+cursor.seek(b"user:");
+let first_ten: Vec<_> = cursor.entries().take(10).collect();
+```
+
+`Db::scan` returns a `Vec` and reads the whole range up front. Prefer a cursor,
+or `scan_page` for explicit page-sized reads.
+
+regolith stays synchronous and needs no async runtime, so it does not implement
+`Stream`. Building one is a one-liner where the async context already is:
+
+```rust
+let stream = futures::stream::iter(db.snapshot().owned_iter());
+```
+
+Writes stream too. A `WriteBatch` costs memory proportional to its input, which
+is wrong for a stream whose length the caller does not control. A
+`StreamingWriter` costs a fixed budget instead:
+
+```rust
+use regolith::StreamOptions;
+
+let mut writer = db.streaming_writer(StreamOptions {
+    max_buffered_bytes: 1 << 20,
+    ..Default::default()
+});
+for (key, value) in huge_source {
+    writer.put_owned(&key, value)?;  // takes the buffer, does not copy it
+}
+let sequence = writer.finish()?;
+```
+
+Peak footprint is the budget plus one operation, whatever the stream's length.
+The tradeoff is explicit: each flush is atomic, the stream as a whole is not.
+A crash partway through leaves a valid prefix of the stream, never a
+half-applied flush. Work that must land all-or-nothing wants a single
+`WriteBatch` and has to pay the memory for it.
+
 ## Transactions
 
 Pick the isolation a unit of work actually needs. The level decides how much of the
@@ -90,6 +149,34 @@ txn.commit()?;
 
 `TransactionDb` is the pessimistic flavour: it takes key locks, so contention waits
 instead of retrying. `OptimisticTransactionDb` validates at commit and retries.
+
+Buffering a read or a write takes `&self`, so one transaction can be shared across
+threads without a lock around it. The write buffer and the read set are lock-free, and
+every read is folded into the commit-time validation set no matter which thread recorded
+it. Only `commit`, `rollback`, and the savepoint calls need exclusive access, because
+those are the points where the buffer stops changing.
+
+```rust
+use std::sync::Arc;
+use regolith::{IsolationLevel, OptimisticTransactionDb, Options};
+
+let db = Arc::new(OptimisticTransactionDb::open("/tmp/shared_db", Options::default())?);
+
+// `begin_transaction` borrows the database, so the transaction cannot outlive it or be
+// stored in a `'static` container. `begin_transaction_owned` returns an
+// `OwnedTransaction`, which carries an `Arc` on the database instead and can be boxed,
+// shared, and moved freely.
+let txn = Arc::new(db.begin_transaction_owned(IsolationLevel::Serializable));
+
+std::thread::scope(|scope| {
+    for thread in 0..4 {
+        let txn = txn.clone();
+        scope.spawn(move || txn.put(format!("k{thread}").as_bytes(), b"v"));
+    }
+});
+
+txn.into_inner().expect("threads joined").commit()?;
+```
 
 Commits report the sequence they landed at, so an upper layer can order its own versions
 against the store without a lock of its own:
@@ -192,3 +279,5 @@ regressed.
 ## License
 
 Dual-licensed under Apache-2.0 or MIT, at your option.
+
+<sub><sup>Here men from the [planet Earth](https://open.spotify.com/track/6qZthmNcaK0jlrkMZ3khmy) first set foot upon the Moon July 1969, A.D. We came in peace for all mankind.<sup><sub>

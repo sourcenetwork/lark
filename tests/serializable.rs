@@ -48,7 +48,7 @@ fn write_skew_pairs(isolation: IsolationLevel, rounds: usize) -> usize {
             let db = Arc::clone(&db);
             let barrier = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
-                let mut tx = db.begin_transaction();
+                let tx = db.begin_transaction();
                 // Read the key the *other* transaction is about to write.
                 // A plain read: this is the edge snapshot isolation does
                 // not validate.
@@ -119,7 +119,7 @@ fn serializable_commits_transactions_that_do_not_conflict() {
         .with_isolation(IsolationLevel::Serializable);
 
     for i in 0..200u64 {
-        let mut tx = db.begin_transaction();
+        let tx = db.begin_transaction();
         let k = format!("k{i:04}");
         tx.get(k.as_bytes()).expect("read");
         tx.put(k.as_bytes(), b"v").expect("write");
@@ -146,7 +146,7 @@ fn serializable_read_only_transactions_commit_under_concurrent_writes() {
             .expect("seed");
     }
 
-    let mut tx = db.begin_transaction();
+    let tx = db.begin_transaction();
     for i in 0..50u64 {
         tx.get(format!("r{i:04}").as_bytes()).expect("read");
     }
@@ -170,7 +170,7 @@ fn the_level_can_be_chosen_per_transaction() {
     assert_eq!(db.isolation(), IsolationLevel::SnapshotIsolation);
 
     db.db().put(b"a", b"0").expect("seed");
-    let mut tx = db.begin_transaction_with(IsolationLevel::Serializable);
+    let tx = db.begin_transaction_with(IsolationLevel::Serializable);
     tx.get(b"a").expect("read");
     // A concurrent commit to the key this transaction read.
     db.db().put(b"a", b"1").expect("concurrent write");

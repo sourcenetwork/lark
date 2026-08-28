@@ -131,7 +131,7 @@ fn a_transaction_that_carries_no_work_still_fails_to_commit_when_closed() {
     let tdb = OptimisticTransactionDb::open(dir.path(), opts()).expect("open");
     tdb.db().put(b"k", b"v").expect("put");
     let empty = tdb.begin_transaction();
-    let mut loaded = tdb.begin_transaction();
+    let loaded = tdb.begin_transaction();
     loaded.put(b"a", b"b").expect("buffer");
     tdb.db().close().expect("close");
 

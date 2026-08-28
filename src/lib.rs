@@ -1,12 +1,20 @@
-//! Regolith: A pure Rust LSM-tree key-value store.
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/sourcenetwork/regolith/main/art/regolith_banner_2048x512.png"
+)]
+//! Regolith: ACID, performance oriented, embedded key-value database engine for edge systems.
 //!
 //! Regolith provides a fast, embedded key-value store with:
-//! - **Snapshot isolation** via MVCC sequence numbers
+//! - **Read committed, snapshot isolation, or serializable** per
+//!   transaction, via MVCC sequence numbers
+//! - **Lock-free transactions** whose reads and writes take `&self`, so
+//!   one transaction can be shared across threads without a lock
 //! - **Crash recovery** via write-ahead logging (WAL)
 //! - **LZ4 compression** for data blocks
 //! - **Bloom filters** for fast negative lookups
 //! - **Level-based compaction** on a dedicated OS thread
 //! - **Lock-free reads** via an arena-backed skip list memtable
+//! - **Zero-copy reads** via [`DbSlice`], which borrows the bytes the
+//!   database already holds
 //!
 //! # Quick Start
 //!
@@ -61,10 +69,12 @@ mod rate_limiter;
 mod slice;
 mod sst_file_writer;
 mod statistics;
+mod stream_writer;
 mod sync;
 mod tailing;
 mod transaction;
 mod ttl;
+mod txn_buffer;
 
 pub use backup::{BackupEngine, BackupId, BackupInfo};
 pub use checkpoint::Checkpoint;
@@ -82,18 +92,20 @@ pub use iter::Iter;
 pub use options::{
     ArenaProfile, CompactionDecision, CompactionFilter, CompactionStyle, CompressionType,
     DEFAULT_MAX_BACKGROUND_COMPACTIONS, DEFAULT_MAX_KEY_SIZE, DEFAULT_MAX_VALUE_SIZE,
-    DurabilityMode, FifoCompactionOptions, FixedLengthPrefix, MAX_BLOCK_CACHE_SHARD_BITS,
-    MAX_BLOOM_BITS_PER_KEY, MergeOperator, Options, PrefixExtractor, UniversalCompactionOptions,
-    WriteOptions,
+    DEFAULT_TRANSACTION_KEYS_INLINE, DurabilityMode, FifoCompactionOptions, FixedLengthPrefix,
+    MAX_BLOCK_CACHE_SHARD_BITS, MAX_BLOOM_BITS_PER_KEY, MergeOperator, Options, PrefixExtractor,
+    UniversalCompactionOptions, WriteOptions,
 };
 pub use perf_context::{PerfContext, PerfContextSnapshot, PerfLevel};
 pub use rate_limiter::{Priority, RateLimiter, TokenBucketRateLimiter};
 pub use slice::DbSlice;
 pub use sst_file_writer::{IngestOptions, SstFileMeta, SstFileWriter};
 pub use statistics::{Histogram, HistogramSnapshot, Statistics, Ticker};
+pub use stream_writer::{StreamOptions, StreamingWriter};
 pub use tailing::TailingIter;
 pub use transaction::{
-    IsolationLevel, OptimisticTransactionDb, Transaction, TransactionDb, TransactionError, TxResult,
+    IsolationLevel, OptimisticTransactionDb, OwnedTransaction, Transaction, TransactionDb,
+    TransactionError, TxResult, TxnScanStream,
 };
 pub use ttl::{DbWithTtl, TtlCompactionFilter, strip_timestamp};
 
@@ -298,6 +310,7 @@ struct OptionsSnapshot {
     read_only: bool,
     max_key_size: usize,
     max_value_size: usize,
+    transaction_keys_inline: usize,
 }
 
 /// Format a raw engine key for inclusion in a property string.
@@ -358,6 +371,7 @@ pub struct Db {
     read_only: bool,
     max_key_size: usize,
     max_value_size: usize,
+    transaction_keys_inline: usize,
 }
 
 impl std::fmt::Debug for Db {
@@ -387,6 +401,7 @@ impl Db {
         let read_only = opts.read_only;
         let max_key_size = opts.max_key_size;
         let max_value_size = opts.max_value_size;
+        let transaction_keys_inline = opts.transaction_keys_inline;
         let durability = match opts.durability {
             DurabilityMode::Immediate => engine::DurabilityMode::Immediate,
             DurabilityMode::Eventual => engine::DurabilityMode::Eventual,
@@ -405,6 +420,7 @@ impl Db {
             read_only,
             max_key_size,
             max_value_size,
+            transaction_keys_inline,
         };
         db.load_cf_registry()?;
         Ok(db)
@@ -728,6 +744,24 @@ impl Db {
             .map_err(Error::from)
     }
 
+    /// Keys a transaction buffers before indexing them. See
+    /// [`Options::transaction_keys_inline`].
+    pub(crate) fn transaction_keys_inline(&self) -> usize {
+        self.transaction_keys_inline
+    }
+
+    /// Open a write stream that bounds its own memory.
+    ///
+    /// [`WriteBatch`] costs memory proportional to its input, which a
+    /// caller feeding an unbounded stream cannot afford. A
+    /// [`StreamingWriter`] costs the configured budget instead, at the
+    /// price of atomicity across the whole stream. Read
+    /// [`StreamingWriter`]'s own documentation before choosing it: that
+    /// tradeoff is the entire reason the type exists.
+    pub fn streaming_writer(&self, opts: StreamOptions) -> StreamingWriter<'_> {
+        StreamingWriter::new(self, opts)
+    }
+
     /// Apply a batch of writes atomically using the database-global
     /// durability mode.
     pub fn write(&self, batch: WriteBatch) -> Result<()> {
@@ -1004,13 +1038,36 @@ impl Db {
         }
     }
 
+    /// Scan a key range lazily, holding one entry rather than the range.
+    ///
+    /// The streaming counterpart to [`Db::scan`], and what a caller
+    /// should reach for by default: a scan that stops early pays only for
+    /// what it read, and memory does not grow with the size of the range.
+    /// Values come back as [`DbSlice`], so no value bytes are copied.
+    ///
+    /// The scan is served from a snapshot pinned when it is created, so
+    /// concurrent writes cannot shift the range underneath it.
+    ///
+    /// ```no_run
+    /// # use regolith::{Db, Options};
+    /// # let db = Db::open("/tmp/scan_stream_doc", Options::default()).unwrap();
+    /// for (key, value) in db.scan_stream(Some(b"user:"), Some(b"user;"))? {
+    ///     println!("{} is {} bytes", String::from_utf8_lossy(&key), value.len());
+    /// }
+    /// # Ok::<(), regolith::Error>(())
+    /// ```
+    pub fn scan_stream(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<ScanStream> {
+        Ok(self.snapshot().into_scan_stream(start, end))
+    }
+
     /// Scan a key range in the default column family.
     ///
     /// Returns all key-value pairs where `start <= key < end`, with
-    /// keys in their user-visible form (no CF prefix). This is a
-    /// convenience method that materializes the entire range into
-    /// memory. Prefer [`Db::iter`] for streaming scans or
-    /// [`Db::scan_page`] when the caller needs an explicit page size.
+    /// keys in their user-visible form (no CF prefix). This
+    /// materializes the entire range into memory, so it is bounded by
+    /// the size of the range rather than by the caller. Prefer
+    /// [`Db::scan_stream`], or [`Db::scan_page`] when the caller wants an
+    /// explicit page size.
     pub fn scan(
         &self,
         start: Option<&[u8]>,
@@ -1313,6 +1370,7 @@ impl Db {
             read_only: self.read_only,
             max_key_size: self.max_key_size,
             max_value_size: self.max_value_size,
+            transaction_keys_inline: self.transaction_keys_inline,
         }
     }
 
@@ -1994,6 +2052,159 @@ impl OwnedSnapshotIter {
     }
 }
 
+/// A lazy, bounded scan over a key range.
+///
+/// Returned by [`Db::scan_stream`] and [`Snapshot::scan_stream`]. Holds
+/// one entry at a time rather than the range, so a caller that stops
+/// early pays only for what it read: the opposite of [`Db::scan`], which
+/// reads the whole range up front. The value is a [`DbSlice`], so no
+/// value bytes are copied.
+///
+/// The scan runs against a pinned snapshot, so writes that land while it
+/// is being drained are invisible to it and the range cannot shift
+/// underneath the cursor.
+pub struct ScanStream {
+    entries: Entries<OwnedSnapshotIter>,
+    /// Exclusive upper bound in user-visible form, or `None` for the end
+    /// of the column family.
+    end: Option<Vec<u8>>,
+    done: bool,
+}
+
+impl Iterator for ScanStream {
+    type Item = (Vec<u8>, DbSlice);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let (key, value) = self.entries.next()?;
+        if let Some(end) = &self.end
+            && key.as_slice() >= end.as_slice()
+        {
+            // Keys come out ascending, so the first key at or past the
+            // bound ends the scan; nothing after it can be in range.
+            self.done = true;
+            return None;
+        }
+        Some((key, value))
+    }
+}
+
+impl std::fmt::Debug for ScanStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScanStream")
+            .field("done", &self.done)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Ordered entries drained from a cursor, from its current position on.
+///
+/// Returned by the `IntoIterator` impls on the cursors and by
+/// [`OwnedSnapshotIter::entries`] / [`OwnedSnapshotIter::entries_rev`].
+/// The value is a [`DbSlice`], so iterating copies keys but never value
+/// bytes: a key is reassembled from its prefix-compressed form into a
+/// buffer the cursor owns and has to be copied out, while a value is
+/// stored whole and can be handed over by reference.
+///
+/// This is the seam to build a `Stream` on. regolith's IO is synchronous
+/// and it requires no async runtime, so wrapping a ready iterator with
+/// `futures::stream::iter` belongs where the async context is rather than
+/// here, where it would add a dependency and never yield.
+pub struct Entries<C> {
+    cursor: C,
+    started: bool,
+    reverse: bool,
+}
+
+impl<C> Entries<C> {
+    fn new(cursor: C, reverse: bool) -> Self {
+        Self {
+            cursor,
+            started: false,
+            reverse,
+        }
+    }
+
+    /// Give the cursor back, positioned wherever iteration stopped.
+    pub fn into_cursor(self) -> C {
+        self.cursor
+    }
+}
+
+/// A cursor already positioned by `seek` is left where it is on the first
+/// step, so seeking and then iterating resumes from the seek instead of
+/// restarting at the end of the range.
+macro_rules! impl_entries {
+    ($cursor:ty $(, $lt:lifetime)?) => {
+        impl$(<$lt>)? Iterator for Entries<$cursor> {
+            type Item = (Vec<u8>, DbSlice);
+
+            fn next(&mut self) -> Option<Self::Item> {
+                if self.started {
+                    if self.reverse {
+                        self.cursor.prev();
+                    } else {
+                        self.cursor.next();
+                    }
+                } else {
+                    self.started = true;
+                    if !self.cursor.valid() {
+                        if self.reverse {
+                            self.cursor.seek_to_last();
+                        } else {
+                            self.cursor.seek_to_first();
+                        }
+                    }
+                }
+                if !self.cursor.valid() {
+                    return None;
+                }
+                let key = self.cursor.key()?.to_vec();
+                let value = self.cursor.value_slice()?;
+                Some((key, value))
+            }
+        }
+
+        impl$(<$lt>)? IntoIterator for $cursor {
+            type Item = (Vec<u8>, DbSlice);
+            type IntoIter = Entries<$cursor>;
+
+            fn into_iter(self) -> Self::IntoIter {
+                Entries::new(self, false)
+            }
+        }
+    };
+}
+
+impl_entries!(OwnedSnapshotIter);
+impl_entries!(CfIter<'a>, 'a);
+
+impl OwnedSnapshotIter {
+    /// Iterate forward from the cursor's current position.
+    pub fn entries(self) -> Entries<Self> {
+        Entries::new(self, false)
+    }
+
+    /// Iterate backward from the cursor's current position.
+    pub fn entries_rev(self) -> Entries<Self> {
+        Entries::new(self, true)
+    }
+}
+
+impl<'a> CfIter<'a> {
+    /// Iterate forward from the cursor's current position.
+    pub fn entries(self) -> Entries<CfIter<'a>> {
+        Entries::new(self, false)
+    }
+
+    /// Iterate backward from the cursor's current position.
+    pub fn entries_rev(self) -> Entries<CfIter<'a>> {
+        Entries::new(self, true)
+    }
+}
+
 /// A point-in-time snapshot for consistent reads.
 pub struct Snapshot {
     engine: Arc<RegolithEngine>,
@@ -2169,6 +2380,31 @@ impl Snapshot {
                 .with_stats(self.engine.statistics_arc()),
             DEFAULT_CF_ID,
         )
+    }
+
+    /// Scan a key range lazily against this snapshot.
+    ///
+    /// The streaming counterpart to [`Snapshot::scan`]. The whole walk
+    /// sees one point in time, because the snapshot stays pinned for as
+    /// long as the stream lives.
+    pub fn scan_stream(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> ScanStream {
+        self.clone_pin().into_scan_stream(start, end)
+    }
+
+    /// [`Snapshot::scan_stream`], consuming the snapshot instead of
+    /// pinning a second handle on it.
+    pub fn into_scan_stream(self, start: Option<&[u8]>, end: Option<&[u8]>) -> ScanStream {
+        let end = end.map(<[u8]>::to_vec);
+        let mut cursor = self.into_owned_iter();
+        match start {
+            Some(start) => cursor.seek(start),
+            None => cursor.seek_to_first(),
+        }
+        ScanStream {
+            entries: Entries::new(cursor, false),
+            end,
+            done: false,
+        }
     }
 
     /// Create an owned streaming iterator at this snapshot's sequence
@@ -2363,6 +2599,20 @@ pub(crate) enum WriteBatchOp {
     Merge { key: Vec<u8>, operand: Vec<u8> },
 }
 
+impl WriteBatchOp {
+    /// Heap bytes this op holds. Drives the streaming writer's flush
+    /// budget, so it counts what is buffered now, not what the op will
+    /// encode to later.
+    pub(crate) fn buffered_bytes(&self) -> usize {
+        match self {
+            Self::Put { key, value } => key.len() + value.len(),
+            Self::Delete { key } => key.len(),
+            Self::DeleteRange { start, end } => start.len() + end.len(),
+            Self::Merge { key, operand } => key.len() + operand.len(),
+        }
+    }
+}
+
 /// A batch of write operations to apply atomically.
 #[derive(Debug, Default)]
 pub struct WriteBatch {
@@ -2377,10 +2627,26 @@ impl WriteBatch {
 
     /// Add a put operation to the batch (default column family).
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
+        self.put_owned(key, value.to_vec());
+    }
+
+    /// [`WriteBatch::put`] for a value the caller already owns.
+    ///
+    /// Takes the buffer instead of copying it, which is what a producer
+    /// that just built the bytes wants. The key is still copied because
+    /// it is rewritten with a column-family prefix, so there is nothing
+    /// to hand over.
+    pub fn put_owned(&mut self, key: &[u8], value: Vec<u8>) {
         self.ops.push(WriteBatchOp::Put {
             key: prefix_key(DEFAULT_CF_ID, key),
-            value: value.to_vec(),
+            value,
         });
+    }
+
+    /// Bytes this batch is holding: the key and value of every buffered
+    /// operation. What a caller bounds when it decides to flush.
+    pub fn buffered_bytes(&self) -> usize {
+        self.ops.iter().map(WriteBatchOp::buffered_bytes).sum()
     }
 
     /// Add a delete operation to the batch (default column family).
