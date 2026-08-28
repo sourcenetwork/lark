@@ -79,12 +79,12 @@
 //!   commit then iterate, or use point lookups).
 
 use crate::portability::{AtomicBool, AtomicU64, Ordering};
-use kovan_map::HopscotchMap as ConcurrentMap;
 use kovan_queue::seg_queue::SegQueue;
+
+use crate::txn_buffer::TxnBuffer;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::sync::{Condvar, Mutex};
@@ -243,6 +243,7 @@ impl OptimisticTransactionDb {
             None,
             DEFAULT_LOCK_TIMEOUT,
             isolation,
+            self.inner.transaction_keys_inline(),
         )
     }
 
@@ -342,6 +343,7 @@ impl TransactionDb {
             Some(Arc::clone(&self.lock_manager)),
             self.lock_timeout,
             isolation,
+            self.inner.transaction_keys_inline(),
         )
     }
 
@@ -440,7 +442,7 @@ pub struct Transaction<'db> {
     /// delete. Concurrent so that buffering a write takes `&self`;
     /// drained into a `BTreeMap` at commit, which is where the order
     /// the engine applies them in is restored.
-    writes: OnceLock<ConcurrentMap<Vec<u8>, Option<Vec<u8>>>>,
+    writes: TxnBuffer<Vec<u8>, Option<Vec<u8>>>,
     /// Range deletes buffered for commit. Not tracked in the
     /// optimistic conflict set (initial impl limitation).
     range_deletes: SegQueue<(Vec<u8>, Vec<u8>)>,
@@ -450,7 +452,7 @@ pub struct Transaction<'db> {
     /// Sorted at commit so a multi-key conflict always reports the
     /// same key. Never rewound: a savepoint rollback undoes buffered
     /// writes, not reads that already happened.
-    tracked: OnceLock<ConcurrentMap<Vec<u8>, Arc<KeyState>>>,
+    tracked: TxnBuffer<Vec<u8>, Arc<KeyState>>,
     /// Savepoint stack. Each entry captures the full write buffer
     /// and a count of locks held at that point.
     savepoints: Vec<Savepoint>,
@@ -459,9 +461,12 @@ pub struct Transaction<'db> {
     /// locking operation, and release order does not matter.
     /// Released by `Drop` if not already released by `commit` or
     /// `rollback`.
-    held_locks: OnceLock<ConcurrentMap<Vec<u8>, ()>>,
+    held_locks: TxnBuffer<Vec<u8>, ()>,
     lock_manager: Option<Arc<LockManager>>,
     lock_timeout: Duration,
+    /// See [`crate::Options::transaction_keys_inline`]. Kept so a
+    /// savepoint rollback rebuilds the buffer the same way.
+    keys_inline: usize,
     resolved: bool,
     resources_released: bool,
     _phantom: std::marker::PhantomData<&'db ()>,
@@ -521,6 +526,7 @@ impl<'db> Transaction<'db> {
         lock_manager: Option<Arc<LockManager>>,
         lock_timeout: Duration,
         isolation: IsolationLevel,
+        keys_inline: usize,
     ) -> Self {
         Self {
             engine,
@@ -528,47 +534,19 @@ impl<'db> Transaction<'db> {
             durability,
             mode,
             isolation,
-            writes: OnceLock::new(),
+            writes: TxnBuffer::new(keys_inline),
             range_deletes: SegQueue::new(),
             merges: SegQueue::new(),
-            tracked: OnceLock::new(),
+            tracked: TxnBuffer::new(keys_inline),
             savepoints: Vec::new(),
-            held_locks: OnceLock::new(),
+            held_locks: TxnBuffer::new(keys_inline),
             lock_manager,
             lock_timeout,
+            keys_inline,
             resolved: false,
             resources_released: false,
             _phantom: std::marker::PhantomData,
         }
-    }
-
-    /// The write buffer, allocated on first write.
-    ///
-    /// A concurrent map costs a table of buckets the moment it exists,
-    /// which a transaction that never writes should not pay and which at
-    /// this call rate dominates everything else. `_peek` is the read side:
-    /// it reports what is there without bringing a table into being.
-    fn writes(&self) -> &ConcurrentMap<Vec<u8>, Option<Vec<u8>>> {
-        self.writes.get_or_init(ConcurrentMap::new)
-    }
-
-    fn writes_peek(&self) -> Option<&ConcurrentMap<Vec<u8>, Option<Vec<u8>>>> {
-        self.writes.get()
-    }
-
-    /// The read set, allocated on first read.
-    fn tracked(&self) -> &ConcurrentMap<Vec<u8>, Arc<KeyState>> {
-        self.tracked.get_or_init(ConcurrentMap::new)
-    }
-
-    fn tracked_peek(&self) -> Option<&ConcurrentMap<Vec<u8>, Arc<KeyState>>> {
-        self.tracked.get()
-    }
-
-    /// The held-lock set, allocated on the first pessimistic lock. An
-    /// optimistic transaction takes no locks and never allocates it.
-    fn held_locks(&self) -> &ConcurrentMap<Vec<u8>, ()> {
-        self.held_locks.get_or_init(ConcurrentMap::new)
     }
 
     /// Read `key` from the default column family. Returns the
@@ -587,7 +565,7 @@ impl<'db> Transaction<'db> {
     /// in conflict detection on its own.
     pub fn get(&self, key: &[u8]) -> TxResult<Option<Vec<u8>>> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
-        if let Some(buffered) = self.writes_peek().and_then(|w| w.get(&prefixed)) {
+        if let Some(buffered) = self.writes.get(&prefixed) {
             return Ok(buffered);
         }
         let read_seq = self.observe(&prefixed, self.snapshot_seq, false);
@@ -603,7 +581,7 @@ impl<'db> Transaction<'db> {
     /// materialized on the way out.
     pub fn get_slice(&self, key: &[u8]) -> TxResult<Option<DbSlice>> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
-        if let Some(buffered) = self.writes_peek().and_then(|w| w.get(&prefixed)) {
+        if let Some(buffered) = self.writes.get(&prefixed) {
             return Ok(buffered.map(DbSlice::from));
         }
         let read_seq = self.observe(&prefixed, self.snapshot_seq, false);
@@ -625,9 +603,9 @@ impl<'db> Transaction<'db> {
         let hi = end.map(|e| prefix_key(DEFAULT_CF_ID, e));
 
         let mut buffered: Vec<(Vec<u8>, Option<Vec<u8>>)> = self
-            .writes_peek()
+            .writes
+            .snapshot()
             .into_iter()
-            .flat_map(ConcurrentMap::iter)
             .filter(|(key, _)| {
                 lo.as_ref().is_none_or(|lo| key >= lo) && hi.as_ref().is_none_or(|hi| key < hi)
             })
@@ -666,7 +644,7 @@ impl<'db> Transaction<'db> {
         let already_held = self.lock_key(&prefixed)?;
         let horizon = self.read_horizon(&prefixed, already_held);
         let read_seq = self.observe(&prefixed, horizon, true);
-        if let Some(buffered) = self.writes_peek().and_then(|w| w.get(&prefixed)) {
+        if let Some(buffered) = self.writes.get(&prefixed) {
             return Ok(buffered);
         }
         self.engine
@@ -679,7 +657,7 @@ impl<'db> Transaction<'db> {
     pub fn put(&self, key: &[u8], value: &[u8]) -> TxResult<()> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         self.lock_key(&prefixed)?;
-        self.writes().insert(prefixed, Some(value.to_vec()));
+        self.writes.insert(prefixed, Some(value.to_vec()));
         Ok(())
     }
 
@@ -688,7 +666,7 @@ impl<'db> Transaction<'db> {
     pub fn delete(&self, key: &[u8]) -> TxResult<()> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         self.lock_key(&prefixed)?;
-        self.writes().insert(prefixed, None);
+        self.writes.insert(prefixed, None);
         Ok(())
     }
 
@@ -735,13 +713,10 @@ impl<'db> Transaction<'db> {
         // state, so taking one is an exclusive operation even though
         // buffering is not.
         self.savepoints.push(Savepoint {
-            writes: self
-                .writes_peek()
-                .map(|w| w.iter().collect())
-                .unwrap_or_default(),
+            writes: self.writes.snapshot().into_iter().collect(),
             range_deletes: drain(&self.range_deletes),
             merges: drain(&self.merges),
-            held_lock_count: self.held_locks.get().map_or(0, ConcurrentMap::len),
+            held_lock_count: self.held_locks.len(),
         });
         // `drain` emptied them, so put back what the savepoint captured.
         if let Some(sp) = self.savepoints.last() {
@@ -765,12 +740,9 @@ impl<'db> Transaction<'db> {
     /// that landed around the lock manager in the meantime.
     pub fn rollback_to_savepoint(&mut self) -> TxResult<()> {
         let sp = self.savepoints.pop().ok_or(TransactionError::NoSavepoint)?;
-        self.writes = OnceLock::new();
-        if !sp.writes.is_empty() {
-            let writes = self.writes();
-            for (key, value) in sp.writes {
-                writes.insert(key, value);
-            }
+        self.writes = TxnBuffer::new(self.keys_inline);
+        for (key, value) in sp.writes {
+            self.writes.insert(key, value);
         }
         self.range_deletes = SegQueue::new();
         for entry in sp.range_deletes {
@@ -820,17 +792,28 @@ impl<'db> Transaction<'db> {
         // `&mut self` here means buffering is over, so draining the
         // concurrent buffers cannot race. Every buffer is moved out
         // rather than copied: the transaction is being consumed, so
-        // nothing needs the maps' own copies afterwards, and
-        // `into_iter` hands over the stored keys and values instead of
-        // cloning each one. Collecting into a `BTreeMap` is what
-        // restores the key order the engine applies them in.
-        let writes: BTreeMap<Vec<u8>, Option<Vec<u8>>> = std::mem::take(&mut self.writes)
-            .into_inner()
-            .map(|w| w.into_iter().collect())
-            .unwrap_or_default();
+        // nothing needs the buffers' own copies afterwards, and draining
+        // hands over the stored keys and values instead of cloning each
+        // one.
+        //
+        // A buffer yields the newest write of a key first, with the ones
+        // it replaced behind it, so the first value seen for a key is the
+        // one that commits. Collecting into a `BTreeMap` with `or_insert`
+        // keeps that value and restores the key order the engine applies
+        // them in.
+        let mut writes: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+        for (key, value) in self.writes.drain() {
+            writes.entry(key).or_insert(value);
+        }
         let range_deletes = drain(&self.range_deletes);
         let merges = drain(&self.merges);
-        let tracked = std::mem::take(&mut self.tracked).into_inner();
+        let mut seen = std::collections::HashSet::new();
+        let tracked: Vec<(Vec<u8>, Arc<KeyState>)> = self
+            .tracked
+            .drain()
+            .into_iter()
+            .filter(|(key, _)| seen.insert(key.clone()))
+            .collect();
         let conflict_keys = self.validation_set(tracked, &writes, &merges);
 
         let outcome = self
@@ -884,7 +867,7 @@ impl<'db> Transaction<'db> {
     ///   no anti-dependency edge can form unseen.
     fn validation_set(
         &self,
-        tracked: Option<ConcurrentMap<Vec<u8>, Arc<KeyState>>>,
+        tracked: Vec<(Vec<u8>, Arc<KeyState>)>,
         writes: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         merges: &[(Vec<u8>, Vec<u8>)],
     ) -> Vec<(Vec<u8>, u64)> {
@@ -895,7 +878,7 @@ impl<'db> Transaction<'db> {
         // has to come out sorted so a multi-key conflict names the same
         // key on every run.
         let mut checks: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
-        for (key, state) in tracked.into_iter().flatten() {
+        for (key, state) in tracked {
             let written =
                 writes.contains_key(&key) || merges.iter().any(|(merged, _)| *merged == key);
             let validate = if serializable {
@@ -944,7 +927,7 @@ impl<'db> Transaction<'db> {
         match self.mode {
             TxMode::Optimistic => self.snapshot_seq,
             TxMode::Pessimistic { .. } => {
-                if already_held && let Some(state) = self.tracked_peek().and_then(|t| t.get(key)) {
+                if already_held && let Some(state) = self.tracked.get(key) {
                     return state.read_seq.load(Ordering::Acquire);
                 }
                 self.engine.snapshot_seq()
@@ -962,7 +945,7 @@ impl<'db> Transaction<'db> {
     /// return an older value than an earlier one.
     fn observe(&self, key: &[u8], horizon: u64, for_update: bool) -> u64 {
         let state = self
-            .tracked()
+            .tracked
             .get_or_insert(key.to_vec(), Arc::new(KeyState::new(horizon, for_update)));
         // `get_or_insert` is linearizable, so exactly one caller's cell
         // wins and every other caller folds its observation into that
@@ -993,12 +976,12 @@ impl<'db> Transaction<'db> {
         let Some(lm) = self.lock_manager.as_ref() else {
             return Ok(false);
         };
-        if self.held_locks.get().is_some_and(|l| l.get(key).is_some()) {
+        if self.held_locks.get(key).is_some() {
             return Ok(true);
         }
         lm.acquire(key, tx_id, self.lock_timeout)
             .map_err(|_| TransactionError::Busy(strip_cf_prefix(key.to_vec())))?;
-        self.held_locks().insert(key.to_vec(), ());
+        self.held_locks.insert(key.to_vec(), ());
         Ok(false)
     }
 
@@ -1010,11 +993,7 @@ impl<'db> Transaction<'db> {
         if let Some(lm) = self.lock_manager.as_ref()
             && let TxMode::Pessimistic { tx_id } = self.mode
         {
-            for (key, ()) in std::mem::take(&mut self.held_locks)
-                .into_inner()
-                .into_iter()
-                .flatten()
-            {
+            for (key, ()) in self.held_locks.drain() {
                 lm.release(&key, tx_id);
             }
         }

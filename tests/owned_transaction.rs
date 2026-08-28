@@ -262,3 +262,202 @@ fn concurrent_reads_through_a_shared_transaction_are_all_validated() {
         "a read recorded from another thread must still be validated, got {outcome:?}"
     );
 }
+
+/// The transaction's buffer switches lookup strategy once it grows past a
+/// threshold. Cross it in both directions and check nothing is lost,
+/// reordered, or stale.
+#[test]
+fn a_transaction_keeps_every_key_across_the_buffer_spill_threshold() {
+    // Comfortably past the internal SPILL_AT so the promotion runs.
+    const KEYS: usize = 200;
+
+    let dir = TempDir::new().expect("tempdir");
+    let db = optimistic(&dir);
+    let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+
+    for i in 0..KEYS {
+        txn.put(format!("k/{i:04}").as_bytes(), format!("v{i}").as_bytes())
+            .expect("put");
+    }
+    // Every key must read back through the buffer, including the ones
+    // written before the promotion and the ones written after.
+    for i in 0..KEYS {
+        assert_eq!(
+            txn.get(format!("k/{i:04}").as_bytes())
+                .expect("get")
+                .as_deref(),
+            Some(format!("v{i}").as_bytes()),
+            "key {i} was lost across the spill threshold"
+        );
+    }
+
+    txn.commit().expect("commit");
+    for i in 0..KEYS {
+        assert_eq!(
+            db.db()
+                .get(format!("k/{i:04}").as_bytes())
+                .expect("get")
+                .as_deref(),
+            Some(format!("v{i}").as_bytes()),
+            "key {i} did not survive the commit"
+        );
+    }
+}
+
+/// Overwriting a key has to win no matter which side of the threshold the
+/// original and the replacement landed on.
+#[test]
+fn a_later_write_wins_across_the_buffer_spill_threshold() {
+    const KEYS: usize = 200;
+
+    let dir = TempDir::new().expect("tempdir");
+    let db = optimistic(&dir);
+    let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+
+    for i in 0..KEYS {
+        txn.put(format!("k/{i:04}").as_bytes(), b"first")
+            .expect("put");
+    }
+    for i in 0..KEYS {
+        txn.put(format!("k/{i:04}").as_bytes(), b"second")
+            .expect("put");
+    }
+    for i in 0..KEYS {
+        assert_eq!(
+            txn.get(format!("k/{i:04}").as_bytes())
+                .expect("get")
+                .as_deref(),
+            Some(&b"second"[..]),
+            "key {i} kept a stale value"
+        );
+    }
+
+    txn.commit().expect("commit");
+    for i in 0..KEYS {
+        assert_eq!(
+            db.db()
+                .get(format!("k/{i:04}").as_bytes())
+                .expect("get")
+                .as_deref(),
+            Some(&b"second"[..]),
+            "key {i} committed the value it replaced"
+        );
+    }
+}
+
+/// A delete after the buffer has spilled must still hide the key.
+#[test]
+fn a_delete_after_the_spill_threshold_still_applies() {
+    const KEYS: usize = 100;
+
+    let dir = TempDir::new().expect("tempdir");
+    let db = optimistic(&dir);
+    for i in 0..KEYS {
+        db.db()
+            .put(format!("k/{i:04}").as_bytes(), b"committed")
+            .expect("seed");
+    }
+
+    let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+    for i in 0..KEYS {
+        txn.delete(format!("k/{i:04}").as_bytes()).expect("delete");
+    }
+    txn.commit().expect("commit");
+
+    for i in 0..KEYS {
+        assert_eq!(
+            db.db().get(format!("k/{i:04}").as_bytes()).expect("get"),
+            None,
+            "key {i} survived a delete made past the spill threshold"
+        );
+    }
+}
+
+/// Concurrent writers pushing one shared transaction past the threshold
+/// is where a promotion race would show up as a lost key.
+#[test]
+fn concurrent_writers_cross_the_spill_threshold_without_losing_a_key() {
+    const THREADS: usize = 8;
+    const PER_THREAD: usize = 100;
+
+    let dir = TempDir::new().expect("tempdir");
+    let db = optimistic(&dir);
+    let txn = Arc::new(db.begin_transaction_owned(IsolationLevel::Serializable));
+
+    std::thread::scope(|scope| {
+        for thread in 0..THREADS {
+            let txn = Arc::clone(&txn);
+            scope.spawn(move || {
+                for i in 0..PER_THREAD {
+                    let key = format!("k/{thread}/{i:04}");
+                    txn.put(key.as_bytes(), key.as_bytes()).expect("put");
+                }
+            });
+        }
+    });
+
+    Arc::into_inner(txn)
+        .expect("sole owner after the scope joined")
+        .commit()
+        .expect("commit");
+
+    for thread in 0..THREADS {
+        for i in 0..PER_THREAD {
+            let key = format!("k/{thread}/{i:04}");
+            assert_eq!(
+                db.db().get(key.as_bytes()).expect("get").as_deref(),
+                Some(key.as_bytes()),
+                "{key} was lost while the buffer was promoting"
+            );
+        }
+    }
+}
+
+/// The threshold is a knob, so a database opened with a different one has
+/// to behave the same way and only differ in when it indexes.
+#[test]
+fn the_buffer_threshold_is_configurable_and_correct_at_every_setting() {
+    const KEYS: usize = 80;
+
+    for keys_inline in [0, 1, 8, 32, 1024] {
+        let dir = TempDir::new().expect("tempdir");
+        let opts = Options {
+            transaction_keys_inline: keys_inline,
+            ..Options::default()
+        };
+        let db = Arc::new(OptimisticTransactionDb::open(dir.path(), opts).expect("open"));
+        let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+
+        for i in 0..KEYS {
+            txn.put(format!("k/{i:04}").as_bytes(), b"first")
+                .expect("put");
+        }
+        for i in (0..KEYS).step_by(2) {
+            txn.put(format!("k/{i:04}").as_bytes(), b"second")
+                .expect("put");
+        }
+        for i in 0..KEYS {
+            let expected: &[u8] = if i % 2 == 0 { b"second" } else { b"first" };
+            assert_eq!(
+                txn.get(format!("k/{i:04}").as_bytes())
+                    .expect("get")
+                    .as_deref(),
+                Some(expected),
+                "key {i} read wrong at transaction_keys_inline={keys_inline}"
+            );
+        }
+        txn.commit().expect("commit");
+
+        for i in 0..KEYS {
+            let expected: &[u8] = if i % 2 == 0 { b"second" } else { b"first" };
+            assert_eq!(
+                db.db()
+                    .get(format!("k/{i:04}").as_bytes())
+                    .expect("get")
+                    .as_deref(),
+                Some(expected),
+                "key {i} committed wrong at transaction_keys_inline={keys_inline}"
+            );
+        }
+    }
+}

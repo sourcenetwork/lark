@@ -74,6 +74,7 @@ mod sync;
 mod tailing;
 mod transaction;
 mod ttl;
+mod txn_buffer;
 
 pub use backup::{BackupEngine, BackupId, BackupInfo};
 pub use checkpoint::Checkpoint;
@@ -91,9 +92,9 @@ pub use iter::Iter;
 pub use options::{
     ArenaProfile, CompactionDecision, CompactionFilter, CompactionStyle, CompressionType,
     DEFAULT_MAX_BACKGROUND_COMPACTIONS, DEFAULT_MAX_KEY_SIZE, DEFAULT_MAX_VALUE_SIZE,
-    DurabilityMode, FifoCompactionOptions, FixedLengthPrefix, MAX_BLOCK_CACHE_SHARD_BITS,
-    MAX_BLOOM_BITS_PER_KEY, MergeOperator, Options, PrefixExtractor, UniversalCompactionOptions,
-    WriteOptions,
+    DEFAULT_TRANSACTION_KEYS_INLINE, DurabilityMode, FifoCompactionOptions, FixedLengthPrefix,
+    MAX_BLOCK_CACHE_SHARD_BITS, MAX_BLOOM_BITS_PER_KEY, MergeOperator, Options, PrefixExtractor,
+    UniversalCompactionOptions, WriteOptions,
 };
 pub use perf_context::{PerfContext, PerfContextSnapshot, PerfLevel};
 pub use rate_limiter::{Priority, RateLimiter, TokenBucketRateLimiter};
@@ -309,6 +310,7 @@ struct OptionsSnapshot {
     read_only: bool,
     max_key_size: usize,
     max_value_size: usize,
+    transaction_keys_inline: usize,
 }
 
 /// Format a raw engine key for inclusion in a property string.
@@ -369,6 +371,7 @@ pub struct Db {
     read_only: bool,
     max_key_size: usize,
     max_value_size: usize,
+    transaction_keys_inline: usize,
 }
 
 impl std::fmt::Debug for Db {
@@ -398,6 +401,7 @@ impl Db {
         let read_only = opts.read_only;
         let max_key_size = opts.max_key_size;
         let max_value_size = opts.max_value_size;
+        let transaction_keys_inline = opts.transaction_keys_inline;
         let durability = match opts.durability {
             DurabilityMode::Immediate => engine::DurabilityMode::Immediate,
             DurabilityMode::Eventual => engine::DurabilityMode::Eventual,
@@ -416,6 +420,7 @@ impl Db {
             read_only,
             max_key_size,
             max_value_size,
+            transaction_keys_inline,
         };
         db.load_cf_registry()?;
         Ok(db)
@@ -737,6 +742,12 @@ impl Db {
             )
             .map(|_| ())
             .map_err(Error::from)
+    }
+
+    /// Keys a transaction buffers before indexing them. See
+    /// [`Options::transaction_keys_inline`].
+    pub(crate) fn transaction_keys_inline(&self) -> usize {
+        self.transaction_keys_inline
     }
 
     /// Open a write stream that bounds its own memory.
@@ -1359,6 +1370,7 @@ impl Db {
             read_only: self.read_only,
             max_key_size: self.max_key_size,
             max_value_size: self.max_value_size,
+            transaction_keys_inline: self.transaction_keys_inline,
         }
     }
 
