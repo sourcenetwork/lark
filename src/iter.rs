@@ -55,6 +55,13 @@ pub struct Iter<'a> {
     /// ticker increments and timing histograms through this
     /// handle, guarded by a single `Option` branch.
     stats: Option<Arc<Statistics>>,
+    /// Whether any positioning call has been made on this cursor.
+    ///
+    /// Distinct from [`Iter::valid`], which is also false for a cursor
+    /// that was positioned and then walked off the end of the range.
+    /// Something that wants to know "did the caller place this cursor"
+    /// has to ask this, because validity cannot tell the two apart.
+    positioned: bool,
     // Ties the iterator's lifetime to its parent `Db` / `Snapshot` so the
     // borrow checker prevents the iterator from outliving the engine it
     // was built from.
@@ -66,6 +73,7 @@ impl<'a> Iter<'a> {
         Self {
             inner,
             stats: None,
+            positioned: false,
             _marker: PhantomData,
         }
     }
@@ -92,6 +100,7 @@ impl<'a> Iter<'a> {
     /// calls advance alphabetically.
     pub fn seek(&mut self, target: &[u8]) {
         self.tick_seek();
+        self.positioned = true;
         let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterSeek);
         self.inner.seek(target);
     }
@@ -102,6 +111,7 @@ impl<'a> Iter<'a> {
     /// `seek_for_prev` flips direction and moves alphabetically forward.
     pub fn seek_for_prev(&mut self, target: &[u8]) {
         self.tick_seek();
+        self.positioned = true;
         let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterSeek);
         self.inner.seek_for_prev(target);
     }
@@ -120,6 +130,7 @@ impl<'a> Iter<'a> {
     /// [`PrefixExtractor`]: crate::PrefixExtractor
     pub fn seek_prefix(&mut self, prefix: &[u8]) {
         self.tick_seek();
+        self.positioned = true;
         let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterSeek);
         self.inner.seek_prefix(prefix);
     }
@@ -128,6 +139,7 @@ impl<'a> Iter<'a> {
     /// Sets the scan direction to forward.
     pub fn seek_to_first(&mut self) {
         self.tick_seek();
+        self.positioned = true;
         let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterSeek);
         self.inner.seek_to_first();
     }
@@ -136,6 +148,7 @@ impl<'a> Iter<'a> {
     /// Sets the scan direction to reverse.
     pub fn seek_to_last(&mut self) {
         self.tick_seek();
+        self.positioned = true;
         let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterSeek);
         self.inner.seek_to_last();
     }
@@ -145,6 +158,7 @@ impl<'a> Iter<'a> {
     /// by the column-family iterator, whose upper bound is exclusive.
     pub(crate) fn seek_to_last_before(&mut self, exclusive_upper: &[u8]) {
         self.tick_seek();
+        self.positioned = true;
         let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterSeek);
         self.inner.seek_to_last_before(exclusive_upper);
     }
@@ -172,6 +186,21 @@ impl<'a> Iter<'a> {
         if self.inner.valid() {
             self.tick_next();
         }
+    }
+
+    /// Whether the caller has positioned this cursor at all.
+    ///
+    /// A cursor that was seeked past the end of the range is not valid, but
+    /// it is positioned, and re-seeking it would undo what the caller asked
+    /// for. Anything that seeks on the caller's behalf has to check this
+    /// rather than [`Iter::valid`].
+    ///
+    /// Only the seek family sets it. Stepping with [`Iter::next`] or
+    /// [`Iter::prev`] cannot be what first positions a cursor, because on one
+    /// nobody placed the step is a no-op, so the flag stays off the per-entry
+    /// path where it would cost something.
+    pub fn positioned(&self) -> bool {
+        self.positioned
     }
 
     /// Whether the iterator currently points at a valid `(key, value)`
