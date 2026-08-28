@@ -90,7 +90,7 @@ use std::time::Duration;
 use crate::sync::{Condvar, Mutex};
 
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
-use crate::engine::{CommitOutcome, RegolithEngine};
+use crate::engine::{CommitOutcome, ConflictKey, RegolithEngine};
 use crate::{Db, DbSlice, Error, Options, Result};
 
 /// Default lock-acquisition timeout for [`TransactionDb`] when the
@@ -360,6 +360,19 @@ impl TransactionDb {
     }
 }
 
+/// Which way a scan walks its range.
+///
+/// The range is the same either way: `[start, end)`, with `start` inclusive
+/// and `end` exclusive. Only the order entries arrive in changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScanDirection {
+    /// Ascending, from `start` towards `end`.
+    #[default]
+    Forward,
+    /// Descending, from the highest key below `end` down to `start`.
+    Reverse,
+}
+
 /// How much a transaction is protected against concurrent commits.
 ///
 /// The level decides what the commit-time validation covers, so it
@@ -599,8 +612,28 @@ impl<'db> Transaction<'db> {
     /// is bounded by what this transaction has written rather than by
     /// what the database holds.
     pub fn scan_stream(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> TxnScanStream<'_> {
+        self.scan_stream_in(start, end, ScanDirection::Forward)
+    }
+
+    /// [`Transaction::scan_stream`], walking `direction`.
+    ///
+    /// The range is `[start, end)` either way; only the order the entries
+    /// arrive in changes. Reverse starts at the highest key below `end` and
+    /// walks down to `start` inclusive.
+    ///
+    /// Both sides of the merge reverse together: the snapshot cursor steps
+    /// with `prev`, and the transaction's own writes are sorted descending, so
+    /// a buffered put still replaces the snapshot entry it shadows and a
+    /// buffered delete still hides it.
+    pub fn scan_stream_in(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        direction: ScanDirection,
+    ) -> TxnScanStream<'_> {
         let lo = start.map(|s| prefix_key(DEFAULT_CF_ID, s));
         let hi = end.map(|e| prefix_key(DEFAULT_CF_ID, e));
+        let reverse = direction == ScanDirection::Reverse;
 
         let mut buffered: Vec<(Vec<u8>, Option<Vec<u8>>)> = self
             .writes
@@ -610,22 +643,42 @@ impl<'db> Transaction<'db> {
                 lo.as_ref().is_none_or(|lo| key >= lo) && hi.as_ref().is_none_or(|hi| key < hi)
             })
             .collect();
-        buffered.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        if reverse {
+            buffered.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        } else {
+            buffered.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        }
 
         let mut cursor = crate::CfIter::new(
             crate::Iter::from_internal(self.engine.new_iter_at(self.snapshot_seq)),
             DEFAULT_CF_ID,
         );
-        match &lo {
-            Some(lo) => cursor.seek(&lo[4..]),
-            None => cursor.seek_to_first(),
+        if reverse {
+            match &hi {
+                // `end` is exclusive, so a backward walk starts below it.
+                Some(hi) => {
+                    let end = &hi[4..];
+                    cursor.seek_for_prev(end);
+                    if cursor.valid() && cursor.key() == Some(end) {
+                        cursor.prev();
+                    }
+                }
+                None => cursor.seek_to_last(),
+            }
+        } else {
+            match &lo {
+                Some(lo) => cursor.seek(&lo[4..]),
+                None => cursor.seek_to_first(),
+            }
         }
 
         TxnScanStream {
             cursor,
             cursor_done: false,
             buffered: buffered.into_iter().peekable(),
+            start: lo.map(|lo| lo[4..].to_vec()),
             end: hi.map(|hi| hi[4..].to_vec()),
+            reverse,
         }
     }
 
@@ -870,14 +923,17 @@ impl<'db> Transaction<'db> {
         tracked: Vec<(Vec<u8>, Arc<KeyState>)>,
         writes: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         merges: &[(Vec<u8>, Vec<u8>)],
-    ) -> Vec<(Vec<u8>, u64)> {
+    ) -> Vec<ConflictKey> {
         let optimistic = matches!(self.mode, TxMode::Optimistic);
         let serializable = self.isolation == IsolationLevel::Serializable;
         let read_committed = self.isolation == IsolationLevel::ReadCommitted;
         // A `BTreeMap` rather than the tracked map's own order: the set
         // has to come out sorted so a multi-key conflict names the same
         // key on every run.
-        let mut checks: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+        // The flag records whether the transaction read the key, which the
+        // commit check needs to decide whether an idempotent write may be
+        // elided: a stale read must still abort.
+        let mut checks: BTreeMap<Vec<u8>, (u64, bool)> = BTreeMap::new();
         for (key, state) in tracked {
             let written =
                 writes.contains_key(&key) || merges.iter().any(|(merged, _)| *merged == key);
@@ -890,18 +946,43 @@ impl<'db> Transaction<'db> {
                 state.for_update.load(Ordering::Acquire) || written
             };
             if validate {
-                checks.insert(key, state.first_read_seq);
+                // Any read at all, whatever the level. This flag exists to
+                // stop an idempotent-write elision at commit, and the
+                // equivalence that elision rests on holds only for a write
+                // nobody derived from a read.
+                //
+                // A read-modify-write is the counterexample: two transactions
+                // read a counter at 5 and both write 6. The writes are
+                // byte-identical, so eliding the second lets both commit and
+                // the counter advances once, losing an increment. No serial
+                // order produces that: run second, the transaction reads 6 and
+                // writes 7. `first_read_seq` anchors the check at the read for
+                // exactly this reason, and honouring the anchor is what makes
+                // the abort correct.
+                checks.insert(key, (state.first_read_seq, true));
             }
         }
         if optimistic {
+            // `or_insert`, so a key already recorded above keeps its read flag.
             for key in writes.keys() {
-                checks.entry(key.clone()).or_insert(self.snapshot_seq);
+                checks
+                    .entry(key.clone())
+                    .or_insert((self.snapshot_seq, false));
             }
             for (key, _) in merges {
-                checks.entry(key.clone()).or_insert(self.snapshot_seq);
+                checks
+                    .entry(key.clone())
+                    .or_insert((self.snapshot_seq, false));
             }
         }
-        checks.into_iter().collect()
+        checks
+            .into_iter()
+            .map(|(key, (observed_seq, read))| ConflictKey {
+                key,
+                observed_seq,
+                read,
+            })
+            .collect()
     }
 
     /// Take `key`'s exclusive lock in pessimistic mode. Returns
@@ -1018,24 +1099,56 @@ pub struct TxnScanStream<'txn> {
     cursor: crate::CfIter<'txn>,
     cursor_done: bool,
     buffered: BufferedWrites,
-    /// Exclusive upper bound, user-visible form.
+    /// Inclusive lower bound, user-visible form. Where a reverse walk stops.
+    start: Option<Vec<u8>>,
+    /// Exclusive upper bound, user-visible form. Where a forward walk stops.
     end: Option<Vec<u8>>,
+    reverse: bool,
 }
 
 impl TxnScanStream<'_> {
     /// The next snapshot entry inside the range, or `None` past the end.
+    ///
+    /// Whichever way the walk runs, it stops at the bound it is running
+    /// towards: `end` is exclusive going forward, `start` inclusive going
+    /// back.
     fn peek_cursor(&mut self) -> Option<Vec<u8>> {
         if self.cursor_done || !self.cursor.valid() {
             return None;
         }
         let key = self.cursor.key()?.to_vec();
-        if let Some(end) = &self.end
-            && key.as_slice() >= end.as_slice()
-        {
+        let past_bound = if self.reverse {
+            self.start
+                .as_ref()
+                .is_some_and(|start| key.as_slice() < start.as_slice())
+        } else {
+            self.end
+                .as_ref()
+                .is_some_and(|end| key.as_slice() >= end.as_slice())
+        };
+        if past_bound {
             self.cursor_done = true;
             return None;
         }
         Some(key)
+    }
+
+    /// Step the snapshot cursor the way this scan runs.
+    fn step_cursor(&mut self) {
+        if self.reverse {
+            self.cursor.prev();
+        } else {
+            self.cursor.next();
+        }
+    }
+
+    /// Whether `first` comes before `second` in this scan's order.
+    fn precedes(&self, first: &[u8], second: &[u8]) -> std::cmp::Ordering {
+        if self.reverse {
+            second.cmp(first)
+        } else {
+            first.cmp(second)
+        }
     }
 }
 
@@ -1061,13 +1174,13 @@ impl Iterator for TxnScanStream<'_> {
                 // Only the database has it.
                 (Some(key), None) => {
                     let value = self.cursor.value_slice()?;
-                    self.cursor.next();
+                    self.step_cursor();
                     return Some((key, value));
                 }
-                (Some(ckey), Some(bkey)) => match ckey.cmp(&bkey) {
+                (Some(ckey), Some(bkey)) => match self.precedes(&ckey, &bkey) {
                     std::cmp::Ordering::Less => {
                         let value = self.cursor.value_slice()?;
-                        self.cursor.next();
+                        self.step_cursor();
                         return Some((ckey, value));
                     }
                     std::cmp::Ordering::Greater => {
@@ -1080,7 +1193,7 @@ impl Iterator for TxnScanStream<'_> {
                     // so its write wins and the snapshot entry is skipped
                     // whether that write was a put or a delete.
                     std::cmp::Ordering::Equal => {
-                        self.cursor.next();
+                        self.step_cursor();
                         let (key, value) = self.buffered.next()?;
                         if let Some(value) = value {
                             return Some((key[4..].to_vec(), DbSlice::from(value)));

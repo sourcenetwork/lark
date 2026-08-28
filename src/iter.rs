@@ -174,6 +174,21 @@ impl<'a> Iter<'a> {
         }
     }
 
+    /// Whether the caller has positioned this cursor at all.
+    ///
+    /// A cursor that was seeked past the end of the range is not valid, but
+    /// it is positioned, and re-seeking it would undo what the caller asked
+    /// for. Anything that seeks on the caller's behalf has to check this
+    /// rather than [`Iter::valid`].
+    ///
+    /// Only the seek family sets it. Stepping with [`Iter::next`] or
+    /// [`Iter::prev`] cannot be what first positions a cursor, because on one
+    /// nobody placed the step is a no-op, so the flag stays off the per-entry
+    /// path where it would cost something.
+    pub fn positioned(&self) -> bool {
+        self.inner.positioned()
+    }
+
     /// Whether the iterator currently points at a valid `(key, value)`
     /// pair. Becomes `false` once the end of the stream is reached or an
     /// error is encountered.

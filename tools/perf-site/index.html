@@ -22,8 +22,27 @@ main{padding-bottom:60px}
 label{font-size:12px;color:var(--mute);display:block;margin-bottom:3px}
 select{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:6px;
   padding:6px 9px;font-family:"JetBrains Mono",monospace;font-size:12px;min-width:210px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px;padding:0 26px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px;padding:0 26px;
+  align-items:start}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;
+  cursor:zoom-in;position:relative}
+.card:hover{border-color:#2a322a}
+/* A long table is the reason a column used to run off the screen. It scrolls
+   inside its own card instead, and the cap lifts when the card is zoomed. */
+.card .scroll{max-height:46vh;overflow:auto}
+.card::after{content:"expand";position:absolute;top:12px;right:14px;font-size:10px;
+  letter-spacing:.05em;text-transform:uppercase;color:var(--mute);opacity:0;transition:opacity .12s}
+.card:hover::after{opacity:.75}
+/* Zoomed: one card fills the viewport, with nothing else competing for it. */
+.card.zoomed{position:fixed;inset:18px;z-index:50;overflow:auto;cursor:zoom-out;
+  box-shadow:0 24px 80px rgba(0,0,0,.7)}
+.card.zoomed .scroll{max-height:none}
+.card.zoomed::after{content:"close  esc";opacity:.75}
+.zoom-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.74);z-index:40}
+/* A section that fails to draw says so in place of itself, because a blank
+   page reads as "nothing to report" rather than as a defect. */
+.card.broken{border-color:#3a2118}
+.card.broken .note{color:var(--red)}
 .card h3{margin:0 0 3px;font-size:14px;font-weight:600}
 .note{margin:0 0 12px;font-size:12px;color:var(--mute);line-height:1.4}
 .headline{font-size:26px;font-weight:700;letter-spacing:-.02em;margin:2px 0 10px}
@@ -56,8 +75,10 @@ svg{display:block;width:100%;height:auto}
     <div><label for="cur">This run</label><select id="cur"></select></div>
     <div><label for="base">Compared with</label><select id="base"></select></div>
     <div><label for="thresh">Highlight changes over</label>
-      <select id="thresh"><option value="1">1%</option><option value="3" selected>3%</option>
-      <option value="5">5%</option><option value="10">10%</option></select></div>
+      <select id="thresh"><option value="1">1%</option><option value="3">3%</option>
+      <option value="5">5%</option><option value="10">10%</option>
+      <option value="15" selected>15%</option><option value="20">20%</option>
+      <option value="25">25%</option><option value="30">30%</option></select></div>
   </div>
 </header>
 <main id="main"><div class="empty">Loading runs...</div></main>
@@ -81,6 +102,11 @@ function fmt(n,unit){
 // is a footprint to minimise, and both contain "mib". The regex is the
 // fallback for rows that predate the explicit flag.
 const LOWER_BETTER=/rss|size|\bmib\b|\bkib\b|bytes|latency|alloc/i;
+// A family the collector marked `absent` writes its parts as stub objects
+// rather than empty arrays, and `for...of` over one throws. A throw inside
+// `draw` used to leave the page on "Loading runs..." forever, which reads as
+// "no data yet" rather than as the defect it is.
+const arr=v=>Array.isArray(v)?v:[];
 function delta(cur,base,name,unit,lower){
   if(base===null||base===undefined||cur===null||cur===undefined||!base)return null;
   const pct=100*(cur-base)/Math.abs(base);
@@ -171,26 +197,31 @@ function scalars(doc){
 
   for(const nm of ["buffered_write","durable_write"]){
     const label=nm.replace("_"," ");
-    for(const r of w[nm]?.by_threads||[])
+    for(const r of arr(w[nm]?.by_threads))
       add(`${nm}.t${r.threads}`,`${label} at ${r.threads} threads`,r.ops_per_sec_median,"ops/s",false);
   }
 
   add("scan.stream","scan stream rate",w.scan?.stream_mib_per_s,"MiB/s",false);
 
-  for(const r of w.batch?.by_batch_size||[])
+  add("scan_stream.peak","streaming scan peak bytes",m.scan_stream?.stream_peak_bytes,"B",true);
+  add("scan_stream.peak_materialized","materializing scan peak bytes",m.scan_stream?.materialize_peak_bytes,"B",true);
+  add("scan_stream.peak_ratio","materialized over streamed peak",m.scan_stream?.peak_ratio,"x",true);
+  add("scan_stream.page_peak","first page peak bytes",m.scan_stream?.page_peak_bytes,"B",true);
+
+  for(const r of arr(w.batch?.by_batch_size))
     add(`batch.b${r.batch_ops}`,`batch of ${r.batch_ops}`,r.median,"ops/s",false);
   add("batch.bulk","bulk load",w.batch?.bulk_load?.median,"MiB/s",false);
 
-  for(const r of w.large_value?.sizes||[]){
+  for(const r of arr(w.large_value?.sizes)){
     add(`lv.put${r.value_mib}`,`large value put, ${r.value_mib} MiB`,r.put_mib_per_s,"MiB/s",false);
     add(`lv.get${r.value_mib}`,`large value get, ${r.value_mib} MiB`,r.get_mib_per_s,"MiB/s",false);
   }
 
   const rss=m.rss||{};
   add("rss.baseline","baseline RSS",rss.baseline_rss_kib,"KiB",true);
-  for(const r of rss.shard_sweep||[])
+  for(const r of arr(rss.shard_sweep))
     add(`rss.shard${r.shard_bits}`,`RSS at ${r.requested_shards} cache shards`,r.rss_kib,"KiB",true);
-  for(const r of rss.write_sweep||[])
+  for(const r of arr(rss.write_sweep))
     add(`rss.write${r.written_mib}`,`RSS after writing ${r.written_mib} MiB`,r.rss_kib,"KiB",true);
   add("rss.replay","RSS replaying the WAL",rss.wal_replay?.replay_rss_kib,"KiB",true);
   add("rss.replay_open","WAL replay open time",rss.wal_replay?.open_s,"s",true);
@@ -501,6 +532,26 @@ function allocsSection(cur,base,threshold){
     bars(budgets,"allocs/op",threshold), ca.trust)}</div>`;
 }
 
+function scanStreamSection(cur,base,threshold){
+  const c=cur?.metrics?.scan_stream||{}, b=base?.metrics?.scan_stream||{};
+  if(c.stream_peak_bytes===undefined)return "";
+  // Rate is not the story. The two APIs walk the same bytes at close to the
+  // same speed; what differs is how much a caller has to hold to do it, so
+  // the headline is the ratio between the two peaks.
+  return `<h2>Streaming scan</h2><div class="grid">`
+    +card("Peak live bytes",
+      `${fmt(c.keys)} keys of ${c.value_bytes} B. A materializing scan builds the whole `
+      +`${fmtBytes(c.scanned_bytes)} before the caller sees a row; a streaming scan hands them `
+      +`over as it walks. Lower is better.`,
+      `<div class="headline">${fmt(c.peak_ratio)}<small> x more held to materialize</small></div>`
+      +bars([{name:"streamed",cur:c.stream_peak_bytes,base:b.stream_peak_bytes,unit:"B",lower:true},
+             {name:"materialized",cur:c.materialize_peak_bytes,base:b.materialize_peak_bytes,unit:"B",lower:true},
+             {name:`first ${c.page} rows, streamed`,cur:c.page_peak_bytes,base:b.page_peak_bytes,unit:"B",lower:true}],
+            "",threshold),
+      c.trust)
+    +`</div>`;
+}
+
 function trendSection(all){
   // The reason the history is kept: one run answers "is this fast", the
   // series answers "when did this change".
@@ -634,19 +685,73 @@ async function boot(){
   $("#base").innerHTML=`<option value="">(none)</option>`+RUNS.map(opt).join("");
   if(RUNS.length>1)$("#base").value=RUNS[1].meta.file;
   for(const el of ["#cur","#base","#thresh"])$(el).addEventListener("change",draw);
+  zoomable();
   draw();
 }
+/// Draw one section, or a card saying why it could not be drawn.
+///
+/// One malformed family used to throw out of `draw` and leave the page on
+/// "Loading runs..." forever. A dashboard that silently shows nothing is worse
+/// than one that shows a broken panel, because only the second one is
+/// obviously wrong.
+function section(name,build){
+  try{ return build(); }
+  catch(e){
+    return `<h2>${esc(name)}</h2><div class="grid"><div class="card broken">`
+      +`<h3>${esc(name)} failed to draw</h3>`
+      +`<p class="note">${esc(String(e&&e.message||e))}</p>`
+      +`<p class="note">The run document is on file; this section could not read it. `
+      +`Every other section on this page still drew.</p></div></div>`;
+  }
+}
+
 function draw(){
   const cur=RUNS.find(r=>r.meta.file===$("#cur").value)?.doc;
   const base=RUNS.find(r=>r.meta.file===$("#base").value)?.doc||null;
   const th=parseFloat($("#thresh").value);
-  $("#main").innerHTML=overview(cur,base,th)+throughputSection(cur,base,th)
-    +isolationSection(cur,base,th)+correctnessSection(cur,base,th)+rssSection(cur,base,th)
-    +sizeSection(cur,base,th)+allocsSection(cur,base,th)+trendSection(RUNS);
+  $("#main").innerHTML=
+     section("Overview",()=>overview(cur,base,th))
+    +section("Throughput",()=>throughputSection(cur,base,th))
+    +section("Transaction isolation",()=>isolationSection(cur,base,th))
+    +section("Transaction correctness",()=>correctnessSection(cur,base,th))
+    +section("Resident memory",()=>rssSection(cur,base,th))
+    +section("Binary size",()=>sizeSection(cur,base,th))
+    +section("Allocations per operation",()=>allocsSection(cur,base,th))
+    +section("Streaming scan",()=>scanStreamSection(cur,base,th))
+    +section("Trend",()=>trendSection(RUNS));
   // Re-attached after every redraw: the picker lives inside the markup
   // that redraw replaces.
   const tm=$("#trendmetric");
   if(tm)tm.addEventListener("change",e=>{TREND_METRIC=e.target.value;draw();});
+}
+
+/// Click a panel to fill the viewport with it, escape or click again to
+/// return. Delegated from the document, so it survives every redraw, and it
+/// keeps its hands off the controls inside a card.
+function zoomable(){
+  const backdrop=document.createElement("div");
+  backdrop.className="zoom-backdrop";
+  backdrop.hidden=true;
+  document.body.appendChild(backdrop);
+  const close=()=>{
+    for(const el of document.querySelectorAll(".card.zoomed")) el.classList.remove("zoomed");
+    backdrop.hidden=true;
+  };
+  backdrop.addEventListener("click",close);
+  document.addEventListener("keydown",e=>{ if(e.key==="Escape") close(); });
+  document.addEventListener("click",e=>{
+    // A select, link or button inside a card is doing its own job.
+    if(e.target.closest("select,option,a,button,input")) return;
+    const card=e.target.closest(".card");
+    if(!card) return;
+    const wasZoomed=card.classList.contains("zoomed");
+    close();
+    if(!wasZoomed){
+      card.classList.add("zoomed");
+      backdrop.hidden=false;
+      card.scrollTop=0;
+    }
+  });
 }
 boot();
 </script>

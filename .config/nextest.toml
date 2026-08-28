@@ -43,11 +43,23 @@ final-status-level = "flaky"
 #
 # Everything else still runs here, including every corruption, recovery,
 # lifecycle and public-API test.
+#
+# THE STANDING RULE: a heavy test does not run on Windows. "Heavy" means a
+# soak, a hammer, a multi-second concurrency or corruption sweep, or anything
+# whose cost is dominated by durable operations rather than by the logic it
+# checks. Such a test belongs in a binary whose name starts with
+# `adversarial_`, `adv_`, `soak_` or `heavy_`, which this filter drops by
+# construction, so a new one is excluded without anyone remembering to edit
+# the list below. Name it otherwise and it must be listed explicitly.
+#
+# The reason is not that Windows matters less. It is that this leg exists for
+# the code only Windows runs, and a soak's subject is engine logic that is
+# identical everywhere and already covered twice.
 [profile.windows]
 inherits = "ci"
 default-filter = """
     not (
-        binary(/^(adversarial_|adv_)/)
+        binary(/^(adversarial_|adv_|soak_|heavy_)/)
         or binary(mvcc_invariants)
         or binary(read_view_hammer)
         or binary(read_view_chaos_workload)

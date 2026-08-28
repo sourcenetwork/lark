@@ -1131,6 +1131,39 @@ impl Options {
         }
     }
 
+    /// A database that lives only in memory. Nothing reaches a filesystem and
+    /// nothing outlives the handle.
+    ///
+    /// The reason to reach for this rather than assembling it by hand is one
+    /// non-obvious constraint: [`MemEnv`](crate::MemEnv) starts no threads, so
+    /// a background compaction worker cannot exist on it and asking for one
+    /// fails the open. Compaction runs on the calling thread instead. Building
+    /// the options by hand means discovering that from an open error that does
+    /// not mention the environment.
+    ///
+    /// Sized from [`Options::embedded`], because a process that opens a dozen
+    /// of these for tests should not reserve a server's write buffer for each.
+    /// Durability is [`DurabilityMode::Eventual`]: there is nothing to make
+    /// durable, so an fsync per commit would be pure cost.
+    ///
+    /// ```
+    /// use regolith::{Db, Options};
+    ///
+    /// let db = Db::open("in-memory", Options::memory())?;
+    /// db.put(b"k", b"v")?;
+    /// assert_eq!(db.get(b"k")?.as_deref(), Some(&b"v"[..]));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn memory() -> Self {
+        Self {
+            env: Arc::new(crate::env::MemEnv::new()),
+            // Not a tuning choice: the environment cannot spawn.
+            max_background_compactions: 0,
+            durability: DurabilityMode::Eventual,
+            ..Self::embedded()
+        }
+    }
+
     /// Validate option invariants before the database uses them.
     ///
     /// Public open paths call this automatically. Callers that build
@@ -1145,17 +1178,17 @@ impl Options {
         require_nonzero_u64("target_file_size", self.target_file_size)?;
         require_nonzero_usize("metadata_block_size", self.metadata_block_size)?;
 
-        // No wasm build can carry a compaction worker: `Env::spawn`
-        // reports `Unsupported` there and the worker's blocking wait
-        // has no wasm implementation to build against. Reject it here
-        // so the reason arrives with the option that caused it rather
-        // than as an io error from the middle of `open`.
-        #[cfg(target_family = "wasm")]
-        if self.max_background_compactions > 0 {
+        // A background compaction worker needs a thread, and not every
+        // environment has one: wasm cannot spawn, and neither can `MemEnv`.
+        // Reject it here so the reason arrives with the option that caused it,
+        // naming the environment, rather than as an io error from the middle
+        // of `open`.
+        if self.max_background_compactions > 0 && !self.env.capabilities().threads {
             return invalid_option(
                 "max_background_compactions",
-                "must be 0 on wasm, which has no threads; compaction then runs on the \
-                 calling thread. Options::wasm() sets this and the rest of the profile",
+                "must be 0 for an environment that cannot spawn threads, such as MemEnv \
+                 or wasm; compaction then runs on the calling thread. Options::memory() \
+                 and Options::wasm() set this along with the rest of their profile",
             );
         }
 

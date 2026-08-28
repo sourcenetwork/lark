@@ -92,6 +92,22 @@ fn grouped_batch_ops(
     ops
 }
 
+/// A key a commit must validate, and what the transaction did with it.
+///
+/// The distinction between a key the transaction read and one it only wrote
+/// is what makes idempotent-write elision safe: a stale read can have changed
+/// what the transaction decided, so it must still abort, while a blind write
+/// of the value already stored changes nothing at all.
+#[derive(Clone, Debug)]
+pub(crate) struct ConflictKey {
+    /// The prefixed key.
+    pub key: Vec<u8>,
+    /// The sequence the transaction observed it at.
+    pub observed_seq: u64,
+    /// The transaction read this key, rather than only writing it.
+    pub read: bool,
+}
+
 fn batch_op_wal_bytes(op: &WriteBatchOp) -> u64 {
     match op {
         WriteBatchOp::Put { key, value } => (key.len() + value.len() + 8) as u64,
@@ -2071,13 +2087,87 @@ impl RegolithEngine {
 
     pub(crate) fn commit_with_conflict_check(
         &self,
-        conflict_keys: &[(Vec<u8>, u64)],
+        conflict_keys: &[ConflictKey],
         point_ops: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
         merges: Vec<(Vec<u8>, Vec<u8>)>,
         durability: DurabilityMode,
     ) -> std::io::Result<CommitOutcome> {
         self.commit_optimistic(conflict_keys, point_ops, range_deletes, merges, durability)
+    }
+
+    /// Whether this commit's write for `key` would store exactly what `key`
+    /// already holds.
+    ///
+    /// Such a write is not a conflict. Take two transactions that both write
+    /// `K = v`, with the first committing: under the serial order "first, then
+    /// second" the second writes `K = v` and the final state is `K = v`, which
+    /// is what letting both commit produces. The schedule has a serial
+    /// equivalent, so refusing it rejects a correct history.
+    ///
+    /// The comparison is against the *committed* value, not against what the
+    /// transaction observed, and byte equality is the whole test: "the key
+    /// exists" is not enough. A delete is equal only to an absent key.
+    ///
+    /// Only ever called on a key that was about to abort the commit, so the
+    /// read it costs is paid on the failure path and never on a clean commit.
+    fn write_matches_committed(
+        &self,
+        key: &[u8],
+        ops: &[WriteBatchOp],
+        view: &ReadView,
+    ) -> std::io::Result<bool> {
+        // A merge operator resolves values by replaying operands, so what a
+        // point read returns is not what this key would hold afterwards.
+        if self.options.merge_operator.is_some() {
+            return Ok(false);
+        }
+
+        let mut intended: Option<Option<&[u8]>> = None;
+        for op in ops {
+            match op {
+                WriteBatchOp::Put { key: op_key, value } if op_key == key => {
+                    intended = Some(Some(value.as_slice()));
+                }
+                WriteBatchOp::Delete { key: op_key } if op_key == key => {
+                    intended = Some(None);
+                }
+                // A merge is not idempotent: two `+1` operands are not one
+                // `+1`, so a merge on this key always conflicts.
+                WriteBatchOp::Merge { key: op_key, .. } if op_key == key => return Ok(false),
+                // A range delete makes the key's final value a function of the
+                // range as well as the point op, which this comparison does
+                // not model.
+                WriteBatchOp::DeleteRange { start, end }
+                    if start.as_slice() <= key && key < end.as_slice() =>
+                {
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+
+        // No write for this key means it is here because the transaction read
+        // it, and a read that no longer holds has to abort.
+        let Some(intended) = intended else {
+            return Ok(false);
+        };
+
+        let snap = u64::MAX;
+        let lk = LookupKey::from_prefixed(key, snap);
+        let committed = self.lookup_in_view(key, snap, &lk, Materialize::Value, view)?;
+        let committed = match committed {
+            Some(PointValue::Value(slice)) => Some(slice),
+            Some(PointValue::Length(_)) => return Ok(false),
+            None => None,
+        };
+
+        Ok(match (intended, committed.as_deref()) {
+            (Some(intended), Some(committed)) => intended == committed,
+            // A delete of a key that is already absent stores the same thing.
+            (None, None) => true,
+            _ => false,
+        })
     }
 
     /// Return the sequence number of the newest write that touched

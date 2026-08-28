@@ -104,8 +104,8 @@ pub use statistics::{Histogram, HistogramSnapshot, Statistics, Ticker};
 pub use stream_writer::{StreamOptions, StreamingWriter};
 pub use tailing::TailingIter;
 pub use transaction::{
-    IsolationLevel, OptimisticTransactionDb, OwnedTransaction, Transaction, TransactionDb,
-    TransactionError, TxResult, TxnScanStream,
+    IsolationLevel, OptimisticTransactionDb, OwnedTransaction, ScanDirection, Transaction,
+    TransactionDb, TransactionError, TxResult, TxnScanStream,
 };
 pub use ttl::{DbWithTtl, TtlCompactionFilter, strip_timestamp};
 
@@ -1922,6 +1922,12 @@ impl<'a> CfIter<'a> {
         self.inner.prev();
     }
 
+    /// Whether the caller has positioned this cursor at all. See
+    /// [`Iter::positioned`].
+    pub fn positioned(&self) -> bool {
+        self.inner.positioned()
+    }
+
     /// Whether the cursor is positioned on a visible key within
     /// the CF.
     pub fn valid(&self) -> bool {
@@ -2023,6 +2029,12 @@ impl OwnedSnapshotIter {
     /// Move the cursor backward.
     pub fn prev(&mut self) {
         self.inner.prev();
+    }
+
+    /// Whether the caller has positioned this cursor at all. See
+    /// [`Iter::positioned`].
+    pub fn positioned(&self) -> bool {
+        self.inner.positioned()
     }
 
     /// Whether the cursor is positioned on a visible key.
@@ -2150,7 +2162,11 @@ macro_rules! impl_entries {
                     }
                 } else {
                     self.started = true;
-                    if !self.cursor.valid() {
+                    // `positioned`, not `valid`. A cursor the caller seeked
+                    // past the end of the range is invalid but positioned,
+                    // and seeking it again would hand back the very rows the
+                    // caller seeked away from.
+                    if !self.cursor.positioned() {
                         if self.reverse {
                             self.cursor.seek_to_last();
                         } else {

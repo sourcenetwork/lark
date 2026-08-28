@@ -10,7 +10,7 @@ resolver = "2"
 
 [package]
 name = "regolith"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors = [
     "Ivan Vercenco <ivan@source.network>",
@@ -150,6 +150,10 @@ harness = false
 
 [[bench]]
 name = "scan"
+harness = false
+
+[[bench]]
+name = "scan_stream"
 harness = false
 
 [[bench]]
