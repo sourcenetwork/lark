@@ -209,7 +209,7 @@ impl RegolithEngine {
     /// precisely the write-write conflict the check exists to catch.
     pub(crate) fn commit_optimistic(
         &self,
-        conflict_keys: &[(Vec<u8>, u64)],
+        conflict_keys: &[crate::engine::ConflictKey],
         point_ops: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
         merges: Vec<(Vec<u8>, Vec<u8>)>,
@@ -222,13 +222,20 @@ impl RegolithEngine {
         let mut pipe = self.pipeline.lock();
 
         let view = self.view.load();
-        for (key, observed_seq) in conflict_keys {
-            if let Some(latest_seq) = self.latest_version_seq_in_view(key, &view)?
-                && latest_seq > *observed_seq
+        for check in conflict_keys {
+            if let Some(latest_seq) = self.latest_version_seq_in_view(&check.key, &view)?
+                && latest_seq > check.observed_seq
             {
+                // A blind write of the value the key already holds is not a
+                // conflict: the schedule has a serial equivalent reaching the
+                // same state. A key the transaction *read* still aborts, since
+                // the stale read may have changed what it decided.
+                if !check.read && self.write_matches_committed(&check.key, &ops, &view)? {
+                    continue;
+                }
                 return Ok(CommitOutcome::Conflict {
-                    key: key.clone(),
-                    observed_seq: *observed_seq,
+                    key: check.key.clone(),
+                    observed_seq: check.observed_seq,
                     latest_seq,
                 });
             }

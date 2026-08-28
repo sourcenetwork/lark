@@ -90,7 +90,7 @@ use std::time::Duration;
 use crate::sync::{Condvar, Mutex};
 
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
-use crate::engine::{CommitOutcome, RegolithEngine};
+use crate::engine::{CommitOutcome, ConflictKey, RegolithEngine};
 use crate::{Db, DbSlice, Error, Options, Result};
 
 /// Default lock-acquisition timeout for [`TransactionDb`] when the
@@ -870,38 +870,61 @@ impl<'db> Transaction<'db> {
         tracked: Vec<(Vec<u8>, Arc<KeyState>)>,
         writes: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         merges: &[(Vec<u8>, Vec<u8>)],
-    ) -> Vec<(Vec<u8>, u64)> {
+    ) -> Vec<ConflictKey> {
         let optimistic = matches!(self.mode, TxMode::Optimistic);
         let serializable = self.isolation == IsolationLevel::Serializable;
         let read_committed = self.isolation == IsolationLevel::ReadCommitted;
         // A `BTreeMap` rather than the tracked map's own order: the set
         // has to come out sorted so a multi-key conflict names the same
         // key on every run.
-        let mut checks: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+        // The flag records whether the transaction read the key, which the
+        // commit check needs to decide whether an idempotent write may be
+        // elided: a stale read must still abort.
+        let mut checks: BTreeMap<Vec<u8>, (u64, bool)> = BTreeMap::new();
         for (key, state) in tracked {
             let written =
                 writes.contains_key(&key) || merges.iter().any(|(merged, _)| *merged == key);
+            let for_update = state.for_update.load(Ordering::Acquire);
             let validate = if serializable {
                 // Every read, whether or not the transaction wrote it.
                 true
             } else if read_committed {
                 written
             } else {
-                state.for_update.load(Ordering::Acquire) || written
+                for_update || written
             };
             if validate {
-                checks.insert(key, state.first_read_seq);
+                // The read is only *honoured* where the level says it is:
+                // everywhere under serializable, and through `get_for_update`
+                // otherwise. A plain read at a weaker level is already
+                // unprotected, so a key here for that reason alone is a blind
+                // write as far as an idempotent commit is concerned, and
+                // marking it read would refuse an elision the level permits.
+                let honoured_read = serializable || for_update;
+                checks.insert(key, (state.first_read_seq, honoured_read));
             }
         }
         if optimistic {
+            // `or_insert`, so a key already recorded above keeps its read flag.
             for key in writes.keys() {
-                checks.entry(key.clone()).or_insert(self.snapshot_seq);
+                checks
+                    .entry(key.clone())
+                    .or_insert((self.snapshot_seq, false));
             }
             for (key, _) in merges {
-                checks.entry(key.clone()).or_insert(self.snapshot_seq);
+                checks
+                    .entry(key.clone())
+                    .or_insert((self.snapshot_seq, false));
             }
         }
-        checks.into_iter().collect()
+        checks
+            .into_iter()
+            .map(|(key, (observed_seq, read))| ConflictKey {
+                key,
+                observed_seq,
+                read,
+            })
+            .collect()
     }
 
     /// Take `key`'s exclusive lock in pessimistic mode. Returns
