@@ -22,8 +22,27 @@ main{padding-bottom:60px}
 label{font-size:12px;color:var(--mute);display:block;margin-bottom:3px}
 select{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:6px;
   padding:6px 9px;font-family:"JetBrains Mono",monospace;font-size:12px;min-width:210px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px;padding:0 26px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px;padding:0 26px;
+  align-items:start}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;
+  cursor:zoom-in;position:relative}
+.card:hover{border-color:#2a322a}
+/* A long table is the reason a column used to run off the screen. It scrolls
+   inside its own card instead, and the cap lifts when the card is zoomed. */
+.card .scroll{max-height:46vh;overflow:auto}
+.card::after{content:"expand";position:absolute;top:12px;right:14px;font-size:10px;
+  letter-spacing:.05em;text-transform:uppercase;color:var(--mute);opacity:0;transition:opacity .12s}
+.card:hover::after{opacity:.75}
+/* Zoomed: one card fills the viewport, with nothing else competing for it. */
+.card.zoomed{position:fixed;inset:18px;z-index:50;overflow:auto;cursor:zoom-out;
+  box-shadow:0 24px 80px rgba(0,0,0,.7)}
+.card.zoomed .scroll{max-height:none}
+.card.zoomed::after{content:"close  esc";opacity:.75}
+.zoom-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.74);z-index:40}
+/* A section that fails to draw says so in place of itself, because a blank
+   page reads as "nothing to report" rather than as a defect. */
+.card.broken{border-color:#3a2118}
+.card.broken .note{color:var(--red)}
 .card h3{margin:0 0 3px;font-size:14px;font-weight:600}
 .note{margin:0 0 12px;font-size:12px;color:var(--mute);line-height:1.4}
 .headline{font-size:26px;font-weight:700;letter-spacing:-.02em;margin:2px 0 10px}
@@ -56,8 +75,10 @@ svg{display:block;width:100%;height:auto}
     <div><label for="cur">This run</label><select id="cur"></select></div>
     <div><label for="base">Compared with</label><select id="base"></select></div>
     <div><label for="thresh">Highlight changes over</label>
-      <select id="thresh"><option value="1">1%</option><option value="3" selected>3%</option>
-      <option value="5">5%</option><option value="10">10%</option></select></div>
+      <select id="thresh"><option value="1">1%</option><option value="3">3%</option>
+      <option value="5">5%</option><option value="10">10%</option>
+      <option value="15" selected>15%</option><option value="20">20%</option>
+      <option value="25">25%</option><option value="30">30%</option></select></div>
   </div>
 </header>
 <main id="main"><div class="empty">Loading runs...</div></main>
@@ -509,6 +530,26 @@ function allocsSection(cur,base,threshold){
     note, bars(rows,"allocs/op",threshold), ca.trust)}${card("budget",
     "The ceiling each path is gated against, for reference against the measured column.",
     bars(budgets,"allocs/op",threshold), ca.trust)}</div>`;
+}
+
+function scanStreamSection(cur,base,threshold){
+  const c=cur?.metrics?.scan_stream||{}, b=base?.metrics?.scan_stream||{};
+  if(c.stream_peak_bytes===undefined)return "";
+  // Rate is not the story. The two APIs walk the same bytes at close to the
+  // same speed; what differs is how much a caller has to hold to do it, so
+  // the headline is the ratio between the two peaks.
+  return `<h2>Streaming scan</h2><div class="grid">`
+    +card("Peak live bytes",
+      `${fmt(c.keys)} keys of ${c.value_bytes} B. A materializing scan builds the whole `
+      +`${fmtBytes(c.scanned_bytes)} before the caller sees a row; a streaming scan hands them `
+      +`over as it walks. Lower is better.`,
+      `<div class="headline">${fmt(c.peak_ratio)}<small> x more held to materialize</small></div>`
+      +bars([{name:"streamed",cur:c.stream_peak_bytes,base:b.stream_peak_bytes,unit:"B",lower:true},
+             {name:"materialized",cur:c.materialize_peak_bytes,base:b.materialize_peak_bytes,unit:"B",lower:true},
+             {name:`first ${c.page} rows, streamed`,cur:c.page_peak_bytes,base:b.page_peak_bytes,unit:"B",lower:true}],
+            "",threshold),
+      c.trust)
+    +`</div>`;
 }
 
 function trendSection(all){
