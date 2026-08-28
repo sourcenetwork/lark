@@ -279,3 +279,5 @@ regressed.
 ## License
 
 Dual-licensed under Apache-2.0 or MIT, at your option.
+
+<sub><sup>Here men from the [planet Earth](https://open.spotify.com/track/6qZthmNcaK0jlrkMZ3khmy) first set foot upon the Moon July 1969, A.D. We came in peace for all mankind.<sup><sub>
