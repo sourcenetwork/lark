@@ -727,13 +727,18 @@ impl<'db> Transaction<'db> {
 
     fn commit_inner(&mut self) -> TxResult<()> {
         // `&mut self` here means buffering is over, so draining the
-        // concurrent buffers cannot race. Collecting `writes` into a
-        // `BTreeMap` is what restores the key order the engine applies
-        // and reports conflicts in.
-        let writes: BTreeMap<Vec<u8>, Option<Vec<u8>>> = self.writes.iter().collect();
+        // concurrent buffers cannot race. Every buffer is moved out
+        // rather than copied: the transaction is being consumed, so
+        // nothing needs the maps' own copies afterwards, and
+        // `into_iter` hands over the stored keys and values instead of
+        // cloning each one. Collecting into a `BTreeMap` is what
+        // restores the key order the engine applies them in.
+        let writes: BTreeMap<Vec<u8>, Option<Vec<u8>>> =
+            std::mem::take(&mut self.writes).into_iter().collect();
         let range_deletes = drain(&self.range_deletes);
         let merges = drain(&self.merges);
-        let conflict_keys = self.validation_set(&writes, &merges);
+        let tracked = std::mem::take(&mut self.tracked);
+        let conflict_keys = self.validation_set(tracked, &writes, &merges);
 
         let outcome = self
             .engine
@@ -786,6 +791,7 @@ impl<'db> Transaction<'db> {
     ///   no anti-dependency edge can form unseen.
     fn validation_set(
         &self,
+        tracked: ConcurrentMap<Vec<u8>, Arc<KeyState>>,
         writes: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         merges: &[(Vec<u8>, Vec<u8>)],
     ) -> Vec<(Vec<u8>, u64)> {
@@ -796,7 +802,7 @@ impl<'db> Transaction<'db> {
         // has to come out sorted so a multi-key conflict names the same
         // key on every run.
         let mut checks: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
-        for (key, state) in self.tracked.iter() {
+        for (key, state) in tracked {
             let written =
                 writes.contains_key(&key) || merges.iter().any(|(merged, _)| *merged == key);
             let validate = if serializable {
@@ -911,10 +917,9 @@ impl<'db> Transaction<'db> {
         if let Some(lm) = self.lock_manager.as_ref()
             && let TxMode::Pessimistic { tx_id } = self.mode
         {
-            for (key, ()) in self.held_locks.iter() {
+            for (key, ()) in std::mem::take(&mut self.held_locks) {
                 lm.release(&key, tx_id);
             }
-            self.held_locks = ConcurrentMap::new();
         }
         self.engine.release_snapshot(self.snapshot_seq);
     }
