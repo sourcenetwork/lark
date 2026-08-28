@@ -1023,6 +1023,17 @@ impl RegolithEngine {
         self.get(key, snapshot_seq)
     }
 
+    /// [`RegolithEngine::get_at`] without copying the value out of the
+    /// block or heap buffer it already lives in.
+    pub(crate) fn get_slice_at(
+        &self,
+        prefixed_key: &[u8],
+        snapshot_seq: u64,
+    ) -> std::io::Result<Option<DbSlice>> {
+        let lk = LookupKey::from_prefixed(prefixed_key, snapshot_seq);
+        self.get_slice(&lk)
+    }
+
     /// Point lookup resolved against one already-loaded view.
     ///
     /// Walks sources newest→oldest (active memtable, frozen memtables

@@ -261,3 +261,176 @@ fn a_streaming_write_is_visible_to_a_later_snapshot() {
         Some(&b"v"[..])
     );
 }
+
+#[test]
+fn scan_stream_respects_the_range_bounds() {
+    let (db, _dir) = db_with(&[("a", "1"), ("b", "2"), ("c", "3"), ("d", "4"), ("e", "5")]);
+
+    let keys: Vec<Vec<u8>> = db
+        .scan_stream(Some(b"b"), Some(b"d"))
+        .expect("scan_stream")
+        .map(|(key, _)| key)
+        .collect();
+
+    assert_eq!(keys, vec![b"b".to_vec(), b"c".to_vec()]);
+}
+
+#[test]
+fn scan_stream_with_open_bounds_covers_everything() {
+    let (db, _dir) = db_with(&[("a", "1"), ("b", "2"), ("c", "3")]);
+
+    let keys: Vec<Vec<u8>> = db
+        .scan_stream(None, None)
+        .expect("scan_stream")
+        .map(|(key, _)| key)
+        .collect();
+
+    assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+}
+
+#[test]
+fn scan_stream_agrees_with_the_materializing_scan() {
+    let entries: Vec<(String, String)> = (0..500)
+        .map(|i| (format!("key/{i:04}"), format!("value/{i}")))
+        .collect();
+    let dir = TempDir::new().expect("tempdir");
+    let db = Db::open(dir.path(), Options::default()).expect("open");
+    for (key, value) in &entries {
+        db.put(key.as_bytes(), value.as_bytes()).expect("put");
+    }
+
+    let materialized = db.scan(Some(b"key/0100"), Some(b"key/0200")).expect("scan");
+    let streamed: Vec<(Vec<u8>, Vec<u8>)> = db
+        .scan_stream(Some(b"key/0100"), Some(b"key/0200"))
+        .expect("scan_stream")
+        .map(|(key, value)| (key, value.to_vec()))
+        .collect();
+
+    assert_eq!(streamed, materialized);
+}
+
+mod txn_scan {
+    use super::*;
+    use regolith::{IsolationLevel, OptimisticTransactionDb};
+    use std::sync::Arc;
+
+    fn txn_db(entries: &[(&str, &str)]) -> (Arc<OptimisticTransactionDb>, TempDir) {
+        let dir = TempDir::new().expect("tempdir");
+        let db =
+            Arc::new(OptimisticTransactionDb::open(dir.path(), Options::default()).expect("open"));
+        for (key, value) in entries {
+            db.db().put(key.as_bytes(), value.as_bytes()).expect("put");
+        }
+        (db, dir)
+    }
+
+    fn collect(
+        txn: &regolith::OwnedTransaction,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+    ) -> Vec<(String, String)> {
+        txn.scan_stream(lo, hi)
+            .map(|(k, v)| {
+                (
+                    String::from_utf8_lossy(&k).into_owned(),
+                    String::from_utf8_lossy(&v).into_owned(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_transaction_scan_sees_the_committed_state() {
+        let (db, _dir) = txn_db(&[("a", "1"), ("b", "2"), ("c", "3")]);
+        let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+
+        assert_eq!(
+            collect(&txn, None, None),
+            vec![
+                ("a".into(), "1".into()),
+                ("b".into(), "2".into()),
+                ("c".into(), "3".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_transaction_scan_sees_its_own_uncommitted_writes() {
+        let (db, _dir) = txn_db(&[("a", "1"), ("c", "3")]);
+        let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+        txn.put(b"b", b"2").expect("put");
+
+        assert_eq!(
+            collect(&txn, None, None),
+            vec![
+                ("a".into(), "1".into()),
+                ("b".into(), "2".into()),
+                ("c".into(), "3".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_buffered_write_overrides_the_committed_value() {
+        let (db, _dir) = txn_db(&[("a", "1"), ("b", "old"), ("c", "3")]);
+        let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+        txn.put(b"b", b"new").expect("put");
+
+        assert_eq!(
+            collect(&txn, None, None),
+            vec![
+                ("a".into(), "1".into()),
+                ("b".into(), "new".into()),
+                ("c".into(), "3".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_buffered_delete_hides_the_committed_value() {
+        let (db, _dir) = txn_db(&[("a", "1"), ("b", "2"), ("c", "3")]);
+        let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+        txn.delete(b"b").expect("delete");
+
+        assert_eq!(
+            collect(&txn, None, None),
+            vec![("a".into(), "1".into()), ("c".into(), "3".into())]
+        );
+    }
+
+    #[test]
+    fn a_transaction_scan_respects_the_range_bounds() {
+        let (db, _dir) = txn_db(&[("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")]);
+        let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+        txn.put(b"bb", b"buffered").expect("put");
+
+        assert_eq!(
+            collect(&txn, Some(b"b"), Some(b"d")),
+            vec![
+                ("b".into(), "2".into()),
+                ("bb".into(), "buffered".into()),
+                ("c".into(), "3".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_transaction_scan_over_an_empty_range_yields_nothing() {
+        let (db, _dir) = txn_db(&[("a", "1")]);
+        let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+        assert_eq!(collect(&txn, Some(b"m"), Some(b"n")), vec![]);
+    }
+
+    #[test]
+    fn a_transaction_read_can_avoid_copying_the_value() {
+        let (db, _dir) = txn_db(&[("k", "committed-bytes")]);
+        let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+
+        let slice = txn.get_slice(b"k").expect("get_slice").expect("present");
+        assert_eq!(&*slice, b"committed-bytes");
+
+        txn.put(b"k", b"buffered-bytes").expect("put");
+        let slice = txn.get_slice(b"k").expect("get_slice").expect("present");
+        assert_eq!(&*slice, b"buffered-bytes");
+    }
+}

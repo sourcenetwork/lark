@@ -104,7 +104,7 @@ pub use stream_writer::{StreamOptions, StreamingWriter};
 pub use tailing::TailingIter;
 pub use transaction::{
     IsolationLevel, OptimisticTransactionDb, OwnedTransaction, Transaction, TransactionDb,
-    TransactionError, TxResult,
+    TransactionError, TxResult, TxnScanStream,
 };
 pub use ttl::{DbWithTtl, TtlCompactionFilter, strip_timestamp};
 
@@ -1027,13 +1027,36 @@ impl Db {
         }
     }
 
+    /// Scan a key range lazily, holding one entry rather than the range.
+    ///
+    /// The streaming counterpart to [`Db::scan`], and what a caller
+    /// should reach for by default: a scan that stops early pays only for
+    /// what it read, and memory does not grow with the size of the range.
+    /// Values come back as [`DbSlice`], so no value bytes are copied.
+    ///
+    /// The scan is served from a snapshot pinned when it is created, so
+    /// concurrent writes cannot shift the range underneath it.
+    ///
+    /// ```no_run
+    /// # use regolith::{Db, Options};
+    /// # let db = Db::open("/tmp/scan_stream_doc", Options::default()).unwrap();
+    /// for (key, value) in db.scan_stream(Some(b"user:"), Some(b"user;"))? {
+    ///     println!("{} is {} bytes", String::from_utf8_lossy(&key), value.len());
+    /// }
+    /// # Ok::<(), regolith::Error>(())
+    /// ```
+    pub fn scan_stream(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<ScanStream> {
+        Ok(self.snapshot().into_scan_stream(start, end))
+    }
+
     /// Scan a key range in the default column family.
     ///
     /// Returns all key-value pairs where `start <= key < end`, with
-    /// keys in their user-visible form (no CF prefix). This is a
-    /// convenience method that materializes the entire range into
-    /// memory. Prefer [`Db::iter`] for streaming scans or
-    /// [`Db::scan_page`] when the caller needs an explicit page size.
+    /// keys in their user-visible form (no CF prefix). This
+    /// materializes the entire range into memory, so it is bounded by
+    /// the size of the range rather than by the caller. Prefer
+    /// [`Db::scan_stream`], or [`Db::scan_page`] when the caller wants an
+    /// explicit page size.
     pub fn scan(
         &self,
         start: Option<&[u8]>,
@@ -2017,6 +2040,53 @@ impl OwnedSnapshotIter {
     }
 }
 
+/// A lazy, bounded scan over a key range.
+///
+/// Returned by [`Db::scan_stream`] and [`Snapshot::scan_stream`]. Holds
+/// one entry at a time rather than the range, so a caller that stops
+/// early pays only for what it read: the opposite of [`Db::scan`], which
+/// reads the whole range up front. The value is a [`DbSlice`], so no
+/// value bytes are copied.
+///
+/// The scan runs against a pinned snapshot, so writes that land while it
+/// is being drained are invisible to it and the range cannot shift
+/// underneath the cursor.
+pub struct ScanStream {
+    entries: Entries<OwnedSnapshotIter>,
+    /// Exclusive upper bound in user-visible form, or `None` for the end
+    /// of the column family.
+    end: Option<Vec<u8>>,
+    done: bool,
+}
+
+impl Iterator for ScanStream {
+    type Item = (Vec<u8>, DbSlice);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let (key, value) = self.entries.next()?;
+        if let Some(end) = &self.end
+            && key.as_slice() >= end.as_slice()
+        {
+            // Keys come out ascending, so the first key at or past the
+            // bound ends the scan; nothing after it can be in range.
+            self.done = true;
+            return None;
+        }
+        Some((key, value))
+    }
+}
+
+impl std::fmt::Debug for ScanStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScanStream")
+            .field("done", &self.done)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Ordered entries drained from a cursor, from its current position on.
 ///
 /// Returned by the `IntoIterator` impls on the cursors and by
@@ -2298,6 +2368,31 @@ impl Snapshot {
                 .with_stats(self.engine.statistics_arc()),
             DEFAULT_CF_ID,
         )
+    }
+
+    /// Scan a key range lazily against this snapshot.
+    ///
+    /// The streaming counterpart to [`Snapshot::scan`]. The whole walk
+    /// sees one point in time, because the snapshot stays pinned for as
+    /// long as the stream lives.
+    pub fn scan_stream(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> ScanStream {
+        self.clone_pin().into_scan_stream(start, end)
+    }
+
+    /// [`Snapshot::scan_stream`], consuming the snapshot instead of
+    /// pinning a second handle on it.
+    pub fn into_scan_stream(self, start: Option<&[u8]>, end: Option<&[u8]>) -> ScanStream {
+        let end = end.map(<[u8]>::to_vec);
+        let mut cursor = self.into_owned_iter();
+        match start {
+            Some(start) => cursor.seek(start),
+            None => cursor.seek_to_first(),
+        }
+        ScanStream {
+            entries: Entries::new(cursor, false),
+            end,
+            done: false,
+        }
     }
 
     /// Create an owned streaming iterator at this snapshot's sequence

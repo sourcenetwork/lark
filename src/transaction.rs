@@ -84,13 +84,14 @@ use kovan_queue::seg_queue::SegQueue;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::sync::{Condvar, Mutex};
 
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
 use crate::engine::{CommitOutcome, RegolithEngine};
-use crate::{Db, Error, Options, Result};
+use crate::{Db, DbSlice, Error, Options, Result};
 
 /// Default lock-acquisition timeout for [`TransactionDb`] when the
 /// caller doesn't specify one on [`TransactionDb::with_lock_timeout`].
@@ -439,7 +440,7 @@ pub struct Transaction<'db> {
     /// delete. Concurrent so that buffering a write takes `&self`;
     /// drained into a `BTreeMap` at commit, which is where the order
     /// the engine applies them in is restored.
-    writes: ConcurrentMap<Vec<u8>, Option<Vec<u8>>>,
+    writes: OnceLock<ConcurrentMap<Vec<u8>, Option<Vec<u8>>>>,
     /// Range deletes buffered for commit. Not tracked in the
     /// optimistic conflict set (initial impl limitation).
     range_deletes: SegQueue<(Vec<u8>, Vec<u8>)>,
@@ -449,7 +450,7 @@ pub struct Transaction<'db> {
     /// Sorted at commit so a multi-key conflict always reports the
     /// same key. Never rewound: a savepoint rollback undoes buffered
     /// writes, not reads that already happened.
-    tracked: ConcurrentMap<Vec<u8>, Arc<KeyState>>,
+    tracked: OnceLock<ConcurrentMap<Vec<u8>, Arc<KeyState>>>,
     /// Savepoint stack. Each entry captures the full write buffer
     /// and a count of locks held at that point.
     savepoints: Vec<Savepoint>,
@@ -458,7 +459,7 @@ pub struct Transaction<'db> {
     /// locking operation, and release order does not matter.
     /// Released by `Drop` if not already released by `commit` or
     /// `rollback`.
-    held_locks: ConcurrentMap<Vec<u8>, ()>,
+    held_locks: OnceLock<ConcurrentMap<Vec<u8>, ()>>,
     lock_manager: Option<Arc<LockManager>>,
     lock_timeout: Duration,
     resolved: bool,
@@ -527,18 +528,47 @@ impl<'db> Transaction<'db> {
             durability,
             mode,
             isolation,
-            writes: ConcurrentMap::new(),
+            writes: OnceLock::new(),
             range_deletes: SegQueue::new(),
             merges: SegQueue::new(),
-            tracked: ConcurrentMap::new(),
+            tracked: OnceLock::new(),
             savepoints: Vec::new(),
-            held_locks: ConcurrentMap::new(),
+            held_locks: OnceLock::new(),
             lock_manager,
             lock_timeout,
             resolved: false,
             resources_released: false,
             _phantom: std::marker::PhantomData,
         }
+    }
+
+    /// The write buffer, allocated on first write.
+    ///
+    /// A concurrent map costs a table of buckets the moment it exists,
+    /// which a transaction that never writes should not pay and which at
+    /// this call rate dominates everything else. `_peek` is the read side:
+    /// it reports what is there without bringing a table into being.
+    fn writes(&self) -> &ConcurrentMap<Vec<u8>, Option<Vec<u8>>> {
+        self.writes.get_or_init(ConcurrentMap::new)
+    }
+
+    fn writes_peek(&self) -> Option<&ConcurrentMap<Vec<u8>, Option<Vec<u8>>>> {
+        self.writes.get()
+    }
+
+    /// The read set, allocated on first read.
+    fn tracked(&self) -> &ConcurrentMap<Vec<u8>, Arc<KeyState>> {
+        self.tracked.get_or_init(ConcurrentMap::new)
+    }
+
+    fn tracked_peek(&self) -> Option<&ConcurrentMap<Vec<u8>, Arc<KeyState>>> {
+        self.tracked.get()
+    }
+
+    /// The held-lock set, allocated on the first pessimistic lock. An
+    /// optimistic transaction takes no locks and never allocates it.
+    fn held_locks(&self) -> &ConcurrentMap<Vec<u8>, ()> {
+        self.held_locks.get_or_init(ConcurrentMap::new)
     }
 
     /// Read `key` from the default column family. Returns the
@@ -557,13 +587,68 @@ impl<'db> Transaction<'db> {
     /// in conflict detection on its own.
     pub fn get(&self, key: &[u8]) -> TxResult<Option<Vec<u8>>> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
-        if let Some(buffered) = self.writes.get(&prefixed) {
+        if let Some(buffered) = self.writes_peek().and_then(|w| w.get(&prefixed)) {
             return Ok(buffered);
         }
         let read_seq = self.observe(&prefixed, self.snapshot_seq, false);
         self.engine
             .get_at(&prefixed, read_seq)
             .map_err(TransactionError::Io)
+    }
+
+    /// [`Transaction::get`] without copying the value.
+    ///
+    /// The returned [`DbSlice`] borrows the bytes the database already
+    /// holds, or the buffered write this transaction made. Nothing is
+    /// materialized on the way out.
+    pub fn get_slice(&self, key: &[u8]) -> TxResult<Option<DbSlice>> {
+        let prefixed = prefix_key(DEFAULT_CF_ID, key);
+        if let Some(buffered) = self.writes_peek().and_then(|w| w.get(&prefixed)) {
+            return Ok(buffered.map(DbSlice::from));
+        }
+        let read_seq = self.observe(&prefixed, self.snapshot_seq, false);
+        self.engine
+            .get_slice_at(&prefixed, read_seq)
+            .map_err(TransactionError::Io)
+    }
+
+    /// Scan a key range without materializing it, merging this
+    /// transaction's buffered writes over the snapshot underneath.
+    ///
+    /// The database side is streamed, so memory does not grow with the
+    /// size of the range and a caller that stops early pays only for what
+    /// it read. The transaction's own writes are sorted up front, which
+    /// is bounded by what this transaction has written rather than by
+    /// what the database holds.
+    pub fn scan_stream(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> TxnScanStream<'_> {
+        let lo = start.map(|s| prefix_key(DEFAULT_CF_ID, s));
+        let hi = end.map(|e| prefix_key(DEFAULT_CF_ID, e));
+
+        let mut buffered: Vec<(Vec<u8>, Option<Vec<u8>>)> = self
+            .writes_peek()
+            .into_iter()
+            .flat_map(ConcurrentMap::iter)
+            .filter(|(key, _)| {
+                lo.as_ref().is_none_or(|lo| key >= lo) && hi.as_ref().is_none_or(|hi| key < hi)
+            })
+            .collect();
+        buffered.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        let mut cursor = crate::CfIter::new(
+            crate::Iter::from_internal(self.engine.new_iter_at(self.snapshot_seq)),
+            DEFAULT_CF_ID,
+        );
+        match &lo {
+            Some(lo) => cursor.seek(&lo[4..]),
+            None => cursor.seek_to_first(),
+        }
+
+        TxnScanStream {
+            cursor,
+            cursor_done: false,
+            buffered: buffered.into_iter().peekable(),
+            end: hi.map(|hi| hi[4..].to_vec()),
+        }
     }
 
     /// Read `key`, flag it for conflict detection at commit, and,
@@ -581,7 +666,7 @@ impl<'db> Transaction<'db> {
         let already_held = self.lock_key(&prefixed)?;
         let horizon = self.read_horizon(&prefixed, already_held);
         let read_seq = self.observe(&prefixed, horizon, true);
-        if let Some(buffered) = self.writes.get(&prefixed) {
+        if let Some(buffered) = self.writes_peek().and_then(|w| w.get(&prefixed)) {
             return Ok(buffered);
         }
         self.engine
@@ -594,7 +679,7 @@ impl<'db> Transaction<'db> {
     pub fn put(&self, key: &[u8], value: &[u8]) -> TxResult<()> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         self.lock_key(&prefixed)?;
-        self.writes.insert(prefixed, Some(value.to_vec()));
+        self.writes().insert(prefixed, Some(value.to_vec()));
         Ok(())
     }
 
@@ -603,7 +688,7 @@ impl<'db> Transaction<'db> {
     pub fn delete(&self, key: &[u8]) -> TxResult<()> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         self.lock_key(&prefixed)?;
-        self.writes.insert(prefixed, None);
+        self.writes().insert(prefixed, None);
         Ok(())
     }
 
@@ -650,10 +735,13 @@ impl<'db> Transaction<'db> {
         // state, so taking one is an exclusive operation even though
         // buffering is not.
         self.savepoints.push(Savepoint {
-            writes: self.writes.iter().collect(),
+            writes: self
+                .writes_peek()
+                .map(|w| w.iter().collect())
+                .unwrap_or_default(),
             range_deletes: drain(&self.range_deletes),
             merges: drain(&self.merges),
-            held_lock_count: self.held_locks.len(),
+            held_lock_count: self.held_locks.get().map_or(0, ConcurrentMap::len),
         });
         // `drain` emptied them, so put back what the savepoint captured.
         if let Some(sp) = self.savepoints.last() {
@@ -677,9 +765,12 @@ impl<'db> Transaction<'db> {
     /// that landed around the lock manager in the meantime.
     pub fn rollback_to_savepoint(&mut self) -> TxResult<()> {
         let sp = self.savepoints.pop().ok_or(TransactionError::NoSavepoint)?;
-        self.writes = ConcurrentMap::new();
-        for (key, value) in sp.writes {
-            self.writes.insert(key, value);
+        self.writes = OnceLock::new();
+        if !sp.writes.is_empty() {
+            let writes = self.writes();
+            for (key, value) in sp.writes {
+                writes.insert(key, value);
+            }
         }
         self.range_deletes = SegQueue::new();
         for entry in sp.range_deletes {
@@ -733,11 +824,13 @@ impl<'db> Transaction<'db> {
         // `into_iter` hands over the stored keys and values instead of
         // cloning each one. Collecting into a `BTreeMap` is what
         // restores the key order the engine applies them in.
-        let writes: BTreeMap<Vec<u8>, Option<Vec<u8>>> =
-            std::mem::take(&mut self.writes).into_iter().collect();
+        let writes: BTreeMap<Vec<u8>, Option<Vec<u8>>> = std::mem::take(&mut self.writes)
+            .into_inner()
+            .map(|w| w.into_iter().collect())
+            .unwrap_or_default();
         let range_deletes = drain(&self.range_deletes);
         let merges = drain(&self.merges);
-        let tracked = std::mem::take(&mut self.tracked);
+        let tracked = std::mem::take(&mut self.tracked).into_inner();
         let conflict_keys = self.validation_set(tracked, &writes, &merges);
 
         let outcome = self
@@ -791,7 +884,7 @@ impl<'db> Transaction<'db> {
     ///   no anti-dependency edge can form unseen.
     fn validation_set(
         &self,
-        tracked: ConcurrentMap<Vec<u8>, Arc<KeyState>>,
+        tracked: Option<ConcurrentMap<Vec<u8>, Arc<KeyState>>>,
         writes: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         merges: &[(Vec<u8>, Vec<u8>)],
     ) -> Vec<(Vec<u8>, u64)> {
@@ -802,7 +895,7 @@ impl<'db> Transaction<'db> {
         // has to come out sorted so a multi-key conflict names the same
         // key on every run.
         let mut checks: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
-        for (key, state) in tracked {
+        for (key, state) in tracked.into_iter().flatten() {
             let written =
                 writes.contains_key(&key) || merges.iter().any(|(merged, _)| *merged == key);
             let validate = if serializable {
@@ -851,7 +944,7 @@ impl<'db> Transaction<'db> {
         match self.mode {
             TxMode::Optimistic => self.snapshot_seq,
             TxMode::Pessimistic { .. } => {
-                if already_held && let Some(state) = self.tracked.get(key) {
+                if already_held && let Some(state) = self.tracked_peek().and_then(|t| t.get(key)) {
                     return state.read_seq.load(Ordering::Acquire);
                 }
                 self.engine.snapshot_seq()
@@ -869,7 +962,7 @@ impl<'db> Transaction<'db> {
     /// return an older value than an earlier one.
     fn observe(&self, key: &[u8], horizon: u64, for_update: bool) -> u64 {
         let state = self
-            .tracked
+            .tracked()
             .get_or_insert(key.to_vec(), Arc::new(KeyState::new(horizon, for_update)));
         // `get_or_insert` is linearizable, so exactly one caller's cell
         // wins and every other caller folds its observation into that
@@ -900,12 +993,12 @@ impl<'db> Transaction<'db> {
         let Some(lm) = self.lock_manager.as_ref() else {
             return Ok(false);
         };
-        if self.held_locks.get(key).is_some() {
+        if self.held_locks.get().is_some_and(|l| l.get(key).is_some()) {
             return Ok(true);
         }
         lm.acquire(key, tx_id, self.lock_timeout)
             .map_err(|_| TransactionError::Busy(strip_cf_prefix(key.to_vec())))?;
-        self.held_locks.insert(key.to_vec(), ());
+        self.held_locks().insert(key.to_vec(), ());
         Ok(false)
     }
 
@@ -917,11 +1010,112 @@ impl<'db> Transaction<'db> {
         if let Some(lm) = self.lock_manager.as_ref()
             && let TxMode::Pessimistic { tx_id } = self.mode
         {
-            for (key, ()) in std::mem::take(&mut self.held_locks) {
+            for (key, ()) in std::mem::take(&mut self.held_locks)
+                .into_inner()
+                .into_iter()
+                .flatten()
+            {
                 lm.release(&key, tx_id);
             }
         }
         self.engine.release_snapshot(self.snapshot_seq);
+    }
+}
+
+/// The transaction's own writes for a range, sorted and ready to merge.
+/// `Some` is a put, `None` a delete.
+type BufferedWrites = std::iter::Peekable<std::vec::IntoIter<(Vec<u8>, Option<Vec<u8>>)>>;
+
+/// A transaction's view of a key range, streamed.
+///
+/// Merges the transaction's buffered writes over a snapshot cursor, so a
+/// scan inside a transaction sees its own uncommitted writes without
+/// either side being materialized: the database side is a cursor, and the
+/// buffered side is bounded by what this transaction wrote.
+///
+/// A buffered delete hides the snapshot's entry for that key, and a
+/// buffered put replaces it.
+pub struct TxnScanStream<'txn> {
+    cursor: crate::CfIter<'txn>,
+    cursor_done: bool,
+    buffered: BufferedWrites,
+    /// Exclusive upper bound, user-visible form.
+    end: Option<Vec<u8>>,
+}
+
+impl TxnScanStream<'_> {
+    /// The next snapshot entry inside the range, or `None` past the end.
+    fn peek_cursor(&mut self) -> Option<Vec<u8>> {
+        if self.cursor_done || !self.cursor.valid() {
+            return None;
+        }
+        let key = self.cursor.key()?.to_vec();
+        if let Some(end) = &self.end
+            && key.as_slice() >= end.as_slice()
+        {
+            self.cursor_done = true;
+            return None;
+        }
+        Some(key)
+    }
+}
+
+impl Iterator for TxnScanStream<'_> {
+    type Item = (Vec<u8>, DbSlice);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let cursor_key = self.peek_cursor();
+            // Buffered keys carry the CF prefix; the cursor reports the
+            // user-visible key, so compare on the stripped form.
+            let buffered_key = self.buffered.peek().map(|(key, _)| key[4..].to_vec());
+
+            match (cursor_key, buffered_key) {
+                (None, None) => return None,
+                // Only the transaction has this key.
+                (None, Some(_)) => {
+                    let (key, value) = self.buffered.next()?;
+                    if let Some(value) = value {
+                        return Some((key[4..].to_vec(), DbSlice::from(value)));
+                    }
+                }
+                // Only the database has it.
+                (Some(key), None) => {
+                    let value = self.cursor.value_slice()?;
+                    self.cursor.next();
+                    return Some((key, value));
+                }
+                (Some(ckey), Some(bkey)) => match ckey.cmp(&bkey) {
+                    std::cmp::Ordering::Less => {
+                        let value = self.cursor.value_slice()?;
+                        self.cursor.next();
+                        return Some((ckey, value));
+                    }
+                    std::cmp::Ordering::Greater => {
+                        let (key, value) = self.buffered.next()?;
+                        if let Some(value) = value {
+                            return Some((key[4..].to_vec(), DbSlice::from(value)));
+                        }
+                    }
+                    // The transaction wrote a key the snapshot also has,
+                    // so its write wins and the snapshot entry is skipped
+                    // whether that write was a put or a delete.
+                    std::cmp::Ordering::Equal => {
+                        self.cursor.next();
+                        let (key, value) = self.buffered.next()?;
+                        if let Some(value) = value {
+                            return Some((key[4..].to_vec(), DbSlice::from(value)));
+                        }
+                    }
+                },
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for TxnScanStream<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TxnScanStream").finish_non_exhaustive()
     }
 }
 
