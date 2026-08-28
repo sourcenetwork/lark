@@ -40,11 +40,11 @@ cov-summary:
     # The `ci` profile, not the default: instrumented code runs several
     # times slower, and the default profile's 60s slow-timeout turns the
     # heavier soaks into timeouts that say nothing about the code.
-    cargo llvm-cov nextest --summary-only --workspace --profile ci
+    cargo llvm-cov nextest --summary-only --workspace --profile ci --ignore-filename-regex '(^|/)tools/'
 
 # The browsable HTML report, for reading locally.
 cov:
-    cargo llvm-cov --workspace --html
+    cargo llvm-cov --workspace --html --ignore-filename-regex '(^|/)tools/'
     @echo "report: target/llvm-cov/html/index.html"
 
 # ── suites CI runs as their own jobs, split by mechanism ─────
