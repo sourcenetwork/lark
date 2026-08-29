@@ -166,7 +166,14 @@ pub mod fuzzing {
     /// Open arbitrary bytes as a complete SSTable file.
     pub fn open_sst(data: &[u8]) {
         with_temp_file("sst", "sst", data, |path| {
-            let _ = crate::engine::sstable::SsTableReader::open(path, 0);
+            // `open_with`, not `open`: the latter is `#[cfg(test)]`, so under
+            // the `fuzzing` feature it does not exist and the crate does not build.
+            let _ = crate::engine::sstable::SsTableReader::open_with(
+                &crate::env::std_env(),
+                path,
+                0,
+                crate::engine::sstable::MetadataPolicy::Pinned,
+            );
         });
     }
 
@@ -1787,7 +1794,7 @@ impl Db {
         if self.is_live_cf_handle(cf) {
             CfIter::new(inner, cf.id())
         } else {
-            CfIter::invalid(inner)
+            CfIter::invalid(inner, cf)
         }
     }
 
@@ -1807,7 +1814,7 @@ impl Db {
         if self.is_live_cf_handle(cf) {
             tailing::new_for_cf(engine, cf)
         } else {
-            tailing::new_empty(engine)
+            tailing::new_empty(engine, cf)
         }
     }
 
@@ -1838,11 +1845,19 @@ pub struct CfIter<'a> {
     cf_id: u32,
     upper_bound: Vec<u8>,
     valid_cf: bool,
+    /// Why this iterator has no column family to read, when it has none.
+    ///
+    /// A handle that is not live is a detected error, and the rest of the CF
+    /// read surface returns it. An iterator cannot, so it is held here and
+    /// handed back by [`CfIter::status`]. `None` on every live iterator, so
+    /// the path that works allocates nothing.
+    invalid_cf: Option<Box<str>>,
 }
 
 impl<'a> CfIter<'a> {
     fn new(inner: Iter<'a>, cf_id: u32) -> Self {
         Self {
+            invalid_cf: None,
             inner,
             cf_id,
             upper_bound: cf_upper_bound(cf_id),
@@ -1850,12 +1865,20 @@ impl<'a> CfIter<'a> {
         }
     }
 
-    fn invalid(inner: Iter<'a>) -> Self {
+    fn invalid(inner: Iter<'a>, cf: &ColumnFamilyHandle) -> Self {
         Self {
             inner,
             cf_id: DEFAULT_CF_ID,
             upper_bound: cf_upper_bound(DEFAULT_CF_ID),
             valid_cf: false,
+            invalid_cf: Some(
+                format!(
+                    "column family handle '{}' with id {} is not live",
+                    cf.name(),
+                    cf.id()
+                )
+                .into_boxed_str(),
+            ),
         }
     }
 
@@ -1971,8 +1994,17 @@ impl<'a> CfIter<'a> {
         self.inner.value_slice()
     }
 
-    /// Propagate any I/O error from the underlying iterator.
+    /// Why the walk stopped, or why it never started.
+    ///
+    /// A handle that is not live is reported here rather than dropped. The
+    /// rest of the CF read surface (`get_cf`, `scan_cf`, `scan_page_cf`,
+    /// `multi_get_cf`) returns that as an `Err`; an iterator has no way to,
+    /// so without this a dropped column family, or a handle belonging to a
+    /// different `Db`, would read as an empty one and report success.
     pub fn status(&self) -> Result<()> {
+        if let Some(reason) = &self.invalid_cf {
+            return Err(Error::invalid_column_family(reason.to_string()));
+        }
         self.inner.status()
     }
 }
@@ -2083,6 +2115,31 @@ pub struct ScanStream {
     done: bool,
 }
 
+impl ScanStream {
+    /// Why the scan stopped.
+    ///
+    /// `Ok(())` means the range ended. An error means it did not: what the
+    /// stream yielded is a prefix of the range and the rest was never read.
+    ///
+    /// This matters because [`Iterator`] cannot carry a failure. A scan that
+    /// dies on a corrupt block ends exactly like one that reached the end of
+    /// its range, and a caller that only iterates cannot tell a short answer
+    /// from a complete one. Check this after iterating whenever a missing row
+    /// would be worse than an error.
+    ///
+    /// ```no_run
+    /// # use regolith::{Db, Options};
+    /// # let db = Db::open("/tmp/scan_status_doc", Options::default()).unwrap();
+    /// let mut scan = db.scan_stream(None, None)?;
+    /// let rows: Vec<_> = scan.by_ref().collect();
+    /// scan.status()?;  // the rows above are the whole range only if this is Ok
+    /// # Ok::<(), regolith::Error>(())
+    /// ```
+    pub fn status(&self) -> Result<()> {
+        self.entries.status()
+    }
+}
+
 impl Iterator for ScanStream {
     type Item = (Vec<u8>, DbSlice);
 
@@ -2175,11 +2232,37 @@ macro_rules! impl_entries {
                     }
                 }
                 if !self.cursor.valid() {
+                    // A cursor goes invalid for two reasons that look
+                    // identical from here: the range ended, or the walk
+                    // failed. `Iterator` has nowhere to put the difference,
+                    // so say it out loud rather than let a failed scan read
+                    // as a complete one. `Entries::status` returns it to a
+                    // caller that checks.
+                    if let Err(e) = self.cursor.status() {
+                        tracing::error!(
+                            error = %e,
+                            "scan ended early: the iterator failed mid-range, \
+                             so the rows returned are a prefix and not the range"
+                        );
+                    }
                     return None;
                 }
                 let key = self.cursor.key()?.to_vec();
                 let value = self.cursor.value_slice()?;
                 Some((key, value))
+            }
+        }
+
+        impl$(<$lt>)? Entries<$cursor> {
+            /// Why the walk stopped.
+            ///
+            /// `Ok(())` means the range ended. An error means it did not:
+            /// the entries handed out are a prefix of the range, and the
+            /// rest was not read. Iterating alone cannot tell the two
+            /// apart, so a caller that must not silently lose rows checks
+            /// this once the iteration finishes.
+            pub fn status(&self) -> Result<()> {
+                self.cursor.status()
             }
         }
 
@@ -2516,7 +2599,7 @@ impl Snapshot {
         if self.is_live_cf_handle(cf) {
             CfIter::new(inner, cf.id())
         } else {
-            CfIter::invalid(inner)
+            CfIter::invalid(inner, cf)
         }
     }
 }

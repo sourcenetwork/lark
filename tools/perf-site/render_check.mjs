@@ -45,7 +45,32 @@ const node = (id) =>
     },
   });
 
-globalThis.document = { querySelector: (sel) => node(sel) };
+// The page also wires up interaction it cannot use here: a zoom overlay it
+// builds and appends, and document-level listeners. None of it affects what
+// gets rendered, but it runs during boot, so it has to find something rather
+// than throw and take the whole check down with it. These stubs exist to let
+// boot reach the end, not to stand in for a browser: nothing below is
+// asserted on.
+const detached = () => ({
+  className: "",
+  hidden: false,
+  style: {},
+  classList: { add() {}, remove() {}, contains: () => false },
+  appendChild() {},
+  addEventListener() {},
+  closest: () => null,
+});
+
+globalThis.document = {
+  querySelector: (sel) => node(sel),
+  // Nothing in the check inspects elements the page creates or the nodes it
+  // sweeps for a class, so an empty sweep and a detached element are the
+  // honest answers.
+  querySelectorAll: () => [],
+  createElement: () => detached(),
+  addEventListener() {},
+  body: { appendChild() {} },
+};
 globalThis.fetch = async (path) => {
   try {
     const body = readFileSync(`${site}/${path}`, "utf8");
@@ -84,10 +109,26 @@ const SECTION = {
 };
 
 const failures = [];
+
+// A section that throws is not a section that is missing, and until this
+// existed it was not a failure either. `section(name, build)` in index.html
+// catches every throw and emits `<h2>${name}</h2>` plus a `card broken`
+// panel, using the very heading this check matches on, so the failure output
+// satisfied the success assertion. Look for the panel first, and name it.
+for (const m of out.matchAll(/<div class="card broken">\s*<h3>([^<]*)<\/h3>\s*<p class="note">([^<]*)<\/p>/g)) {
+  failures.push(`${m[1]}: ${m[2]}`);
+}
+if (/class="card broken"/.test(out) && !failures.length) {
+  failures.push("a section rendered as a broken card, in a shape this check could not name");
+}
+
+// Match the heading tag, not a bare substring. `emptyState` prints five of
+// these six names as table cells, so a substring test is satisfied by a page
+// that rendered no data at all.
 for (const [family, heading] of Object.entries(SECTION)) {
   const m = newest.metrics?.[family];
   if (!m || m.trust === "absent") continue;
-  if (!out.includes(heading)) {
+  if (!out.includes(`<h2>${heading}</h2>`)) {
     failures.push(`${family} was collected (trust=${m.trust ?? "per-entry"}) but "${heading}" is not on the page`);
   }
 }

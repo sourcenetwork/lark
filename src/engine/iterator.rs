@@ -60,7 +60,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use super::block::encoded_entry_size;
-use super::block::{Block, RESTART_INTERVAL, decode_entry_at};
+use super::block::{Block, decode_entry_at};
 use super::block_cache::BlockCache;
 use super::internal_key::{
     INTERNAL_KEY_SUFFIX_LEN, VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE,
@@ -288,10 +288,58 @@ struct SsTableLevelIter {
     /// Lazily built on the first backward step; maps entry index to
     /// byte offset in entry_data.
     entry_offsets: Option<Vec<usize>>,
+    /// A span of the data area held for the forward walk, and the offset
+    /// it starts at. Empty until this iterator has actually stepped from
+    /// one block to the next, so a seek that reads a single block still
+    /// costs a single block-sized read.
+    span: Vec<u8>,
+    span_start: u64,
+    /// Ceiling on this iterator's span, its share of the scan-wide budget.
+    /// A merging scan holds one `SsTableLevelIter` per L0 file plus one per
+    /// level below it, so a fixed per-iterator ceiling would let the total
+    /// grow with L0 depth. The budget is divided at construction instead,
+    /// which bounds the bytes a scan holds rather than the bytes one
+    /// iterator holds.
+    span_cap: u64,
+    /// Blocks the next span will try to cover. Doubles per refill.
+    span_blocks: u64,
+    /// Set once the iterator walks off the end of a block into the next
+    /// one. From then on its reads are known to be sequential and worth
+    /// reading ahead for.
+    sequential: bool,
 }
 
+/// Blocks a sequential walk pulls per read, and the ceiling on that.
+///
+/// One positional read per block makes a scan pay one round trip per
+/// block, which on a network-backed volume is nearly all of what it
+/// spends its time on. Reading a span of adjacent blocks amortizes the
+/// trip over many of them.
+///
+/// The span is sized from the block it starts at rather than fixed, so
+/// the memory follows the configuration that chose the block size: the
+/// embedded and wasm profiles use 4 KiB blocks and so read 64 KiB, while
+/// a server profile with 64 KiB blocks reads the full megabyte. The
+/// ceiling is per level iterator, and levels below L0 are walked one file
+/// at a time, so a cursor holds one span per level rather than one per
+/// file. Nothing is allocated until the iterator has actually stepped
+/// from one block into the next, and the buffer is released as soon as it
+/// stops walking forward, so a point lookup and a seek-driven workload
+/// both hold none of it.
+const SCAN_SPAN_BLOCKS: u64 = 16;
+const SCAN_SPAN_MAX: u64 = 1 << 20;
+
+/// Blocks the first span covers, before the ramp widens it.
+///
+/// A walk that reads two blocks and stops must not pay for sixteen. The
+/// span starts here and doubles per refill up to [`SCAN_SPAN_BLOCKS`], so a
+/// scan that ends early reads about what it used and a long one reaches the
+/// ceiling after a few refills. The only evidence that a walk is long is
+/// that it has already been long.
+const SCAN_SPAN_BLOCKS_INITIAL: u64 = 2;
+
 impl SsTableLevelIter {
-    fn new(reader: Arc<SsTableReader>, cache: Arc<BlockCache>) -> Self {
+    fn new(reader: Arc<SsTableReader>, cache: Arc<BlockCache>, span_cap: u64) -> Self {
         Self {
             reader,
             cache,
@@ -305,7 +353,87 @@ impl SsTableLevelIter {
             valid: false,
             current_entry_index: None,
             entry_offsets: None,
+            span: Vec::new(),
+            span_start: 0,
+            span_cap,
+            span_blocks: SCAN_SPAN_BLOCKS_INITIAL,
+            sequential: false,
         }
+    }
+
+    /// The block a handle points at, read ahead when the walk is known to
+    /// be sequential.
+    ///
+    /// Falls back to a single block-sized read whenever reading ahead
+    /// cannot serve the block: before the first block-to-block step, for a
+    /// block larger than one span, and at the end of the data area where
+    /// the span comes back short.
+    fn block_for(&mut self, handle: super::block::BlockHandle) -> io::Result<Arc<Block>> {
+        // `read_block` consults the cache itself, so the non-span path must
+        // not look first: a second lookup would double every miss the block
+        // cache and `PerfContext` count.
+        if !self.sequential || handle.size > self.span_cap {
+            return self.reader.read_block(handle, &self.cache);
+        }
+        if let Some(block) = self.cache.get(self.reader.file_id, handle.offset) {
+            return Ok(block);
+        }
+
+        // A handle comes out of the index, and an index read off a damaged
+        // file can say anything: an offset near u64::MAX, a size that runs
+        // past the end of the address space. Every bound below is therefore
+        // checked, and anything that does not add up falls back to
+        // `read_block`, which validates the region against `data_end` and
+        // returns an error. A corrupt file must fail the read, not the
+        // process.
+        let Some(handle_end) = handle.offset.checked_add(handle.size) else {
+            return self.reader.read_block(handle, &self.cache);
+        };
+        let span_end = self.span_start.saturating_add(self.span.len() as u64);
+        let held =
+            !self.span.is_empty() && handle.offset >= self.span_start && handle_end <= span_end;
+        if !held {
+            let want = handle
+                .size
+                .saturating_mul(self.span_blocks)
+                .clamp(handle.size, self.span_cap.max(handle.size));
+            // Widen the next one: a walk earns its readahead by continuing.
+            self.span_blocks = (self.span_blocks * 2).min(SCAN_SPAN_BLOCKS);
+            self.span = self.reader.read_span(handle.offset, want)?;
+            self.span_start = handle.offset;
+            if (self.span.len() as u64) < handle.size {
+                // Ran into the end of the data area; the block is not
+                // wholly inside the span, so read it on its own.
+                self.span.clear();
+                return self.reader.read_block(handle, &self.cache);
+            }
+        }
+
+        // Slice by lookup rather than by index: on a 32-bit target the
+        // casts below can truncate, and the span is the caller's buffer,
+        // not something a damaged file gets to index freely.
+        let frame = usize::try_from(handle.offset - self.span_start)
+            .ok()
+            .zip(usize::try_from(handle.size).ok())
+            .and_then(|(lo, len)| lo.checked_add(len).map(|hi| (lo, hi)))
+            .and_then(|(lo, hi)| self.span.get(lo..hi));
+        let Some(frame) = frame else {
+            return self.reader.read_block(handle, &self.cache);
+        };
+        self.reader.decode_block_frame(handle, frame, &self.cache)
+    }
+
+    /// Forget the span. A seek can land anywhere, so what was read ahead
+    /// for the previous position says nothing about the new one.
+    ///
+    /// Releases the buffer rather than keeping its capacity: an iterator
+    /// that is not walking forward should hold no readahead memory at all,
+    /// and one that resumes walking pays a single allocation to say so.
+    fn reset_readahead(&mut self) {
+        self.span = Vec::new();
+        self.span_start = 0;
+        self.span_blocks = SCAN_SPAN_BLOCKS_INITIAL;
+        self.sequential = false;
     }
 
     /// The current value, borrowed from the decoded block holding it.
@@ -330,7 +458,8 @@ impl SsTableLevelIter {
     }
 
     fn load_block(&mut self, cursor: SsTableBlockCursor) -> io::Result<()> {
-        self.block = Some(self.reader.load_block_at_cursor(&cursor, &self.cache)?);
+        let handle = self.reader.cursor_handle(&cursor, &self.cache)?;
+        self.block = Some(self.block_for(handle)?);
         self.block_cursor = Some(cursor);
         self.entry_pos = 0;
         self.next_entry_pos = 0;
@@ -359,6 +488,7 @@ impl SsTableLevelIter {
     }
 
     fn seek_to_first(&mut self) -> io::Result<()> {
+        self.reset_readahead();
         let Some(cursor) = self.reader.first_block_cursor(&self.cache)? else {
             self.valid = false;
             return Ok(());
@@ -369,6 +499,7 @@ impl SsTableLevelIter {
     }
 
     fn seek(&mut self, target: &[u8]) -> io::Result<()> {
+        self.reset_readahead();
         let cursor = match self.reader.seek_block_cursor(target, &self.cache)? {
             Some(cursor) => cursor,
             None => {
@@ -400,12 +531,14 @@ impl SsTableLevelIter {
             self.valid = false;
             return Ok(());
         };
+        self.sequential = true;
         self.load_block(next)?;
         self.decode_current();
         Ok(())
     }
 
     fn seek_for_prev(&mut self, target: &[u8]) -> io::Result<()> {
+        self.reset_readahead();
         let cursor = match self.reader.seek_block_cursor(target, &self.cache)? {
             Some(cursor) => cursor,
             None => match self.reader.last_block_cursor(&self.cache)? {
@@ -466,6 +599,7 @@ impl SsTableLevelIter {
             let next = self
                 .reader
                 .next_block_cursor(self.block_cursor.as_ref().unwrap(), &self.cache)?;
+            self.sequential = true;
             let Some(next) = next else {
                 self.valid = false;
                 return Ok(());
@@ -477,6 +611,7 @@ impl SsTableLevelIter {
     }
 
     fn seek_to_last(&mut self) -> io::Result<()> {
+        self.reset_readahead();
         let Some(cursor) = self.reader.last_block_cursor(&self.cache)? else {
             self.valid = false;
             return Ok(());
@@ -554,16 +689,55 @@ impl SsTableLevelIter {
     /// `entry_pos`, `next_entry_pos`, and cached value metadata are
     /// all consistent with the entry at `target_idx`.
     fn replay_key_to_index(&mut self, target_idx: usize) {
-        let restart_idx = target_idx / RESTART_INTERVAL;
+        // Find where to replay from by asking the block, not by assuming how
+        // it was written.
+        //
+        // The obvious form of this divides `target_idx` by `RESTART_INTERVAL`
+        // and trusts that restart `n` sits at entry `n * RESTART_INTERVAL`.
+        // Nothing enforces that pairing: `validate_restarts_and_entries`
+        // checks only that restart offsets increase, land on entry
+        // boundaries, and share no prefix. A block whose second restart
+        // points one entry further along passes validation, and the replay
+        // then starts past the entry it counts from, walks off the end of the
+        // entry region, and panics inside `decode_entry_at`. Where it happens
+        // to stay in bounds it returns the wrong entry and says nothing.
+        //
+        // Both are the same mistake, so neither is fixed by tightening the
+        // format. `entry_offsets` is already built by every caller, and the
+        // restart array is already known to be strictly increasing, so the
+        // covering restart can simply be looked up. `start_offset` is then an
+        // entry boundary at or before the target by construction, and the
+        // replay cannot leave the block whatever the file claims.
         let block = self.block.as_ref().unwrap();
         let data = block.entry_data();
-        let start_offset = if restart_idx > 0 && restart_idx < block.restart_count() {
-            block.restart_offset(restart_idx)
+        let Some(offsets) = self.entry_offsets.as_ref() else {
+            return;
+        };
+        let Some(&target_off) = offsets.get(target_idx) else {
+            return;
+        };
+
+        // Largest restart offset at or before the target.
+        let (mut lo, mut hi) = (0usize, block.restart_count());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if block.restart_offset(mid) <= target_off {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let start_offset = if lo > 0 {
+            block.restart_offset(lo - 1)
         } else {
             0
         };
+        // A restart offset is an entry boundary, so this resolves; a file
+        // that says otherwise replays from the start of the block, which is
+        // correct if slower rather than out of bounds.
+        let start_entry_idx = offsets.binary_search(&start_offset).unwrap_or(0);
+
         self.cached_key.clear();
-        let start_entry_idx = restart_idx * RESTART_INTERVAL;
         let mut pos = start_offset;
         for idx in start_entry_idx..=target_idx {
             let (consumed, val_off, val_len) = decode_entry_at(data, pos, &mut self.cached_key);
@@ -589,15 +763,17 @@ struct LevelConcatIter {
     cache: Arc<BlockCache>,
     file_idx: usize,
     current: Option<SsTableLevelIter>,
+    span_cap: u64,
 }
 
 impl LevelConcatIter {
-    fn new(files: Vec<Arc<LiveSst>>, cache: Arc<BlockCache>) -> Self {
+    fn new(files: Vec<Arc<LiveSst>>, cache: Arc<BlockCache>, span_cap: u64) -> Self {
         Self {
             files,
             cache,
             file_idx: 0,
             current: None,
+            span_cap,
         }
     }
 
@@ -606,6 +782,7 @@ impl LevelConcatIter {
             self.current = Some(SsTableLevelIter::new(
                 Arc::clone(&self.files[self.file_idx].reader),
                 Arc::clone(&self.cache),
+                self.span_cap,
             ));
         } else {
             self.current = None;
@@ -1032,6 +1209,17 @@ impl RegolithIterator {
         let mut levels: Vec<LevelIter> = Vec::new();
         let mut range_tombstones: Vec<RangeTombstone> = Vec::new();
 
+        // Split the readahead budget before building anything. L0 gets one
+        // iterator per file and every level below it gets one, so a fixed
+        // ceiling per iterator would let a scan's readahead grow with L0
+        // depth, which `level0_stop_writes_trigger` does not bound when it
+        // is zero. Dividing a scan-wide budget bounds the total instead. A
+        // share smaller than one block simply reads a block at a time,
+        // because the span is clamped to at least the block it starts at.
+        let sstable_sources =
+            version.levels[0].len() + version.levels[1..].iter().filter(|l| !l.is_empty()).count();
+        let span_cap = SCAN_SPAN_MAX / (sstable_sources.max(1) as u64);
+
         range_tombstones.extend(active.clone_range_tombstones());
         levels.push(LevelIter::Memtable(MemtableLevelIter::new(active)));
         for mt in frozen.iter().rev() {
@@ -1044,6 +1232,7 @@ impl RegolithIterator {
             levels.push(LevelIter::SsTable(SsTableLevelIter::new(
                 Arc::clone(&file.reader),
                 Arc::clone(&cache),
+                span_cap,
             )));
         }
         // L1+: one concatenation iterator per level rather than one
@@ -1077,6 +1266,7 @@ impl RegolithIterator {
             levels.push(LevelIter::LevelConcat(LevelConcatIter::new(
                 sorted,
                 Arc::clone(&cache),
+                span_cap,
             )));
         }
 

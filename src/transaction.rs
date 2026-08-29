@@ -1107,6 +1107,22 @@ pub struct TxnScanStream<'txn> {
 }
 
 impl TxnScanStream<'_> {
+    /// Why the snapshot side of the walk stopped.
+    ///
+    /// `Ok(())` means the range ended. An error means it did not: the
+    /// entries handed out are the transaction's buffered writes merged with
+    /// a *prefix* of what the database holds, and the rest was never read.
+    ///
+    /// A merged stream cannot report this any other way. `Iterator` has
+    /// nowhere to put a failure, and a cursor that dies mid-range goes
+    /// invalid exactly as one that reached the end does, after which the
+    /// merge finishes on the buffered side alone and looks complete. Check
+    /// this after iterating whenever a missing row would be worse than an
+    /// error. It is the same contract as [`crate::ScanStream::status`].
+    pub fn status(&self) -> Result<()> {
+        self.cursor.status()
+    }
+
     /// The next snapshot entry inside the range, or `None` past the end.
     ///
     /// Whichever way the walk runs, it stops at the bound it is running
@@ -1114,6 +1130,18 @@ impl TxnScanStream<'_> {
     /// back.
     fn peek_cursor(&mut self) -> Option<Vec<u8>> {
         if self.cursor_done || !self.cursor.valid() {
+            // The cursor going invalid means one of two things and this is
+            // where they become indistinguishable: the range ended, or the
+            // walk failed and the merge is about to finish on the buffered
+            // side as though the database held nothing more. Say it out
+            // loud; `status` returns it to a caller that checks.
+            if let Err(e) = self.cursor.status() {
+                tracing::error!(
+                    error = %e,
+                    "transaction scan ended early: the snapshot cursor failed \
+                     mid-range, so the rows returned are a prefix and not the range"
+                );
+            }
             return None;
         }
         let key = self.cursor.key()?.to_vec();

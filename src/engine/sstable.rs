@@ -1540,7 +1540,7 @@ impl SsTableReader {
     }
 
     /// The data-block handle a cursor points at.
-    fn cursor_handle(
+    pub(crate) fn cursor_handle(
         &self,
         cursor: &SsTableBlockCursor,
         cache: &BlockCache,
@@ -1852,7 +1852,11 @@ impl SsTableReader {
         total
     }
 
-    fn read_block(&self, handle: BlockHandle, cache: &BlockCache) -> io::Result<Arc<Block>> {
+    pub(crate) fn read_block(
+        &self,
+        handle: BlockHandle,
+        cache: &BlockCache,
+    ) -> io::Result<Arc<Block>> {
         if let Some(block) = cache.get(self.file_id, handle.offset) {
             return Ok(block);
         }
@@ -1867,6 +1871,36 @@ impl SsTableReader {
             self.data_end,
             "data block",
         )?;
+        self.decode_block_frame(handle, &block_data, cache)
+    }
+
+    /// Read a contiguous span of the data area, clamped to what the file
+    /// actually holds.
+    ///
+    /// A forward scan reads block after adjacent block, and one positional
+    /// read per block is one round trip per block. On a network-backed
+    /// volume that latency, not bandwidth, is what the scan waits on. The
+    /// sequential reader above pulls a span covering many blocks at once
+    /// and decodes them out of it.
+    pub(crate) fn read_span(&self, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+        let len = len.min(self.data_end.saturating_sub(offset));
+        read_file_region(&*self.file, offset, len, self.data_end, "data span")
+    }
+
+    /// Turn one block frame into a decoded block, whatever read produced
+    /// the bytes. Shared by the per-block read and the span reader so the
+    /// checksum, the compression handling and the cache insert cannot
+    /// drift between the two paths.
+    ///
+    pub(crate) fn decode_block_frame(
+        &self,
+        handle: BlockHandle,
+        block_data: &[u8],
+        cache: &BlockCache,
+    ) -> io::Result<Arc<Block>> {
+        if block_data.len() < 5 {
+            return Err(invalid_data("block frame too short"));
+        }
 
         // Frame: [compression_type: u8][payload][checksum: u32].
         // The checksum is an accidental-corruption guard, not a MAC.
