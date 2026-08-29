@@ -132,3 +132,38 @@ fn an_undamaged_scan_reports_success_and_returns_everything() {
     scan.status().expect("an intact store must scan clean");
     assert_eq!(rows as u64, KEYS);
 }
+
+/// The same contract on the transaction side. A merged stream that loses its
+/// snapshot cursor finishes on the buffered writes alone, which looks exactly
+/// like a range that ended.
+#[test]
+fn a_transaction_scan_cut_short_says_so_too() {
+    use regolith::TransactionDb;
+
+    let dir = tempfile::tempdir().unwrap();
+    let tdb = TransactionDb::open(dir.path(), small_options()).unwrap();
+    for i in 0..10u64 {
+        tdb.db().put(format!("k{i:02}").as_bytes(), b"v").unwrap();
+    }
+
+    let txn = tdb.begin_transaction();
+    txn.put(b"zzz", b"buffered").unwrap();
+
+    let mut scan = txn.scan_stream(None, None);
+    let before = scan.by_ref().count();
+    scan.status().expect("an intact snapshot must scan clean");
+    assert_eq!(before, 11, "ten committed rows plus the buffered write");
+
+    // Closing the database makes every iterator built afterwards carry a
+    // terminal error. Without a status to consult, the merged stream would
+    // return the one buffered write and look like a complete range.
+    tdb.db().close().unwrap();
+
+    let mut scan = txn.scan_stream(None, None);
+    let after = scan.by_ref().count();
+    assert!(
+        scan.status().is_err(),
+        "the snapshot side died, so a scan returning {after} of {before} rows \
+         must report why rather than read as a complete range"
+    );
+}
