@@ -166,7 +166,14 @@ pub mod fuzzing {
     /// Open arbitrary bytes as a complete SSTable file.
     pub fn open_sst(data: &[u8]) {
         with_temp_file("sst", "sst", data, |path| {
-            let _ = crate::engine::sstable::SsTableReader::open(path, 0);
+            // `open_with`, not `open`: the latter is `#[cfg(test)]`, so under
+            // the `fuzzing` feature it does not exist and the crate does not build.
+            let _ = crate::engine::sstable::SsTableReader::open_with(
+                &crate::env::std_env(),
+                path,
+                0,
+                crate::engine::sstable::MetadataPolicy::Pinned,
+            );
         });
     }
 
@@ -2182,6 +2189,7 @@ macro_rules! impl_entries {
                 Some((key, value))
             }
         }
+
 
         impl$(<$lt>)? IntoIterator for $cursor {
             type Item = (Vec<u8>, DbSlice);
