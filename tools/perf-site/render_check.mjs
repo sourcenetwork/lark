@@ -45,7 +45,32 @@ const node = (id) =>
     },
   });
 
-globalThis.document = { querySelector: (sel) => node(sel) };
+// The page also wires up interaction it cannot use here: a zoom overlay it
+// builds and appends, and document-level listeners. None of it affects what
+// gets rendered, but it runs during boot, so it has to find something rather
+// than throw and take the whole check down with it. These stubs exist to let
+// boot reach the end, not to stand in for a browser: nothing below is
+// asserted on.
+const detached = () => ({
+  className: "",
+  hidden: false,
+  style: {},
+  classList: { add() {}, remove() {}, contains: () => false },
+  appendChild() {},
+  addEventListener() {},
+  closest: () => null,
+});
+
+globalThis.document = {
+  querySelector: (sel) => node(sel),
+  // Nothing in the check inspects elements the page creates or the nodes it
+  // sweeps for a class, so an empty sweep and a detached element are the
+  // honest answers.
+  querySelectorAll: () => [],
+  createElement: () => detached(),
+  addEventListener() {},
+  body: { appendChild() {} },
+};
 globalThis.fetch = async (path) => {
   try {
     const body = readFileSync(`${site}/${path}`, "utf8");
