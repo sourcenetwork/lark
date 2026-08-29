@@ -3188,6 +3188,19 @@ impl RegolithEngine {
     /// Drop all data in the engine.
     pub(crate) fn drop_all(&self) -> std::io::Result<()> {
         self.ensure_writable()?;
+        // Exclude background compaction for the whole drop, as
+        // `compact_range`, `ingest_external_files` and `checkpoint_capture`
+        // do. Without it a worker holding the read side runs straight
+        // through the `Reset` below and then applies its `AddFile`, which
+        // `VersionSet::apply` lays over whatever version is current: a file
+        // full of pre-drop rows lands in the freshly emptied version, and
+        // `remove_obsolete_sst_files` cannot unlink it because the pre-drop
+        // version never named it. The drop reports success and the data is
+        // still there, across a reopen.
+        //
+        // Taken before `pipeline`, matching the `compaction_lock ->
+        // write_lock` order documented on `run_one_compaction_pass`.
+        let _compact_guard = self.compaction_lock.write();
         let _write_guard = self.pipeline.lock();
         self.ensure_writable()?;
 
@@ -3322,7 +3335,22 @@ impl RegolithEngine {
             .as_mut()
             .ok_or_else(Self::read_only_error)?
             .sync_data()?;
-        self.compaction.lock().shutdown();
+        // Signal under the mutex, join without it.
+        //
+        // A worker parked in `compaction_lock.read()` cannot exit until
+        // whoever holds that gate is done, and `ingest_external_files` holds
+        // it across a call that wants this same mutex. Joining while holding
+        // the mutex therefore closes a cycle: close waits on the worker, the
+        // worker waits on the ingest gate, and ingest waits on this mutex.
+        // Dropping the guard before the join is what breaks it.
+        let handles = {
+            let mut scheduler = self.compaction.lock();
+            scheduler.signal_shutdown();
+            scheduler.take_handles()
+        };
+        for handle in handles {
+            handle.join();
+        }
 
         Ok(())
     }

@@ -219,15 +219,35 @@ impl CompactionScheduler {
     /// their condvar timeout and make close latency scale with
     /// `max_background_compactions`.
     pub(crate) fn shutdown(&mut self) {
+        self.signal_shutdown();
+        for handle in self.take_handles() {
+            handle.join();
+        }
+    }
+
+    /// Tell every worker to stop, without waiting for any of them.
+    ///
+    /// Split from the join so a caller holding a lock a worker needs can
+    /// release it before waiting. See [`Self::take_handles`].
+    pub(crate) fn signal_shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Release);
         // One token per worker, bypassing the coalescing gate, so every
         // thread wakes now instead of waiting out its periodic poll.
         for _ in 0..self.handles.len() {
             self.trigger.send(());
         }
-        for handle in self.handles.drain(..) {
-            handle.join();
-        }
+    }
+
+    /// Take the worker handles so they can be joined with no lock held.
+    ///
+    /// Joining while holding the mutex that guards this scheduler is a
+    /// deadlock: a worker parked in `compaction_lock.read()` cannot exit
+    /// until whoever holds that gate finishes, and `ingest_external_files`
+    /// holds it across a call that wants this very mutex. Handing the
+    /// handles out lets the caller drop its guard first, which is the only
+    /// ordering in which all three can make progress.
+    pub(crate) fn take_handles(&mut self) -> Vec<Box<dyn crate::env::JoinHandle>> {
+        std::mem::take(&mut self.handles)
     }
 }
 
@@ -1189,7 +1209,71 @@ fn perform_compaction_to(
     // Atomically apply the remove / add edits. `SetNextFileId` is not
     // needed here - each output file already advanced it when it was
     // allocated above.
-    versions.lock().apply(&edits)?;
+    {
+        let mut versions = versions.lock();
+        if level == 0 && target_level == 0 {
+            // An L0 to L0 merge has to be placed, not appended.
+            //
+            // Recency inside L0 is position, not sequence number: `get`
+            // walks the level in reverse and takes the first match without
+            // comparing sequence numbers across files. `apply` appends, so
+            // an appended merge output claims the newest slot. Nothing
+            // excludes a flush while the merge runs, and a memtable flushed
+            // mid-merge installs a genuinely newer file first. Appending
+            // then puts the older merged data in front of it and the newer
+            // write reads as lost until some later merge folds it in.
+            //
+            // So rebuild the level explicitly: everything that was in front
+            // of the oldest input stays in front, the merge output takes
+            // that oldest input's slot, and every survivor after it keeps
+            // its order. Files installed while the merge ran are survivors
+            // and stay newer, which is what they are.
+            //
+            // Expressed with the edits that already exist rather than a new
+            // one, because every edit is also a manifest record and replay
+            // has to reproduce this order from the log. `apply` walks edits
+            // in order, so remove-all-then-add-in-order says it exactly.
+            let current = versions.current();
+            let input_ids: std::collections::HashSet<u64> =
+                input_files.iter().map(|f| f.meta.file_id).collect();
+            let oldest = current.levels[0]
+                .iter()
+                .position(|f| input_ids.contains(&f.meta.file_id))
+                .unwrap_or(0);
+
+            let mut rebuilt: Vec<VersionEdit> = Vec::new();
+            for f in current.levels[0].iter() {
+                rebuilt.push(VersionEdit::RemoveFile {
+                    level: 0,
+                    file_id: f.meta.file_id,
+                });
+            }
+            let keep = |f: &Arc<LiveSst>| !input_ids.contains(&f.meta.file_id);
+            for f in current.levels[0][..oldest].iter().filter(|f| keep(f)) {
+                rebuilt.push(VersionEdit::AddFile {
+                    level: 0,
+                    file: Arc::clone(f),
+                });
+            }
+            for edit in edits.iter() {
+                if let VersionEdit::AddFile { level: 0, file } = edit {
+                    rebuilt.push(VersionEdit::AddFile {
+                        level: 0,
+                        file: Arc::clone(file),
+                    });
+                }
+            }
+            for f in current.levels[0][oldest..].iter().filter(|f| keep(f)) {
+                rebuilt.push(VersionEdit::AddFile {
+                    level: 0,
+                    file: Arc::clone(f),
+                });
+            }
+            versions.apply(&rebuilt)?;
+        } else {
+            versions.apply(&edits)?;
+        }
+    }
 
     // Unlink the old SSTable paths. Their file descriptors stay alive
     // through any `Arc<LiveSst>` still held by older versions or by
