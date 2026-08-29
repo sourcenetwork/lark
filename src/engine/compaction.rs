@@ -483,6 +483,50 @@ pub(crate) enum CompactionOutcome {
 /// two can never diverge on what "one job" means. Callers hold either
 /// side of the engine-wide compaction lock and pass the engine-wide
 /// `in_progress` set.
+/// Sentinel claim for the styles that merge across the whole L0 pool.
+///
+/// File ids are allocated from a counter, so `u64::MAX` is never a real
+/// one and can stand for "the entire pool is spoken for". Claiming it
+/// keeps the exclusion honest when the pool happens to be empty, where
+/// claiming only the live ids would claim nothing and exclude nobody.
+const WHOLE_POOL_CLAIM: u64 = u64::MAX;
+
+/// Claim every live file, or report that another worker already holds one.
+///
+/// Used by the styles whose jobs span the whole L0 pool. Checking that the
+/// in-progress set is empty without then claiming anything does not
+/// exclude a second worker: it reaches the same check and finds the same
+/// empty set. The check and the claim have to be one critical section.
+fn claim_whole_pool(
+    versions: &Arc<VersionStore>,
+    in_progress: &crate::sync::Mutex<HashSet<u64>>,
+) -> Option<Vec<u64>> {
+    let mut ip = in_progress.lock();
+    if !ip.is_empty() {
+        return None;
+    }
+    let version = versions.lock().current();
+    let mut ids: Vec<u64> = version
+        .levels
+        .iter()
+        .flat_map(|files| files.iter().map(|f| f.meta.file_id))
+        .collect();
+    ids.push(WHOLE_POOL_CLAIM);
+    for &id in &ids {
+        ip.insert(id);
+    }
+    Some(ids)
+}
+
+/// Drop a claim. Always runs, including on a failed job, so a worker that
+/// errors does not strand the files it held.
+fn release_claim(in_progress: &crate::sync::Mutex<HashSet<u64>>, ids: &[u64]) {
+    let mut ip = in_progress.lock();
+    for id in ids {
+        ip.remove(id);
+    }
+}
+
 pub(crate) fn pick_and_run_compaction(
     versions: &Arc<VersionStore>,
     sst_dir: &Path,
@@ -496,22 +540,23 @@ pub(crate) fn pick_and_run_compaction(
             pick_and_run_level_compaction(versions, sst_dir, cache, opts, pin_seq, in_progress)
         }
         crate::options::CompactionStyle::Fifo => {
-            // Skip if any file is already being compacted - with a
-            // single L0 pool there's nothing safe to pick in parallel.
-            if !in_progress.lock().is_empty() {
+            // One L0 pool, so there is nothing safe to pick in parallel.
+            let Some(claim) = claim_whole_pool(versions, in_progress) else {
                 return Ok(CompactionOutcome::Contended);
-            }
-            Ok(outcome(run_fifo_pass(versions, sst_dir, opts)?))
+            };
+            let result = run_fifo_pass(versions, sst_dir, opts);
+            release_claim(in_progress, &claim);
+            Ok(outcome(result?))
         }
         crate::options::CompactionStyle::Universal => {
-            // Same: universal merges all L0 files, so parallel picks
-            // would conflict. Skip until the in-progress set clears.
-            if !in_progress.lock().is_empty() {
+            // Same: universal merges across all L0 files, so two jobs
+            // would pick overlapping inputs.
+            let Some(claim) = claim_whole_pool(versions, in_progress) else {
                 return Ok(CompactionOutcome::Contended);
-            }
-            Ok(outcome(pick_and_run_universal(
-                versions, sst_dir, cache, opts, pin_seq,
-            )?))
+            };
+            let result = pick_and_run_universal(versions, sst_dir, cache, opts, pin_seq);
+            release_claim(in_progress, &claim);
+            Ok(outcome(result?))
         }
     }
 }
@@ -814,6 +859,11 @@ fn level_target_size(level: usize, opts: &CompactionOptions) -> u64 {
 }
 
 /// Compact all L0 SSTables into L1.
+///
+/// L0 files may overlap each other, so the whole level is one job.
+/// `compact_level` claims it, which is where the contention check for L0
+/// lives: a check here would be a separate critical section from the claim
+/// and so would not exclude anything.
 fn compact_l0(
     versions: &Arc<VersionStore>,
     sst_dir: &Path,
@@ -822,19 +872,6 @@ fn compact_l0(
     pin_seq: u64,
     in_progress: &crate::sync::Mutex<HashSet<u64>>,
 ) -> std::io::Result<CompactionOutcome> {
-    // If any L0 file is already being compacted by another worker,
-    // skip - L0 files may overlap so concurrent picks would produce
-    // conflicting output sets.
-    {
-        let ip = in_progress.lock();
-        let version = versions.lock().current();
-        if version.levels[0]
-            .iter()
-            .any(|f| ip.contains(&f.meta.file_id))
-        {
-            return Ok(CompactionOutcome::Contended);
-        }
-    }
     compact_level(versions, sst_dir, cache, opts, 0, pin_seq, in_progress)
 }
 
@@ -855,56 +892,60 @@ fn compact_level(
         return Ok(CompactionOutcome::Idle);
     }
 
-    let version = versions.lock().current();
+    // Choose the input set and claim it in a single critical section.
+    //
+    // Checking that a file is unclaimed and then claiming it in a later
+    // lock hold does not exclude anything: two workers can both observe
+    // the same file free, both claim it, and both compact the same inputs
+    // into two output sets covering the same key range. Every level below
+    // L0 is read as one sorted run, so a level holding both sets is no
+    // longer sorted, and a scan across it stops at the first key that does
+    // not advance.
+    //
+    // The version is read under the same hold, so the files claimed are
+    // the ones live at claim time rather than ones another worker has
+    // already replaced. `in_progress` is taken before `versions`
+    // throughout this module; no path holds a version guard across a claim.
+    let (input_files, overlap_files, all_ids) = {
+        let mut ip = in_progress.lock();
+        let version = versions.lock().current();
 
-    let input_files: Vec<Arc<LiveSst>> = version.levels[level].clone();
-    if input_files.is_empty() {
-        return Ok(CompactionOutcome::Idle);
-    }
+        let level_files = &version.levels[level];
+        if level_files.is_empty() {
+            return Ok(CompactionOutcome::Idle);
+        }
 
-    // For L0, all files may overlap. For other levels, pick the first
-    // file that is not already being compacted by another worker.
-    let (input_files, overlap_files) = if level == 0 {
-        let l0_files = input_files;
-        let (min_key, max_key) = key_range(&l0_files);
-        let overlapping = find_overlapping(&version.levels[target_level], &min_key, &max_key);
-        (l0_files, overlapping)
-    } else {
-        let ip = in_progress.lock();
-        let candidate = input_files
-            .iter()
-            .find(|f| !ip.contains(&f.meta.file_id))
-            .map(Arc::clone);
-        drop(ip);
-        let picked = match candidate {
-            Some(f) => vec![f],
-            None => return Ok(CompactionOutcome::Contended),
-        };
-        let (min_key, max_key) = key_range(&picked);
-        // Also skip if any overlap file is already in-progress.
-        let overlapping = find_overlapping(&version.levels[target_level], &min_key, &max_key);
-        {
-            let ip = in_progress.lock();
-            if overlapping.iter().any(|f| ip.contains(&f.meta.file_id)) {
+        // L0 files may overlap each other, so the level goes in one job and
+        // any claimed file blocks it. L1+ files do not overlap, so one
+        // unclaimed file at a time is a valid job on its own.
+        let picked: Vec<Arc<LiveSst>> = if level == 0 {
+            if level_files.iter().any(|f| ip.contains(&f.meta.file_id)) {
                 return Ok(CompactionOutcome::Contended);
             }
-        }
-        (picked, overlapping)
-    };
+            level_files.clone()
+        } else {
+            match level_files.iter().find(|f| !ip.contains(&f.meta.file_id)) {
+                Some(f) => vec![Arc::clone(f)],
+                None => return Ok(CompactionOutcome::Contended),
+            }
+        };
 
-    // Register all input and overlap file ids before releasing the
-    // version snapshot so concurrent workers see them immediately.
-    let all_ids: Vec<u64> = input_files
-        .iter()
-        .chain(overlap_files.iter())
-        .map(|f| f.meta.file_id)
-        .collect();
-    {
-        let mut ip = in_progress.lock();
-        for &id in &all_ids {
+        let (min_key, max_key) = key_range(&picked);
+        let overlapping = find_overlapping(&version.levels[target_level], &min_key, &max_key);
+        if overlapping.iter().any(|f| ip.contains(&f.meta.file_id)) {
+            return Ok(CompactionOutcome::Contended);
+        }
+
+        let ids: Vec<u64> = picked
+            .iter()
+            .chain(overlapping.iter())
+            .map(|f| f.meta.file_id)
+            .collect();
+        for &id in &ids {
             ip.insert(id);
         }
-    }
+        (picked, overlapping, ids)
+    };
 
     let result = perform_compaction(
         versions,
@@ -919,12 +960,7 @@ fn compact_level(
 
     // Always deregister, even on error, so workers don't stall
     // forever waiting for a slot that will never clear.
-    {
-        let mut ip = in_progress.lock();
-        for id in &all_ids {
-            ip.remove(id);
-        }
-    }
+    release_claim(in_progress, &all_ids);
 
     result?;
     Ok(CompactionOutcome::DidWork)
