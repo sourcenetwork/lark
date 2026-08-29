@@ -356,10 +356,19 @@ impl SsTableLevelIter {
             return self.reader.read_block(handle, &self.cache);
         }
 
-        let span_end = self.span_start + self.span.len() as u64;
-        let held = !self.span.is_empty()
-            && handle.offset >= self.span_start
-            && handle.offset + handle.size <= span_end;
+        // A handle comes out of the index, and an index read off a damaged
+        // file can say anything: an offset near u64::MAX, a size that runs
+        // past the end of the address space. Every bound below is therefore
+        // checked, and anything that does not add up falls back to
+        // `read_block`, which validates the region against `data_end` and
+        // returns an error. A corrupt file must fail the read, not the
+        // process.
+        let Some(handle_end) = handle.offset.checked_add(handle.size) else {
+            return self.reader.read_block(handle, &self.cache);
+        };
+        let span_end = self.span_start.saturating_add(self.span.len() as u64);
+        let held =
+            !self.span.is_empty() && handle.offset >= self.span_start && handle_end <= span_end;
         if !held {
             let want = handle
                 .size
@@ -375,10 +384,18 @@ impl SsTableLevelIter {
             }
         }
 
-        let lo = (handle.offset - self.span_start) as usize;
-        let hi = lo + handle.size as usize;
-        self.reader
-            .decode_block_frame(handle, &self.span[lo..hi], &self.cache)
+        // Slice by lookup rather than by index: on a 32-bit target the
+        // casts below can truncate, and the span is the caller's buffer,
+        // not something a damaged file gets to index freely.
+        let frame = usize::try_from(handle.offset - self.span_start)
+            .ok()
+            .zip(usize::try_from(handle.size).ok())
+            .and_then(|(lo, len)| lo.checked_add(len).map(|hi| (lo, hi)))
+            .and_then(|(lo, hi)| self.span.get(lo..hi));
+        let Some(frame) = frame else {
+            return self.reader.read_block(handle, &self.cache);
+        };
+        self.reader.decode_block_frame(handle, frame, &self.cache)
     }
 
     /// Forget the span. A seek can land anywhere, so what was read ahead
