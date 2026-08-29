@@ -288,7 +288,37 @@ struct SsTableLevelIter {
     /// Lazily built on the first backward step; maps entry index to
     /// byte offset in entry_data.
     entry_offsets: Option<Vec<usize>>,
+    /// A span of the data area held for the forward walk, and the offset
+    /// it starts at. Empty until this iterator has actually stepped from
+    /// one block to the next, so a seek that reads a single block still
+    /// costs a single block-sized read.
+    span: Vec<u8>,
+    span_start: u64,
+    /// Set once the iterator walks off the end of a block into the next
+    /// one. From then on its reads are known to be sequential and worth
+    /// reading ahead for.
+    sequential: bool,
 }
+
+/// Blocks a sequential walk pulls per read, and the ceiling on that.
+///
+/// One positional read per block makes a scan pay one round trip per
+/// block, which on a network-backed volume is nearly all of what it
+/// spends its time on. Reading a span of adjacent blocks amortizes the
+/// trip over many of them.
+///
+/// The span is sized from the block it starts at rather than fixed, so
+/// the memory follows the configuration that chose the block size: the
+/// embedded and wasm profiles use 4 KiB blocks and so read 64 KiB, while
+/// a server profile with 64 KiB blocks reads the full megabyte. The
+/// ceiling is per level iterator, and levels below L0 are walked one file
+/// at a time, so a cursor holds one span per level rather than one per
+/// file. Nothing is allocated until the iterator has actually stepped
+/// from one block into the next, and the buffer is released as soon as it
+/// stops walking forward, so a point lookup and a seek-driven workload
+/// both hold none of it.
+const SCAN_SPAN_BLOCKS: u64 = 16;
+const SCAN_SPAN_MAX: u64 = 1 << 20;
 
 impl SsTableLevelIter {
     fn new(reader: Arc<SsTableReader>, cache: Arc<BlockCache>) -> Self {
@@ -305,7 +335,62 @@ impl SsTableLevelIter {
             valid: false,
             current_entry_index: None,
             entry_offsets: None,
+            span: Vec::new(),
+            span_start: 0,
+            sequential: false,
         }
+    }
+
+    /// The block a handle points at, read ahead when the walk is known to
+    /// be sequential.
+    ///
+    /// Falls back to a single block-sized read whenever reading ahead
+    /// cannot serve the block: before the first block-to-block step, for a
+    /// block larger than one span, and at the end of the data area where
+    /// the span comes back short.
+    fn block_for(&mut self, handle: super::block::BlockHandle) -> io::Result<Arc<Block>> {
+        if let Some(block) = self.cache.get(self.reader.file_id, handle.offset) {
+            return Ok(block);
+        }
+        if !self.sequential || handle.size > SCAN_SPAN_MAX {
+            return self.reader.read_block(handle, &self.cache);
+        }
+
+        let span_end = self.span_start + self.span.len() as u64;
+        let held = !self.span.is_empty()
+            && handle.offset >= self.span_start
+            && handle.offset + handle.size <= span_end;
+        if !held {
+            let want = handle
+                .size
+                .saturating_mul(SCAN_SPAN_BLOCKS)
+                .clamp(handle.size, SCAN_SPAN_MAX);
+            self.span = self.reader.read_span(handle.offset, want)?;
+            self.span_start = handle.offset;
+            if (self.span.len() as u64) < handle.size {
+                // Ran into the end of the data area; the block is not
+                // wholly inside the span, so read it on its own.
+                self.span.clear();
+                return self.reader.read_block(handle, &self.cache);
+            }
+        }
+
+        let lo = (handle.offset - self.span_start) as usize;
+        let hi = lo + handle.size as usize;
+        self.reader
+            .decode_block_frame(handle, &self.span[lo..hi], &self.cache)
+    }
+
+    /// Forget the span. A seek can land anywhere, so what was read ahead
+    /// for the previous position says nothing about the new one.
+    ///
+    /// Releases the buffer rather than keeping its capacity: an iterator
+    /// that is not walking forward should hold no readahead memory at all,
+    /// and one that resumes walking pays a single allocation to say so.
+    fn reset_readahead(&mut self) {
+        self.span = Vec::new();
+        self.span_start = 0;
+        self.sequential = false;
     }
 
     /// The current value, borrowed from the decoded block holding it.
@@ -330,7 +415,8 @@ impl SsTableLevelIter {
     }
 
     fn load_block(&mut self, cursor: SsTableBlockCursor) -> io::Result<()> {
-        self.block = Some(self.reader.load_block_at_cursor(&cursor, &self.cache)?);
+        let handle = self.reader.cursor_handle(&cursor, &self.cache)?;
+        self.block = Some(self.block_for(handle)?);
         self.block_cursor = Some(cursor);
         self.entry_pos = 0;
         self.next_entry_pos = 0;
@@ -359,6 +445,7 @@ impl SsTableLevelIter {
     }
 
     fn seek_to_first(&mut self) -> io::Result<()> {
+        self.reset_readahead();
         let Some(cursor) = self.reader.first_block_cursor(&self.cache)? else {
             self.valid = false;
             return Ok(());
@@ -369,6 +456,7 @@ impl SsTableLevelIter {
     }
 
     fn seek(&mut self, target: &[u8]) -> io::Result<()> {
+        self.reset_readahead();
         let cursor = match self.reader.seek_block_cursor(target, &self.cache)? {
             Some(cursor) => cursor,
             None => {
@@ -400,12 +488,14 @@ impl SsTableLevelIter {
             self.valid = false;
             return Ok(());
         };
+        self.sequential = true;
         self.load_block(next)?;
         self.decode_current();
         Ok(())
     }
 
     fn seek_for_prev(&mut self, target: &[u8]) -> io::Result<()> {
+        self.reset_readahead();
         let cursor = match self.reader.seek_block_cursor(target, &self.cache)? {
             Some(cursor) => cursor,
             None => match self.reader.last_block_cursor(&self.cache)? {
@@ -466,6 +556,7 @@ impl SsTableLevelIter {
             let next = self
                 .reader
                 .next_block_cursor(self.block_cursor.as_ref().unwrap(), &self.cache)?;
+            self.sequential = true;
             let Some(next) = next else {
                 self.valid = false;
                 return Ok(());
@@ -477,6 +568,7 @@ impl SsTableLevelIter {
     }
 
     fn seek_to_last(&mut self) -> io::Result<()> {
+        self.reset_readahead();
         let Some(cursor) = self.reader.last_block_cursor(&self.cache)? else {
             self.valid = false;
             return Ok(());
