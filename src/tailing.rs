@@ -74,6 +74,9 @@ pub struct TailingIter {
     /// step.
     cf_upper: Vec<u8>,
     valid_cf: bool,
+    /// Why this iterator has no column family to read, when it has none.
+    /// `None` on every live iterator, so the working path allocates nothing.
+    invalid_cf: Option<Box<str>>,
     /// Statistics sink captured at construction so seek/next
     /// instrumentation borrows only this field, not the whole
     /// `&self` (which would conflict with the mutable borrows in
@@ -92,13 +95,27 @@ impl TailingIter {
             cf_id,
             cf_upper: cf_upper_bound(cf_id),
             valid_cf: true,
+            invalid_cf: None,
             stats,
         }
     }
 
-    pub(crate) fn empty(engine: Arc<RegolithEngine>) -> Self {
+    /// A tailing iterator over a handle that is not live.
+    ///
+    /// The handle is carried so [`TailingIter::status`] can report why this
+    /// iterator will never yield anything, rather than letting a dropped
+    /// column family read as an empty one.
+    pub(crate) fn empty(engine: Arc<RegolithEngine>, cf: &crate::ColumnFamilyHandle) -> Self {
         let mut iter = Self::new(engine, DEFAULT_CF_ID);
         iter.valid_cf = false;
+        iter.invalid_cf = Some(
+            format!(
+                "column family handle '{}' with id {} is not live",
+                cf.name(),
+                cf.id()
+            )
+            .into_boxed_str(),
+        );
         iter
     }
 
@@ -282,7 +299,14 @@ impl TailingIter {
     }
 
     /// Propagate any I/O error from the underlying cursor.
+    /// Why the walk stopped, or why it never started.
+    ///
+    /// Reports a handle that is not live rather than dropping it, so a
+    /// dropped column family cannot read as an empty one that succeeded.
     pub fn status(&self) -> Result<()> {
+        if let Some(reason) = &self.invalid_cf {
+            return Err(crate::Error::invalid_column_family(reason.to_string()));
+        }
         self.inner.status().map_err(crate::Error::from)
     }
 }
@@ -299,6 +323,6 @@ pub(crate) fn new_for_cf(engine: Arc<RegolithEngine>, cf: &ColumnFamilyHandle) -
 }
 
 /// Helper called when a stale CF handle is used with `Db::iter_tailing_cf`.
-pub(crate) fn new_empty(engine: Arc<RegolithEngine>) -> TailingIter {
-    TailingIter::empty(engine)
+pub(crate) fn new_empty(engine: Arc<RegolithEngine>, cf: &ColumnFamilyHandle) -> TailingIter {
+    TailingIter::empty(engine, cf)
 }

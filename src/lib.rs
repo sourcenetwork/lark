@@ -1794,7 +1794,7 @@ impl Db {
         if self.is_live_cf_handle(cf) {
             CfIter::new(inner, cf.id())
         } else {
-            CfIter::invalid(inner)
+            CfIter::invalid(inner, cf)
         }
     }
 
@@ -1814,7 +1814,7 @@ impl Db {
         if self.is_live_cf_handle(cf) {
             tailing::new_for_cf(engine, cf)
         } else {
-            tailing::new_empty(engine)
+            tailing::new_empty(engine, cf)
         }
     }
 
@@ -1845,11 +1845,19 @@ pub struct CfIter<'a> {
     cf_id: u32,
     upper_bound: Vec<u8>,
     valid_cf: bool,
+    /// Why this iterator has no column family to read, when it has none.
+    ///
+    /// A handle that is not live is a detected error, and the rest of the CF
+    /// read surface returns it. An iterator cannot, so it is held here and
+    /// handed back by [`CfIter::status`]. `None` on every live iterator, so
+    /// the path that works allocates nothing.
+    invalid_cf: Option<Box<str>>,
 }
 
 impl<'a> CfIter<'a> {
     fn new(inner: Iter<'a>, cf_id: u32) -> Self {
         Self {
+            invalid_cf: None,
             inner,
             cf_id,
             upper_bound: cf_upper_bound(cf_id),
@@ -1857,12 +1865,20 @@ impl<'a> CfIter<'a> {
         }
     }
 
-    fn invalid(inner: Iter<'a>) -> Self {
+    fn invalid(inner: Iter<'a>, cf: &ColumnFamilyHandle) -> Self {
         Self {
             inner,
             cf_id: DEFAULT_CF_ID,
             upper_bound: cf_upper_bound(DEFAULT_CF_ID),
             valid_cf: false,
+            invalid_cf: Some(
+                format!(
+                    "column family handle '{}' with id {} is not live",
+                    cf.name(),
+                    cf.id()
+                )
+                .into_boxed_str(),
+            ),
         }
     }
 
@@ -1978,8 +1994,17 @@ impl<'a> CfIter<'a> {
         self.inner.value_slice()
     }
 
-    /// Propagate any I/O error from the underlying iterator.
+    /// Why the walk stopped, or why it never started.
+    ///
+    /// A handle that is not live is reported here rather than dropped. The
+    /// rest of the CF read surface (`get_cf`, `scan_cf`, `scan_page_cf`,
+    /// `multi_get_cf`) returns that as an `Err`; an iterator has no way to,
+    /// so without this a dropped column family, or a handle belonging to a
+    /// different `Db`, would read as an empty one and report success.
     pub fn status(&self) -> Result<()> {
+        if let Some(reason) = &self.invalid_cf {
+            return Err(Error::invalid_column_family(reason.to_string()));
+        }
         self.inner.status()
     }
 }
@@ -2574,7 +2599,7 @@ impl Snapshot {
         if self.is_live_cf_handle(cf) {
             CfIter::new(inner, cf.id())
         } else {
-            CfIter::invalid(inner)
+            CfIter::invalid(inner, cf)
         }
     }
 }
