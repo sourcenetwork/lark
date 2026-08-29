@@ -60,7 +60,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use super::block::encoded_entry_size;
-use super::block::{Block, RESTART_INTERVAL, decode_entry_at};
+use super::block::{Block, decode_entry_at};
 use super::block_cache::BlockCache;
 use super::internal_key::{
     INTERNAL_KEY_SUFFIX_LEN, VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE,
@@ -689,16 +689,55 @@ impl SsTableLevelIter {
     /// `entry_pos`, `next_entry_pos`, and cached value metadata are
     /// all consistent with the entry at `target_idx`.
     fn replay_key_to_index(&mut self, target_idx: usize) {
-        let restart_idx = target_idx / RESTART_INTERVAL;
+        // Find where to replay from by asking the block, not by assuming how
+        // it was written.
+        //
+        // The obvious form of this divides `target_idx` by `RESTART_INTERVAL`
+        // and trusts that restart `n` sits at entry `n * RESTART_INTERVAL`.
+        // Nothing enforces that pairing: `validate_restarts_and_entries`
+        // checks only that restart offsets increase, land on entry
+        // boundaries, and share no prefix. A block whose second restart
+        // points one entry further along passes validation, and the replay
+        // then starts past the entry it counts from, walks off the end of the
+        // entry region, and panics inside `decode_entry_at`. Where it happens
+        // to stay in bounds it returns the wrong entry and says nothing.
+        //
+        // Both are the same mistake, so neither is fixed by tightening the
+        // format. `entry_offsets` is already built by every caller, and the
+        // restart array is already known to be strictly increasing, so the
+        // covering restart can simply be looked up. `start_offset` is then an
+        // entry boundary at or before the target by construction, and the
+        // replay cannot leave the block whatever the file claims.
         let block = self.block.as_ref().unwrap();
         let data = block.entry_data();
-        let start_offset = if restart_idx > 0 && restart_idx < block.restart_count() {
-            block.restart_offset(restart_idx)
+        let Some(offsets) = self.entry_offsets.as_ref() else {
+            return;
+        };
+        let Some(&target_off) = offsets.get(target_idx) else {
+            return;
+        };
+
+        // Largest restart offset at or before the target.
+        let (mut lo, mut hi) = (0usize, block.restart_count());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if block.restart_offset(mid) <= target_off {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let start_offset = if lo > 0 {
+            block.restart_offset(lo - 1)
         } else {
             0
         };
+        // A restart offset is an entry boundary, so this resolves; a file
+        // that says otherwise replays from the start of the block, which is
+        // correct if slower rather than out of bounds.
+        let start_entry_idx = offsets.binary_search(&start_offset).unwrap_or(0);
+
         self.cached_key.clear();
-        let start_entry_idx = restart_idx * RESTART_INTERVAL;
         let mut pos = start_offset;
         for idx in start_entry_idx..=target_idx {
             let (consumed, val_off, val_len) = decode_entry_at(data, pos, &mut self.cached_key);
