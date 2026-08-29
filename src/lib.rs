@@ -2090,6 +2090,31 @@ pub struct ScanStream {
     done: bool,
 }
 
+impl ScanStream {
+    /// Why the scan stopped.
+    ///
+    /// `Ok(())` means the range ended. An error means it did not: what the
+    /// stream yielded is a prefix of the range and the rest was never read.
+    ///
+    /// This matters because [`Iterator`] cannot carry a failure. A scan that
+    /// dies on a corrupt block ends exactly like one that reached the end of
+    /// its range, and a caller that only iterates cannot tell a short answer
+    /// from a complete one. Check this after iterating whenever a missing row
+    /// would be worse than an error.
+    ///
+    /// ```no_run
+    /// # use regolith::{Db, Options};
+    /// # let db = Db::open("/tmp/scan_status_doc", Options::default()).unwrap();
+    /// let mut scan = db.scan_stream(None, None)?;
+    /// let rows: Vec<_> = scan.by_ref().collect();
+    /// scan.status()?;  // the rows above are the whole range only if this is Ok
+    /// # Ok::<(), regolith::Error>(())
+    /// ```
+    pub fn status(&self) -> Result<()> {
+        self.entries.status()
+    }
+}
+
 impl Iterator for ScanStream {
     type Item = (Vec<u8>, DbSlice);
 
@@ -2182,6 +2207,19 @@ macro_rules! impl_entries {
                     }
                 }
                 if !self.cursor.valid() {
+                    // A cursor goes invalid for two reasons that look
+                    // identical from here: the range ended, or the walk
+                    // failed. `Iterator` has nowhere to put the difference,
+                    // so say it out loud rather than let a failed scan read
+                    // as a complete one. `Entries::status` returns it to a
+                    // caller that checks.
+                    if let Err(e) = self.cursor.status() {
+                        tracing::error!(
+                            error = %e,
+                            "scan ended early: the iterator failed mid-range, \
+                             so the rows returned are a prefix and not the range"
+                        );
+                    }
                     return None;
                 }
                 let key = self.cursor.key()?.to_vec();
@@ -2190,6 +2228,18 @@ macro_rules! impl_entries {
             }
         }
 
+        impl$(<$lt>)? Entries<$cursor> {
+            /// Why the walk stopped.
+            ///
+            /// `Ok(())` means the range ended. An error means it did not:
+            /// the entries handed out are a prefix of the range, and the
+            /// rest was not read. Iterating alone cannot tell the two
+            /// apart, so a caller that must not silently lose rows checks
+            /// this once the iteration finishes.
+            pub fn status(&self) -> Result<()> {
+                self.cursor.status()
+            }
+        }
 
         impl$(<$lt>)? IntoIterator for $cursor {
             type Item = (Vec<u8>, DbSlice);
