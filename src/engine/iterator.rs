@@ -294,6 +294,15 @@ struct SsTableLevelIter {
     /// costs a single block-sized read.
     span: Vec<u8>,
     span_start: u64,
+    /// Ceiling on this iterator's span, its share of the scan-wide budget.
+    /// A merging scan holds one `SsTableLevelIter` per L0 file plus one per
+    /// level below it, so a fixed per-iterator ceiling would let the total
+    /// grow with L0 depth. The budget is divided at construction instead,
+    /// which bounds the bytes a scan holds rather than the bytes one
+    /// iterator holds.
+    span_cap: u64,
+    /// Blocks the next span will try to cover. Doubles per refill.
+    span_blocks: u64,
     /// Set once the iterator walks off the end of a block into the next
     /// one. From then on its reads are known to be sequential and worth
     /// reading ahead for.
@@ -320,8 +329,17 @@ struct SsTableLevelIter {
 const SCAN_SPAN_BLOCKS: u64 = 16;
 const SCAN_SPAN_MAX: u64 = 1 << 20;
 
+/// Blocks the first span covers, before the ramp widens it.
+///
+/// A walk that reads two blocks and stops must not pay for sixteen. The
+/// span starts here and doubles per refill up to [`SCAN_SPAN_BLOCKS`], so a
+/// scan that ends early reads about what it used and a long one reaches the
+/// ceiling after a few refills. The only evidence that a walk is long is
+/// that it has already been long.
+const SCAN_SPAN_BLOCKS_INITIAL: u64 = 2;
+
 impl SsTableLevelIter {
-    fn new(reader: Arc<SsTableReader>, cache: Arc<BlockCache>) -> Self {
+    fn new(reader: Arc<SsTableReader>, cache: Arc<BlockCache>, span_cap: u64) -> Self {
         Self {
             reader,
             cache,
@@ -337,6 +355,8 @@ impl SsTableLevelIter {
             entry_offsets: None,
             span: Vec::new(),
             span_start: 0,
+            span_cap,
+            span_blocks: SCAN_SPAN_BLOCKS_INITIAL,
             sequential: false,
         }
     }
@@ -349,11 +369,14 @@ impl SsTableLevelIter {
     /// block larger than one span, and at the end of the data area where
     /// the span comes back short.
     fn block_for(&mut self, handle: super::block::BlockHandle) -> io::Result<Arc<Block>> {
+        // `read_block` consults the cache itself, so the non-span path must
+        // not look first: a second lookup would double every miss the block
+        // cache and `PerfContext` count.
+        if !self.sequential || handle.size > self.span_cap {
+            return self.reader.read_block(handle, &self.cache);
+        }
         if let Some(block) = self.cache.get(self.reader.file_id, handle.offset) {
             return Ok(block);
-        }
-        if !self.sequential || handle.size > SCAN_SPAN_MAX {
-            return self.reader.read_block(handle, &self.cache);
         }
 
         // A handle comes out of the index, and an index read off a damaged
@@ -372,8 +395,10 @@ impl SsTableLevelIter {
         if !held {
             let want = handle
                 .size
-                .saturating_mul(SCAN_SPAN_BLOCKS)
-                .clamp(handle.size, SCAN_SPAN_MAX);
+                .saturating_mul(self.span_blocks)
+                .clamp(handle.size, self.span_cap.max(handle.size));
+            // Widen the next one: a walk earns its readahead by continuing.
+            self.span_blocks = (self.span_blocks * 2).min(SCAN_SPAN_BLOCKS);
             self.span = self.reader.read_span(handle.offset, want)?;
             self.span_start = handle.offset;
             if (self.span.len() as u64) < handle.size {
@@ -407,6 +432,7 @@ impl SsTableLevelIter {
     fn reset_readahead(&mut self) {
         self.span = Vec::new();
         self.span_start = 0;
+        self.span_blocks = SCAN_SPAN_BLOCKS_INITIAL;
         self.sequential = false;
     }
 
@@ -698,15 +724,17 @@ struct LevelConcatIter {
     cache: Arc<BlockCache>,
     file_idx: usize,
     current: Option<SsTableLevelIter>,
+    span_cap: u64,
 }
 
 impl LevelConcatIter {
-    fn new(files: Vec<Arc<LiveSst>>, cache: Arc<BlockCache>) -> Self {
+    fn new(files: Vec<Arc<LiveSst>>, cache: Arc<BlockCache>, span_cap: u64) -> Self {
         Self {
             files,
             cache,
             file_idx: 0,
             current: None,
+            span_cap,
         }
     }
 
@@ -715,6 +743,7 @@ impl LevelConcatIter {
             self.current = Some(SsTableLevelIter::new(
                 Arc::clone(&self.files[self.file_idx].reader),
                 Arc::clone(&self.cache),
+                self.span_cap,
             ));
         } else {
             self.current = None;
@@ -1141,6 +1170,17 @@ impl RegolithIterator {
         let mut levels: Vec<LevelIter> = Vec::new();
         let mut range_tombstones: Vec<RangeTombstone> = Vec::new();
 
+        // Split the readahead budget before building anything. L0 gets one
+        // iterator per file and every level below it gets one, so a fixed
+        // ceiling per iterator would let a scan's readahead grow with L0
+        // depth, which `level0_stop_writes_trigger` does not bound when it
+        // is zero. Dividing a scan-wide budget bounds the total instead. A
+        // share smaller than one block simply reads a block at a time,
+        // because the span is clamped to at least the block it starts at.
+        let sstable_sources =
+            version.levels[0].len() + version.levels[1..].iter().filter(|l| !l.is_empty()).count();
+        let span_cap = SCAN_SPAN_MAX / (sstable_sources.max(1) as u64);
+
         range_tombstones.extend(active.clone_range_tombstones());
         levels.push(LevelIter::Memtable(MemtableLevelIter::new(active)));
         for mt in frozen.iter().rev() {
@@ -1153,6 +1193,7 @@ impl RegolithIterator {
             levels.push(LevelIter::SsTable(SsTableLevelIter::new(
                 Arc::clone(&file.reader),
                 Arc::clone(&cache),
+                span_cap,
             )));
         }
         // L1+: one concatenation iterator per level rather than one
@@ -1186,6 +1227,7 @@ impl RegolithIterator {
             levels.push(LevelIter::LevelConcat(LevelConcatIter::new(
                 sorted,
                 Arc::clone(&cache),
+                span_cap,
             )));
         }
 
