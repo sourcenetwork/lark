@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Append one benchmark run to the published history.
 
-The history is the point. A single rendered `index.html` per CI run
+The history is the point. A single rendered `perf.html` per CI run
 answers "is this run fast" and nothing else: the moment it is replaced
 the comparison it supported is gone. Keeping every run document and
 rendering from the whole set instead answers "when did this regress",
@@ -9,9 +9,13 @@ which is the question a performance gate actually has to answer.
 
 Layout under the site root:
 
-    index.html          the dashboard, self-contained, reads the JSON below
+    perf.html           the dashboard, self-contained, reads the JSON below
     runs/index.json     manifest, newest first
     runs/<commit>.json  one run document per CI run, verbatim
+
+`index.html` is the project landing page. It is maintained on the
+gh-pages branch and is never written from here; the publish step keeps
+existing files, which is what preserves it.
 
 The manifest is regenerated from the directory on every publish rather
 than appended to, so a run file that was removed cannot leave a dangling

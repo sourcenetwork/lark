@@ -384,7 +384,12 @@ jobs:
           mkdir -p site
           # `keep_files` on the publish step preserves what is already
           # there, so only this run's document has to be produced here.
-          cp tools/perf-site/index.html site/index.html
+          #
+          # The dashboard publishes as `perf.html`, never as `index.html`:
+          # `index.html` is the project landing page, maintained on the
+          # gh-pages branch, and `keep_files` is what keeps it alive across
+          # publishes. Writing `site/index.html` here would overwrite it.
+          cp tools/perf-site/perf.html site/perf.html
       - name: Fetch the existing history
         continue-on-error: true
         run: |
@@ -396,6 +401,15 @@ jobs:
       # Refuse to publish a dashboard that would drop a family it
       # collected. A blank section is not an error to the browser, so
       # without this the job stays green and the site goes quiet.
+      - name: Refuse to publish anything that would replace the landing page
+        run: |
+          set -euo pipefail
+          if [ -e site/index.html ]; then
+            echo "site/index.html was staged for publish." >&2
+            echo "index.html is the landing page on gh-pages; publishing one" >&2
+            echo "here would overwrite it. The dashboard is site/perf.html." >&2
+            exit 1
+          fi
       - name: Check the page renders every collected family
         run: node tools/perf-site/render_check.mjs site
       - name: Publish
@@ -411,5 +425,5 @@ jobs:
           {
             echo "## Performance dashboard"
             echo ""
-            echo "https://${GITHUB_REPOSITORY%%/*}.github.io/${GITHUB_REPOSITORY##*/}/"
+            echo "https://${GITHUB_REPOSITORY%%/*}.github.io/${GITHUB_REPOSITORY##*/}/perf.html"
           } >> "$GITHUB_STEP_SUMMARY"

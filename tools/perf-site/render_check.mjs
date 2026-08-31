@@ -21,7 +21,7 @@ if (!site) {
   process.exit(2);
 }
 
-const html = readFileSync(`${site}/index.html`, "utf8");
+const html = readFileSync(`${site}/perf.html`, "utf8");
 const script = html.slice(html.indexOf("<script>") + 8, html.lastIndexOf("</script>"));
 
 // Enough of a <select> for the page's own boot path to run unchanged: a
@@ -111,7 +111,7 @@ const SECTION = {
 const failures = [];
 
 // A section that throws is not a section that is missing, and until this
-// existed it was not a failure either. `section(name, build)` in index.html
+// existed it was not a failure either. `section(name, build)` in perf.html
 // catches every throw and emits `<h2>${name}</h2>` plus a `card broken`
 // panel, using the very heading this check matches on, so the failure output
 // satisfied the success assertion. Look for the panel first, and name it.
